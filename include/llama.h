@@ -371,6 +371,8 @@ extern "C" {
 
         uint32_t prefill_reuse;         // CUDA prefill GEMM tile for lossless weight reuse, 0 = disabled [EXPERIMENTAL]
 
+        bool rs_rollback_prompt_only;   // keep recurrent rollback snapshots for PP but not TG [EXPERIMENTAL]
+
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
@@ -919,6 +921,10 @@ extern "C" {
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
+// Serialize the immediately preceding recurrent rollback snapshot instead of the live state.
+// Only valid with PARTIAL_ONLY for a single sequence when n_rs_seq >= 1.
+#define LLAMA_STATE_SEQ_FLAGS_RECURRENT_PREV 4
 
     typedef uint32_t llama_state_seq_flags;
 

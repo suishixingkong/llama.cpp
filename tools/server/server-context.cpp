@@ -730,6 +730,12 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        // ON_DEVICE checkpoints refer to the source sequence's transient context storage and
+        // cannot be cloned to a child sequence. The copied live memory is sufficient; portable
+        // host checkpoints remain available for deeper replay.
+        other.prompt.checkpoints.remove_if([](const common_prompt_checkpoint & ckpt) {
+            return ckpt.data_tgt_on_device;
+        });
         other.init_sampler();
     }
 };
@@ -2306,17 +2312,31 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+                           bool is_replay_boundary = false, llama_state_seq_flags tgt_extra_flags = 0) {
         const int id_task = slot.task->id;
+        const int64_t checkpoint_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // A device-backed checkpoint is a transient view into the context's own storage for one
+        // exact prefix; at any other prefix it would alias the wrong device state. Drop stale ones.
+        if (tgt_extra_flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                if (it->data_tgt_on_device && it->n_tokens != checkpoint_n_tokens) {
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
+        // created by the current task, or they are a deliberate replay boundary
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && !it->is_replay_boundary && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2330,20 +2350,31 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Prefer evicting an ordinary periodic checkpoint: a replay boundary marks a prefix the
+            // agent is expected to come back to, so dropping it would defeat the point of keeping it.
+            auto victim = slot.prompt.checkpoints.begin();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++it) {
+                if (!it->is_replay_boundary) {
+                    victim = it;
+                    break;
+                }
+            }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", replay_boundary = %d, size = %.3f MiB)\n",
+                    victim->pos_min, victim->pos_max, victim->n_tokens, victim->is_replay_boundary ? 1 : 0,
+                    (float) victim->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        bool superseded_replay_boundary = false;
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    superseded_replay_boundary = superseded_replay_boundary || it->is_replay_boundary;
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2354,21 +2385,22 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.is_replay_boundary = is_replay_boundary || superseded_replay_boundary;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | tgt_extra_flags);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", replay_boundary = %d, size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, cur.is_replay_boundary ? 1 : 0, (float) cur.size() / 1024 / 1024);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3562,10 +3594,30 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // Lossless prefill reuse may use a larger physical ubatch while
+                            // preserving the baseline GEMM tile. Keep semantic checkpoint
+                            // boundaries tied to that baseline tile too; otherwise enabling
+                            // reuse changes prompt segmentation and therefore MTP/checkpoint
+                            // trajectories even when the CUDA math itself is bit-identical.
+                            const int checkpoint_ubatch = params_base.prefill_reuse > 0
+                                ? std::min(n_ubatch, params_base.prefill_reuse)
+                                : n_ubatch;
+                            const uint64_t n_task_tokens = (uint64_t) std::max<int32_t>(0, slot.task->n_tokens());
+                            const uint64_t n_prompt_new = n_task_tokens > slot.stats.n_prompt_cached
+                                ? n_task_tokens - slot.stats.n_prompt_cached
+                                : 0;
+                            // With a preceding rollback snapshot available, the 4+ubatch boundary
+                            // checkpoint is redundant: the snapshot lands 1 token before the end of
+                            // the prompt, which is finer than that boundary. Skipping it also frees
+                            // a checkpoint slot for the snapshot itself.
+                            const bool snapshot_prev = params_base.checkpoint_recurrent_prev &&
+                                    llama_n_rs_seq(ctx_tgt) > 0 && spec == nullptr && n_prompt_new > 64;
+                            const int checkpoint_offsets[] = {4 + checkpoint_ubatch, 4};
+                            const int n_offsets = snapshot_prev ? 1 : 2;
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int oi = 0; oi < n_offsets; ++oi) {
+                                const int offset = checkpoint_offsets[oi];
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3825,6 +3877,21 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                const bool snapshot_prev = params_base.checkpoint_recurrent_prev &&
+                        params_base.n_ctx_checkpoints > 0 && spec == nullptr &&
+                        llama_n_rs_seq(ctx_tgt) > 0 && slot.stats.n_prompt_processed > 64 &&
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0);
+                if (snapshot_prev && slot.prompt.n_tokens() > 0) {
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    if (pos_min > 0 && pos_max > 0) {
+                        create_checkpoint(slot, /* n_tokens_cur = */ 1, pos_min - 1, pos_max - 1,
+                                          /* is_replay_boundary = */ true,
+                                          LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_RECURRENT_PREV);
+                    }
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
