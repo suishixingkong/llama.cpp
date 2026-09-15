@@ -297,11 +297,20 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
-llama_build_and_test(test-kv-stream-plan.cpp)
+# The kv-stream planner/config/softmax helpers are internal to libllama, so their
+# implementation files are compiled directly into the tests. That keeps the tests
+# working on Windows shared builds, where only LLAMA_API symbols are exported.
+llama_build_and_test(
+    test-kv-stream-plan.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp)
 target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-kv-stream-config.cpp)
+llama_build_and_test(
+    test-kv-stream-config.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
 target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-kv-stream-softmax.cpp)
+llama_build_and_test(
+    test-kv-stream-softmax.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-softmax.cpp)
 target_include_directories(test-kv-stream-softmax PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
     test-kv-stream-bench-config.cpp

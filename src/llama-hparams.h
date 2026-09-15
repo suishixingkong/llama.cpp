@@ -459,6 +459,9 @@ struct llama_hparams {
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
 
+    // number of effective layers that carry a KV cache
+    uint32_t n_layer_kv() const;
+
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function
