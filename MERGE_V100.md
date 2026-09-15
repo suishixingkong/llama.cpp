@@ -40,7 +40,7 @@ taking the fork's file list.
 
 The fork carries 110 changed files. Excluded, with the reason:
 
-- **The fork's own `ggml-backend-meta.cpp` rewrite** (`+1748/-…`). This is the
+- **The fork's own `ggml-backend-meta.cpp` rewrite** (`+1607/-141`). This is the
   single biggest item and the reason the fork's README reads as a V100 story.
   The fork's base already had `-sm tensor` (`LLAMA_SPLIT_MODE_TENSOR = 3`,
   marked EXPERIMENTAL in `arg.cpp`) and a meta backend that already used split
