@@ -7,13 +7,19 @@ tree, on top of the existing turboquant + adaptive-KV-streaming integration.
 |---|---|---|---|
 | `llamacpp-v100` @ `15e91bbbb` (local `C:/Users/confu/llama/llamacpp-v100`) | `fork-master` | `6d5a910c5` (881 commits behind `master`) | the CUDA/Volta items only — 4 files |
 
-Result: branch **`v100-cuda-port`**, **4 files, +249 / -5** against
-`turbo-kvstream-merge`.
+Result: **4 code files, +249 / -5**, plus these notes, landed on the integration
+branch `turbo-kvstream-merge`.
 
 ```
 bfd6c4416  turbo-kvstream-merge   (turboquant KV cache + adaptive KV streaming)
-  └─ 1c5965914  v100-cuda-port    (V100/Volta CUDA pieces from llamacpp-v100)
+  └─ 1c5965914  ggml-cuda: port the Tesla V100 (Volta) specific pieces
+       └─ bcc6ddd6f  docs: MERGE_V100.md
+            └─ 3de3e117a  docs: exact diffstat for the excluded meta rewrite
 ```
+
+The work was done on a side branch `v100-cuda-port` (identical tree at
+`3de3e117a`) and fast-forwarded into `turbo-kvstream-merge`, which is 3 commits
+ahead of `origin/master` and **not pushed**.
 
 The fork itself is a distribution: 110 files between the merge base and its tip.
 Despite the README's "V100 tuning" framing, only a small part of that is
