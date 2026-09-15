@@ -1197,6 +1197,11 @@ struct ggml_cuda_device_info {
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
 
     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
+
+    // peer access map, filled in by ggml_cuda_init() when GGML_CUDA_P2P is set.
+    // Used by the KV-streaming cross-device copy path to pick cudaMemcpyPeerAsync
+    // over a pinned-host staging round trip.
+    bool peer_access[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
 };
 
 const ggml_cuda_device_info & ggml_cuda_info();

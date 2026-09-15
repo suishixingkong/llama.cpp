@@ -2553,9 +2553,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     size_t nbd2 = dst->nb[2];
     size_t nbd3 = dst->nb[3];
 
-    const bool f32_pedantic = compute_type == GGML_TYPE_F32 &&
-        src0->type == GGML_TYPE_F32 && ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
-
     cublasComputeType_t cu_compute_type = traits::compute_type;
     cudaDataType_t cu_data_type = traits::data_type;
     cudaDataType_t cu_data_type_a = traits::data_type;
@@ -2587,17 +2584,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         }
     }
 
-    if (f32_pedantic) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11020
-        cu_compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
-#else
-        // no pedantic compute enum here; ordinary F32 is the strongest available contract
-        cu_compute_type = CUBLAS_COMPUTE_32F;
-#endif
-    }
-
-    const auto cu_gemm_algo = f32_pedantic ?
-        CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    const auto cu_gemm_algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
@@ -2722,11 +2709,6 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
-    }
-
-    // a scoped pedantic request overrides the process-wide compute type, for F32 weights only
-    if (src0->type == GGML_TYPE_F32 && ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC) {
-        compute_type = GGML_TYPE_F32;
     }
 
     switch (compute_type) {
@@ -2936,8 +2918,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
-        ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -2959,7 +2939,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (!f32_pedantic && ggml_cuda_should_use_mmf(
+    if (ggml_cuda_should_use_mmf(
             src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -3023,8 +3003,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
-        ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
@@ -3051,7 +3029,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (!f32_pedantic && ggml_cuda_should_use_mmf(
+        if (ggml_cuda_should_use_mmf(
                 src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
@@ -3275,6 +3253,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_op_set_rows(ctx, dst);
             }
             break;
+        }
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
             break;
