@@ -324,6 +324,16 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // keep Inkling's shortconv kernels and rel-proj table unquantized; arch-gated so the
+    // name substrings cannot hit another architecture
+    if (arch == LLM_ARCH_INKLING) {
+        quantize &= name.find("shortconv_k.weight")    == std::string::npos;
+        quantize &= name.find("shortconv_v.weight")    == std::string::npos;
+        quantize &= name.find("shortconv_attn.weight") == std::string::npos;
+        quantize &= name.find("shortconv_mlp.weight")  == std::string::npos;
+        quantize &= name.find("attn_rel_proj.weight")  == std::string::npos;
+    }
+
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
@@ -858,6 +868,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -873,6 +884,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
+        case LLAMA_FTYPE_MOSTLY_TQ3_1S:  return GGML_TYPE_TQ3_1S;
+        case LLAMA_FTYPE_MOSTLY_TQ4_1S:  return GGML_TYPE_TQ4_1S;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;

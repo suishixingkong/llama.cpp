@@ -344,6 +344,11 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+
+    # TurboQuant CPU round-trip test (standalone, links ggml only)
+    add_executable(test-turbo-quant test-turbo-quant.c)
+    target_link_libraries(test-turbo-quant PRIVATE ggml)
+    add_test(NAME test-turbo-quant COMMAND test-turbo-quant)
 endif()
 
 # libmtmd

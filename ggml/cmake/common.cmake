@@ -92,6 +92,31 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
     endif()
     list(REMOVE_DUPLICATES FA_COMBINATIONS)
 
+    # TurboQuant KV-cache instances. The turbo types only ever show up as a KV cache,
+    # never as a model weight type, so they are not part of GGML_CUDA_FA_QUANTS and
+    # their template instances are always compiled in.
+    set(TQ_FA_TYPES turbo2_0 turbo3_0 turbo4_0)
+    set(TQ_FA_COMBINATIONS "")
+    foreach (TYPE_T IN LISTS TQ_FA_TYPES)
+        list(APPEND TQ_FA_COMBINATIONS
+            f16-${TYPE_T}      ${TYPE_T}-f16
+            q8_0-${TYPE_T}     ${TYPE_T}-q8_0
+            ${TYPE_T}-${TYPE_T})
+    endforeach()
+    list(APPEND TQ_FA_COMBINATIONS
+        turbo2_0-turbo3_0 turbo3_0-turbo2_0
+        turbo2_0-turbo4_0 turbo4_0-turbo2_0
+        turbo3_0-turbo4_0 turbo4_0-turbo3_0)
+    foreach (COMBINATION IN LISTS TQ_FA_COMBINATIONS)
+        string(REPLACE "-" ";" TQ_PARTS "${COMBINATION}")
+        list(GET TQ_PARTS 0 TQ_TYPE_K)
+        list(GET TQ_PARTS 1 TQ_TYPE_V)
+        string(TOUPPER "GGML_CUDA_FA_${TQ_TYPE_K}_${TQ_TYPE_V}" TQ_DEF)
+        add_compile_definitions(${TQ_DEF}=1)
+    endforeach()
+    list(APPEND FA_COMBINATIONS ${TQ_FA_COMBINATIONS})
+    list(REMOVE_DUPLICATES FA_COMBINATIONS)
+
     string(REPLACE ";" "," FA_QUANTS_DEFINE "${FA_QUANTS}")
     add_compile_definitions(GGML_CUDA_FA_QUANTS="${FA_QUANTS_DEFINE}")
     foreach (TYPE_V IN LISTS FA_TYPES)
