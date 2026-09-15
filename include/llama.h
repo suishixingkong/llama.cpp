@@ -388,6 +388,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        uint32_t kv_stream_arena_mib; // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -990,6 +991,19 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Describes the role of subsequent llama_decode() batches for
+    // phase-specialized memory allocators. It does not change model math.
+    enum llama_decode_phase {
+        LLAMA_DECODE_PHASE_AUTOMATIC  = 0,
+        LLAMA_DECODE_PHASE_PROMPT     = 1,
+        LLAMA_DECODE_PHASE_GENERATION = 2,
+    };
+
+    // The selected phase remains active until changed. AUTOMATIC preserves
+    // the traditional token-count heuristic for callers without phase state.
+    LLAMA_API void llama_set_decode_phase(
+        struct llama_context * ctx, enum llama_decode_phase phase);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
