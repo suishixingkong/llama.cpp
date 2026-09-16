@@ -136,6 +136,9 @@ Two orientation facts that shaped the port:
 # --- A1: q8_0 KV tensor-core attention (opt-in) ---
 GGML_CUDA_VOLTA_Q8_FATTN_TC=1 ./build/bin/llama-server -m model.gguf -fa on -ctk q8_0 -ctv q8_0 -c 65536
 
+# --- A2: turn the compact FA specialization *off* (it is on by default) ---
+GGML_CUDA_VOLTA_FA_COMPACT=0 ./build/bin/llama-server -m model.gguf -fa on -c 65536
+
 # --- A3: exact long-K GQA8 geometry (opt-in) ---
 GGML_CUDA_VOLTA_GQA8_NCOLS2=2 ./build/bin/llama-server -m model.gguf -fa on -c 163840
 
@@ -153,6 +156,34 @@ GGML_CUDA_VOLTA_FORCE_MMQ=moe ./build/bin/llama-server -m moe-model.gguf
 Everything above defaults to **off**, except the FA config rows and the compact
 specialization, which are selected automatically for the shapes they were tuned
 for and are inert elsewhere.
+
+Every switch in this list is read at runtime with `getenv` — none of them is a
+build option, so a single binary can be A/B'd without rebuilding. Be aware that
+the *semantics* differ and this is inherited from the fork:
+
+| switch | test | so |
+|---|---|---|
+| `GGML_CUDA_VOLTA_Q8_FATTN_TC` | `getenv(...) != nullptr` | `=0` still **enables** it |
+| `GGML_CUDA_VOLTA_Q5_X4`, `_Q6_W4R4` | `getenv(...) != nullptr` | `=0` still **enables** it |
+| `GGML_CUDA_VOLTA_GQA8_NCOLS2` | `atoi(env) == 2` | value-based |
+| `GGML_CUDA_VOLTA_FORCE_MMQ` | `strcmp(env, "moe") == 0` | value-based |
+| `GGML_CUDA_VOLTA_FA_COMPACT` | `atoi(env) == 0` ⇒ off | value-based; **on by default** |
+
+`GGML_CUDA_VOLTA_FA_COMPACT` is our addition, not the fork's: the compact
+specialization is selected automatically and the fork ships no way to disable
+it, which makes a suspicion about it unrecoverable without a rebuild. `unset`
+and `=1` keep the ported behaviour, `=0` falls through to the generic MMA kernel
+(the compact block ends in `return`, so nothing else changes).
+
+The remaining two default-on pieces of the port have **no** runtime switch, because
+both are compile-time constants that the host and the device must agree on (host
+`nbatch_fa`/`nbatch_K2`/... must equal the device `constexpr` values, or the shared
+memory layout mismatches):
+- the three new `get_config_volta` tile rows, and
+- the `J >= 48` → Pascal DP4A routing for Q6_K in `mmq.cuh`.
+
+Reverting either means editing source. See *Verification → Not verified* for what
+that implies for the V100 bring-up.
 
 ## Deliberately *not* ported
 
@@ -194,6 +225,23 @@ faster on a V100 and/or enlarge the usable context?**
    forced to 0 unless `volta_mma_available(cc)`, so the flag is inert elsewhere
    and needs no user-side guard.
 
+5. **We added a kill switch the fork does not have.** `GGML_CUDA_VOLTA_FA_COMPACT=0`
+   disables the compact specialization at runtime. The fork selects it purely from
+   `cc`/geometry, so on a V100 the only way to test "is it the compact kernel's
+   fault?" was to rebuild. Since the port makes the compact kernel part of the
+   *default* V100 path (i.e. this is no longer an opt-in experiment), a
+   no-rebuild escape hatch is worth the one `getenv`. Scope is deliberately one
+   `if`: the kernel choice is a host-side branch, so the switch cannot desync the
+   host-computed shared-memory size from the device `constexpr` values.
+
+6. **The two other default-on pieces are not switchable, on purpose.** The
+   `get_config_volta` rows and the Q6_K `J >= 48` DP4A routing are read by both the
+   host (to size shared memory and pick `J`) and the device (as `constexpr`). A
+   runtime switch there would have to change the host answer while leaving the
+   device `constexpr` alone — that is a shared-memory size mismatch, i.e. exactly
+   the failure mode we are trying to protect against. Reverting them must be a
+   source edit.
+
 ## Verification
 
 Performed (Windows, MSVC 14.40, CUDA 12.4, `CMAKE_CUDA_ARCHITECTURES=70`,
@@ -203,7 +251,10 @@ Performed (Windows, MSVC 14.40, CUDA 12.4, `CMAKE_CUDA_ARCHITECTURES=70`,
    (`fattn.cu`, `mmvq.cu`, `mmq.cu`, `gated_delta_net.cu`, `ggml-cuda.cu`)
    compile with no errors. `fattn.cu` is the TU that pulls in
    `fattn-mma-f16.cuh` and the new `fattn-q8-volta.cuh`, so those headers are
-   covered by a real compile, not just a syntax read.
+   covered by a real compile, not just a syntax read. `fattn.cu` is also the only
+   TU that includes `fattn-mma-f16.cuh` (verified by grep), which is why the
+   `GGML_CUDA_VOLTA_FA_COMPACT` change — a host-side branch in that header —
+   needed only that one object rebuilt.
 2. **Template-instance coverage.** `ggml/src/ggml-cuda/template-instances/` is
    picked up by a CMake **glob** and is where the MMQ and FA kernels are really
    instantiated. Two representative instance TUs —

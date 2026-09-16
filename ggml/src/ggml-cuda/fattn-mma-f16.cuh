@@ -2235,7 +2235,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
         const ggml_tensor * Q = KQV->src[0];
         const ggml_tensor * K = KQV->src[1];
         const ggml_tensor * V = KQV->src[2];
-        bool use_volta_2cta = cc == GGML_CUDA_CC_VOLTA && !Q_in_reg && nbatch_fa == 32 &&
+        // The compact specialization is selected automatically for the shapes it was tuned
+        // for. GGML_CUDA_VOLTA_FA_COMPACT=0 is the escape hatch back to the generic kernel;
+        // unset or any other value keeps it enabled. This one is value-based (unlike some of
+        // the other GGML_CUDA_VOLTA_* switches, where merely being set means "on").
+        const char * fa_compact_env = std::getenv("GGML_CUDA_VOLTA_FA_COMPACT");
+        const bool   fa_compact_on  = fa_compact_env == nullptr || std::atoi(fa_compact_env) != 0;
+        bool use_volta_2cta = fa_compact_on && cc == GGML_CUDA_CC_VOLTA && !Q_in_reg && nbatch_fa == 32 &&
             nbatch_K2 == 128 && nbatch_V2 == 64 && nbatch_combine == 128 && Q->ne[1] < 1024 && Q->ne[3] == 1;
         if (use_volta_2cta) {
             const int gqa_ratio = Q->ne[2] / K->ne[2];
