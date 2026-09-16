@@ -160,10 +160,38 @@ since the diff contains no CUDA):
 - **CLI registration confirmed at runtime**, not by reading the source:
   `llama-server --help` lists `--checkpoint-recurrent-prev, --no-checkpoint-recurrent-prev`
   next to the existing `--ctx-checkpoints` / `--checkpoint-min-step`.
-- **`test-recurrent-state-rollback` builds, links and runs.** Against the only
-  GGUF on this machine (a non-recurrent `qwen2.5-0.5b-q4km`) it exits 0 with
-  `skipping for non-recurrent model`, i.e. it does not crash, but it also does not
-  reach the new test.
+- **`test-recurrent-state-rollback` builds, links and runs.** Against a non-recurrent
+  GGUF it exits 0 with `skipping for non-recurrent model`.
+- **The feature was then exercised and it works.** With a `qwen35` hybrid model
+  (Qwen3.5-0.8B-Q4_K_M) the new test passes and reports
+  `max logit drift=0 at token -1, top1=314/314` — the state restored from the
+  preceding snapshot is *numerically identical* to the control's full-prompt run.
+  That is the correctness claim the fork makes, now reproduced here.
+- **Server-side mechanism confirmed in the log**, not inferred: with the flag on, a
+  checkpoint is created at `n_tokens = 10801` — i.e. `prompt_n - 1` — carrying
+  `replay_boundary = 1`, and the following request restores *that* one instead of the
+  `prompt_n - 4` checkpoint that the flag-off run restores.
+- **A/B throughput measurement** on the same model (10 turns per side, feature flag
+  the only difference):
+
+  | | tokens processed per turn | prompt ms per turn | cache_n |
+  |---|---|---:|---:|
+  | feature off | **21** (9x) / 22 (1x) | ~426 | 10798 |
+  | feature on | **18** (9x) / 19 (1x) | ~382 | 10801 |
+
+  The two distributions do not overlap across ten turns. See "Known limitations" for
+  why this is a 3-token saving rather than the fork's percentage.
+- **`test_rollback` fails on this tree — pre-existing, not caused by this port.**
+  The dirty-context phase reports `logits mismatch at position 6, token 0
+  (6.14735 != 7.3468)`. Two independent checks pin it on upstream:
+  reverting all 12 files to the pre-port commit, rebuilding and re-running produces
+  **byte-identical numbers**; and none of the three forks already merged here
+  (`turboquant`, `adaptive-KV-streaming`, the two V100 ports) ever touched
+  `src/llama-memory-recurrent.{cpp,h}` or `src/models/delta-net-base.cpp`
+  (`git diff master <pre-port> -- …` is empty), nor the test file. So it is an
+  upstream dirty-recurrent-state-restore defect on `qwen35`, worth reporting
+  separately. Note: the test needs a small `-c` here, because the default sizes the
+  KV cache from the model's training length (~3 GiB, allocation fails).
 - **Port completeness by set difference** against the fork's own diff (normalised
   added lines): 238 fork lines vs 285 ours; the only fork lines not present
   verbatim are (a) one `cur.update_tgt(... | tgt_extra_flags)` occurrence whose
@@ -174,33 +202,38 @@ since the diff contains no CUDA):
   test file silently converted it to CRLF (the same trap as `gated_delta_net.cu`
   in the previous port).
 
-**Not verified — the important one:**
+**Still not verified:**
 
-- **The feature itself was never exercised.** There is no recurrent or hybrid GGUF
-  on this machine, so the new `test_previous_recurrent_snapshot` test and the
-  server path both skip. Nothing here demonstrates that a suffix actually
-  resumes from the preceding snapshot, or that the restored state is numerically
-  equal to a full recompute. The fork has a five-branch replay test claiming
-  16 identical generated tokens; that is the fork's result, not a re-measurement.
-- The `--prefill-reuse` + `--checkpoint-recurrent-prev` combination is untested,
-  including the boundary-spacing fix from decision 5.
-- Interaction with the adaptive-KV-streaming fork was not checked end to end; that
-  fork rewrites `llama-kv-cache.cpp`, while this change touches the *recurrent*
-  memory and the server checkpoint list, so they are disjoint by construction but
-  not by measurement.
+- The `--prefill-reuse` + `--checkpoint-recurrent-prev` combination, including the
+  boundary-spacing fix from decision 5.
+- Interaction with the adaptive-KV-streaming fork end to end; that fork rewrites
+  `llama-kv-cache.cpp`, while this change touches the *recurrent* memory and the
+  server checkpoint list, so they are disjoint by construction but not by
+  measurement.
+- Any GPU behaviour. All of the above is CPU.
 
 ## Known limitations
 
-- **The fork's numbers do not transfer.** The measured `+14.08% / +11.50% / +10.63%`
-  prefill for 128 / 177 / 256 appended tokens were obtained with the fork's
-  *whole* checkpoint subsystem, which includes the value-based eviction policy and
-  the refresh-in-place path that this port deliberately leaves out. What is ported
-  is the mechanism (resume from `prompt_n - 1` instead of replaying the checkpoint
-  tail); the expected gain is bounded below by the eliminated tail replay and is
-  not the fork's percentage. Re-measure before quoting anything.
+- **The fork's percentages do not reproduce, and the reason is measured.** The saving
+  is an absolute **3 tokens of replay per turn**, not a proportion: the flag-off
+  server restores upstream's checkpoint at `prompt_n - 4` and the flag-on server
+  restores the snapshot at `prompt_n - 1`. Upstream already places boundary
+  checkpoints at `4 + n_ubatch` and `4` before the end of a prompt
+  (`checkpoint_offsets`, upstream `a7b3dee7a` / PR #20288) — and the fork's own base
+  `465e49b9c` carries that same array — so this port effectively *replaces* the `-4`
+  checkpoint with a `-1` snapshot.
+
+  Consequence: the gain scales inversely with suffix length. Measured
+  `-14%` of tokens / `-10%` wall at a ~17-token suffix; that becomes ~`-2.3%` at a
+  128-token suffix. **The fork's `+14.08%` at `+128` is not reproduced and should not
+  be used for planning.** The plausible explanation for the gap is a regime this test
+  could not synthesize: one where the nearest *surviving* checkpoint is far from the
+  prompt end (long context, checkpoint list filled, eviction active). Neither the
+  4-turn nor the 10-turn run filled a 4-slot list.
 - Gains only exist in a specific workload shape: a large cached context receiving
-  a short append. The fork measures 64 tokens as neutral, and the benefit decays
-  as the suffix grows (`+3.33%` at 1000).
+  a short append. The fork measures 64 tokens as neutral and the benefit decays as the
+  suffix grows (`+3.33%` at 1000) — which is consistent with a fixed-size saving rather
+  than a proportional one, and is worth keeping in mind when reading the fork's table.
 - Requires a hybrid/recurrent model **and** `--ctx-checkpoints > 0` **and** no
   speculative decoding. On a plain attention model the flag is a no-op.
 - `ON_DEVICE` checkpoints are not portable: they are dropped on slot
