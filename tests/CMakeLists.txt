@@ -316,7 +316,12 @@ llama_build_and_test(
     test-kv-stream-bench-config.cpp
     ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
 target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
-if (GGML_CUDA)
+# These three call the CUDA backend's C API directly (ggml_backend_cuda_init and the
+# ggml_backend_cuda_kv_stream_* / ggml_backend_cuda_phase_arena_* entry points), so they can
+# only link when ggml-cuda is a regular library that `ggml` links PUBLICly. With
+# GGML_BACKEND_DL=ON the backends are MODULE libraries loaded at runtime and those symbols are
+# deliberately not exported, so building them is not possible - skip instead of failing the link.
+if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
