@@ -242,6 +242,28 @@ faster on a V100 and/or enlarge the usable context?**
    the failure mode we are trying to protect against. Reverting them must be a
    source edit.
 
+7. **The two V100 forks do not collide on decode.** Both are in this tree now —
+   `MERGE_V100.md` ported `llamacpp-v100`'s Volta GEMV *parameter table*, this port
+   adds jusko's new GEMV *variants* — so their interaction had to be checked rather
+   than assumed. It is safe, and mechanically so:
+
+   - The Volta table differs from `MMVQ_PARAMETERS_GENERIC` at exactly **one** point:
+     `ncols_dst == 1` for Q2_K…Q6_K, `nwarps` 4 -> 2. Every other cell, including all
+     of `ncols_dst` 2..8, is identical (`mmvq.cu`, both switch blocks).
+   - jusko's variants exist only at `ncols_dst == 4`: `_Q5_X4` is gated on
+     `type == GGML_TYPE_Q5_K && c_ncols_dst == 4` in the kernel dispatcher, and
+     `_Q6_W4R4` lives in the `case 4:` arm with `rows_per_block = 4`. Note `_Q6_W4R4`
+     also deliberately launches with `calc_nwarps(..., MMVQ_PARAMETERS_GENERIC)`.
+   - At `ncols_dst == 4` both tables return `nwarps == 4`, so the launch's
+     `block_dims.y` on the host still equals the kernel's `__launch_bounds__` on the
+     device — and equals the value jusko measured in a tree where Volta fell through
+     to GENERIC.
+
+   So no combination is unreachable, mis-sized, or silently re-tuned. Had either
+   variant sat at `ncols_dst == 1`, the two ports would have changed each other's
+   geometry — which is the trap worth remembering, since neither fork's own
+   benchmarks could have shown it.
+
 ## Verification
 
 Performed (Windows, MSVC 14.40, CUDA 12.4, `CMAKE_CUDA_ARCHITECTURES=70`,
