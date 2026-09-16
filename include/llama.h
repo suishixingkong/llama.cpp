@@ -369,6 +369,8 @@ extern "C" {
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
+        uint32_t prefill_reuse;         // CUDA prefill GEMM tile for lossless weight reuse, 0 = disabled [EXPERIMENTAL]
+
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id

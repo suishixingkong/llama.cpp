@@ -19,6 +19,9 @@ struct llama_cparams {
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
+    // CUDA prefill GEMM tile for lossless weight reuse, 0 = disabled [EXPERIMENTAL, Volta only]
+    uint32_t prefill_reuse = 0;
+
     int32_t  nextn_layer_offset = 0;
 
     float rope_freq_base;

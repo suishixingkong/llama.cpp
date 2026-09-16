@@ -2,6 +2,7 @@
 #include "convert.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-q8-volta.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -2353,6 +2354,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
+    // Qwen3.8-27B on Volta: use the NInfer-derived 32-column sm70 configuration for
+    // small/medium cached-prompt appends. The 64-column compact specialization remains faster
+    // for wide appends, so keep the measured crossover at 512 query tokens.
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 == 2) {
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const bool qwen38_q8 =
+            Q->ne[2] == 24 && Q->ne[3] == 1 &&
+            K->ne[0] == 256 && K->ne[2] == 4 && K->ne[3] == 1 &&
+            V->ne[0] == 256 && V->ne[2] == 4 && V->ne[3] == 1 &&
+            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+        if (cc == GGML_CUDA_CC_VOLTA && qwen38_q8 && Q->ne[1] > 16 && Q->ne[1] <= 512) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
@@ -2391,6 +2409,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // Exact long-context Volta GQA8 geometry (D=256, one K/V head): the generic GQA=8
+    // choice (ncols2=8) wastes work on heads that do not exist, while ncols2=2 is faster
+    // for cached-prompt appends. Opt-in because the crossover is shape dependent.
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (cc == GGML_CUDA_CC_VOLTA && use_gqa_opt && gqa_ratio == 8 && K->ne[2] == 1 &&
+                K->ne[1] >= 65536 && Q->ne[1] >= 128 && Q->ne[1] <= 1024) {
+            if (const char * env = getenv("GGML_CUDA_VOLTA_GQA8_NCOLS2")) {
+                if (atoi(env) == 2) {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                    return;
+                }
+            }
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -2735,6 +2768,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_VOLTA_Q8_W4 = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -2911,6 +2945,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    // Opt-in validated Qwen3.8-27B target-verification route: ordinary llama q8_0 KV is
+    // widened only on shared-memory tile load and consumed by Volta tensor cores.
+    if (cc == GGML_CUDA_CC_VOLTA && std::getenv("GGML_CUDA_VOLTA_Q8_FATTN_TC") != nullptr &&
+            Q->ne[0] == 256 && Q->ne[1] == 4 && Q->ne[2] == 24 && Q->ne[3] == 1 &&
+            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+            K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] == 4 && V->ne[2] == 4 &&
+            K->ne[3] == 1 && V->ne[3] == 1 && mask != nullptr && max_bias == 0.0f &&
+            KQV->src[4] == nullptr) {
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f) {
+            return BEST_FATTN_KERNEL_VOLTA_Q8_W4;
+        }
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -2995,6 +3044,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
+    if (kernel == BEST_FATTN_KERNEL_VOLTA_Q8_W4) {
+        return ggml_q8v::get_alloc_size(dst);
+    }
+
     bool need_f16_K = false;
     bool need_f16_V = false;
 
@@ -3011,6 +3064,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         } break;
         case BEST_FATTN_KERNEL_NONE:
             break;
+        case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
+            GGML_ABORT("unreachable");
     }
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
@@ -3032,6 +3087,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
+            ggml_q8v::launch(ctx, dst);
             break;
     }
 }

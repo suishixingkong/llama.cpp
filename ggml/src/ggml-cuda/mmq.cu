@@ -330,6 +330,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return true;
 #endif //GGML_CUDA_FORCE_MMQ
 
+    // Opt-in routed-MoE override on Volta: dense models stay on the measured default route,
+    // but MoE experts can win from MMQ. Requires GGML_CUDA_VOLTA_FORCE_MMQ=moe.
+    if (cc == GGML_CUDA_CC_VOLTA && n_experts > 0) {
+        const char * force = getenv("GGML_CUDA_VOLTA_FORCE_MMQ");
+        if (force != nullptr && strcmp(force, "moe") == 0) {
+            return true;
+        }
+    }
+
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
