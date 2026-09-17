@@ -5,8 +5,14 @@ import os
 
 HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
 
+# D=640 is not a model head size: the turbo KV cache zero-pads K head_dim 576 up to a
+# multiple of 128 (one WHT group), and fattn.cu dispatches that as DKQ=640. It only
+# needs MMA instantiations (fattn.cu uses ncols1 = 1 and 2 at ncols2 = 16); there is
+# no tile path for it, so it is kept out of HEAD_SIZES_KQ above.
+MMA_EXTRA_HEAD_SIZES_KQ = [640]
+
 # DKQ -> DV override for asymmetric head dims.
-HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
+HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128, 640: 512}
 
 TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
 
@@ -83,7 +89,7 @@ for ncols in [8, 16, 32, 64]:
         with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
             f.write(SOURCE_FATTN_MMA_START)
 
-            for head_size_kq in HEAD_SIZES_KQ:
+            for head_size_kq in HEAD_SIZES_KQ + MMA_EXTRA_HEAD_SIZES_KQ:
                 if head_size_kq == 40:
                     continue
                 if head_size_kq == 72:
@@ -97,7 +103,9 @@ for ncols in [8, 16, 32, 64]:
                     continue
                 if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
                     continue
-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
+                if head_size_kq == 640 and not (ncols2 == 16 and ncols1 in (1, 2)): # turbo KV cache, padded DKQ 576 -> 640
+                    continue
+                if head_size_kq not in (192, 320, 576, 640) and ncols2 in (16, 32):
                     continue
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))

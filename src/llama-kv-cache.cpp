@@ -2508,39 +2508,6 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
-void llama_kv_cache::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    const int64_t n_tokens = ubatch->n_tokens;
-
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    int32_t * data = (int32_t *) dst->data;
-
-    const int64_t n_kv = dst->ne[0];
-    GGML_ASSERT(dst->ne[1] == n_tokens);
-
-    // [n_kv, n_tokens] in GLOBAL token order (stream-major, same as the KQ mask)
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        const llama_seq_id seq_id = ubatch->seq_id[i][0];
-
-        const auto & cells = v_cells[seq_to_stream[seq_id]];
-
-        const llama_pos p1 = ubatch->pos[i];
-
-        for (int64_t j = 0; j < n_kv; ++j) {
-            // use the ACTUAL absolute position in the KV cell; physical slot order is not monotonic
-            int32_t rel = (int32_t) extent; // zero-bias column
-            if (!cells.is_empty(j)) {
-                const llama_pos d = p1 - cells.pos_get(j);
-                if (d >= 0 && d < (llama_pos) extent) {
-                    rel = (int32_t) d;
-                }
-            }
-
-            data[i*n_kv + j] = (int32_t) (i*(extent + 1)) + rel;
-        }
-    }
-}
-
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -3586,10 +3553,6 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
-}
-
-void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_pos_rel_flat(dst, ubatch, extent);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

@@ -2476,3 +2476,9 @@ extern DECL_FATTN_MMA_F16_CASE(576, 512,  8,  4);
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 16,  4);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  1, 32);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  2, 32);
+
+// D=640: turbo KV cache zero-pads K head_dim 576 -> 640. Only the two shapes
+// fattn.cu actually dispatches are instantiated; keep this list in sync with
+// template-instances/fattn-mma-f16-instance-ncols1_{1,2}-ncols2_16.cu.
+extern DECL_FATTN_MMA_F16_CASE(640, 512, 1, 16);
+extern DECL_FATTN_MMA_F16_CASE(640, 512, 2, 16);

@@ -423,7 +423,11 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
 
-        ggml_cuda_syncwarp();
+        // Turbo V keeps KQ in registers and shuffles it, so there is no
+        // shared-memory write to publish: the barrier is pure overhead there.
+        if constexpr (!V_is_turbo) {
+            ggml_cuda_syncwarp();
+        }
 
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
