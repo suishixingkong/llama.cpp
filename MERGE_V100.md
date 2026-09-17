@@ -5,7 +5,7 @@ tree, on top of the existing turboquant + adaptive-KV-streaming integration.
 
 | source | branch in this repo | upstream base | what was taken |
 |---|---|---|---|
-| `llamacpp-v100` @ `15e91bbbb` (local `C:/Users/confu/llama/llamacpp-v100`) | `fork-master` | `6d5a910c5` (881 commits behind `master`) | the CUDA/Volta items only — 4 files |
+| [`anyei/llamacpp-v100`](https://github.com/anyei/llamacpp-v100) @ `15e91bbbb` | `fork-master` | `6d5a910c5` (881 commits behind `master`) | the CUDA/Volta items only — 4 files |
 
 Result: **4 code files, +249 / -5**, plus these notes, landed on the integration
 branch `turbo-kvstream-merge`.
@@ -25,6 +25,20 @@ The fork itself is a distribution: 110 files between the merge base and its tip.
 Despite the README's "V100 tuning" framing, only a small part of that is
 Volta-specific, so the port was scoped by reviewing every hunk rather than by
 taking the fork's file list.
+
+## 激活方式（编译 / 环境变量 / 参数）
+
+合并进来的两项都不需要任何额外的 CMake 编译开关；唯一的硬性前置条件是**构建时必须开启 CUDA 并把 Volta 架构编进去**：
+
+- `GGML_CUDA=ON`
+- `CMAKE_CUDA_ARCHITECTURES` 必须包含 `70`（即 sm_70）。若只编了 sm_80/90，所有 Volta 设备代码会编译成 `NO_DEVICE_CODE`，下面的功能在 V100 上**完全无效**。
+
+| 合并项 | 激活方式 | 默认 | 备注 |
+|---|---|---|---|
+| sm70 MMVQ 参数表（`MMVQ_PARAMETERS_VOLTA`） | **无开关**，V100(sm70) 上自动生效 | 默认开 | 仅把 `ncols_dst == 1` 的 Q2_K…Q6_K 的 `nwarps` 由 4 调到 2，其它架构/路径不变，无需任何操作 |
+| P2P NVLink AllReduce（双卡张量并行） | 运行时环境变量 `GGML_CUDA_ALLREDUCE=p2p` | 默认走原有 `nccl → internal → none` 链 | 需**恰好 2 张**支持双向 peer access 的 CUDA 设备；否则 init 返回 null、告警并退回原链 |
+
+两项都**没有**对应的 cmake option，除 `GGML_CUDA_ALLREDUCE` 外也没有其它环境变量或运行时参数。
 
 ## What was taken
 

@@ -30,6 +30,31 @@ llama-server -m model.gguf --cache-reuse 256 --kv-stream-stage-mib 1024 -np 1
 `-ctk/-ctv` now accept `turbo2`, `turbo3`, `turbo4` in addition to the upstream
 types. Weight quantisation gained `--outtype tq3_1s` / `tq4_1s`.
 
+## 激活方式（编译 / 环境变量 / 参数）
+
+**编译前置**：必须 `GGML_CUDA=ON` 才能用到 CUDA 上的 turbo 内核，默认编译包含turbo常用组合；CPU 后端也自带 turbo 参考实现（可被 `test-backend-ops` 覆盖）。架构需覆盖目标卡（如 sm_80 / sm_70）。
+
+**运行时参数（CLI）**：
+
+| 功能 | 参数 | 说明 |
+|---|---|---|
+| Turbo KV 缓存 | `-ctk turbo4 -ctv turbo4 -fa on` | 需开启 FlashAttention；`llama_context` 会自动启用 FA。KV 类型支持 `turbo2`/`turbo3`/`turbo4` |
+| 权重量化 | `--outtype tq3_1s` / `tq4_1s` | 转换模型权重时选用 turbo 权重量化 |
+| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**仅 Qwen3.5 可用**（其它架构设了 `--kv-stream-stage-mib` 会建上下文失败，这是上游 fork 自身限制） |
+
+**环境变量**：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `LLAMA_ATTN_ROT_K_OVERRIDE=1` | 按侧开启注意力旋转（fork 策略默认已改为 **OFF**） | OFF（本树默认关） |
+| `LLAMA_ATTN_ROT_V_OVERRIDE=1` | 同上，V 侧 | OFF |
+| `LLAMA_ATTN_ROT_DISABLE=1` | 硬性锁定关闭旋转 | — |
+| `TURBO_AUTO_ASYMMETRIC=0` | 强制对称 turbo K/V（默认 ON：高 GQA 比时把 K 缓存从 turbo* 升级到 q8_0 保护质量） | ON |
+
+⚠ 注意力旋转默认值被本树改成了 OFF（与纯上游不同），这也会影响非 turbo 的量化 KV（如 `q8_0`）。如需恢复上游行为，把 `llama_kv_cache::llama_kv_cache()` 里 `attn_rot_k = !attn_rot_disable && ...` 改回无条件开启。
+
+⚠ Turbo KV 缓存类型**仅运行时使用、不写入 GGUF**；但用 fork 的 `TQ3_1S`/`TQ4_1S` 权重量化出的 GGUF 与本构建**不兼容**（类型编号被重新排过）。Metal/Vulkan 后端无 turbo 内核，会拒绝 turbo 缓存类型。
+
 ## What was deliberately *not* ported
 
 The turboquant fork is a full distribution (308 changed files). Excluded:
