@@ -1,110 +1,48 @@
-# Adaptive KV Streaming for llama.cpp
+# llama.cpp — multi-fork integration build
 
-This branch adds experimental, block-granular adaptive KV cache streaming to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache, without relying on uncontrolled Unified Memory page migration.
+> This repository is a personal integration fork of the upstream
+> [llama.cpp](https://github.com/ggml-org/llama.cpp). It is **not** an official
+> llama.cpp release. On top of the upstream `master` it layers performance and
+> feature optimizations taken from several community forks. Every integration
+> step is recorded in the per-fork `MERGE_*.md` notes (and independently reviewed
+> in the `AUDIT_*.md` notes) listed below.
 
-## Adaptive KV streaming
+The integrated work lands on the branch **`turbo-kvstream-merge`**, which is
+published as `origin/master`. Build instructions, supported backends, license,
+and the rest of the upstream project description are preserved verbatim further
+down under [Upstream llama.cpp README](#upstream-llama-cpp-readme).
 
-The authoritative KV tensors remain in pinned host memory while a bounded CUDA pool is divided between resident KV pages and one transfer ring shared by all streamed attention layers. As the active context grows, the runtime keeps as many pages resident as the budget allows and gradually reclaims resident space for a larger ring. Nonresident pages are prefetched for later layers while the current layer computes, and consumed ring slots are recycled immediately. Every attention layer still processes its complete KV history; only physical residency and transfer scheduling change.
+## Merged open-source forks
 
-## Phase arena
+| Repository | Origin / focus | What was integrated | Notes |
+|---|---|---|---|
+| [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) | TurboQuant KV cache + turbo weight quantization | TurboQuant KV cache types (`turbo2/3/4`) and `TQ3_1S`/`TQ4_1S` weight quantization (subset only) | [MERGE_TURBO_KVSTREAM.md](MERGE_TURBO_KVSTREAM.md) |
+| [`RaymondHuang210129/llama.cpp-adaptive-kv-streaming`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming) | Adaptive KV cache streaming for the CUDA `llama-server` | Host-pinned KV with a bounded CUDA arena, phase multiplexing, and prefetch scheduling (the full KV-streaming branch) | [MERGE_TURBO_KVSTREAM.md](MERGE_TURBO_KVSTREAM.md) |
+| [`anyei/llamacpp-v100`](https://github.com/anyei/llamacpp-v100) | Tesla V100 (Volta) CUDA tuning | sm70 `MMVQ_PARAMETERS_VOLTA` table + one-shot P2P NVLink AllReduce for 2-GPU tensor mode (4 files) | [MERGE_V100.md](MERGE_V100.md) · [AUDIT_V100_MERGE.md](AUDIT_V100_MERGE.md) |
+| [`jackjusko/jusko-llama-volta-qwen3flash`](https://github.com/jackjusko/jusko-llama-volta-qwen3flash) | Volta / SM70 Qwen3.8-Flash optimizations | sm70 q8_0 tensor-core FA, 256×256 compact FA specialization, Volta GEMV variants (Q5_K×4, Q6_K W4R4), Q6_K MMQ Pascal-DP4A routing, GDN 128×4 Volta kernel, `--prefill-reuse`, and `--checkpoint-recurrent-prev` recurrent-state replay | [MERGE_JUSKO_VOLTA.md](MERGE_JUSKO_VOLTA.md) · [AUDIT_JUSKO_MERGE.md](AUDIT_JUSKO_MERGE.md) |
+| [`jackinthebox52/qwen38-v100-serve`](https://github.com/jackinthebox52/qwen38-v100-serve) | Qwen3.8-27B V100 serving | `flash_attn_ext_vec` `ncols2 = 3` GQA head packing for GQA ratios with factor 3 (e.g. Qwen3.8-27B 24/4) on Volta (1 file) | [MERGE_QWEN38_V100.md](MERGE_QWEN38_V100.md) |
 
-`--kv-stream-arena-mib N` extends that adaptive pool into one fixed physical CUDA allocation shared by KV storage, the transfer ring, and phase-specific compute buffers. Prompt processing and token generation do not need their peak compute workspaces simultaneously. During prefill, the scheduler borrows the larger prompt-processing workspace while KV retains a small nonzero ring. When ordinary TG1 decode begins, the prefill CUDA graph and scheduler workspace are released, and those bytes become additional resident/ring KV capacity.
+Each fork is a full distribution; this tree takes only the parts relevant to its
+targets (CUDA + Volta / V100, and a backend-agnostic recurrent-checkpoint feature),
+scoped file by file. See each merge note for exactly what was taken, what was
+deliberately **excluded**, the integration decisions, and the verification results.
 
-This phase multiplexing prevents context-specific compute reservations from permanently reducing the memory available to decode. As a result, the usable decode KV pool remains nearly constant across different `--ctx-size` settings. Inside that stable total budget, adaptive KV streaming still changes the resident/ring partition in real time according to active context length and measured prefetch behavior.
+## Merge & audit documents in this repository
 
-Detailed project story, design, implementation, and benchmark results are in
-[Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
+- **[`MERGE_TURBO_KVSTREAM.md`](MERGE_TURBO_KVSTREAM.md)** — TurboQuant KV cache + adaptive KV streaming (two forks merged together).
+- **[`AUDIT_TURBO_PORT.md`](AUDIT_TURBO_PORT.md)** — independent audit of the TurboQuant (+ adaptive-KV-streaming) port (verdict: algorithm ported correctly, no numeric drift; issues were in test coverage, the template-instance list, and excluded-arch leftovers — all fixed).
+- **[`MERGE_V100.md`](MERGE_V100.md)** — Tesla V100 (Volta) CUDA port from `llamacpp-v100`.
+- **[`AUDIT_V100_MERGE.md`](AUDIT_V100_MERGE.md)** — independent audit of the `llamacpp-v100` port (verdict: complete & correct).
+- **[`MERGE_JUSKO_VOLTA.md`](MERGE_JUSKO_VOLTA.md)** — Volta/SM70 pieces + recurrent checkpoint tail replay from `jusko-llama-volta-qwen3flash`.
+- **[`AUDIT_JUSKO_MERGE.md`](AUDIT_JUSKO_MERGE.md)** — independent audit of the `jusko` port (verdict: faithful, complete, doc/code consistent).
+- **[`MERGE_QWEN38_V100.md`](MERGE_QWEN38_V100.md)** — Qwen3.8-27B GQA packing from `qwen38-v100-serve`.
 
-## Performance
+## Caveats (read before using)
 
-The first comparison uses Qwen3.8 27B `UD-Q3_K_XL` with a Q8_0 K cache and Q4_0 V cache on an RTX 5070 Ti 16 GB. Adaptive KV streaming keeps explicit control of residency and transfer scheduling, while the phase arena preserves its decode KV budget as the configured context grows. The implementation continues through the model's 256K native context; the stock Unified Memory run was measured through 192K.
-
-![Qwen3.8 27B Q3 XL phase arena compared with stock Unified Memory](media/phase-arena-q3-vs-stock-uvm.png)
-
-The second comparison isolates the phase-arena implementation and shows how target-model quantization changes the available KV budget. `UD-Q3_K_XL` leaves more VRAM for resident KV and begins streaming later than the larger `UD-IQ4_XS` model. All three panels share the same context-capacity axis. The subtitle reports the decode KV pool: 3737 MiB for Q3 XL and 2681 MiB for IQ4 XS. PCIe utilization estimates effective decode KV H2D traffic against the measured 50 GB/s transfer ceiling, and diamonds mark the first decode-streaming point.
-
-![Qwen3.8 27B phase-arena Q3 XL and IQ4 XS comparison](media/phase-arena-q3-vs-iq4.png)
-
-Both phase-arena sweeps use 256-token batch and micro-batch sizes, a 256-token decode, Q8_0 K/Q4_0 V, one server slot, and no Unified Memory. The benchmark driver selected the largest validated arena for each configured context capacity.
-
-> [!WARNING]
-> This is research code optimized and production-validated primarily for an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot.
-> CUDA correctness tests cover every KV type currently accepted by the CLI, including native and F16-conversion fallback paths. Production performance for other models, KV combinations, parallel slots, and non-CUDA backends is not yet broadly characterized.
-
-## Build the modified server
-
-Install a C++ compiler, CMake, and the CUDA toolkit, then run this command from the repository root:
-
-```bash
-cmake -S . -B build -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --target llama-server -j
-```
-
-The executable is created at `build/bin/llama-server`.
-
-Example using the tested cache configuration:
-
-```bash
-./build/bin/llama-server \
-  --model /path/to/model.gguf \
-  --ctx-size 262144 \
-  -fa on \
-  -ctk q8_0 \
-  -ctv q4_0 \
-  -ngl all \
-  -b 512 \
-  -ub 512 \
-  -np 1 \
-  --kv-stream-arena-mib 2304
-```
-
-The arena value is the fixed total shared allocation, not just KV capacity. Its bytes are reassigned between the active phase's CUDA compute workspace and the adaptive resident/ring KV pool. The best value depends on the model, batch sizes, GPU, and other VRAM consumers. Once selected, the same arena can preserve nearly the same decode KV capacity across different context settings. The benchmark driver below probes the maximum usable value automatically. `--kv-stream-stage-mib` remains a compatibility alias with the same total-arena semantics.
-
-llama.cpp's device-memory auto-fit dry run is bypassed when a nonzero arena is configured. The arena and supported single-GPU layer placement are already explicit, while the upstream no-allocation estimator cannot represent overlapping phase lifetimes. Real context initialization still measures both phase graphs and rejects an arena that cannot fit either layout.
-
-### Batch and micro-batch sizes
-
-`-b` sets the logical prompt batch size and `-ub` sets the largest physical batch submitted to one graph. This branch no longer requires `256/256`; `-ub` may be any positive value no larger than `-b`.
-
-The Qwen3.8 MMA prefill path processes the full physical batch and allocates only the partial workspace that kernel actually emits. Generic vector and F16-conversion fallback paths use a bounded 256-query workspace: each staged KV span is consumed by all query tiles before its ring slot is released, so wider micro-batches do not multiply KV host-to-device transfers.
-
-The Q8_0/Q4_0 Qwen configuration has been exercised with `b/ub` values `256/256`, `512/512`, `768/512`, and `1024/1024`, including non-divisible final micro-batches. A 122880-token production-shaped run at `512/512` completed with adaptive streaming active. Wider values can require more graph and accumulator memory, so validate them on the target GPU.
-
-### Optional Unified Memory for model weights
-
-Adaptive KV streaming works with or without Unified Memory. Leave `GGML_CUDA_ENABLE_UNIFIED_MEMORY` unset for ordinary CUDA device allocations. To make GPU-offloaded model buffers CUDA managed allocations, launch the same server with the environment variable enabled:
-
-```bash
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
-./build/bin/llama-server \
-  --model /path/to/model.gguf \
-  --ctx-size 262144 \
-  -fa on \
-  -ctk q8_0 \
-  -ctv q4_0 \
-  -ngl all \
-  -b 512 \
-  -ub 512 \
-  -np 1 \
-  --kv-stream-arena-mib 2304
-```
-
-With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The shared phase arena is intentionally different: it is still allocated with `cudaMalloc`, so its compute, resident-page, and transfer-ring slices remain physically allocated in VRAM. UVM is therefore optional for this branch and does not change the shared arena into pageable storage.
-
-## Recreate the benchmark graph
-
-The benchmark driver automatically selects the largest practical shared arena for each configured context capacity, sweeps from 8K through the requested maximum, and generates the CSV, PNG, and SVG results:
-
-```bash
-python3 -m pip install matplotlib
-
-python3 benchmarks/benchmark_kv_stream.py \
-  --model /path/to/model.gguf \
-  --max-context 192K \
-  --batch-size 512 \
-  --ubatch-size 512
-```
-
-The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the arena-probing algorithm, generated files, optional settings, and resumable output directories.
+- **Compile-verified only.** The maintainer's build machine has no NVIDIA GPU, so every CUDA/Volta feature is validated by compilation (incl. `sm_70` PTX checks) but **not** by end-to-end execution. The throughput/latency numbers in the merge notes are the upstream forks' own measurements, not re-measured here.
+- **Hardware-specific.** The adaptive-KV-streaming branch targets an RTX 5070 Ti 16 GB; the V100/Volta ports target Tesla V100 (`sm_70`). Build with `GGML_CUDA=ON` and `CMAKE_CUDA_ARCHITECTURES` including `70` for the Volta features to be active.
+- **Model-specific restrictions.** Adaptive KV streaming is restricted to Qwen3.5 by the upstream fork; TurboQuant KV cache types are CUDA-only (Metal/Vulkan reject them); several Volta switches are opt-in and some are GQA-shape-gated. See each merge note.
+- This is an integration sandbox, not a supported distribution. Prefer the upstream llama.cpp for general use.
 
 ---
 
