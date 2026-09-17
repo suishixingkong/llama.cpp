@@ -196,11 +196,23 @@ static libs. Logs under `D:\llama-build\`.
   instantiations of `ggml_type` 10/11/12/13/14 — GGML_TYPE_Q2_K/Q3_K/Q4_K/Q5_K/Q6_K
   (4+4+6+6+6). That is exactly the table's whitelist and nothing else.
 - **Completeness of the port** was checked by set difference against the fork's
-  own diff (normalised added lines, per the usual method): `mmvq.cu` 31 vs 31
-  with a single explainable delta (the `calc_rows_per_block` guard line, which
-  must also carry GB10); `ggml-cuda.cu`'s residuals are exactly the three
-  excluded features plus the five comment lines. Every P2P line matches
-  bidirectionally.
+  own diff (normalised added lines, per the usual method). `mmvq.cu` carries
+  two real deltas beyond the fork:
+  1. the `calc_rows_per_block` guard line, which had to gain
+     `MMVQ_PARAMETERS_GB10` because upstream added that table *after* the fork's
+     base (genuine, must-exist);
+  2. the fork's `calc_nwarps` additionally has a tail
+     `switch (ncols_dst) { 2–4 → 4; 5–8 → 2; default → 1 }` for `ncols_dst >= 2`
+     that this tree does **not** carry. That tail is a **redundant no-op**: this
+     tree's `GENERIC`/`TURING` already return exactly `2–4 → 4 / 5–8 → 2 /
+     default → 1` for those `ncols_dst` values, so the VOLTA case falling through
+     to them yields identical results — and the fork's own `TASKS.md` (#18) notes
+     the `ncols_dst` 2–4 tuning was "investigated but NOT shipped / reverted".
+     Dropping it changes no behaviour.
+  (The previously quoted "31 vs 31" line count was loose; the actual fork hunk is
+  ~44 added lines vs ~39 in this tree — the gap *is* exactly the no-op tail
+  above.) `ggml-cuda.cu`'s residuals are exactly the three excluded features plus
+  the five comment lines. Every P2P line matches bidirectionally.
 
 ## Known limitations
 
