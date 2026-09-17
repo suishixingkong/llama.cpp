@@ -45,6 +45,13 @@ The turboquant fork is a full distribution (308 changed files). Excluded:
 - **Metal and Vulkan turbo kernels** — chose CPU + CUDA. Those backends reject
   turbo cache types at `supports_op`, and `ggml/src/ggml-metal`,
   `ggml/src/ggml-vulkan` are untouched.
+- Traces the exclusions had left in *shared* files were cleaned up in a
+  follow-up: a duplicate `MODEL_TENSOR.SSM_G` in `gguf-py/gguf/constants.py`
+  (raised at import time, so `import gguf` and every gguf-py tool were broken),
+  the `inkling` entries in `MODEL_ARCH` / `MODEL_TENSORS` / `MODEL_TENSOR` /
+  `VisionProjectorType`, the missing `TURBO{2,3,4}_0` rows in
+  `GGML_QUANT_SIZES`, and the now-callerless `set_input_pos_rel_flat()` in
+  `llama-kv-cache.{h,cpp}`.
 
 ## Type numbering
 
@@ -74,7 +81,13 @@ Turbo KV cache types are runtime-only and never stored in a GGUF.
   `GGML_CUDA_FA_QUANTS`.
 - **D=640 MMA config.** Turbo KV zero-pads K/V head_dim to a multiple of 128
   (`llama-kv-cache.cpp`), so MLA models (576 → 640) need MMA config cases, which
-  were added to all five `ggml_cuda_fattn_mma_get_config_*()`.
+  were added to all five `ggml_cuda_fattn_mma_get_config_*()`. The matching
+  explicit instantiations of `(640, 512, {1,2}, 16)` were missing from
+  `template-instances/` — `fattn.cu` called them and it still linked only because
+  the kernel bodies live in `fattn-mma-f16.cuh` — so a follow-up added them,
+  together with the `generate_cu_files.py` rule that regenerates them (the
+  generator could not produce 640 before, so a regeneration would silently drop
+  them again).
 - **Attention rotation default changed to OFF.** This is the fork's policy
   (empirically model- and quant-specific). Enable per side with
   `LLAMA_ATTN_ROT_K_OVERRIDE=1` / `LLAMA_ATTN_ROT_V_OVERRIDE=1`;
@@ -100,6 +113,13 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
 - **CPU: `314/314` targets, 0 errors.**
 - `test-turbo-quant` (turbo3/turbo4 round trip), `test-quantize-fns`
   (incl. `tq3_1s`, `tq4_1s`), `test-arg-parser`, `test-chat`: pass.
+- **`test-backend-ops` turbo cases on the CPU backend** (`-b CPU`, i.e. the
+  reference implementations): `TURBO_WHT` **27/27** — including
+  `test_turbo_wht_roundtrip`, which bounds the error of the full
+  f32 → WHT → PolarQuant → turbo3/turbo4 → f32 chain — `SET_ROWS` turbo3
+  **21/21**, `FLASH_ATTN_EXT` `turbo3` **8/8**. The cases themselves come from
+  the fork and were ported in a follow-up to this merge; see the correction
+  under *Known limitations*.
 - `test-kv-stream-plan` / `-config` / `-softmax` / `-bench-config`:
   54 tests, 325 assertions, 0 failures.
 - End-to-end generation, `Qwen2.5-0.5B-Instruct Q4_K_M`, `-ctk turbo4 -ctv turbo4
@@ -122,5 +142,12 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
   Qwen3.5`). Other architectures fail context creation when
   `--kv-stream-stage-mib` is set. This is the upstream fork's own restriction.
 - Turbo KV cache is unusable on Metal/Vulkan in this tree (no kernels ported).
-- `test-backend-ops` cannot validate the turbo kernels with a CPU-only device —
-  the harness skips the CPU backend, so CUDA GPU validation is still outstanding.
+- **CUDA GPU validation is still outstanding.** The turbo kernels *are* covered
+  by `test-backend-ops` on the CPU backend (see *Verification performed*); the
+  harness does not skip it, it runs the reference implementations. An earlier
+  revision of this note claimed a CPU-only device cannot validate the turbo
+  kernels — that was wrong, and the actual gap was simply that no test cases
+  existed in this tree. What genuinely remains unverified is the CUDA path:
+  the full 367-target `ggml-cuda` link was never run, and no run has happened on
+  a real GPU (this machine has none), so an end-to-end MLA model (576 → 640) with
+  `-ctk turbo4` is still unmeasured.
