@@ -14,7 +14,7 @@
 > **2026-09-17 更新：下面"二、发现的问题"中的 5 项已全部修复，并追加发现 1 个 P0
 > （`gguf-py` 原本无法导入）。验证结果见文末"五、修复与验证记录"。**
 
-## 二·补 P0 — `gguf-py/gguf/constants.py` 无法导入（原审计漏掉的）
+## 新增 P0 — `gguf-py/gguf/constants.py` 无法导入（原审计漏掉的）
 
 `MODEL_TENSOR` 里 `SSM_G` 被定义了两次：
 
@@ -199,7 +199,7 @@ fork：
 - Metal / Vulkan 未编译（本就未移植）。
 - `--cache-reuse` / KV streaming 路径与 turbo 的组合未验证（不属本次审计范围）。
 
-## 四、建议的修复顺序
+## 四、当时建议的修复顺序（实际执行顺序见 §五）
 
 1. 补齐 `tests/test-backend-ops.cpp` 的 turbo 用例（P1）。
 2. 修 `gguf-py` 的 `SSM_G` 重复（P0，否则转换器完全不可用）。
@@ -241,6 +241,10 @@ CUDA (D:\llama-build\cuda, arch sm_80, 无 GPU，仅编译)
 kernels with a CPU-only device" ——**这个说法不成立**。CPU 后端能跑 turbo FA、
 SET_ROWS turbo3、TURBO_WHT（走 CPU 参考实现），上面 56 个用例就是证据。
 原来的缺口纯粹是"没有测试用例"，不是"设备不支持"。
+
+**已处理**：那句话已在本报告之后随 `7a4592b89` 改写为实际仍未验证的部分
+（CUDA 全量链接 + 真实 GPU 上的端到端），同时把 D=640 实例化缺失与排除项残留
+两处一并补进该文档。
 
 ### 仍然未验证
 
