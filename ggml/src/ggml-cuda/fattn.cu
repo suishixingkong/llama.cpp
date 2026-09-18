@@ -2042,7 +2042,12 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_flash_attn_ext_needs_f16(dst, &need_f16_K, &need_f16_V);
     const bool f16_scratch_reserved = need_f16_K && need_f16_V;
 
-    const bool use_mma_prefill = !convert_to_f16 && f16_scratch_reserved &&
+    // The MMA kernel carries no (K,V) type template parameters - it reads its inputs as f16.
+    // That is why the unstreamed MMA_F16 route always converts K/V first, and why the streamed
+    // path may only borrow it when the staged pages already are f16: under DIRECT they are still
+    // quantized. A quantized direct pair keeps the native vector partial kernel instead.
+    const bool mma_kv_is_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    const bool use_mma_prefill = !convert_to_f16 && f16_scratch_reserved && mma_kv_is_f16 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
