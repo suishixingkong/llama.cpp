@@ -1104,6 +1104,9 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.classified = true;
             break;
         default:
@@ -1122,6 +1125,11 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        // TurboQuant: k_set_rows_turbo* quantise the rows on the device, including the
+        // forward WHT and the InnerQ calibration, so the cache can be written online.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.online_write = true;
             break;
         default:
@@ -1155,6 +1163,11 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        // TurboQuant: ggml_get_to_fp16_cuda dequantises the turbo blocks element-wise, which
+        // is exactly the transform the streamed pages need before the F16 fallback attention.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.decode_f16 = true;
             break;
         default:
@@ -1171,6 +1184,16 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_Q8_0:
             result.direct_attention = true;
             break;
+        // TurboQuant is deliberately left out of the direct path, for a concrete reason rather
+        // than a missing measurement: get_attention_mode() below only returns DIRECT inside
+        // `#ifdef GGML_CUDA_FA_ALL_QUANTS`, a macro that no build defines anymore (the CMake
+        // option is deprecated in favour of GGML_CUDA_FA_QUANTS and no longer emits a define),
+        // and kv_stream_resolve_native_partial() has no turbo entries - so a turbo pair marked
+        // direct would trade a correct fallback for GGML_ASSERT(native_partial != nullptr).
+        // storage + online_write + decode_f16 are real capabilities and take turbo through the
+        // conversion path below, which is the same arithmetic as the non-streamed turbo cache
+        // (rotated K/V in, rotated Q, inverse rotation on the attention output). See
+        // FIX_KVSTREAM_TURBO_MTP.md, "remaining limitations", for what enabling direct needs.
         default:
             break;
     }

@@ -64,6 +64,13 @@ std::vector<uint8_t> run_set_rows(
 int main() {
     testing t;
 
+    // GGML_CUDA_FA_ALL_QUANTS=OFF (the default) compiles only the default flash-attention kernel
+    // set, so no KV pair can take the native (direct) streamed attention there - every pair falls
+    // back to the conversion path. Ask the backend instead of guessing from the build flags.
+    const bool direct_kernels =
+        ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_F16, GGML_TYPE_F16) ==
+        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
+
     t.test("KV stream quant types are classified", [](testing & t) {
         for (int type = 0; type < GGML_TYPE_COUNT; ++type) {
             const ggml_type ggml_type_value = (ggml_type) type;
@@ -73,6 +80,12 @@ int main() {
                     ggml_type_value != GGML_TYPE_BF16) {
                 continue;
             }
+            // TQ3_1S / TQ4_1S are weight-only formats (LLAMA_FTYPE_MOSTLY_TQ*_1S): -ctk/-ctv
+            // does not offer them and they have no KV cache path at all.
+            if (ggml_type_value == GGML_TYPE_TQ3_1S ||
+                    ggml_type_value == GGML_TYPE_TQ4_1S) {
+                continue;
+            }
 
             const auto capabilities =
                 ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type_value);
@@ -80,18 +93,19 @@ int main() {
         }
     });
 
-    t.test("Q8 K and Q4 V retain direct streamed attention", [](testing & t) {
+    t.test("Q8 K and Q4 V retain direct streamed attention", [dot_kernels = direct_kernels](testing & t) {
         const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q8_0);
         const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q4_0);
 
         t.assert_true("Q8 supports direct attention", k.direct_attention);
         t.assert_true("Q4 supports direct attention", v.direct_attention);
         t.assert_equal(
-            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+            dot_kernels ? GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
+                          GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
             ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     });
 
-    t.test("all native CUDA flash-attention KV pairs use direct streaming", [](testing & t) {
+    t.test("all native CUDA flash-attention KV pairs use one execution class", [dot_kernels = direct_kernels](testing & t) {
         const ggml_type native_types[] = {
             GGML_TYPE_F16,
             GGML_TYPE_Q4_0,
@@ -105,18 +119,20 @@ int main() {
         for (const ggml_type type_k : native_types) {
             for (const ggml_type type_v : native_types) {
                 t.assert_equal(
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+                    dot_kernels ? GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
+                                  GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
                     ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v));
             }
         }
     });
 
-    t.test("all exposed KV-cache pairs select an optimized execution class", [](testing & t) {
+    t.test("all exposed KV-cache pairs select an optimized execution class", [dot_kernels = direct_kernels](testing & t) {
         const ggml_type kv_types[] = {
             GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
         size_t direct_pairs = 0;
         size_t fallback_pairs = 0;
@@ -124,7 +140,7 @@ int main() {
             const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
             for (const ggml_type type_v : kv_types) {
                 const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-                const auto expected = k.direct_attention && v.direct_attention ?
+                const auto expected = dot_kernels && k.direct_attention && v.direct_attention ?
                     GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
                     GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
                 const auto actual =
@@ -138,8 +154,10 @@ int main() {
                 fallback_pairs += actual == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
             }
         }
-        t.assert_equal(size_t(49), direct_pairs);
-        t.assert_equal(size_t(32), fallback_pairs);
+        // 7 native types are direct-capable: squared when the direct kernels are compiled,
+        // otherwise every pair (12*12) takes the F16 conversion fallback
+        t.assert_equal(dot_kernels ? size_t(49) : size_t(0),   direct_pairs);
+        t.assert_equal(dot_kernels ? size_t(95) : size_t(144), fallback_pairs);
     });
 
     t.test("every exposed KV-cache type has a GPU online writer", [](testing & t) {
@@ -148,6 +166,7 @@ int main() {
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
         for (const ggml_type type : kv_types) {
             const auto capabilities =
@@ -163,6 +182,55 @@ int main() {
             GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED,
             ggml_backend_cuda_kv_stream_get_attention_mode(
                 GGML_TYPE_Q2_K, GGML_TYPE_Q4_0));
+    });
+
+    t.test("CUDA registry answers turbo KV stream queries without a device", [](testing & t) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        if (!t.assert_true("CUDA registry is registered", reg != nullptr)) {
+            return;
+        }
+
+        using supported_fn_t = bool (*)(ggml_type, ggml_type);
+        using query_fn_t = bool (*)(
+            ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
+        auto supported_fn = reinterpret_cast<supported_fn_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_type_pair_supported"));
+        auto page_bytes_fn = reinterpret_cast<query_fn_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_page_bytes"));
+        auto workspace_fn = reinterpret_cast<query_fn_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_workspace_bytes"));
+        if (!t.assert_true("kv stream queries are registered",
+                supported_fn != nullptr && page_bytes_fn != nullptr && workspace_fn != nullptr)) {
+            return;
+        }
+
+        // the combination that motivated this test: turbo4 K with turbo3 V on a 256-wide head
+        t.assert_true("turbo K is streamable",
+            supported_fn(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0));
+
+        constexpr uint32_t head_dim    = 256;
+        constexpr uint32_t head_count  = 4;
+        constexpr uint32_t page_tokens = 256;
+
+        size_t page_bytes = 0;
+        t.assert_true("turbo page geometry is available", page_bytes_fn(
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, head_dim, head_dim,
+            head_count, page_tokens, &page_bytes));
+        t.assert_equal(
+            size_t(page_tokens)*(head_count*ggml_row_size(GGML_TYPE_TURBO4_0, head_dim) +
+                                 head_count*ggml_row_size(GGML_TYPE_TURBO3_0, head_dim)),
+            page_bytes);
+
+        const size_t f16_page = ggml_row_size(GGML_TYPE_F16, head_dim)*head_count*page_tokens;
+        size_t workspace_bytes = 0;
+        t.assert_true("turbo conversion workspace is available", workspace_fn(
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, head_dim, head_dim,
+            head_count, page_tokens, &workspace_bytes));
+        t.assert_equal(((f16_page + 127) & ~size_t(127)) + f16_page, workspace_bytes);
+
+        t.assert_equal(
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
+            ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0));
     });
 
     t.test("CUDA backend reports executable KV stream pairs", [](testing & t) {
@@ -219,6 +287,18 @@ int main() {
         t.assert_true("overflow is rejected", !page_bytes_fn(
             GGML_TYPE_F32, GGML_TYPE_F32, UINT32_MAX, UINT32_MAX,
             UINT32_MAX, UINT32_MAX, &page_bytes));
+
+        size_t turbo_page_bytes = 0;
+        t.assert_true("turbo4/turbo3 geometry is valid", page_bytes_fn(
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, 256, 256, 4, 256, &turbo_page_bytes));
+        t.assert_equal(
+            256*(4*ggml_row_size(GGML_TYPE_TURBO4_0, 256) + 4*ggml_row_size(GGML_TYPE_TURBO3_0, 256)),
+            turbo_page_bytes);
+        t.assert_true("turbo rejects a partial WHT group", !page_bytes_fn(
+            GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 192, 256, 4, 256, &turbo_page_bytes));
+        // the cache zero-pads turbo heads to 128, which is what the caller has to query with
+        t.assert_true("padded turbo head dim is a valid WHT group", page_bytes_fn(
+            GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 256, 256, 4, 256, &turbo_page_bytes));
     });
 
     t.test("conversion workspace is bounded to one page for every exposed KV pair", [](testing & t) {
@@ -248,6 +328,7 @@ int main() {
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
 
         for (const ggml_type type_k : kv_types) {
@@ -293,6 +374,7 @@ int main() {
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
         for (const ggml_type type : kv_types) {
             const std::vector<uint8_t> expected = run_set_rows(

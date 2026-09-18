@@ -397,6 +397,12 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        // resolve the K cache type here as well: llama_kv_cache applies the TurboQuant
+        // auto-asymmetric upgrade, and the phase-arena geometry has to match the cache that
+        // the memory module is about to allocate
+        const ggml_type type_k = llama_kv_cache_resolve_type_k(params.type_k, params.type_v, hparams);
+        const ggml_type type_v = params.type_v;
+
         const uint64_t kv_stream_arena_bytes = uint64_t(cparams.kv_stream_arena_mib)*1024ULL*1024ULL;
         uint64_t kv_stream_stage_bytes = kv_stream_arena_bytes;
         uint64_t kv_stream_minimum_stage_bytes = 0;
@@ -450,12 +456,14 @@ llama_context::llama_context(
                 size_t layer_page_bytes = 0;
                 size_t layer_conversion_bytes = 0;
                 if (!page_bytes_fn(
-                        params.type_k, params.type_v,
-                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        type_k, type_v,
+                        llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
+                        llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
                         hparams.n_head_kv(il), 256, &layer_page_bytes) ||
                     !workspace_bytes_fn(
-                        params.type_k, params.type_v,
-                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        type_k, type_v,
+                        llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
+                        llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
                         hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
                     throw std::runtime_error("invalid block KV streaming page geometry");
                 }
@@ -542,8 +550,8 @@ llama_context::llama_context(
         }
 
         llama_memory_params params_mem = {
-            /*.type_k                =*/ params.type_k,
-            /*.type_v                =*/ params.type_v,
+            /*.type_k                =*/ type_k,
+            /*.type_v                =*/ type_v,
             /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
             /*.kv_stream_phase_arena =*/ kv_stream_phase_arena.arena,
             /*.kv_stream_maximum_pool_bytes =*/ kv_stream_arena_bytes,

@@ -20,6 +20,48 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+uint32_t llama_kv_cache_padded_head_dim(ggml_type type, uint32_t head_dim) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            return ((head_dim + 127)/128)*128;
+        default:
+            return head_dim;
+    }
+}
+
+ggml_type llama_kv_cache_resolve_type_k(ggml_type type_k, ggml_type type_v, const llama_hparams & hparams) {
+    const bool k_is_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+        type_k == GGML_TYPE_TURBO4_0;
+    if (!k_is_turbo) {
+        return type_k;
+    }
+
+    const uint32_t n_head    = hparams.n_head(0);
+    const uint32_t n_head_kv = hparams.n_head_kv(0);
+    const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
+
+    const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
+    const bool disabled = (env && env[0] == '0');
+
+    // Turbo K quantization error gets amplified by the GQA broadcast factor.
+    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
+    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
+    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
+    if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
+        // the tag is spelled out on purpose: the rule moved into this helper, but the log
+        // line has to keep reading "llama_kv_cache: ..."
+        LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                       "upgrading K from %s to q8_0 to prevent quality degradation. "
+                       "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
+                       "llama_kv_cache", gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
+        return GGML_TYPE_Q8_0;
+    }
+
+    return type_k;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -134,29 +176,9 @@ llama_kv_cache::llama_kv_cache(
 
     // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
     // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
-    // Turbo K quantization error gets amplified by the GQA broadcast factor.
-    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
-    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
-    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
-    {
-        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-        if (k_is_turbo) {
-            const uint32_t n_head    = hparams.n_head(0);
-            const uint32_t n_head_kv = hparams.n_head_kv(0);
-            const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
-
-            const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
-            const bool disabled = (env && env[0] == '0');
-
-            if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
-                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
-                               "upgrading K from %s to q8_0 to prevent quality degradation. "
-                               "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
-                               __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
-                type_k = GGML_TYPE_Q8_0;
-            }
-        }
-    }
+    // Shared with llama_context, which needs the same effective type for the
+    // KV-stream phase-arena geometry.
+    type_k = llama_kv_cache_resolve_type_k(type_k, type_v, hparams);
 
     // #24060/MTP fix: iterate ALL layers (incl. nextn) so an all-nextn draft
     // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
@@ -370,14 +392,18 @@ llama_kv_cache::llama_kv_cache(
                     size_t page_bytes = 0;
                     if (!page_bytes_fn(
                             type_k, type_v,
-                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+                            llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
+                            llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
+                            hparams.n_head_kv(il),
                             256, &page_bytes)) {
                         throw std::runtime_error("invalid block KV streaming page geometry");
                     }
                     size_t conversion_bytes = 0;
                     if (!workspace_bytes_fn(
                             type_k, type_v,
-                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+                            llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
+                            llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
+                            hparams.n_head_kv(il),
                             256, &conversion_bytes)) {
                         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
                     }

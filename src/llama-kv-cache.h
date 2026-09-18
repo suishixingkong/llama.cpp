@@ -417,6 +417,16 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
+// TurboQuant cache types zero-pad every head to the next multiple of 128 in the KV cache
+// (see the zero-padding block in llama_kv_cache), so anything that derives the on-device
+// cache geometry has to use the padded head dim, not the model's raw head dim.
+uint32_t llama_kv_cache_padded_head_dim(ggml_type type, uint32_t head_dim);
+
+// Resolve the effective K cache type. Symmetric TurboQuant K/V on high-GQA models is
+// upgraded to q8_0 to protect quality - the rule lives in llama_kv_cache, but the context
+// needs the same answer when it sizes buffers and validates the cache geometry.
+ggml_type llama_kv_cache_resolve_type_k(ggml_type type_k, ggml_type type_v, const llama_hparams & hparams);
+
 class llama_kv_cache_context : public llama_memory_context_i {
 public:
     // some shorthands
