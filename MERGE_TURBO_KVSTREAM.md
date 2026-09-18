@@ -40,7 +40,7 @@ types. Weight quantisation gained `--outtype tq3_1s` / `tq4_1s`.
 |---|---|---|
 | Turbo KV 缓存 | `-ctk turbo4 -ctv turbo4 -fa on` | 需开启 FlashAttention；`llama_context` 会自动启用 FA。KV 类型支持 `turbo2`/`turbo3`/`turbo4` |
 | 权重量化 | `--outtype tq3_1s` / `tq4_1s` | 转换模型权重时选用 turbo 权重量化 |
-| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**仅 Qwen3.5 可用**（其它架构设了 `--kv-stream-stage-mib` 会建上下文失败，这是上游 fork 自身限制） |
+| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**仅 Qwen3.5 可用**（其它架构设了 `--kv-stream-stage-mib` 会建上下文失败，这是上游 fork 自身限制）。可与 turbo KV（`-ctk turbo4 -ctv turbo3`）和 MTP 推测解码（`--spec-type draft-mtp`）叠加，见 [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md) |
 
 **环境变量**：
 
@@ -167,6 +167,14 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
   Qwen3.5`). Other architectures fail context creation when
   `--kv-stream-stage-mib` is set. This is the upstream fork's own restriction.
 - Turbo KV cache is unusable on Metal/Vulkan in this tree (no kernels ported).
+- **Turbo KV + KV streaming and MTP + KV streaming were broken until
+  [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md)**: turbo types were
+  missing from the CUDA KV-stream capability table (`invalid block KV streaming
+  page geometry` at startup), and the phase arena reserved decode compute for
+  one token per sequence, which a speculative verify batch cannot satisfy
+  (`phase arena currently supports TG1 without speculative batches`). Both are
+  fixed; the GPU-side numerics of the turbo conversion fallback still need a
+  run on real hardware.
 - **CUDA GPU validation is still outstanding.** The turbo kernels *are* covered
   by `test-backend-ops` on the CPU backend (see *Verification performed*); the
   harness does not skip it, it runs the reference implementations. An earlier
