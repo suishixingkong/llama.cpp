@@ -304,6 +304,9 @@ private:
         size_t conversion_bytes = 0;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 8;
+        // upper bound on the tokens a single generation ubatch can carry: n_seq_max plus the
+        // speculative drafts, because the decode phase reserves compute for exactly that shape
+        uint32_t max_generation_tokens = 0;
         size_t backend_index = SIZE_MAX;
         size_t max_nodes = 0;
         size_t current_kv_bytes = 0;

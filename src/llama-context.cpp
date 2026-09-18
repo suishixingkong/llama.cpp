@@ -251,6 +251,10 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // speculative decoding puts the sampled token plus up to n_draft_max drafts into a single
+    // generation ubatch, so the KV-stream phase arena has to reserve compute for that shape
+    cparams.n_draft_max = std::min<uint32_t>(params.n_draft_max, cparams.n_batch);
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -859,9 +863,8 @@ bool llama_context::kv_stream_switch_phase(
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = decode ?
-        n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
-    const uint32_t n_outputs = decode ?
-        n_seqs : std::min(n_tokens, cparams.n_outputs_max);
+        arena.max_generation_tokens : std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
     auto * gf = graph_reserve(
         n_tokens, n_seqs, n_outputs, reserve_mctx.get());
     if (gf == nullptr) {
@@ -948,6 +951,14 @@ void llama_context::sched_reserve() {
 
         const uint32_t n_outputs_pp =
             std::min(n_tokens, cparams.n_outputs_max);
+
+        // a generation ubatch is not necessarily one token per sequence: with speculative
+        // decoding every active sequence can verify its own draft chain, so the decode phase
+        // reserves compute for n_seq_max * (1 + n_draft_max) tokens, capped by the physical ubatch
+        const uint32_t n_tokens_tg = std::min<uint32_t>(
+            n_seqs*(1u + cparams.n_draft_max), cparams.n_ubatch);
+        const uint32_t n_outputs_tg = std::min(n_tokens_tg, cparams.n_outputs_max);
+
         std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
         std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
 
@@ -960,7 +971,7 @@ void llama_context::sched_reserve() {
         const int n_nodes_pp = ggml_graph_n_nodes(gf_pp);
 
         auto * gf_tg = graph_reserve(
-            n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
+            n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), true, sizes_tg.data());
         if (gf_tg == nullptr) {
             throw std::runtime_error("failed to measure compute tg buffers");
         }
@@ -1017,6 +1028,7 @@ void llama_context::sched_reserve() {
             make_layout(plan_tg, std::move(sizes_tg));
         kv_stream_phase_arena.backend_index = backend_index;
         kv_stream_phase_arena.max_nodes = max_nodes;
+        kv_stream_phase_arena.max_generation_tokens = n_tokens_tg;
         kv_stream_phase_arena.configured = true;
 
         sched.reset();
@@ -1034,26 +1046,27 @@ void llama_context::sched_reserve() {
             kv_stream_phase_arena.prefill.resident_pages_per_layer,
             kv_stream_phase_arena.prefill.ring_slots);
         LLAMA_LOG_INFO(
-            "%s: phase arena decode:  KV %.2f MiB, compute %.2f MiB, resident %u pages/layer, ring %u pages\n",
+            "%s: phase arena decode:  KV %.2f MiB, compute %.2f MiB, resident %u pages/layer, ring %u pages, tokens %u\n",
             __func__,
             kv_stream_phase_arena.token_generation.kv_bytes/1024.0/1024.0,
             kv_stream_phase_arena.token_generation.compute_bytes/1024.0/1024.0,
             kv_stream_phase_arena.token_generation.resident_pages_per_layer,
-            kv_stream_phase_arena.token_generation.ring_slots);
+            kv_stream_phase_arena.token_generation.ring_slots,
+            kv_stream_phase_arena.max_generation_tokens);
 
         if (n_nodes_pp == n_nodes_tg) {
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
         } else {
             LLAMA_LOG_INFO(
-                "%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n",
-                __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+                "%s: graph nodes  = %d (with bs=%d), %d (with bs=%d)\n",
+                __func__, n_nodes_pp, n_tokens, n_nodes_tg, n_tokens_tg);
         }
         if (n_splits_pp == n_splits_tg) {
             LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
         } else {
             LLAMA_LOG_INFO(
-                "%s: graph splits = %d (with bs=%d), %d (with bs=1)\n",
-                __func__, n_splits_pp, n_tokens, n_splits_tg);
+                "%s: graph splits = %d (with bs=%d), %d (with bs=%d)\n",
+                __func__, n_splits_pp, n_tokens, n_splits_tg, n_tokens_tg);
         }
 
         const int64_t t_end_us = ggml_time_us();
@@ -1813,10 +1826,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     llama_kv_stream_phase_is_generation(
                         phase, ubatch.n_tokens);
                 if (kv_stream_phase_arena.configured && generation &&
-                        ubatch.n_tokens != cparams.n_seq_max) {
+                        ubatch.n_tokens > kv_stream_phase_arena.max_generation_tokens) {
                     LLAMA_LOG_ERROR(
-                        "%s: phase arena currently supports TG1 without speculative batches\n",
-                        __func__);
+                        "%s: phase arena reserved compute for %u generation tokens "
+                        "(n_seq_max = %u, n_draft_max = %u) but the batch has %u\n",
+                        __func__, kv_stream_phase_arena.max_generation_tokens,
+                        cparams.n_seq_max, cparams.n_draft_max, ubatch.n_tokens);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
@@ -4116,6 +4131,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_draft_max                 =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

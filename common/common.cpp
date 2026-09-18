@@ -1725,6 +1725,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     const uint32_t speculative_rs_seq = params.speculative.need_n_rs_seq();
     cparams.n_rs_seq = speculative_rs_seq;
+    // the target context verifies the drafts in the same generation ubatch that carries the
+    // sampled token, so it has to know how many drafts a single step can add
+    cparams.n_draft_max = std::max(0, common_speculative_n_max(&params.speculative));
     if (params.checkpoint_recurrent_prev && speculative_rs_seq == 0) {
         cparams.n_rs_seq = std::max<uint32_t>(cparams.n_rs_seq, 1);
         cparams.rs_rollback_prompt_only = true;
