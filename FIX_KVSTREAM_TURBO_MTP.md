@@ -272,24 +272,36 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
   2026-09-09；在此之前 `ggml/src/ggml-cuda/CMakeLists.txt:115-118` 是
   `if (GGML_CUDA_FA_ALL_QUANTS) → GLOB 所有实例 + add_compile_definitions(...)`，
   所以 akv fork 2026-08-29 写的 `#ifdef` 在当时是**成立**的，是这次并入新基线让它失效。）
+  另外注意：`GGML_CUDA_FA_ALL_QUANTS` 在 `fattn.cu` 里包的是 **4 处**，不只是模式选择 ——
+  1019-1068（`kv_stream_native_partial_fn` 类型 + `kv_stream_resolve_native_partial()`）、
+  1214-1218（模式选择）、1823-1829（assert）、2300-2305（**真正的启动点**，`GGML_ABORT(
+  "native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS")`）。只改模式选择那一处
+  不是"半通"，而是把"静默退 F16"换成 abort —— 必须四处一起改成 per-pair 判定。
   想让 turbo 真正走 direct，需要三件事（都在 CUDA 侧，且必须真机验证）：
-  1. 修掉那个失效的门。**注意别用错宏**：`GGML_CUDA_FA_QUANTS` 是"语义列表"字符串，
-     只含 `-DGGML_CUDA_FA_QUANTS` 给的或 curated 默认集里的组合，**不含** CMake 追加的
-     `TQ_FA_COMBINATIONS`（实测：用户构建里该字符串 =
-     `"f16-f16,q4_0-q4_0,q8_0-q8_0,bf16-bf16,q8_0-q4_0,f16-q8_0"`，而同一次编译的
-     `GGML_CUDA_FA_<K>_<V>` 宏里有 **16** 个 `=1`，其中 10 个是 turbo，含
-     `GGML_CUDA_FA_TURBO4_0_TURBO3_0=1`）。判断"这一对到底编没编"只能查
-     `GGML_CUDA_FA_<K>_<V>`（`ggml/cmake/common.cmake:131-141` 逐对发 0/1）；
+  1. 修掉那个失效的门，判据要落在 **(K,V) 对**上，而不是"是否全量编译"：
+     `ggml_cuda_fattn_vec_instances()`（`ggml/cmake/common.cmake:53`）为 `FA_TYPES` 的
+     每一对发一个 `GGML_CUDA_FA_<K>_<V>=0/1` 宏（`common.cmake:100-110`，发宏在 108 行），并且只把
+     `FA_COMBINATIONS` 里列出的实例文件加进编译（`file(GLOB)` 只在
+     `GGML_CUDA_FA_QUANTS=all` 时走）—— `FATTN_VEC_CASE` 的 `if constexpr` 用的正是这些
+     逐对宏，所以"按对判定"本来就是上游自己的语义。
+     ⚠️ 两个坑：(a) 这些宏由 `add_compile_definitions` 发在 `ggml/src/ggml-cuda`，
+     作用域只到该目录 —— 测试/其它 target 看不到，host 侧判断只能运行时问后端；
+     (b) 别拿 `GGML_CUDA_FA_QUANTS` 字符串当判据：在 `f531b24b7` 之前该字符串只含"用户给的
+     或 curated 基础集"（实测 6 对），而 cmake 另外追加的 turbo 组只体现在逐对宏上
+     （同一次编译有 16 个 `=1`，含 `GGML_CUDA_FA_TURBO4_0_TURBO3_0=1`）；
+     `f531b24b7` 之后默认值本身就是 16 对显式列表，两者才重新一致；
   2. 给 `kv_stream_resolve_native_partial()` 补 turbo 的 K/V 分支 —— 否则 DIRECT 会命中
-     `GGML_ASSERT(native_partial != nullptr)` 直接 abort（`fattn.cu:2296`）；
+     `GGML_ASSERT(native_partial != nullptr)` 直接 abort（`fattn.cu:2301`）；
   3. 把 turbo 标成 `direct_attention`（严格说该判断应该按 (K,V) 对而不是按单类型，
      因为 `direct_attention` 是 per-type 标志、而内核是 per-pair 的）。
-  内核本身其实已经在了：默认 FA 组合集追加了 10 个 turbo 组合
-  （`ggml/cmake/common.cmake:114` `TQ_FA_COMBINATIONS`，仅当**没有**显式给
-  `-DGGML_CUDA_FA_QUANTS` 时追加 —— 用户构建正是这种情况），对应的
-  `template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu` 会实例化
-  `DECL_FATTN_VEC_CASE`，而该宏同时实例化 `..._case` 与 `..._partial_case`
-  （`fattn-vec.cuh:947`）。所以这是一步"接线 + 验证"，不是"重写内核"。
+  内核本身其实已经在了：默认 FA 组合集（`ggml/CMakeLists.txt:207` 的
+  `GGML_CUDA_FA_QUANTS` 默认值，自 `f531b24b7` 起是一份 16 对的显式列表）就含 10 个 turbo
+  组合，其中就有 `turbo4_0-turbo3_0`；对应的
+  `template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu` 调用
+  `DECL_FATTN_VEC_CASE`，而该宏**同时**实例化 `..._case` 与 `..._partial_case`
+  （`fattn-vec.cuh:944-949`），D=64/128/256 各一份。kv-stream 只会用到 D=256
+  （`KV_STREAM_HEAD_DIM = 256`，且 `ggml_cuda_flash_attn_ext_streamed_supported()` 要求
+  Q、V 的 `ne[0]` 都是 256）。所以这是一步"接线 + 验证"，不是"重写内核"。
   ⚠️ 反例：`D:\llama-build\cuda70` 的 cache 里显式写了
   `GGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`，因此那个目录**一个 turbo
   实例都没编**（实测 `GGML_CUDA_FA_*` 只有 4 个 `=1`）—— 这也说明"这套内核在不在二进制里"
