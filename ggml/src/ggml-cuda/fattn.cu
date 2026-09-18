@@ -1016,56 +1016,122 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
 }
 
-#ifdef GGML_CUDA_FA_ALL_QUANTS
 using kv_stream_native_partial_fn = void (*)(
     ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);
 
-template<ggml_type type_K>
-static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_type type_v) {
-    switch (type_v) {
-        case GGML_TYPE_F16:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_F16>;
-        case GGML_TYPE_Q4_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_0>;
-        case GGML_TYPE_Q4_1:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_1>;
-        case GGML_TYPE_Q5_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_0>;
-        case GGML_TYPE_Q5_1:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_1>;
-        case GGML_TYPE_Q8_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q8_0>;
-        case GGML_TYPE_BF16:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_BF16>;
-        default:
-            return nullptr;
+// Partial (per-KV-chunk) kernel of the exact (K,V) pair, D == KV_STREAM_HEAD_DIM, or nullptr.
+//
+// Whether a pair has that template instance is a per-pair property of the build, not a global
+// one: ggml_cuda_fattn_vec_instances() (ggml/cmake/common.cmake) emits one
+// GGML_CUDA_FA_<type_K>_<type_V> define per K/V type combination from its FA_TYPES list, and
+// only the pairs in FA_COMBINATIONS get their template-instances/fattn-vec-instance-*.cu file
+// compiled. `if constexpr` on those same defines is therefore the exact question "was this pair
+// compiled", and it is how upstream's own ggml_cuda_get_fattn_vec_case() selects a kernel: an
+// uncompiled pair degrades to a null case there and to nullptr here, instead of referencing a
+// symbol the linker does not have.
+//
+// F32 is deliberately absent: it has no partial template instance for any partner (upstream's
+// generic selector maps F32 onto the F16 case instead, which the streamed native path does not
+// do - it stages whatever the KV cache holds).
+#define KV_STREAM_NATIVE_PARTIAL_CASE(type_K_case, type_V_case)                        \
+    if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                        \
+        if (type_k == GGML_TYPE_##type_K_case && type_v == GGML_TYPE_##type_V_case) {  \
+            return ggml_cuda_flash_attn_ext_vec_partial_case<                          \
+                KV_STREAM_HEAD_DIM, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>; \
+        }                                                                             \
     }
-}
 
+// Same K/V pair set as ggml_cuda_get_fattn_vec_case() below, TurboQuant first because that is
+// what the streamed KV cache is normally asked for.
 static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         ggml_type type_k, ggml_type type_v) {
-#define KV_STREAM_NATIVE_K_CASE(type_K) \
-        case type_K: return kv_stream_resolve_native_partial_for_v<type_K>(type_v)
-    switch (type_k) {
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_F16);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_1);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_1);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q8_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_BF16);
-        default: return nullptr;
-    }
-#undef KV_STREAM_NATIVE_K_CASE
+    // TurboQuant KV-cache types.
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, TURBO2_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, TURBO3_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO4_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,      TURBO2_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,     TURBO2_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, Q8_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,      TURBO3_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,     TURBO3_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, Q8_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,      TURBO4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,     TURBO4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, Q8_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, TURBO3_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, TURBO2_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, TURBO4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO2_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, TURBO4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO3_0)
+
+    // Base K/V types.
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, F16)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, Q4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, Q4_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, Q4_1)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, Q5_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, Q5_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, Q5_1)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, Q8_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,  BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1, BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_0, BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1, BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0, BF16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(BF16, BF16)
+
+    return nullptr;
 }
-#endif // GGML_CUDA_FA_ALL_QUANTS
+#undef KV_STREAM_NATIVE_PARTIAL_CASE
 
 } // namespace
 
@@ -1182,18 +1248,15 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        // TurboQuant: the streamed native path consumes the rotated cache blocks directly, via
+        // the same ggml_cuda_flash_attn_ext_vec_partial_case <K,V> instance that non-streamed
+        // turbo attention uses. The forward WHT on Q and the inverse rotation on the attention
+        // output are graph ops (llama-graph.cpp), so they are unaffected by which FA kernel runs.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.direct_attention = true;
             break;
-        // TurboQuant is deliberately left out of the direct path, for a concrete reason rather
-        // than a missing measurement: get_attention_mode() below only returns DIRECT inside
-        // `#ifdef GGML_CUDA_FA_ALL_QUANTS`, a macro that no build defines anymore (the CMake
-        // option is deprecated in favour of GGML_CUDA_FA_QUANTS and no longer emits a define),
-        // and kv_stream_resolve_native_partial() has no turbo entries - so a turbo pair marked
-        // direct would trade a correct fallback for GGML_ASSERT(native_partial != nullptr).
-        // storage + online_write + decode_f16 are real capabilities and take turbo through the
-        // conversion path below, which is the same arithmetic as the non-streamed turbo cache
-        // (rotated K/V in, rotated Q, inverse rotation on the attention output). See
-        // FIX_KVSTREAM_TURBO_MTP.md, "remaining limitations", for what enabling direct needs.
         default:
             break;
     }
@@ -1211,11 +1274,17 @@ ggml_backend_cuda_kv_stream_attention_mode
 ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_v) {
     const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
     const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-    if (capabilities_k.direct_attention && capabilities_v.direct_attention) {
+    // DIRECT is a property of the (K,V) pair, not of either type: direct_attention only says the
+    // type has a native streamed kernel for some partner. Resolve the pair and only then report
+    // DIRECT, so the mode can never promise a kernel that ggml_cuda_flash_attn_ext_streamed()
+    // would fail to find - that mismatch used to be a GGML_ASSERT(native_partial != nullptr),
+    // i.e. an abort on the first streamed layer. Pairs whose instance was not compiled now fall
+    // through to the F16 conversion path below, which is exactly what upstream's generic
+    // selector does for them.
+    if (capabilities_k.direct_attention && capabilities_v.direct_attention &&
+            kv_stream_resolve_native_partial(type_k, type_v) != nullptr) {
         return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
     }
-#endif // GGML_CUDA_FA_ALL_QUANTS
     if (capabilities_k.storage && capabilities_v.storage &&
             capabilities_k.online_write && capabilities_v.online_write &&
             capabilities_k.decode_f16 && capabilities_v.decode_f16 &&
@@ -1802,6 +1871,11 @@ uint32_t ggml_cuda_kv_stream_last_ring_peak_occupancy(
     return ring == nullptr ? 0 : ring->last_ring_peak_occupancy;
 }
 
+// Defined next to ggml_cuda_flash_attn_ext_get_alloc_size() below; answers whether the KQV
+// allocation reserves the f16 scratch that ggml_cuda_flash_attn_ext_get_f16_extra_data() hands out.
+static void ggml_cuda_flash_attn_ext_needs_f16(
+    const ggml_tensor * dst, bool * need_f16_K, bool * need_f16_V);
+
 void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -1820,13 +1894,13 @@ void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
     const bool convert_to_f16 =
         attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
-#ifdef GGML_CUDA_FA_ALL_QUANTS
+    // get_attention_mode() only reports DIRECT after resolving this exact pair, so this is a
+    // belt-and-braces re-derivation rather than the place where the decision is made.
     const kv_stream_native_partial_fn native_partial =
         attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ?
             kv_stream_resolve_native_partial(K->type, V->type) : nullptr;
     GGML_ASSERT(attention_mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ||
         native_partial != nullptr);
-#endif // GGML_CUDA_FA_ALL_QUANTS
     const to_fp16_cuda_t converter_k = convert_to_f16 && K->type != GGML_TYPE_F16 ?
         ggml_get_to_fp16_cuda(K->type) : nullptr;
     const to_fp16_cuda_t converter_v = convert_to_f16 && V->type != GGML_TYPE_F16 ?
@@ -1956,7 +2030,19 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
 
-    const bool use_mma_prefill = !convert_to_f16 &&
+    // The MMA_F16 prefill kernel below consumes f16 K and V, and launch_fattn() materialises
+    // whichever of them is not already f16 into the scratch past the end of KQV (see
+    // ggml_cuda_flash_attn_ext_get_f16_extra_data()). That scratch only exists when the
+    // unstreamed kernel selection also asked for f16, and a pair that is direct can still be
+    // routed to VEC (a short query batch on Volta: Q->ne[1]*gqa_ratio_eff <= 2) or to the Volta
+    // Q8 tensor-core kernel for this very shape - borrowing the MMA kernel then would convert
+    // past the end of the KQV allocation. Ask the same question the graph allocator asks.
+    bool need_f16_K = false;
+    bool need_f16_V = false;
+    ggml_cuda_flash_attn_ext_needs_f16(dst, &need_f16_K, &need_f16_V);
+    const bool f16_scratch_reserved = need_f16_K && need_f16_V;
+
+    const bool use_mma_prefill = !convert_to_f16 && f16_scratch_reserved &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
@@ -2297,12 +2383,8 @@ void ggml_cuda_flash_attn_ext_streamed(
                         KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
                             ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
                 } else {
-#ifdef GGML_CUDA_FA_ALL_QUANTS
                     GGML_ASSERT(native_partial != nullptr);
                     native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
-#else
-                    GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
-#endif // GGML_CUDA_FA_ALL_QUANTS
                 }
             }
 
@@ -3055,41 +3137,53 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Whether the unstreamed kernel selection needs f16 copies of K and V, i.e. whether the KQV
+// allocation reserves the scratch that ggml_cuda_flash_attn_ext_get_f16_extra_data() hands out.
+// That scratch lives past the end of the KQV tensor, so every caller that relies on it - the
+// conversion inside launch_fattn(), and the streamed path when it borrows the MMA_F16 prefill
+// kernel - must ask this, not re-derive it from the K/V types alone.
+static void ggml_cuda_flash_attn_ext_needs_f16(
+        const ggml_tensor * dst, bool * need_f16_K, bool * need_f16_V) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    *need_f16_K = false;
+    *need_f16_V = false;
+
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+        case BEST_FATTN_KERNEL_TILE:
+        case BEST_FATTN_KERNEL_MMA_F16:
+            *need_f16_K = true;
+            *need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_VEC: {
+            const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+            *need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
+            *need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
+        } break;
+        case BEST_FATTN_KERNEL_NONE:
+        case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
+            break;
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
-    const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
-
-    if (kernel == BEST_FATTN_KERNEL_VOLTA_Q8_W4) {
+    if (ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_VOLTA_Q8_W4) {
         return ggml_q8v::get_alloc_size(dst);
     }
 
     bool need_f16_K = false;
     bool need_f16_V = false;
-
-    switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
-            break;
-        case BEST_FATTN_KERNEL_VEC: {
-            const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
-            need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
-            need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
-        } break;
-        case BEST_FATTN_KERNEL_NONE:
-            break;
-        case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
-            GGML_ABORT("unreachable");
-    }
+    ggml_cuda_flash_attn_ext_needs_f16(dst, &need_f16_K, &need_f16_V);
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);

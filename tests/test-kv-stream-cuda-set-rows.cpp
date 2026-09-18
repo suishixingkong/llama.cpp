@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -64,12 +65,25 @@ std::vector<uint8_t> run_set_rows(
 int main() {
     testing t;
 
-    // GGML_CUDA_FA_ALL_QUANTS=OFF (the default) compiles only the default flash-attention kernel
-    // set, so no KV pair can take the native (direct) streamed attention there - every pair falls
-    // back to the conversion path. Ask the backend instead of guessing from the build flags.
+    // Which K/V pairs own a native (direct) streamed kernel is a per-pair property of the build:
+    // ggml_cuda_fattn_vec_instances() (ggml/cmake/common.cmake) always puts f16-f16 into
+    // FA_COMBINATIONS and compiles whatever else GGML_CUDA_FA_QUANTS lists. f16-f16 is therefore
+    // the one pair that is direct in every build, which makes it a reliable probe of "the direct
+    // path is wired up at all" - ask the backend instead of guessing from build flags.
     const bool direct_kernels =
         ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_F16, GGML_TYPE_F16) ==
         GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
+
+    // The exact expectations below are written against the shipped GGML_CUDA_FA_QUANTS default
+    // (ggml/CMakeLists.txt). A build that overrides that list legitimately has a different, still
+    // correct set of direct pairs, so those expectations are only asserted when the default is in
+    // effect. The turbo pairs are the discriminator: they are in the default and are the first
+    // thing a hand-written list drops.
+    const bool curated_quants = direct_kernels &&
+        ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_F16, GGML_TYPE_TURBO4_0) ==
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT &&
+        ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0) ==
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
 
     t.test("KV stream quant types are classified", [](testing & t) {
         for (int type = 0; type < GGML_TYPE_COUNT; ++type) {
@@ -93,19 +107,25 @@ int main() {
         }
     });
 
-    t.test("Q8 K and Q4 V retain direct streamed attention", [dot_kernels = direct_kernels](testing & t) {
+    t.test("Q8 K and Q4 V retain direct streamed attention", [curated = curated_quants](testing & t) {
         const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q8_0);
         const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q4_0);
 
         t.assert_true("Q8 supports direct attention", k.direct_attention);
         t.assert_true("Q4 supports direct attention", v.direct_attention);
-        t.assert_equal(
-            dot_kernels ? GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
-                          GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
-            ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        const auto mode = ggml_backend_cuda_kv_stream_get_attention_mode(
+            GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        if (curated) {
+            t.assert_equal(GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT, mode);
+        } else {
+            // q8_0-q4_0 is not forced into FA_COMBINATIONS, so a custom GGML_CUDA_FA_QUANTS may
+            // leave it on the conversion path - it must still be an optimized class, not NONE.
+            t.assert_true("Q8/Q4 pair is an optimized class",
+                mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED);
+        }
     });
 
-    t.test("all native CUDA flash-attention KV pairs use one execution class", [dot_kernels = direct_kernels](testing & t) {
+    t.test("no native CUDA flash-attention KV pair loses its execution class", [](testing & t) {
         const ggml_type native_types[] = {
             GGML_TYPE_F16,
             GGML_TYPE_Q4_0,
@@ -116,17 +136,58 @@ int main() {
             GGML_TYPE_BF16,
         };
 
+        // These 7 types all have a partial template instance for every partner, so whichever of
+        // them GGML_CUDA_FA_QUANTS compiled must report DIRECT and the rest must report F16.
+        // Reporting UNSUPPORTED for any of them is what the per-pair direct resolution exists to
+        // prevent.
         for (const ggml_type type_k : native_types) {
             for (const ggml_type type_v : native_types) {
-                t.assert_equal(
-                    dot_kernels ? GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
-                                  GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
-                    ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v));
+                const auto mode =
+                    ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v);
+                if (!t.assert_true("pair keeps an optimized execution class",
+                        mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED)) {
+                    std::fprintf(stderr, "unsupported native pair K=%s V=%s\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v));
+                    return;
+                }
             }
         }
     });
 
-    t.test("all exposed KV-cache pairs select an optimized execution class", [dot_kernels = direct_kernels](testing & t) {
+    // The shipped GGML_CUDA_FA_QUANTS default (ggml/CMakeLists.txt) holds exactly these pairs,
+    // every one of them between two direct-capable types. Those are the pairs whose partial
+    // kernel is linked in, so those are the pairs a default build must report as DIRECT.
+    t.test("the curated FA set is exactly the set of direct streamed pairs", [curated = curated_quants](testing & t) {
+        if (!curated) {
+            return;
+        }
+        const std::pair<ggml_type, ggml_type> direct_pairs[] = {
+            { GGML_TYPE_F16,      GGML_TYPE_F16      },
+            { GGML_TYPE_Q4_0,     GGML_TYPE_Q4_0     },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_Q8_0     },
+            { GGML_TYPE_BF16,     GGML_TYPE_BF16     },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_Q4_0     },
+            { GGML_TYPE_F16,      GGML_TYPE_Q8_0     },
+            { GGML_TYPE_F16,      GGML_TYPE_TURBO4_0 },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0 },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0 },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0 },
+            { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0 },
+            { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0 },
+            { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0 },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0 },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0 },
+            { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0 },
+        };
+        for (const auto & pair : direct_pairs) {
+            if (!t.assert_equal(GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+                    ggml_backend_cuda_kv_stream_get_attention_mode(pair.first, pair.second))) {
+                std::fprintf(stderr, "expected DIRECT for K=%s V=%s\n",
+                    ggml_type_name(pair.first), ggml_type_name(pair.second));
+                return;
+            }
+        }
+
         const ggml_type kv_types[] = {
             GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
@@ -134,30 +195,37 @@ int main() {
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
-        size_t direct_pairs = 0;
-        size_t fallback_pairs = 0;
+        size_t direct_count = 0;
+        size_t fallback_count = 0;
         for (const ggml_type type_k : kv_types) {
             const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
             for (const ggml_type type_v : kv_types) {
                 const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-                const auto expected = dot_kernels && k.direct_attention && v.direct_attention ?
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
-                const auto actual =
+                const auto mode =
                     ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v);
-                if (!t.assert_equal(expected, actual)) {
-                    std::fprintf(stderr, "mode mismatch K=%s V=%s\n",
+                if (!t.assert_true("pair is an optimized class",
+                        mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED)) {
+                    std::fprintf(stderr, "unsupported pair K=%s V=%s\n",
                         ggml_type_name(type_k), ggml_type_name(type_v));
                     return;
                 }
-                direct_pairs += actual == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
-                fallback_pairs += actual == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
+                // DIRECT is per pair, so it can only ever be reported for pairs whose two types
+                // both advertise a native streamed kernel.
+                if (mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT &&
+                        !(k.direct_attention && v.direct_attention)) {
+                    t.assert_true("DIRECT pair has direct-capable types", false);
+                    std::fprintf(stderr, "DIRECT without capability K=%s V=%s\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v));
+                    return;
+                }
+                direct_count += mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
+                fallback_count += mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
             }
         }
-        // 7 native types are direct-capable: squared when the direct kernels are compiled,
-        // otherwise every pair (12*12) takes the F16 conversion fallback
-        t.assert_equal(dot_kernels ? size_t(49) : size_t(0),   direct_pairs);
-        t.assert_equal(dot_kernels ? size_t(95) : size_t(144), fallback_pairs);
+        // 16 of the 12x12 pairs are in the curated FA set and all 16 are between the 10
+        // direct-capable types; the remaining 128 pairs take the F16 conversion fallback.
+        t.assert_equal(size_t(16),  direct_count);
+        t.assert_equal(size_t(128), fallback_count);
     });
 
     t.test("every exposed KV-cache type has a GPU online writer", [](testing & t) {
@@ -221,16 +289,25 @@ int main() {
                                  head_count*ggml_row_size(GGML_TYPE_TURBO3_0, head_dim)),
             page_bytes);
 
+        // A staged page needs a conversion workspace only when the pair has no native kernel: a
+        // direct pair consumes the cache blocks as they were written, so its workspace is zero.
+        const auto turbo_mode = ggml_backend_cuda_kv_stream_get_attention_mode(
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
+        if (!t.assert_true("turbo pair is an optimized class",
+                turbo_mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED)) {
+            return;
+        }
+
         const size_t f16_page = ggml_row_size(GGML_TYPE_F16, head_dim)*head_count*page_tokens;
         size_t workspace_bytes = 0;
-        t.assert_true("turbo conversion workspace is available", workspace_fn(
+        t.assert_true("turbo workspace query is answered", workspace_fn(
             GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, head_dim, head_dim,
             head_count, page_tokens, &workspace_bytes));
-        t.assert_equal(((f16_page + 127) & ~size_t(127)) + f16_page, workspace_bytes);
-
-        t.assert_equal(
-            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
-            ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0));
+        if (turbo_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT) {
+            t.assert_equal(size_t(0), workspace_bytes);
+        } else {
+            t.assert_equal(((f16_page + 127) & ~size_t(127)) + f16_page, workspace_bytes);
+        }
     });
 
     t.test("CUDA backend reports executable KV stream pairs", [](testing & t) {

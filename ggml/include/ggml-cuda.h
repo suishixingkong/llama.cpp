@@ -71,6 +71,9 @@ struct ggml_backend_cuda_kv_stream_type_capabilities {
     bool storage;
     bool online_write;
     bool decode_f16;
+    // The type can be consumed by a native streamed kernel, for at least one partner type.
+    // Whether a concrete (K,V) pair can is a property of that pair and is what
+    // ggml_backend_cuda_kv_stream_get_attention_mode() reports.
     bool direct_attention;
     bool requires_initialization;
     bool requires_importance_matrix;

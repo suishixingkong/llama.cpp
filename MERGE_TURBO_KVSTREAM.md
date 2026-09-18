@@ -101,9 +101,12 @@ Turbo KV cache types are runtime-only and never stored in a GGUF.
   GGML_CUDA_FA_ALL_QUANTS` macro dispatch with a table in
   `ggml_cuda_get_fattn_vec_case()` driven by `if constexpr
   (GGML_CUDA_FA_<K>_<V>)`. The 21 turbo combinations are registered there and
-  always compiled via `ggml_cuda_fattn_vec_instances()` in
-  `ggml/cmake/common.cmake`; they are intentionally outside
-  `GGML_CUDA_FA_QUANTS`.
+  compiled via `ggml_cuda_fattn_vec_instances()` in `ggml/cmake/common.cmake`.
+  ⚠️ 勘误（2026-09-18）：原文写的 "always compiled" 与 "intentionally outside
+  `GGML_CUDA_FA_QUANTS`" 只在 `f531b24b7` 之前成立 —— 当时 turbo 组由 cmake 在
+  `GGML_CUDA_FA_QUANTS` 字符串之外另行追加。自 `f531b24b7` 起默认值本身就是一份 16 对的
+  显式列表，turbo 组**就在** `GGML_CUDA_FA_QUANTS` 里；换用自定义列表时它们与其它对一样会
+  被丢掉，该对随即退回 F16 转换（详见 `FIX_KVSTREAM_DIRECT_FA.md`）。
 - **D=640 MMA config.** Turbo KV zero-pads K/V head_dim to a multiple of 128
   (`llama-kv-cache.cpp`), so MLA models (576 → 640) need MMA config cases, which
   were added to all five `ggml_cuda_fattn_mma_get_config_*()`. The matching

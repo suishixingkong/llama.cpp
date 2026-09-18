@@ -234,11 +234,13 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
 5. **回归**：不设 `--kv-stream-stage-mib` 的普通 turbo 路径、以及 `-np 1` 无推测解码的流式路径
    应与修复前表现一致。
 
-> 注：用户机器与本机两处构建的 `GGML_CUDA_FA_ALL_QUANTS` **都是 OFF**（默认值），
-> 此时 `ggml_backend_cuda_kv_stream_get_attention_mode()` 对**所有** KV 类型都返回 F16 转换路径
-> （DIRECT 只在 `GGML_CUDA_FA_ALL_QUANTS=ON` 的构建里才会被选中）。
-> 也就是说：turbo KV 在流式下走的就是 q8_0 / f16 这些类型同样走的那条路，没有额外假设。
-> 测试里 DIRECT 相关的期望值已按构建实际能力参数化，两种配置下都应全绿。
+> 注：**本文写于 direct attention 还不可达的时候，该结论已由
+> `kv-stream-direct-fa` 分支推翻，见 `FIX_KVSTREAM_DIRECT_FA.md`。**
+> 当时两处构建的 `GGML_CUDA_FA_ALL_QUANTS` 都只是 OFF，而 `#ifdef GGML_CUDA_FA_ALL_QUANTS`
+> 恒假（该宏自上游 `5a4d0feca` 起不再被任何人定义），所以
+> `ggml_backend_cuda_kv_stream_get_attention_mode()` 对**所有** KV 类型都返回 F16 转换路径。
+> 也就是说：那时 turbo KV 在流式下走的就是 q8_0 / f16 这些类型同样走的那条路，没有额外假设。
+> 测试里 DIRECT 相关的期望值已按构建实际能力参数化，各种配置下都应全绿。
 
 ### 测试文件本身顺带修掉的两处"必然失败"
 
@@ -249,8 +251,9 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
    KV 流式类型表 —— 连权重专用格式 `TQ3_1S` / `TQ4_1S` 也算（`-ctk/-ctv` 不提供它们，
    它们也没有 KV 路径）。已按 `common/arg.cpp` 的 `kv_cache_types` 语义跳过这两个。
 2. DIRECT 相关用例把期望值写死成 `GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT`，
-   而默认构建（`GGML_CUDA_FA_ALL_QUANTS=OFF`）根本没编出 direct 内核 —— 现在改为运行时探测
-   `direct_kernels`，两种构建配置下都成立。
+   而默认构建根本没编出 direct 内核 —— 改为运行时探测。`kv-stream-direct-fa` 之后这项
+   进一步细化为"逐对探测 + 只在用默认 `GGML_CUDA_FA_QUANTS` 时断言精确集合"，
+   详见 `FIX_KVSTREAM_DIRECT_FA.md`。
 
 ---
 
@@ -259,12 +262,14 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
 - KV streaming 依然**只支持 Qwen3.5 架构**、要求 `-np 1` / FlashAttention / GPU KV offload
   （akv fork 自身限制，见 `llama-kv-stream-config.cpp`）；MTP/draft 上下文永远不用 arena
   （`common/speculative.cpp:2502` 把 `kv_stream_arena_mib` 置 0）。
-- turbo 走的是 **F16 转换回退**，不是 turbo direct 内核：多一次 per-page dequant + 一次
+- turbo 当时走的是 **F16 转换回退**，不是 turbo direct 内核：多一次 per-page dequant + 一次
   workspace 往返，吞吐增益未测。
-  需要澄清的是，这**不是 turbo 特有的待遇，也不是精度上的妥协**：在当前这棵树里
+  > **已修复，见 `FIX_KVSTREAM_DIRECT_FA.md`。** 下面这段记录的是当时的诊断，作为
+  > "为什么这个门会失效"的证据链保留下来。
+  这**不是 turbo 特有的待遇，也不是精度上的妥协**：当时
   `ggml_backend_cuda_kv_stream_get_attention_mode()` 的 DIRECT 分支被
   `#ifdef GGML_CUDA_FA_ALL_QUANTS` 包着，而这个宏**任何构建都不会定义** ——
-  CMake 选项 `GGML_CUDA_FA_ALL_QUANTS` 已 deprecated（`ggml/cmake/common.cmake:66`
+  CMake 选项 `GGML_CUDA_FA_ALL_QUANTS` 已 deprecated（`ggml/cmake/common.cmake:58-61`
   只把它翻成 `GGML_CUDA_FA_QUANTS=all`），再没有任何 `add_compile_definitions` 发这个宏；
   `compile_commands.json` 里出现 0 次。所以 `q8_0` / `f16` 这些"有 direct 内核"的类型
   在流式下走的**也是**同一条转换回退路径。
@@ -272,15 +277,15 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
   2026-09-09；在此之前 `ggml/src/ggml-cuda/CMakeLists.txt:115-118` 是
   `if (GGML_CUDA_FA_ALL_QUANTS) → GLOB 所有实例 + add_compile_definitions(...)`，
   所以 akv fork 2026-08-29 写的 `#ifdef` 在当时是**成立**的，是这次并入新基线让它失效。）
-  另外注意：`GGML_CUDA_FA_ALL_QUANTS` 在 `fattn.cu` 里包的是 **4 处**，不只是模式选择 ——
+  另外注意：那个 `#ifdef` 在 `fattn.cu` 里包的是 **4 处**，不只是模式选择 ——
   1019-1068（`kv_stream_native_partial_fn` 类型 + `kv_stream_resolve_native_partial()`）、
   1214-1218（模式选择）、1823-1829（assert）、2300-2305（**真正的启动点**，`GGML_ABORT(
   "native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS")`）。只改模式选择那一处
   不是"半通"，而是把"静默退 F16"换成 abort —— 必须四处一起改成 per-pair 判定。
-  想让 turbo 真正走 direct，需要三件事（都在 CUDA 侧，且必须真机验证）：
-  1. 修掉那个失效的门，判据要落在 **(K,V) 对**上，而不是"是否全量编译"：
+  当时列的"想让 turbo 真正走 direct 需要三件事"，`kv-stream-direct-fa` 已照此实现：
+  1. 修掉那个失效的门，判据落在 **(K,V) 对**上：
      `ggml_cuda_fattn_vec_instances()`（`ggml/cmake/common.cmake:53`）为 `FA_TYPES` 的
-     每一对发一个 `GGML_CUDA_FA_<K>_<V>=0/1` 宏（`common.cmake:100-110`，发宏在 108 行），并且只把
+     每一对发一个 `GGML_CUDA_FA_<K>_<V>=0/1` 宏（`common.cmake:99-110`），并且只把
      `FA_COMBINATIONS` 里列出的实例文件加进编译（`file(GLOB)` 只在
      `GGML_CUDA_FA_QUANTS=all` 时走）—— `FATTN_VEC_CASE` 的 `if constexpr` 用的正是这些
      逐对宏，所以"按对判定"本来就是上游自己的语义。
@@ -290,10 +295,10 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
      或 curated 基础集"（实测 6 对），而 cmake 另外追加的 turbo 组只体现在逐对宏上
      （同一次编译有 16 个 `=1`，含 `GGML_CUDA_FA_TURBO4_0_TURBO3_0=1`）；
      `f531b24b7` 之后默认值本身就是 16 对显式列表，两者才重新一致；
-  2. 给 `kv_stream_resolve_native_partial()` 补 turbo 的 K/V 分支 —— 否则 DIRECT 会命中
-     `GGML_ASSERT(native_partial != nullptr)` 直接 abort（`fattn.cu:2301`）；
-  3. 把 turbo 标成 `direct_attention`（严格说该判断应该按 (K,V) 对而不是按单类型，
-     因为 `direct_attention` 是 per-type 标志、而内核是 per-pair 的）。
+  2. 给 `kv_stream_resolve_native_partial()` 补 turbo 的 K/V 分支 —— 已补（70 对全覆盖）；
+  3. 把 turbo 标成 `direct_attention` —— 已标；并且把该判断从"两个 per-type 标志"
+     收紧为"标志 + 该对的内核确实存在"，因为 `direct_attention` 是 per-type 标志、
+     而内核是 per-pair 的。
   内核本身其实已经在了：默认 FA 组合集（`ggml/CMakeLists.txt:207` 的
   `GGML_CUDA_FA_QUANTS` 默认值，自 `f531b24b7` 起是一份 16 对的显式列表）就含 10 个 turbo
   组合，其中就有 `turbo4_0-turbo3_0`；对应的
@@ -305,7 +310,8 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
   ⚠️ 反例：`D:\llama-build\cuda70` 的 cache 里显式写了
   `GGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`，因此那个目录**一个 turbo
   实例都没编**（实测 `GGML_CUDA_FA_*` 只有 4 个 `=1`）—— 这也说明"这套内核在不在二进制里"
-  是构建配置决定的，写文档/测试时要以 `compile_commands.json` 为准。
+  是构建配置决定的，写文档/测试时要以 `compile_commands.json` 为准，也说明逐对判定必须
+  能优雅降级而不是断言失败。
 - `n_draft_max` 由 `common_speculative_n_max()` 推出；如果绕过 common 直接调 libllama 且把
   `n_draft_max` 留成 0，则仍然回到"守卫直接报错"的行为（宁可失败，不会算错）。
 - 多序列 + 推测解码的组合会按 `n_seq_max × (1 + n_draft_max)` 预留，arena 吃紧时可能报
@@ -317,7 +323,8 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
 |---|---|---|
 | 直接原因 | turbo 未登记 → `storage = false` → `ggml_cuda_kv_stream_page_bytes()` 第一道门 `return false` | arena 的 decode compute 按 `n_seqs` 预留，且 `ubatch.n_tokens != n_seq_max` 是硬判 |
 | `direct_attention` 的角色 | **无因果作用**：几何检查只读 `storage`，模式判断的 F16 分支只读 `storage/online_write/decode_f16`。只标 direct、不标 storage，问题 1 分毫不动 | **完全无关**：不同文件、不同层（FA 内核选择 vs arena compute 预留） |
-| 与修复的关系 | 属同一张能力表的第 5 个标志：必须**刻意不标**。若连它一起标，等那个死门被修好就会撞 `GGML_ASSERT(native_partial != nullptr)`，把"启动报错"变成"首帧崩溃" | 不参与 |
+| 与修复的关系 | 属同一张能力表的第 5 个标志：当时必须**刻意不标**。若连它一起标，等那个死门被修好就会撞 `GGML_ASSERT(native_partial != nullptr)`，把"启动报错"变成"首帧崩溃" | 不参与 |
+| 后续（`kv-stream-direct-fa`） | 那个死门已按 (K,V) 对修好，turbo 现在**已标** `direct_attention`，同时 `get_attention_mode()` 收紧为"标志 + 该对内核确实存在"，所以上面那个 assert 依然不可能命中 | 不参与 |
 | 共同"元原因" | 本次集成把 turbo KV / kv-stream / MTP 三个特性放进同一棵树，却没有验证**两两组合**。`direct_attention` 落在 turbo×kv-stream 这一格里，TG1 守卫落在 kv-stream×MTP 那一格里 —— 是同一张"特性组合矩阵"上的两个兄弟缺口，技术上彼此独立 | 同左 |
 
 ### direct 的收益在哪、有多大（量级估算，未实测）
