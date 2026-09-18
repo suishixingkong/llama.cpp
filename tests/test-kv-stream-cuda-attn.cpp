@@ -484,10 +484,40 @@ int main() {
                 const size_t v_page_bytes =
                     ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
                 const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+
+                // The runtime needs the conversion workspace whenever the pair cannot be read
+                // natively (the F16 route). Ask the backend the way the graph builder does instead
+                // of assuming it: a pair that resolves to F16 without a workspace trips
+                // GGML_ASSERT(transfer_ring->conversion_data != nullptr) in fattn.cu, which used to
+                // abort this test on the first non-native pair.
+                size_t conversion_bytes = 0;
+                {
+                    using workspace_bytes_fn_t = bool (*)(ggml_type, ggml_type, uint32_t, uint32_t,
+                        uint32_t, uint32_t, size_t *);
+                    ggml_backend_reg_t reg =
+                        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+                    auto * workspace_bytes_fn = (workspace_bytes_fn_t)
+                        ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
+                    if (!t.assert_true("workspace geometry query is available",
+                            workspace_bytes_fn != nullptr &&
+                            workspace_bytes_fn(type_k, type_v, HEAD_DIM, HEAD_DIM, N_KV_HEAD,
+                                256, &conversion_bytes))) {
+                        return;
+                    }
+                }
+
+                const auto mode =
+                    ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v);
+                const char * mode_name =
+                    mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ? "DIRECT" :
+                    mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16    ? "F16" : "UNSUPPORTED";
+
                 ggml_backend_cuda_kv_stream_params params{};
-                params.device      = 0;
-                params.stage_bytes = page_bytes;
-                params.stage_slots = 1;
+                params.device           = 0;
+                params.stage_bytes      = page_bytes;
+                params.stage_slots      = 1;
+                params.conversion_bytes = conversion_bytes;
                 auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
                 if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
                     return;
@@ -509,8 +539,8 @@ int main() {
                 if (!std::isfinite(max_abs) || max_abs > 5e-4f ||
                         stats.asynchronous_page_uploads == 0) {
                     std::fprintf(stderr,
-                        "native pair K=%s V=%s max_abs=%g async_uploads=%llu\n",
-                        ggml_type_name(type_k), ggml_type_name(type_v), max_abs,
+                        "native pair K=%s V=%s mode=%s max_abs=%g async_uploads=%llu\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v), mode_name, max_abs,
                         (unsigned long long) stats.asynchronous_page_uploads);
                 }
                 t.assert_true("native pair executes streamed attention",

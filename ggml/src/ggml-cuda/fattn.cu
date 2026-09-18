@@ -926,6 +926,19 @@ static int kv_stream_parts_per_chunk() {
     return parts;
 }
 
+// Diagnostic switch. The MMA prefill span is a different kernel family: it round-trips the
+// probability matrix through f16, so its output is not comparable with the vector kernels at
+// f16-rounding tolerances. Default on; GGML_CUDA_KV_STREAM_MMA_PREFILL=0 routes every streamed
+// batch through the native/converted vector partial kernels instead, which is what a numerical
+// A/B against the non-streamed reference needs.
+static bool kv_stream_mma_prefill_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    return enabled;
+}
+
 static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_bytes) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -2047,7 +2060,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     // path may only borrow it when the staged pages already are f16: under DIRECT they are still
     // quantized. A quantized direct pair keeps the native vector partial kernel instead.
     const bool mma_kv_is_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-    const bool use_mma_prefill = !convert_to_f16 && f16_scratch_reserved && mma_kv_is_f16 &&
+    const bool use_mma_prefill = kv_stream_mma_prefill_enabled() && !convert_to_f16 &&
+        f16_scratch_reserved && mma_kv_is_f16 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
