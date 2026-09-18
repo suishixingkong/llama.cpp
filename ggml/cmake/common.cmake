@@ -51,25 +51,16 @@ endfunction()
 
 # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
 function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
-    set(TQ_FA_TYPES turbo2_0 turbo3_0 turbo4_0)
-    set(ALL_FA_TYPES ${FA_TYPES} ${TQ_FA_TYPES})
-    # Curated default set, used only when -DGGML_CUDA_FA_QUANTS is not given on the command line.
-    set(FA_DEFAULT_QUANTS "f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16;q8_0-q4_0;f16-q8_0")
+    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16 turbo2_0 turbo3_0 turbo4_0)
 
     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
     string(STRIP   "${FA_QUANTS}" FA_QUANTS)
-    set(USE_DEFAULT OFF)
-    if (NOT FA_QUANTS)
-        set(USE_DEFAULT ON)
-    endif()
     if (GGML_CUDA_FA_ALL_QUANTS)
         message(WARNING "GGML_CUDA_FA_ALL_QUANTS is deprecated, use GGML_CUDA_FA_QUANTS=all instead")
         set(FA_QUANTS all)
     endif()
     if (NOT FA_QUANTS)
-        # No explicit -DGGML_CUDA_FA_QUANTS was given: fall back to the curated default set.
-        set(FA_QUANTS "${FA_DEFAULT_QUANTS}")
+        message(FATAL_ERROR "GGML_CUDA_FA_QUANTS must not be empty")
     endif()
 
     if (FA_QUANTS STREQUAL "all")
@@ -94,36 +85,20 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
             set(TYPE_K ${CMAKE_MATCH_1})
             set(TYPE_V ${CMAKE_MATCH_2})
             foreach (TYPE ${TYPE_K} ${TYPE_V})
-                if (NOT TYPE IN_LIST ALL_FA_TYPES)
+                if (NOT TYPE IN_LIST FA_TYPES)
                     message(FATAL_ERROR
-                        "GGML_CUDA_FA_QUANTS: unknown type \"${TYPE}\" in \"${COMBINATION}\", must be one of: ${ALL_FA_TYPES}")
+                        "GGML_CUDA_FA_QUANTS: unknown type \"${TYPE}\" in \"${COMBINATION}\", must be one of: ${FA_TYPES}")
                 endif()
             endforeach()
             list(APPEND FA_COMBINATIONS ${TYPE_K}-${TYPE_V})
         endforeach()
-
-        # TurboQuant KV-cache instances. The turbo types only ever show up as a KV cache,
-        # never as a model weight type. They are appended only when no explicit
-        # -DGGML_CUDA_FA_QUANTS was given (i.e. the curated default set is in use); an
-        # explicit user list is authoritative and is compiled exactly as written. (Has no
-        # effect when GGML_CUDA_FA_ALL_QUANTS=ON, which took the "all" branch above and
-        # already compiles every available TurboQuant instance.)
-        if (USE_DEFAULT)
-            set(TQ_FA_COMBINATIONS
-                f16-turbo4_0      q8_0-turbo4_0
-                q8_0-turbo3_0     q8_0-turbo2_0
-                turbo4_0-turbo4_0 turbo4_0-turbo3_0
-                turbo4_0-turbo2_0 turbo3_0-turbo3_0
-                turbo3_0-turbo2_0 turbo2_0-turbo2_0)
-            list(APPEND FA_COMBINATIONS ${TQ_FA_COMBINATIONS})
-        endif()
     endif()
     list(REMOVE_DUPLICATES FA_COMBINATIONS)
 
     string(REPLACE ";" "," FA_QUANTS_DEFINE "${FA_QUANTS}")
     add_compile_definitions(GGML_CUDA_FA_QUANTS="${FA_QUANTS_DEFINE}")
-    foreach (TYPE_V IN LISTS ALL_FA_TYPES)
-        foreach (TYPE_K IN LISTS ALL_FA_TYPES)
+    foreach (TYPE_V IN LISTS FA_TYPES)
+        foreach (TYPE_K IN LISTS FA_TYPES)
             if ("${TYPE_K}-${TYPE_V}" IN_LIST FA_COMBINATIONS)
                 set(COMPILED 1)
             else()

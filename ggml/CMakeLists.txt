@@ -204,8 +204,8 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
-set   (GGML_CUDA_FA_QUANTS "" CACHE STRING
-                                            "ggml: FlashAttention K-V type combinations to compile. Leave empty for the curated default set (which also includes the TurboQuant KV-cache combinations); or \"all\" for every available instance; or an explicit list such as \"q8_0-q8_0;q8_0-q4_0\"")
+set   (GGML_CUDA_FA_QUANTS "f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16;q8_0-q4_0;f16-q8_0;f16-turbo4_0;q8_0-turbo4_0;q8_0-turbo3_0;q8_0-turbo2_0;turbo4_0-turbo4_0;turbo4_0-turbo3_0;turbo4_0-turbo2_0;turbo3_0-turbo3_0;turbo3_0-turbo2_0;turbo2_0-turbo2_0" CACHE STRING
+                                            "ggml: FlashAttention K-V type combinations to compile. (includes the TurboQuant KV-cache combinations); \"all\" for every available instance; or an explicit list such as \"q8_0-q8_0;q8_0-q4_0\"")
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
