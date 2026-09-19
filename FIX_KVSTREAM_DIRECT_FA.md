@@ -285,10 +285,45 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
 `mma=0`，把人引向"span 与此无关"。测试已改为同时打印开关状态（`span=ON|off`）与该计数器，
 并以开关为准。
 
-默认继续保持关。仍然开着的是"span 在 sm_70 + 流式分页下的具体错因"——partial 约定已核对过，
-下一步要么在同一颗内核上做 `GGML_CUDA_VOLTA_FA_COMPACT` / 单 span 最短回归的二分，要么先按
-"小批走 vec、大批才允许 span"收窄它。**span 只影响多 token 批（含 MTP 验证批）的 prefill**，
-而"多 token 批 × 流式"正是现场报缺陷的那条组合，所以关掉它同时也是一个可能的修复动作。
+**根因已确认（2026-09-19 深夜，源码级 + 真机 trace）**：
+
+span 实例化 `<256,256,8,8>` → `ncols = 64`；Volta 配置表（`fattn-mma-f16.cuh:139`）
+`nthreads = 128` → `nwarps = 4`，`cols_per_warp = 32` ⇒ **`np = 4*32/64 = 2 > 1`**。
+`np` = "Number of parallel CUDA warps **per Q column**"（`*.cuh:1257`）：**np 个 warp 并行处理
+同一批列、分摊 KV 行**（`threadIdx.y % np` 选 KV 偏移、`threadIdx.y / np` 选列组，`*.cuh:720-770`）。
+所以每个 warp 只持有该列**一部分 KV 行**的 `(max, rowsum)`。
+
+`np > 1` 时 combine（`*.cuh:1618-1674`）把 tile_Q meta 槽改写成
+`make_float2(KQ_cms[imeta], KQ_crs)` = **(per-warp scale, 合并 rowsum)**；而
+`kv_stream_accumulate_chunk_results`（`fattn.cu:990`）要的是 `(max, rowsum)` —— **max 位拿到了 scale**。
+
+**真机 trace 实证**（`GGML_CUDA_KV_STREAM_TRACE_SPAN=1`，同一负载 span 开/关各一次）：
+
+| | max | rowsum |
+|---|---|---|
+| span 开（修复前） | `1`（= scale，warp0 恰为最大 warp） | `20.81` |
+| span 关（vec 基准） | `2.48994` | `18.9589` |
+
+⇒ **max 位就是 per-warp scale**，chunk 权重 `exp(meta.x − global_max) ≈ 1` → 无权合并，
+chunk 之间的 max 差异丢失 → 误差随 chunk 数增长。
+
+**修复（提交 `8e1ad6e57`）**：收尾发布 **combine 的合并值** `(KQ_cmn, KQ_crs)`。
+`tile_stride = combine_scratch + 4`（`*.cuh:1539`）⇒ 每列 padding 恰 4 float，meta float2 占 slot[0]/[1]，
+**slot[2] 空闲**（VKQ combine 1691-1750 只写 `[0..127]`，不碰 padding；1752 有 `__syncthreads()` 隔开）。
+combine 在同一 guarded 块里把 `KQ_cmn` 存到 slot[2]，收尾写
+`dstk_fixup[row] = np == 1 ? (meta_j[0], meta_j[1]) : (meta_j[2], meta_j[1])`。
+**写者集合 / 行号 / 索引零改动**（勿重蹈 `b51ba9e11`：那版改了写者集合 → 漏行 → 1024q 恶化到 0.63）。
+
+> **中间失败的一次（`87aa00883`，已推 gitcode）**：曾改为发布线程寄存器的 `KQ_cmr` —— 只修好了 max，
+> rowsum 仍是单 warp partial（真机 `9.83778` vs 基准 `18.9589`，约一半），误差反而放大
+> （1024q 1.3e-2→0.63、十六层 3.5e-2→7.1e-2）。**教训：`np` 不是"各 warp 管不相交列"；
+> 别从名字/直觉推某个寄存器是否"完整"，要看它在哪一维被并行切开。**
+
+**状态**：修复后本机 sm_70 编译通过；**V100 复核待跑**（`MMA_PREFILL=1`，期望 23 → 0，
+trace 应为 `meta0=(2.48994,18.9589)`）。默认仍关（收益未量化），修好后可按 §6.7 量收益再决定是否翻默认。
+
+**span 只影响多 token 批（含 MTP 验证批）的 prefill**；生产"turbo+流式+MTP 答非所问"的实际根因是
+staged SET_ROWS 丢 `dst_row_base`（见 `FIX_KVSTREAM_TURBO_MTP.md`），与此 span 无关。
 
 > **测量纪律**：本机无 GPU，数值必须在 V100 上采，且该卡必须空闲。
 > 另：**判读配置是否真的生效，别只看"跑起来了"** —— 断言总数、stats 计数器、开关的自述输出
@@ -329,8 +364,11 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
    换来从量化域 vec 内核换到 f16 域 MMA 内核 —— 见 §6.6 末尾的收益测量方法。
 5. **回归**：`test-kv-stream-cuda-set-rows` 全绿（本机已跑，见 §5.2）。
 6. **span 已定性，不用再跑 A/B**：见 §5.4——span 开 = 23 failures（可复现），span 关 = 全绿。
-   **首选错因（源码级定位，2026-09-19，待真机确认）**：span 的 partial meta 语义在
-   `np > 1` 时是 `(scale, rowsum)`，而 `kv_stream_accumulate_chunk_results` 要的是 `(max, rowsum)`。
+   **错因已确认并修复（2026-09-19 深夜，见 §5.4 末 + 提交 `8e1ad6e57`）**：span 的 partial meta 在
+   `np > 1` 时发布的是 `(scale, rowsum)`，而 `kv_stream_accumulate_chunk_results` 要的是 `(max, rowsum)`；
+   修复 = 收尾改为发布 combine 的 `(KQ_cmn, KQ_crs)`（`KQ_cmn` 存进每列 padding 的空闲 slot[2]）。
+   **V100 复核待跑**（期望 23 → 0；trace 应为 `meta0=(2.48994,18.9589)`）。
+   下面 (a)/(a2) 保留为首轮排查记录（已验证并被最终修法取代）。
 
    - span 实例化为 `<DKQ=256, DV=256, ncols1=8, ncols2=8>` → `ncols = 64`；Volta 配置表里
      `nthreads = 128`、`nbatch_fa = 32`（`fattn-mma-f16.cuh:139`），`cols_per_warp = 32`
