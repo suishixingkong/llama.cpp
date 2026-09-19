@@ -340,12 +340,22 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
      这也是 span 关时全绿的原因。
 
    验证/修复步骤（按顺序，每步都能证伪上一步）：
-   (a) **修法已实现（待真机验证）**：partial 收尾在 `np > 1` 时写**合并后的 max**
-       —— 即组合步骤算出的 `KQ_cmn` / `KQ_crs`（`fattn-mma-f16.cuh` 里保存为
-       `KQ_max_combined` / `KQ_rowsum_combined`），并只让跑过组合的线程
-       （`threadIdx.y % np == 0`）写这一行；`np == 1` 仍读 `meta_j`（那时槽里就是 max）。
-       这段只在 `output_partial` 分支里，上游不使用该分支，风险局限于流式 span。
-       本机 nvcc 12.4 / sm_70 编译通过，无新增警告。
+   (a) **一次尝试已回退**（`b51ba9e11`）：按"partial 的 meta 应该是 `(max, rowsum)`"改过一版，
+       真机结果**不是变好而是整体变差**：
+
+       | 用例 | 修改前 | 修改后 |
+       |---|---|---|
+       | native 对（16 个） | 2.0e-3 | 2.2e-3（turbo 侧 3.1e-3 → 5.8e-3） |
+       | wide-query 1024 | 1.31e-2 | **0.632758** |
+       | four-query 页边界 | 1.75e-3 | 2.83e-3 |
+       | server-shaped / 257q / 512q | 1.69e-2 / 3.8e-3 / 2.5e-3 | 1.47e-2 / 2.3e-3 / 2.2e-3（略好） |
+
+       数字确实被这段改到了（方向对），但"分子与 rowsum 相对**合并后的 max** 归一"这个前提
+       不成立；或者写者守卫漏了行 —— 1024q 那次 0.63 更像是整行 meta 没被写。已回退该改动。
+   (a2) **改用测量代替猜测**：新增 `GGML_CUDA_KV_STREAM_TRACE_SPAN=1`，在归一化之前打印合并
+       累积器的 `meta0/meta1 = (max, denominator)` 与前两行的前 4 个分子值，并带上
+       `span=` / `nchunks=` / `parts=` / `nrows=`。**同一负载跑两次**（span 开 / 关），
+       以 span 关（vec 路径）那次为基准，就能读出 span 真正发布的是什么、差在 max 还是分母。
    (b) 真机：`set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 && test-kv-stream-cuda-attn.exe`，
        期望 23 failures → **0**，且各 `max_abs` 掉到 vec 同量级（1e-4）；若仍失败，
        下一步查 numerator 的约定（`FATTN_KQ_MAX_OFFSET` 与 `KQ_cmr`）。

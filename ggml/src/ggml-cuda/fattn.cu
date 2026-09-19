@@ -951,6 +951,17 @@ static bool kv_stream_mma_prefill_enabled() {
     return enabled;
 }
 
+// Diagnostic switch for the chunk merge: prints the accumulated (max, denominator) and the first
+// four numerator values of the first two rows before they are normalized, so a span-enabled run can
+// be compared against a span-disabled (vector) run on the same workload.
+static bool kv_stream_span_trace_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_TRACE_SPAN");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
 static int64_t kv_stream_block_tokens(const ggml_tensor * dst, size_t stage_bytes) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -2451,6 +2462,32 @@ void ggml_cuda_flash_attn_ext_streamed(
                 kv_stream_graph_fill_free_slots(transfer_ring);
             }
             chunk += int(streamed_span_pages) - 1;
+        }
+    }
+
+    // Diagnostic: print what the chunk merge accumulated, so the span's contract can be read off
+    // instead of guessed. With GGML_CUDA_KV_STREAM_TRACE_SPAN=1, run the same workload once with
+    // the span enabled and once disabled; the vec (disabled) run is the reference for what
+    // (max, denominator, numerator) should look like.
+    if (kv_stream_span_trace_enabled()) {
+        static int traces_left = 4;
+        if (traces_left > 0) {
+            --traces_left;
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            const size_t rows = std::min<size_t>(2, size_t(nrows));
+            float2 acc_meta[2] = {};
+            float  acc_num[2*4] = {};
+            CUDA_CHECK(cudaMemcpy(acc_meta, accumulator_meta.ptr, rows*sizeof(float2),
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(acc_num, accumulator.ptr, rows*4*sizeof(float),
+                cudaMemcpyDeviceToHost));
+            std::fprintf(stderr,
+                "kv-stream merge trace: span=%d nchunks=%d parts=%d nrows=%lld "
+                "meta0=(%g,%g) meta1=(%g,%g) num0=(%g,%g,%g,%g) num1=(%g,%g,%g,%g)\n",
+                int(use_mma_prefill), int(nchunks), partial_count, (long long) nrows,
+                acc_meta[0].x, acc_meta[0].y, acc_meta[1].x, acc_meta[1].y,
+                acc_num[0], acc_num[1], acc_num[2], acc_num[3],
+                acc_num[4], acc_num[5], acc_num[6], acc_num[7]);
         }
     }
 
