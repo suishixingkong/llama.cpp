@@ -309,16 +309,24 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
    > 那个形状才会被拦到原生 partial 内核上。
 2. **turbo 流式端到端**：`-ctk turbo4 -ctv turbo3 --kv-stream-stage-mib 3800 -fa on -np 1`
    能否起来 + 输出与非流式 turbo 逐 token 一致（同一 prompt、同一采样参数）。
-3. **该对到底走没走 direct**：`LLAMA_KV_STREAM_TRACE=1` 之外，最直接的证据是
-   `ggml_cuda_kv_stream_workspace_bytes()` 对 DIRECT 对返回 0 —— 启动日志里
-   `phase arena` 那几行的 workspace/convert 字段应当消失或归零；
-   也可以对比 `resident N pages/layer`（direct 不再需要转换工作区，切片会变）。
-4. **收益**：对比 direct 与 F16 回退的 decode 吞吐。用 `LLAMA_KV_STREAM_TRACE=1` 看
-   `copy busy %` / `deadline misses` 判断处在 H2D-bound 还是 compute-bound 一侧 ——
+3. **该对到底走没走 direct**：最直接的两个证据是
+   `ggml_cuda_kv_stream_workspace_bytes()` 对 DIRECT 对返回 0（启动日志里 `phase arena`
+   那几行的 workspace/convert 字段应当消失或归零），以及对比 `resident N pages/layer`
+   （direct 不再需要转换工作区，切片会变）。
+   > ⚠️ 更正（2026-09-19 核对）：`LLAMA_KV_STREAM_TRACE` 这个 env 开关**代码里并不存在**，
+   > `copy busy %` 也没有实现。真实可观测的是 `ggml_backend_cuda_kv_stream_get_stats()`
+   > （`ggml/include/ggml-cuda.h`）里的 `host_to_device_bytes`、
+   > `host_to_device_copy_commands`、`compute_stream_waits`、`deadline_misses`、
+   > `ring_peak_occupancy`、`streamed_attention_spans` 等字段 —— 但目前**没有打印入口**，
+   > 只有测试直接读。需要的话另加周期性日志。
+4. **收益**：对比 direct 与 F16 回退的吞吐，并注意 direct 的收益只在 **decode / resident**
+   一侧 —— **prefill 在 direct 下仍然会转 f16**（`use_mma_prefill` 走 MMA 内核，
+   `launch_fattn(need_f16_K/V = true)`），所以 prefill 侧预期没有收益。
+   判断处在 H2D-bound 还是 compute-bound 可用上面第 3 条的统计字段；
    长上下文（150k）时 KV 搬运约 8.6 GB/token、PCIe Gen3 x16 ≈ 10 GB/s，转换与复制重叠，
    direct 的收益可能被压到个位数百分比；短上下文 / KV 大量 resident 时才可能显出来。
-   另外注意 **prefill 在 direct 下仍然会转 f16**（走 `use_mma_prefill` 的 MMA 内核），
-   所以 prefill 的收益预期为 0，收益只可能出现在 decode / resident 一侧。
+   **注意别搞反**：span 不是"省一次 dequant"，它相对 direct 的 vec 路径**多一次 dequant**，
+   换来从量化域 vec 内核换到 f16 域 MMA 内核 —— 见 §6.6 末尾的收益测量方法。
 5. **回归**：`test-kv-stream-cuda-set-rows` 全绿（本机已跑，见 §5.2）。
 6. **span 已定性，不用再跑 A/B**：见 §5.4——span 开 = 23 failures（可复现），span 关 = 全绿。
    **首选错因（源码级定位，2026-09-19，待真机确认）**：span 的 partial meta 语义在
@@ -363,6 +371,45 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
        收益不明显就直接删掉这条路径。
    （原 (a)(b)(c) 的三条候选 —— `VOLTA_FA_COMPACT=0` 复跑、最短回归、阈值收窄 ——
    留作 (b) 失败后的兜底二分手段。）
+
+### 6.7 span 到底有没有收益：它是什么、怎么量
+
+**它省的不是 dequant，而是换内核族**（这一点容易搞反）。DIRECT 对不开 span 时走
+`native_partial()`，直接读量化页、**不转换**（`fattn.cu:2429`）；开 span 后走
+`launch_fattn(..., need_f16_K/V = true, ...)`，**先把这一页转成 f16**，再跑
+`mma_f16_partial_case`。所以它是把"量化域的 vec 内核"换成"f16 域的 MMA 内核"——
+本质就是上游在非流式里做的事：prefill 形态用 TILE/MMA 家族，decode 形态用 VEC 家族。
+流式路径原本无论批多大都用 vec（decode 取向），span 是给它补上"prefill 该用 MMA"这一档。
+
+**生效条件**：`span 开关 && !convert_to_f16 && f16_scratch_reserved && Q->ne[1] > 1 &&
+Q/V head_dim = 256 && mask && GQA ≤ 8` ⇒ **只作用于多 token 批**：prompt prefill 的大批、
+以及 MTP 的 4-token 验证批；**单 token decode 永不生效**。
+
+**为什么可能反亏**：转换是 **per-page（256 token）的固定成本**，与 query 行数无关；
+MMA 的收益按 query 行数放大。批越大越划算（512/1024 → 摊薄 512/1024 倍），
+**批越小越亏**（MTP 的 4-token 只摊 4 倍，却要为每页付一次 dequant）。
+再叠加 150k 长上下文时 prefill 受 H2D 搬运主导，计算侧收益会被掩盖。
+
+**测量方法（`llama-bench`，每组把 env 设 0 / 1 各跑一次）**：
+
+```bat
+:: A. 大 prefill —— span 的主场
+llama-bench -m MODEL -p 8192 -n 0 -r 3 -ngl all -fa on -c 32768 ^
+            --kv-stream-stage-mib 3000 -ctk q8_0 -ctv q8_0 -ub 512
+:: B. 小批 —— MTP 形态的代理
+llama-bench -m MODEL -p 8192 -n 0 -r 3 ... -ub 4
+:: C. decode —— 预期与开关无关（sanity check）
+llama-bench -m MODEL -p 0 -n 256 -r 3 ...
+```
+
+再补两个对照：去掉 `--kv-stream-stage-mib`（不流式）看 prefill 上限；换成
+`-ctk q8_0 -ctv turbo4`（现场配置）复测 A。
+
+**判读**：
+- A 涨幅 < ~5% ⇒ 没有价值，直接删掉这条路径；
+- A 涨、B 亏 ⇒ 应当把它收窄到真正的 prefill：把 `Q->ne[1] > 1` 抬到阈值（如 ≥ 32），
+  MTP 的 4-token 批回到 vec —— 顺带绕开 §5.4 的数值问题，收益留给 prefill；
+- C 应与开关无关，若有关说明判据理解有误。
 
 ## 7. 改动文件
 
