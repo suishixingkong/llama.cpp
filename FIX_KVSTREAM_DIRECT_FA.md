@@ -390,26 +390,24 @@ MMA 的收益按 query 行数放大。批越大越划算（512/1024 → 摊薄 5
 **批越小越亏**（MTP 的 4-token 只摊 4 倍，却要为每页付一次 dequant）。
 再叠加 150k 长上下文时 prefill 受 H2D 搬运主导，计算侧收益会被掩盖。
 
-**测量方法**：⚠️ **`llama-bench` 不接受 `--kv-stream-stage-mib`**（它的参数表是裁剪过的：
-没有该参数，也没有 `-c`；`-ngl` 要写成数值，如 `-ngl -1`）。所以用 `llama-cli`
-（或 `llama-server`）做 A/B，每次把 env 设 `0` / `1` 各跑一遍，读日志里的
-`prompt eval time`（prefill）与 `eval time`（decode）：
+**测量方法**：`llama-bench` 原本**不接受** `--kv-stream-stage-mib`（它的参数表是手写的裁剪版，
+也没有 `-c`；`-ngl` 要写数值），现已补上该参数（见 §7），所以可以直接测：
 
 ```bat
-:: A. 大 prefill —— span 的主场（同一条命令，env 0 和 1 各跑一次）
+:: A. 大 prefill —— span 的主场（env 0 和 1 各跑一次）
 set GGML_CUDA_KV_STREAM_MMA_PREFILL=0
-llama-cli -m MODEL -f prompt8k.txt -n 1 -ngl -1 -fa on -c 32768 -b 2048 -ub 512 ^
-          --kv-stream-stage-mib 3000 -ctk q8_0 -ctv turbo4
+llama-bench -m MODEL -p 8192 -n 0 -r 3 -ngl -1 -fa on -b 2048 -ub 512 ^
+            --kv-stream-stage-mib 3000 -ctk q8_0 -ctv turbo4
 set GGML_CUDA_KV_STREAM_MMA_PREFILL=1
-llama-cli ...（同上）
-:: B. 小批（MTP 形态的代理）：把 -ub 512 改成 -ub 4
-:: C. 上限对照：去掉 --kv-stream-stage-mib（不流式）
-:: D. decode：短 prompt + -n 256，预期与开关无关（sanity check）
+llama-bench ...（同上，一字不改）
+:: B. 小批（MTP 形态的代理）：-ub 4
+:: C. 上限对照：去掉 --kv-stream-stage-mib（0 = 关闭流式）
+:: D. decode：-p 0 -n 256，预期与开关无关（sanity check）
 ```
 
-每种配置重复 3 次取中位数；A/B/C 都用现场组合（`-ctk q8_0 -ctv turbo4`）测。
-若 `llama-cli` 也不接受该参数，就用 `llama-server`（它接受）+ 一次 `/completion`
-（`"n_predict": 1`）请求，读服务端每次请求打印的 `prompt eval time`。
+一次只给**一个** arena 值（多值会跑出多路但输出列里没有该字段，无法区分）；
+span 那一维用 env 变量做 A/B。若不想用 bench，`llama-cli -f <长文本> -n 1` 同样可行，
+读日志里的 `prompt eval time`。
 
 **判读**：
 - A 涨幅 < ~5% ⇒ 没有价值，直接删掉这条路径；
@@ -432,6 +430,8 @@ docs/build.md                         GGML_CUDA_FA_QUANTS 默认值/合法类型
 FIX_KVSTREAM_TURBO_MTP.md             同步"direct 不可达"的过期结论
 MERGE_TURBO_KVSTREAM.md               勘误：turbo 组自 f531b24b7 起就在 GGML_CUDA_FA_QUANTS 里
 FIX_KVSTREAM_DIRECT_FA.md             本文
+tools/llama-bench/llama-bench.cpp    新增 --kv-stream-arena-mib / --kv-stream-stage-mib 参数
+                                     （§6.7 的 A/B 测量直接走 bench，不再依赖 llama-cli）
 ```
 
 未改动（刻意）：`ggml/CMakeLists.txt` 的 `option(GGML_CUDA_FA_ALL_QUANTS)`、

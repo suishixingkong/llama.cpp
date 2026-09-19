@@ -366,6 +366,7 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    std::vector<int>                 kv_stream_arena_mib;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -411,6 +412,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* kv_stream_arena_mib  */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -482,6 +484,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --kv-stream-arena-mib, --kv-stream-stage-mib <n>  (default: %s)\n", join(cmd_params_defaults.kv_stream_arena_mib, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -912,6 +915,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--kv-stream-arena-mib" || arg == "--kv-stream-stage-mib") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (int v : p) {
+                    if (v < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.kv_stream_arena_mib.insert(params.kv_stream_arena_mib.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1197,6 +1216,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.kv_stream_arena_mib.empty()) {
+        params.kv_stream_arena_mib = cmd_params_defaults.kv_stream_arena_mib;
+    }
 
     return params;
 }
@@ -1230,6 +1252,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    int                kv_stream_arena_mib;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1306,6 +1329,8 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // 0 disables block KV streaming, which is what an "off" control run needs
+        cparams.kv_stream_arena_mib = (uint32_t) std::max(0, kv_stream_arena_mib);
 
         return cparams;
     }
@@ -1341,7 +1366,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
-    for (const auto & pl : params.poll) {
+    for (const auto & pl : params.poll)
+    for (const auto & ks : params.kv_stream_arena_mib) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1375,6 +1401,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_arena_mib   = */ ks,
             };
             instances.push_back(instance);
         }
@@ -1412,6 +1439,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_arena_mib   = */ ks,
             };
             instances.push_back(instance);
         }
@@ -1449,6 +1477,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_arena_mib   = */ ks,
             };
             instances.push_back(instance);
         }
