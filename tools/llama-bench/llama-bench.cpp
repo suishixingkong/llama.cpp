@@ -2249,10 +2249,16 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     return true;
 }
 
-static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) text;
+// Non-verbose mode still wants a quiet run, but context-creation failures must
+// surface: llama_init_from_model logs the underlying cause at ERROR level (e.g.
+// "failed to initialize the context: ...") and then returns NULL. Swallowing it
+// (the old null callback) left the user with only the generic
+// "failed to create context with model" message and no way to diagnose.
+static void llama_quiet_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) user_data;
+    if (level >= GGML_LOG_LEVEL_ERROR && text != NULL) {
+        fprintf(stderr, "%s", text);
+    }
 }
 
 static std::unique_ptr<printer> create_printer(output_formats format) {
@@ -2309,7 +2315,7 @@ int llama_bench(int argc, char ** argv) {
 
     // initialize llama.cpp
     if (!params.verbose) {
-        llama_log_set(llama_null_log_callback, NULL);
+        llama_log_set(llama_quiet_log_callback, NULL);
     }
     llama_backend_init();
     llama_numa_init(params.numa);
