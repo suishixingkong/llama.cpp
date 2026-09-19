@@ -192,7 +192,7 @@ phase arena decode:  KV ... MiB, compute ... MiB, resident N pages/layer, ring M
 | `test-kv-stream-config` / `-plan` / `-softmax` / `-bench-config` | 全绿（0 failures） |
 | CUDA 编译（nvcc 12.4、`-allow-unsupported-compiler`、**arch sm_70**） | 单独编译 `fattn.cu`（含全部 turbo FA 实例化）0 error |
 | `test-kv-stream-cuda-set-rows`（`D:\llama-build\cuda70`，`GGML_BACKEND_DL=OFF`，tests 已打开） | 6 个免设备用例全绿：270 assertions / 仅 4 个用例失败，且失败原因都是 `CUDA backend initializes`（无驱动、`ggml_backend_cuda_init(0)` 返回 nullptr），属于"本机没有 GPU"而非代码问题 |
-| **真机数值与性能** | **未验证** —— 本机无 NVIDIA 设备，需要回 V100-32GB |
+| **真机数值与性能** | **已现场验证（2026-09-19，V100-16GB）**：原命令（turbo4 + 流式 + MTP）能起来并正常推理，两个问题都不再出现；后续又定位并修掉了同组合下的"降速失智"（见 §7），修复后 tok/s 与输出质量恢复正常 |
 
 ### 修复前后的 A/B（同一测试二进制、同一命令，只切换 `fattn.cu`）
 
@@ -399,6 +399,21 @@ turbo2 ×2、turbo3 ×2 含 tail），内核行号改为减 base；分发处传 
 format` 原来只覆盖 9 个基础类型（**没有 turbo**），它断言 `staged_set_rows == 10` 与字节数、
 并与非流式基线做数值比较（5e-4）。已加入 turbo2/3/4：修复前该用例对 turbo 会失败
 （行写错位 → 数值与计数都对不上），修复后应通过。
+
+### 现场验证结果（2026-09-19 15:0x，V100 实测）
+
+用户在 V100 上重编 `8954ede0e` 之后：
+
+- **生产命令（`-ctk q8_0 -ctv turbo4` + `--kv-stream-stage-mib` + `--spec-type draft-mtp`
+  `--spec-draft-n-max 3`）恢复正常**：`GGML_CUDA_KV_STREAM_MMA_PREFILL=0` 与 `=1`
+  **都不再降速、不失智** ⇒ 元凶确认就是这个越界写（两版之间只差这一个提交）。
+- `test-kv-stream-cuda-attn`：
+  - span 关：**1057 断言 / 0 failures**。比修前多 21 条，正是 staged 写用例从 64 涨到 **85**
+    （新加的 turbo2/3/4 各 7 条）——也就是说 **turbo 的 staged 写在真机上被真正数值验证过了**
+    （与「非流式基线」比对 5e-4，并断言 `staged_set_rows == 10`、`staged_set_rows_bytes`）。
+  - span 开：**1058 断言 / 23 failures**，失败点与修前**逐位相同**（各 `max_abs` 一致），
+    而 staged 写用例在 span 开时同样 85 条全过 ⇒ §5.4 的 span 数值问题是**独立问题**，
+    与本次修复无关（关掉 span 整套全绿）。1058 = 1057 + 1 仍是"span 开"的指纹。
 
 ## 6. 改动文件
 
