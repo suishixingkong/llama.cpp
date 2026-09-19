@@ -367,6 +367,7 @@ struct cmd_params {
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     std::vector<int>                 kv_stream_arena_mib;
+    std::vector<int>                 n_parallel;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -413,6 +414,7 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* kv_stream_arena_mib  */ { 0 },
+    /* n_parallel           */ { 1 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -485,6 +487,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --kv-stream-arena-mib, --kv-stream-stage-mib <n>  (default: %s)\n", join(cmd_params_defaults.kv_stream_arena_mib, ",").c_str());
+    printf("  -np, --n-parallel <n>                             number of parallel sequences (default: %s)\n", join(cmd_params_defaults.n_parallel, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -931,6 +934,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.kv_stream_arena_mib.insert(params.kv_stream_arena_mib.end(), p.begin(), p.end());
+            } else if (arg == "-np" || arg == "--n-parallel") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (int v : p) {
+                    if (v < 1) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.n_parallel.insert(params.n_parallel.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1219,6 +1238,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.kv_stream_arena_mib.empty()) {
         params.kv_stream_arena_mib = cmd_params_defaults.kv_stream_arena_mib;
     }
+    if (params.n_parallel.empty()) {
+        params.n_parallel = cmd_params_defaults.n_parallel;
+    }
 
     return params;
 }
@@ -1253,6 +1275,7 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     int                kv_stream_arena_mib;
+    int                n_parallel;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1331,6 +1354,9 @@ struct cmd_params_instance {
         cparams.swa_full        = false;
         // 0 disables block KV streaming, which is what an "off" control run needs
         cparams.kv_stream_arena_mib = (uint32_t) std::max(0, kv_stream_arena_mib);
+        // block KV streaming requires exactly one sequence; default 1 keeps parity with
+        // llama-server's "-np 1" requirement (see llama_kv_stream_config_validate)
+        cparams.n_seq_max = (uint32_t) std::max(1, n_parallel);
 
         return cparams;
     }
@@ -1367,7 +1393,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
     for (const auto & pl : params.poll)
-    for (const auto & ks : params.kv_stream_arena_mib) {
+    for (const auto & ks : params.kv_stream_arena_mib)
+    for (const auto & np : params.n_parallel) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1402,6 +1429,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
+                /* .n_parallel            = */ np,
             };
             instances.push_back(instance);
         }
@@ -1440,6 +1468,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
+                /* .n_parallel            = */ np,
             };
             instances.push_back(instance);
         }
@@ -1478,6 +1507,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
+                /* .n_parallel            = */ np,
             };
             instances.push_back(instance);
         }
