@@ -321,13 +321,35 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
    所以 prefill 的收益预期为 0，收益只可能出现在 decode / resident 一侧。
 5. **回归**：`test-kv-stream-cuda-set-rows` 全绿（本机已跑，见 §5.2）。
 6. **span 已定性，不用再跑 A/B**：见 §5.4——span 开 = 23 failures（可复现），span 关 = 全绿。
-   剩下的是**错因定位**，候选步骤：
-   (a) 用 `set GGML_CUDA_VOLTA_FA_COMPACT=0` 复跑 span 开那一轮，排除/坐实 Volta compact 相关路径；
-   (b) 最短回归：1 层 + 单 span + 单个 256-token 页 + 少量 query，二分"分页 × MMA partial 合并"
-       与"内核本身"；
-   (c) 或者先按"小批走 vec、只有真正 prefill 尺寸才允许 span"收窄（`Q->ne[1] > 1` 抬到 prefill 阈值），
-       这样 MTP 的 4-token 验证批回到 vec，收益只留给 prefill。
-   收益评估要等修好之后再做：span 只影响 prefill，decode 不受影响。
+   **首选错因（源码级定位，2026-09-19，待真机确认）**：span 的 partial meta 语义在
+   `np > 1` 时是 `(scale, rowsum)`，而 `kv_stream_accumulate_chunk_results` 要的是 `(max, rowsum)`。
+
+   - span 实例化为 `<DKQ=256, DV=256, ncols1=8, ncols2=8>` → `ncols = 64`；Volta 配置表里
+     `nthreads = 128`、`nbatch_fa = 32`（`fattn-mma-f16.cuh:139`），`cols_per_warp = 32`
+     （`get_cols_per_warp()`，Volta 分支）⇒ `np = nwarps*cols_per_warp/ncols = 4*32/64 = 2 > 1`。
+   - `np > 1` 时组合步骤把 meta 槽改写为 `make_float2(KQ_cms, KQ_crs)` = **scale**（`exp(warpmax - 合并max)`）
+     + 合并 rowsum（`fattn-mma-f16.cuh:1664-1670`）；真正的 `(max, rowsum)` 只在
+     `needs_fixup/is_fixup` 分支里写进 `dstk_fixup_meta`。
+   - 而 partial 的收尾写的是 `dstk_fixup[row] = make_float2(meta_j[0], meta_j[1])`
+     （`fattn-mma-f16.cuh:1800-1803`）⇒ 拿到的正是那个 **scale**，不是 max。
+   - 合并内核于是按 `weight = exp(meta.x - maximum) ≈ 1` 做**无权合并**；chunk 的 max 差异被丢掉，
+     误差随 chunk 数/跨度增长 —— 与实测（257q 3.8e-3 → 1024q 1.3e-2 → 十六层 3.5e-2）一致。
+   - **`np == 1` 和单 chunk 的情形不受影响**，这正好解释了为什么 `one-page` /
+     `fully resident` 两个用例在 span 开时仍然**逐位相等**（没有可合并的第二块）。
+   - vec 侧是直接写 `make_float2(KQ_max[jc], KQ_sum[jc])`（`fattn-vec.cuh:773`）⇒ 语义正确，
+     这也是 span 关时全绿的原因。
+
+   验证/修复步骤（按顺序，每步都能证伪上一步）：
+   (a) 修法：把 partial 收尾改成写**合并后的 max**（`np > 1` 时写 `make_float2(KQ_cmn, KQ_crs)`，
+       并保证只有跑过组合的线程（`threadIdx.y % np == 0`）写这一行；`np == 1` 保持原样）。
+       这段只在 `output_partial` 分支里，上游不使用该分支，风险局限于流式 span。
+   (b) 真机：`set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 && test-kv-stream-cuda-attn.exe`，
+       期望 23 failures → **0**，且各 `max_abs` 掉到 vec 同量级（1e-4）；若仍失败，
+       下一步查 numerator 的约定（`FATTN_KQ_MAX_OFFSET` 与 `KQ_cmr`）。
+   (c) 若 (b) 通过，再决定默认是否翻回"开"，并先量 prefill tok/s（见上面第 4 条的量级预期）；
+       收益不明显就直接删掉这条路径。
+   （原 (a)(b)(c) 的三条候选 —— `VOLTA_FA_COMPACT=0` 复跑、最短回归、阈值收窄 ——
+   留作 (b) 失败后的兜底二分手段。）
 
 ## 7. 改动文件
 
