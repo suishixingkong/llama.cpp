@@ -926,19 +926,19 @@ static int kv_stream_parts_per_chunk() {
     return parts;
 }
 
-// Opt-in only: measured wrong, not merely unvalidated.
+// Opt-in only.
 //
-// The span is a fork optimization that was unreachable while the direct route was dead, so it has
-// never been validated against the non-streamed reference on a GPU. On a V100, this suite with the
-// span enabled reports 23 numerical failures (2e-3 up to 3.5e-2, growing with the KV span),
-// reproduced bit-for-bit in two independent runs; with it off every case lands within 3.4e-4. The
-// first of those runs was taken alongside a llama-server, but the idle re-run reproduced the same
-// max_abs values to eight digits, so the numbers were never contention.
+// The span is a fork optimization that was unreachable while the direct route was dead. It was first
+// measured wrong (23 numerical failures, 2e-3 up to 3.5e-2, growing with the KV span) because the MMA
+// partial epilogue published the tile_Q meta slot, which the np > 1 combine step overwrites with the
+// per-warp *scale* exp(warp_max - combined_max) instead of the per-column (max, rowsum) that
+// kv_stream_accumulate_chunk_results needs to weight each chunk. Every weight then evaluated to ~1
+// and the chunks merged unweighted, losing the difference between chunk maxima.
 //
-// Ruled out while looking for the cause: a mismatch in the partial count (launch_fattn forces one
-// block per tile when output_partial, and the partial output is the unnormalized numerator plus
-// (max, sum) meta, which is exactly what kv_stream_accumulate_chunk_results consumes) and the Volta
-// compact specialization (already excluded when output_partial).
+// Fixed: the output_partial epilogue now publishes KQ_cmr (the finished per-column (max, rowsum) held
+// in registers, identical to the slot's content for np == 1) rather than the overwritten slot. The
+// np > 1 combine's (scale, combined_rowsum) write-back is untouched because the numerator combination
+// still needs the per-warp scale. With it off every case lands within 3.4e-4.
 //
 // Set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 to exercise it. test-kv-stream-cuda-attn prints which way a
 // run resolved, so an A/B cannot be misread. Note stats.mma_prefill_attention_spans is only
