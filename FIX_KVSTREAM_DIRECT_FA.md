@@ -390,20 +390,26 @@ MMA 的收益按 query 行数放大。批越大越划算（512/1024 → 摊薄 5
 **批越小越亏**（MTP 的 4-token 只摊 4 倍，却要为每页付一次 dequant）。
 再叠加 150k 长上下文时 prefill 受 H2D 搬运主导，计算侧收益会被掩盖。
 
-**测量方法（`llama-bench`，每组把 env 设 0 / 1 各跑一次）**：
+**测量方法**：⚠️ **`llama-bench` 不接受 `--kv-stream-stage-mib`**（它的参数表是裁剪过的：
+没有该参数，也没有 `-c`；`-ngl` 要写成数值，如 `-ngl -1`）。所以用 `llama-cli`
+（或 `llama-server`）做 A/B，每次把 env 设 `0` / `1` 各跑一遍，读日志里的
+`prompt eval time`（prefill）与 `eval time`（decode）：
 
 ```bat
-:: A. 大 prefill —— span 的主场
-llama-bench -m MODEL -p 8192 -n 0 -r 3 -ngl all -fa on -c 32768 ^
-            --kv-stream-stage-mib 3000 -ctk q8_0 -ctv q8_0 -ub 512
-:: B. 小批 —— MTP 形态的代理
-llama-bench -m MODEL -p 8192 -n 0 -r 3 ... -ub 4
-:: C. decode —— 预期与开关无关（sanity check）
-llama-bench -m MODEL -p 0 -n 256 -r 3 ...
+:: A. 大 prefill —— span 的主场（同一条命令，env 0 和 1 各跑一次）
+set GGML_CUDA_KV_STREAM_MMA_PREFILL=0
+llama-cli -m MODEL -f prompt8k.txt -n 1 -ngl -1 -fa on -c 32768 -b 2048 -ub 512 ^
+          --kv-stream-stage-mib 3000 -ctk q8_0 -ctv turbo4
+set GGML_CUDA_KV_STREAM_MMA_PREFILL=1
+llama-cli ...（同上）
+:: B. 小批（MTP 形态的代理）：把 -ub 512 改成 -ub 4
+:: C. 上限对照：去掉 --kv-stream-stage-mib（不流式）
+:: D. decode：短 prompt + -n 256，预期与开关无关（sanity check）
 ```
 
-再补两个对照：去掉 `--kv-stream-stage-mib`（不流式）看 prefill 上限；换成
-`-ctk q8_0 -ctv turbo4`（现场配置）复测 A。
+每种配置重复 3 次取中位数；A/B/C 都用现场组合（`-ctk q8_0 -ctv turbo4`）测。
+若 `llama-cli` 也不接受该参数，就用 `llama-server`（它接受）+ 一次 `/completion`
+（`"n_predict": 1`）请求，读服务端每次请求打印的 `prompt eval time`。
 
 **判读**：
 - A 涨幅 < ~5% ⇒ 没有价值，直接删掉这条路径；
