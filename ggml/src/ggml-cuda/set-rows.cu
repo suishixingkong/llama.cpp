@@ -258,7 +258,8 @@ static __global__ void k_set_rows_turbo3(
         const int64_t s12,
         const int64_t s1,
         const int64_t s2,
-        const int64_t s3) {
+        const int64_t s3,
+        const int64_t dst_row_base) {
 
     static_assert(GROUP_SIZE == 128 || GROUP_SIZE == 64, "GROUP_SIZE must be 128 or 64");
 
@@ -280,7 +281,7 @@ static __global__ void k_set_rows_turbo3(
     const int64_t i11 = i01 % ne11;
     const int64_t i10 = i01;
 
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
     block_turbo3_0 * blk_base    = dst_row_ptr + i_grp * blocks_per_group;
@@ -443,7 +444,8 @@ static __global__ void k_set_rows_turbo3_tail(
         const int64_t s1,
         const int64_t s2,
         const int64_t s3,
-        const int tail_size) {
+        const int tail_size,
+        const int64_t dst_row_base) {
 
     const int j = threadIdx.x;  // 0 .. tail_size-1
 
@@ -457,7 +459,7 @@ static __global__ void k_set_rows_turbo3_tail(
     const int64_t i10 = i01;
     const int64_t i12 = i02;
 
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
 
@@ -543,7 +545,8 @@ static void set_rows_cuda_turbo3(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
 
     const float * src0_d = (const float *)src0->data;
     const idx_t * src1_d = (const idx_t *)src1->data;
@@ -581,13 +584,13 @@ static void set_rows_cuda_turbo3(
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
                 ne00, ne01, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
-                nb1, nb2, nb3);
+                nb1, nb2, nb3, dst_row_base);
         } else {
             k_set_rows_turbo3<idx_t, 64><<<(int)ne_total, 64, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
                 ne00, ne01, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
-                nb1, nb2, nb3);
+                nb1, nb2, nb3, dst_row_base);
         }
     }
 
@@ -600,7 +603,7 @@ static void set_rows_cuda_turbo3(
             src0_d, src1_d, (block_turbo3_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
-            nb1, nb2, nb3, tail_size);
+            nb1, nb2, nb3, tail_size, dst_row_base);
     }
 }
 
@@ -628,7 +631,8 @@ static __global__ void k_set_rows_turbo2(
         const int64_t s12,
         const int64_t s1,
         const int64_t s2,
-        const int64_t s3) {
+        const int64_t s3,
+        const int64_t dst_row_base) {
 
     static_assert(GROUP_SIZE == 128 || GROUP_SIZE == 64, "GROUP_SIZE must be 128 or 64");
 
@@ -648,7 +652,7 @@ static __global__ void k_set_rows_turbo2(
     const int64_t i11 = i01 % ne11;
     const int64_t i10 = i01;
 
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_turbo2_0 * dst_row_ptr = (block_turbo2_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
     block_turbo2_0 * blk_base    = dst_row_ptr + i_grp * blocks_per_group;
@@ -795,7 +799,8 @@ static __global__ void k_set_rows_turbo2_tail(
         const int64_t s1,
         const int64_t s2,
         const int64_t s3,
-        const int tail_size) {
+        const int tail_size,
+        const int64_t dst_row_base) {
 
     const int j = threadIdx.x;
 
@@ -808,7 +813,7 @@ static __global__ void k_set_rows_turbo2_tail(
     const int64_t i10 = i01;
     const int64_t i12 = i02;
 
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_turbo2_0 * dst_row_ptr = (block_turbo2_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
 
@@ -889,7 +894,8 @@ static void set_rows_cuda_turbo2(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
 
     const float * src0_d = (const float *)src0->data;
     const idx_t * src1_d = (const idx_t *)src1->data;
@@ -924,13 +930,13 @@ static void set_rows_cuda_turbo2(
                 src0_d, src1_d, (block_turbo2_0 *)dst->data,
                 ne00, ne01, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
-                nb1, nb2, nb3);
+                nb1, nb2, nb3, dst_row_base);
         } else {
             k_set_rows_turbo2<idx_t, 64><<<(int)ne_total, 64, 0, stream>>>(
                 src0_d, src1_d, (block_turbo2_0 *)dst->data,
                 ne00, ne01, ne10, ne11, ne12, ne13,
                 s01, s02, s03, s10, s11, s12,
-                nb1, nb2, nb3);
+                nb1, nb2, nb3, dst_row_base);
         }
     }
 
@@ -941,7 +947,7 @@ static void set_rows_cuda_turbo2(
             src0_d, src1_d, (block_turbo2_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
-            nb1, nb2, nb3, tail_size);
+            nb1, nb2, nb3, tail_size, dst_row_base);
     }
 }
 
@@ -971,7 +977,8 @@ static __global__ void k_set_rows_turbo4(
         const int64_t s12,
         const int64_t s1,
         const int64_t s2,
-        const int64_t s3) {
+        const int64_t s3,
+        const int64_t dst_row_base) {
 
     // blockIdx.x = flat block index; threadIdx.x = element within block (0..127)
     const int j = threadIdx.x;
@@ -990,7 +997,7 @@ static __global__ void k_set_rows_turbo4(
     const int64_t i11 = i01 % ne11;
     const int64_t i10 = i01;
 
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_turbo4_0 * dst_row_ptr = (block_turbo4_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
     block_turbo4_0 * blk = dst_row_ptr + i_blk;
@@ -1109,7 +1116,8 @@ static void set_rows_cuda_turbo4(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
 
     const float * src0_d = (const float *)src0->data;
     const idx_t * src1_d = (const idx_t *)src1->data;
@@ -1138,7 +1146,7 @@ static void set_rows_cuda_turbo4(
             src0_d, src1_d, (block_turbo4_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
-            nb1, nb2, nb3);
+            nb1, nb2, nb3, dst_row_base);
     }
 }
 
@@ -1244,11 +1252,11 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_TURBO3_0) {
-        set_rows_cuda_turbo3<idx_t>(ctx, src0, src1, dst);
+        set_rows_cuda_turbo3<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else if (dst->type == GGML_TYPE_TURBO2_0) {
-        set_rows_cuda_turbo2<idx_t>(ctx, src0, src1, dst);
+        set_rows_cuda_turbo2<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
-        set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst);
+        set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

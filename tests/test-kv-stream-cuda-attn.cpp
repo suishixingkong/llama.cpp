@@ -1138,6 +1138,10 @@ int main() {
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
             GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+            // TurboQuant types go through this same staged write path, and a staged write must
+            // land on the rows src1 names - the turbo kernels used to ignore the row base, which
+            // only shows up here (multiple rows per write) and only for these types.
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
         };
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {

@@ -352,6 +352,54 @@ D:\llama-build\cuda70\bin\test-kv-stream-cuda-set-rows.exe
   （KV 大量 resident）时 decode 是 compute-bound，收益才显出来。用
   `LLAMA_KV_STREAM_TRACE=1` 看 `copy busy %` / `deadline misses` 可以直接判断处在哪一侧。
 
+## 7. 追加（2026-09-19）：turbo × 流式 × MTP「答非所问」的根因 = staged SET_ROWS 丢行基址
+
+问题 1、2 修好之后，现场又报：turbo（+流式+MTP）输出只有 20 t/s 且答非所问；去掉 turbo、
+去掉流式、或去掉 MTP 都基本正常。定位时先怀疑流式的 MMA span（`use_mma_prefill`），
+但用 `GGML_CUDA_KV_STREAM_MMA_PREFILL=0/1` 在真机对照，**两种设置表现完全相同** ⇒ span 无关。
+
+### 根因
+
+MTP 的验证批（采样 token + 草稿 = 4 个 token）让一次 ubatch 写多行 KV，于是 SET_ROWS 走
+**staged 写路径**（`ggml-cuda.cu:3216` `ggml_cuda_kv_stream_staged_set_rows_range()`）：先把行写进
+只有 `row_count` 行的临时 staging 缓冲，再整块 `cudaMemcpyAsync` 到
+`dst->data + first_row*row_bytes`（`set-rows.cu:1338-1370`）。因此写内核必须把 `src1` 里的
+**绝对行号**减去 `dst_row_base`：
+
+| 内核 | 行号 |
+|---|---|
+| `k_set_rows_quant`（q8_0/q4_0/…）、`k_set_rows`（f32/f16） | `*(src1+…) - dst_row_base` ✅ |
+| `k_set_rows_turbo2/3/4` 及两个 `_tail` | `*(src1+…)`，**没有减 base** ❌ |
+
+分发处（`set-rows.cu:1246-1251`）也只给量化/f32 分支透传 `dst_row_base`（模板形参有默认值 0），
+turbo 三个分支**根本没接收它**。结果：staged 写时 turbo 用绝对行号写进小缓冲 →
+**越界写进 pool 的其它区域，目标行反而没写**（随后 staging 缓冲被整块拷回缓存）。
+
+### 为什么三个条件缺一不可
+
+| 条件 | 作用 |
+|---|---|
+| turbo KV | 只有 turbo 分支丢 base（q8_0/q4_0/… 都透传） |
+| `--kv-stream-stage-mib` | staged 路径只存在于 KV-stream 的 SET_ROWS 分派里 |
+| MTP / 多 token 批 | staged 要求 `runtime->dirty_rows.size() > 1`；单 token decode 走普通 SET_ROWS（base 0，正确） |
+
+这三条正好等于现场观察（q8_0 正常、不流式正常、去掉 MTP 只是"质量一般"）。
+并且 staged 路径还要求 `get_type_capabilities(dst->type).online_write` —— 也就是说
+**这个 latent bug 是被问题 1 的修复点亮的**：在给 turbo 补上 `online_write` 之前，turbo 不会走
+staged 写（那时它连上下文都建不起来）。
+
+### 修复
+
+`set_rows_cuda_turbo{2,3,4}` 增加 `dst_row_base` 形参并透传给 5 个内核（turbo4 ×1、
+turbo2 ×2、turbo3 ×2 含 tail），内核行号改为减 base；分发处传 `dst_row_base`。
+
+### 回归覆盖
+
+`tests/test-kv-stream-cuda-attn.cpp` 的 `resident staged writes support every exposed KV-cache
+format` 原来只覆盖 9 个基础类型（**没有 turbo**），它断言 `staged_set_rows == 10` 与字节数、
+并与非流式基线做数值比较（5e-4）。已加入 turbo2/3/4：修复前该用例对 turbo 会失败
+（行写错位 → 数值与计数都对不上），修复后应通过。
+
 ## 6. 改动文件
 
 ```
@@ -364,4 +412,6 @@ src/llama-cparams.h                   + n_draft_max
 include/llama.h                       llama_context_params + n_draft_max [EXPERIMENTAL]
 common/common.cpp                     从 common_speculative_n_max() 填充 n_draft_max
 tests/test-kv-stream-cuda-set-rows.cpp turbo 类型矩阵 + GPU-free 的 registry 查询用例
+ggml/src/ggml-cuda/set-rows.cu        turbo2/3/4 的 SET_ROWS 内核与启动器补 dst_row_base（§7）
+tests/test-kv-stream-cuda-attn.cpp    staged 写用例加 turbo2/3/4；span 开关自述输出
 ```
