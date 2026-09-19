@@ -409,6 +409,16 @@ std::vector<float> run_attention_layers(
 int main() {
     testing t;
 
+    // Make the run self-describing. A span result was once read off a run it had never executed -
+    // assertion counts differ by one between the two settings, which is far too easy to miss.
+    {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
+        const bool enabled = value != nullptr && atoi(value) != 0;
+        std::fprintf(stderr,
+            "kv-stream MMA prefill span: %s (GGML_CUDA_KV_STREAM_MMA_PREFILL=%s)\n",
+            enabled ? "ENABLED" : "DISABLED", value == nullptr ? "<unset>" : value);
+    }
+
     t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
         ggml_cuda_kv_stream_span_tuner production_tuner;
         production_tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
@@ -541,11 +551,10 @@ int main() {
                 for (size_t i = 0; i < expected.size(); ++i) {
                     max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
                 }
-                // The default streamed path (native or converted vector partial kernels) has to
-                // reproduce the non-streamed reference this closely. The MMA prefill span is
-                // opt-in precisely because it does not: with GGML_CUDA_KV_STREAM_MMA_PREFILL=1
-                // these pairs report up to 3e-3, and the wider cases in this suite up to 1.7e-2,
-                // so a failure here with the span enabled is expected until the span is fixed.
+                // This case builds its runtime without a resident cache, so the MMA prefill span
+                // can never engage here (mma_prefill_attention_spans stays 0) and every reading
+                // below is a vector-path reading: 5e-4 is the vector-path tolerance. The span is
+                // exercised by the wider cases further down this suite.
                 const bool used_mma_span = stats.mma_prefill_attention_spans > 0;
                 const float tolerance = 5e-4f;
                 if (!std::isfinite(max_abs) || max_abs > tolerance ||
@@ -769,7 +778,8 @@ int main() {
             max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
             max_rel = std::max(max_rel, std::abs(expected[i] - actual[i])/(std::abs(expected[i]) + 1e-6f));
         }
-        std::fprintf(stderr, "streamed attention max_abs=%g max_rel=%g\n", max_abs, max_rel);
+        std::fprintf(stderr, "streamed attention max_abs=%g max_rel=%g mma_spans=%llu\n",
+            max_abs, max_rel, (unsigned long long) stats.mma_prefill_attention_spans);
         t.assert_true("outputs remain finite", std::isfinite(max_abs) && std::isfinite(max_rel));
         t.assert_true("streamed output is numerically equivalent", max_abs <= 3e-4f);
     });
@@ -936,9 +946,10 @@ int main() {
                 max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
             }
             std::fprintf(stderr,
-                "wide-query n_batch=%lld max_abs=%g streamed_pages=%llu\n",
+                "wide-query n_batch=%lld max_abs=%g streamed_pages=%llu mma_spans=%llu\n",
                 (long long) n_batch, max_abs,
-                (unsigned long long) stats.streamed_pages);
+                (unsigned long long) stats.streamed_pages,
+                (unsigned long long) stats.mma_prefill_attention_spans);
             t.assert_true("wide-query output remains finite", all_finite);
             t.assert_true("wide-query output remains equivalent", max_abs <= 3e-4f);
             t.assert_true("wide-query test exercises streamed pages", stats.streamed_pages > 0);
@@ -1377,6 +1388,8 @@ int main() {
         for (size_t i = 0; i < expected.size(); ++i) {
             max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
         }
+        std::fprintf(stderr, "sixteen-layer prefill max_abs=%g mma_spans=%llu\n",
+            max_abs, (unsigned long long) stats.mma_prefill_attention_spans);
         t.assert_true("sixteen-layer prefill remains equivalent", max_abs <= 3e-4f);
     });
 

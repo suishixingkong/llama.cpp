@@ -926,12 +926,25 @@ static int kv_stream_parts_per_chunk() {
     return parts;
 }
 
-// Opt-in only. The MMA prefill span is a fork optimization that has never been validated: on a
-// V100 the streamed attention suite reports 23 numerical failures with it enabled (errors from
-// 5e-4 up to 1.7e-2 against the non-streamed reference, worse for longer KV spans), while the
-// native/converted vector partial kernels reproduce that reference to at most 3.4e-4 for every
-// pair tested, including the turbo types. Until the span's partial merge is understood it stays
-// off by default; GGML_CUDA_KV_STREAM_MMA_PREFILL=1 re-enables it.
+// Opt-in only: the span has no trustworthy measurement yet, in either direction.
+//
+// It is a fork optimization that was unreachable while the direct route was dead, so it has never
+// been validated against the non-streamed reference on a GPU. The one span-enabled run to date
+// (V100, 2026-09-19) reported 23 numerical failures - 5e-4 up to 1.7e-2, growing with the KV span
+// - but it was taken while a llama-server was serving inference on the same device, so it is
+// evidence about that machine's contended state, not about the span. The immediate clean re-runs
+// could not settle it either: both resolved to span-off (see below), i.e. the span still has zero
+// clean coverage in this suite.
+//
+// Two things are established and are the reason the default stays conservative rather than
+// flipping back on the strength of the retracted run: with the span off, the native/converted
+// vector partial kernels reproduce the non-streamed reference within 5e-4 on every case of the
+// streamed attention suite (100 pairs including turbo, server-shaped 1.4e-4, 1024-query 2.5e-4),
+// and the span is only reachable in multi-token batches - which is exactly the shape (MTP
+// verification batches) that the field report of garbage output involves.
+//
+// Set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 to exercise it. test-kv-stream-cuda-attn prints which way
+// a run resolved, so an A/B cannot be misread as a result about the span.
 static bool kv_stream_mma_prefill_enabled() {
     static const bool enabled = []() {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");

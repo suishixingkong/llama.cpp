@@ -243,12 +243,43 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
   `ggml/include/ggml-cuda.h`（仅注释）里，`tests/test-kv-stream-cuda-*.cpp` 也由
   `LABEL cuda` 守卫；CPU 构建一个改动文件都不编，属于"树一致性检查"而非证据，故略。
 - **未跑真机数值**（见 §6）。
+- **MMA prefill span 仍未验证**（见 §5.4）。
+
+### 5.4 MMA prefill span（`use_mma_prefill`）的验证状态：至今没有一次干净测量
+
+`use_mma_prefill` 是 fork 自带的加速路径，修复前它是**死代码**（判据含 `!convert_to_f16`），
+所以在本轮之前从未在 GPU 上执行过。它的开关是 `GGML_CUDA_KV_STREAM_MMA_PREFILL`，
+**默认关（opt-in）**，理由如下——其中包含一次被污染的测量和一次无效的复核：
+
+| 轮次 | 条件 | 结果 | 可否作依据 |
+|---|---|---|---|
+| ① 2026-09-19 | span 开，**同一张 V100 上有 llama-server 正在推理** | 23 failures / 1037 断言（2e-3 ~ 1.7e-2，随 KV 跨度增长） | ✗ 受同设备并发干扰 |
+| ② 同一次会话 | span 关（`=0`） | 0 failures / 1036 | ✓（与后来的干净轮一致） |
+| ③ 干净复测第一轮 | 无 env | 0 failures / **1036** | ✗ **无效：span 根本没执行** |
+| ④ 干净复测第二轮 | `=0` | 0 failures / 1036 | ✓ |
+
+③ 无效的原因：span 断言只在开关打开时执行，所以开关开/关的**总断言数差 1**（1037 vs 1036）；
+③ 与 ④ 都是 1036，说明两轮都是 span 关，等于**一次干净测量都没有**。
+为杜绝这类误读，测试现在开头打印一行 `kv-stream MMA prefill span: ENABLED|DISABLED`，
+并在 server-shaped / wide-query / sixteen-layer 三个用例的诊断行里带上 `mma_spans=`。
+
+有依据的正面结论只有一条：**span 关掉时**，native/转换 vec partial 路径在整个
+`test-kv-stream-cuda-attn` 里都能复现非流式参考（100 对含 turbo 全过 5e-4、
+server-shaped 1.4e-4、1024-query 2.5e-4、其余 780+ 断言全绿）。
+
+在拿到一次（GPU 空闲、显式 `=1`）的干净轮之前，默认保持关闭：span 只影响多 token 批
+（含 MTP 验证批）的 prefill，而"多 token 批 × turbo 流式"恰好是现场报缺陷的那条组合，
+宁可先慢不要先错。
+
+> **测量纪律**：本机无 GPU，数值必须在 V100 上采；采集时该卡必须空闲。
+> 2026-09-19 那次在 llama-server 推理占卡时采到的 2e-3~1.7e-2 已在空闲复测中消失，
+> 整轮结论被推翻（详见上表）。GPU 上有其它进程时采到的数值一律不作为结论依据。
 
 
 ## 6. 需要 V100 确认的清单
 
 1. **数值正确性（最关键）**：跑 `tests/test-kv-stream-cuda-attn`，重点三条
-   - `all native CUDA KV pairs preserve streamed prefill results`（49 对，容差 5e-4）
+   - `all native CUDA KV pairs preserve streamed prefill results`（100 对，501 断言，容差 5e-4）
    - `fully resident multi-page prefill stays bit-identical to ordinary CUDA attention`
      （q8_0 K + q4_0 V，512 KV / 2 页全 resident，断言**逐位相等**）——这条现在是
      **真·跑在 direct 上**的，修复前它实际走的是 F16 转换路径；
@@ -270,6 +301,18 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
    另外注意 **prefill 在 direct 下仍然会转 f16**（走 `use_mma_prefill` 的 MMA 内核），
    所以 prefill 的收益预期为 0，收益只可能出现在 decode / resident 一侧。
 5. **回归**：`test-kv-stream-cuda-set-rows` 全绿（本机已跑，见 §5.2）。
+6. **span 的 A/B（先确认这张卡没有别的进程在用）**：
+
+   ```bat
+   test-kv-stream-cuda-attn.exe
+   set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 && test-kv-stream-cuda-attn.exe
+   ```
+
+   两轮都应 0 failures；第二轮断言数多 1 且在 server-shaped / wide-query / sixteen-layer
+   的诊断行里 `mma_spans` 非 0（开头那行会打印 span 是 ENABLED 还是 DISABLED，据此确认
+   配置真的生效）。**若第二轮出现这三处的数值失败**，就是 span 的 partial 合并有实错，
+   按 `max_abs` 与 KV 跨度的关系定位（见 §4）。若干净轮通过，可把默认改回开启——
+   那是一个独立的性能决策，需要先有 tok/s 对比。见 §5.4。
 
 ## 7. 改动文件
 
@@ -280,6 +323,8 @@ ggml/src/ggml-cuda/fattn.cu           direct 判定改按 (K,V) 对解析；turb
                                       use_mma_prefill 加 f16_scratch_reserved 前置条件（§4a）
 ggml/include/ggml-cuda.h              direct_attention 的语义注释（per-type vs per-pair）
 tests/test-kv-stream-cuda-set-rows.cpp 期望值改成逐对；新增 curated 集 == direct 集 的断言
+tests/test-kv-stream-cuda-attn.cpp    direct 对的原生等价性覆盖（7→10 类型 = 100 对）、
+                                      转换工作区补齐、span 开关的自述输出（§5.4）
 docs/build.md                         GGML_CUDA_FA_QUANTS 默认值/合法类型列表按源码订正
 FIX_KVSTREAM_TURBO_MTP.md             同步"direct 不可达"的过期结论
 MERGE_TURBO_KVSTREAM.md               勘误：turbo 组自 f531b24b7 起就在 GGML_CUDA_FA_QUANTS 里
