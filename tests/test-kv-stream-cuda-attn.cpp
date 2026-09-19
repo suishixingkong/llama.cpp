@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -464,6 +465,10 @@ int main() {
             GGML_TYPE_Q5_1,
             GGML_TYPE_Q8_0,
             GGML_TYPE_BF16,
+            // TurboQuant KV cache types: the pairs that a -ctk/-ctv turbo run actually uses.
+            GGML_TYPE_TURBO2_0,
+            GGML_TYPE_TURBO3_0,
+            GGML_TYPE_TURBO4_0,
         };
 
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -536,17 +541,24 @@ int main() {
                 for (size_t i = 0; i < expected.size(); ++i) {
                     max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
                 }
-                if (!std::isfinite(max_abs) || max_abs > 5e-4f ||
+                // The MMA prefill span round-trips the probability matrix through f16, and the
+                // reference for this shape is a different kernel family (the unstreamed selector
+                // returns TILE on Volta for a 4-query batch), so a pair that takes it is only
+                // comparable at f16 tolerances. Everything else must match the vector path.
+                const bool used_mma_span = stats.mma_prefill_attention_spans > 0;
+                const float tolerance = used_mma_span ? 5e-3f : 5e-4f;
+                if (!std::isfinite(max_abs) || max_abs > tolerance ||
                         stats.asynchronous_page_uploads == 0) {
                     std::fprintf(stderr,
-                        "native pair K=%s V=%s mode=%s max_abs=%g async_uploads=%llu\n",
-                        ggml_type_name(type_k), ggml_type_name(type_v), mode_name, max_abs,
+                        "native pair K=%s V=%s mode=%s mma=%d max_abs=%g tol=%g async_uploads=%llu\n",
+                        ggml_type_name(type_k), ggml_type_name(type_v), mode_name,
+                        used_mma_span ? 1 : 0, max_abs, tolerance,
                         (unsigned long long) stats.asynchronous_page_uploads);
                 }
                 t.assert_true("native pair executes streamed attention",
                     stats.asynchronous_page_uploads > 0);
                 t.assert_true("native pair remains numerically equivalent",
-                    std::isfinite(max_abs) && max_abs <= 5e-4f);
+                    std::isfinite(max_abs) && max_abs <= tolerance);
             }
         }
     });
@@ -729,9 +741,15 @@ int main() {
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 256, true);
 
 
+        // GGML_CUDA_KV_STREAM_MMA_PREFILL=0 routes multi-token spans through the vector partial
+        // kernels instead, so the span assertion below only applies while the span is enabled.
+        const char * mma_env = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
+        const bool mma_prefill_enabled = mma_env == nullptr || atoi(mma_env) != 0;
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-        t.assert_true("multi-token streamed spans use MMA partial attention",
-            stats.mma_prefill_attention_spans > 0);
+        if (mma_prefill_enabled) {
+            t.assert_true("multi-token streamed spans use MMA partial attention",
+                stats.mma_prefill_attention_spans > 0);
+        }
         t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(16), stats.host_to_device_copy_commands);
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);
