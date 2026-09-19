@@ -541,12 +541,13 @@ int main() {
                 for (size_t i = 0; i < expected.size(); ++i) {
                     max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
                 }
-                // The MMA prefill span round-trips the probability matrix through f16, and the
-                // reference for this shape is a different kernel family (the unstreamed selector
-                // returns TILE on Volta for a 4-query batch), so a pair that takes it is only
-                // comparable at f16 tolerances. Everything else must match the vector path.
+                // The default streamed path (native or converted vector partial kernels) has to
+                // reproduce the non-streamed reference this closely. The MMA prefill span is
+                // opt-in precisely because it does not: with GGML_CUDA_KV_STREAM_MMA_PREFILL=1
+                // these pairs report up to 3e-3, and the wider cases in this suite up to 1.7e-2,
+                // so a failure here with the span enabled is expected until the span is fixed.
                 const bool used_mma_span = stats.mma_prefill_attention_spans > 0;
-                const float tolerance = used_mma_span ? 5e-3f : 5e-4f;
+                const float tolerance = 5e-4f;
                 if (!std::isfinite(max_abs) || max_abs > tolerance ||
                         stats.asynchronous_page_uploads == 0) {
                     std::fprintf(stderr,
@@ -741,10 +742,10 @@ int main() {
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 256, true);
 
 
-        // GGML_CUDA_KV_STREAM_MMA_PREFILL=0 routes multi-token spans through the vector partial
-        // kernels instead, so the span assertion below only applies while the span is enabled.
+        // GGML_CUDA_KV_STREAM_MMA_PREFILL=1 is the opt-in for the MMA span; the assertion below
+        // only applies when the span is enabled (it is off by default because it is inaccurate).
         const char * mma_env = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
-        const bool mma_prefill_enabled = mma_env == nullptr || atoi(mma_env) != 0;
+        const bool mma_prefill_enabled = mma_env != nullptr && atoi(mma_env) != 0;
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         if (mma_prefill_enabled) {
             t.assert_true("multi-token streamed spans use MMA partial attention",

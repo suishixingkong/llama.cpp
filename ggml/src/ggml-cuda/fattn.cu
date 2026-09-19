@@ -926,15 +926,16 @@ static int kv_stream_parts_per_chunk() {
     return parts;
 }
 
-// Diagnostic switch. The MMA prefill span is a different kernel family: it round-trips the
-// probability matrix through f16, so its output is not comparable with the vector kernels at
-// f16-rounding tolerances. Default on; GGML_CUDA_KV_STREAM_MMA_PREFILL=0 routes every streamed
-// batch through the native/converted vector partial kernels instead, which is what a numerical
-// A/B against the non-streamed reference needs.
+// Opt-in only. The MMA prefill span is a fork optimization that has never been validated: on a
+// V100 the streamed attention suite reports 23 numerical failures with it enabled (errors from
+// 5e-4 up to 1.7e-2 against the non-streamed reference, worse for longer KV spans), while the
+// native/converted vector partial kernels reproduce that reference to at most 3.4e-4 for every
+// pair tested, including the turbo types. Until the span's partial merge is understood it stays
+// off by default; GGML_CUDA_KV_STREAM_MMA_PREFILL=1 re-enables it.
 static bool kv_stream_mma_prefill_enabled() {
     static const bool enabled = []() {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
-        return value == nullptr || atoi(value) != 0;
+        return value != nullptr && atoi(value) != 0;
     }();
     return enabled;
 }
