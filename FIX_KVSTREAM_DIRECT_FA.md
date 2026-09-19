@@ -243,37 +243,56 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
   `ggml/include/ggml-cuda.h`（仅注释）里，`tests/test-kv-stream-cuda-*.cpp` 也由
   `LABEL cuda` 守卫；CPU 构建一个改动文件都不编，属于"树一致性检查"而非证据，故略。
 - **未跑真机数值**（见 §6）。
-- **MMA prefill span 仍未验证**（见 §5.4）。
+- **MMA prefill span 实测有数值错误**（见 §5.4）。
 
-### 5.4 MMA prefill span（`use_mma_prefill`）的验证状态：至今没有一次干净测量
+### 5.4 MMA prefill span（`use_mma_prefill`）：实测错误，默认关
 
 `use_mma_prefill` 是 fork 自带的加速路径，修复前它是**死代码**（判据含 `!convert_to_f16`），
-所以在本轮之前从未在 GPU 上执行过。它的开关是 `GGML_CUDA_KV_STREAM_MMA_PREFILL`，
-**默认关（opt-in）**，理由如下——其中包含一次被污染的测量和一次无效的复核：
+所以在本轮之前从未在 GPU 上执行过。开关是 `GGML_CUDA_KV_STREAM_MMA_PREFILL`，**默认关**。
 
-| 轮次 | 条件 | 结果 | 可否作依据 |
+**四轮 V100 记录（同一二进制，只切开关）**：
+
+| 轮次 | 条件 | 结果 | 判定 |
 |---|---|---|---|
-| ① 2026-09-19 | span 开，**同一张 V100 上有 llama-server 正在推理** | 23 failures / 1037 断言（2e-3 ~ 1.7e-2，随 KV 跨度增长） | ✗ 受同设备并发干扰 |
-| ② 同一次会话 | span 关（`=0`） | 0 failures / 1036 | ✓（与后来的干净轮一致） |
-| ③ 干净复测第一轮 | 无 env | 0 failures / **1036** | ✗ **无效：span 根本没执行** |
-| ④ 干净复测第二轮 | `=0` | 0 failures / 1036 | ✓ |
+| ① 09-19 白天 | span 开；**同卡有 llama-server 在推理** | 23 failures / 1037（2e-3 ~ 1.7e-2） | 数值与 ③ **逐位相同** |
+| ② 同一次会话 | span 关（`=0`） | 0 failures / 1036 | 对照 |
+| ③ 09-19 13:0x，空闲卡 | span 开（显式 `=1`） | **23 failures / 1037**，各用例 `max_abs` 与 ① 相同（0.00202951 / 0.016892 / 0.00382153 / 0.0130784 / 0.0353837） | **权威结果** |
+| ④ 中间一次"干净复测" | 无 env，但二进制已含 `00aa10c12`（span 默认关） | 0 failures / **1036** | **无效：span 未执行** |
 
-③ 无效的原因：span 断言只在开关打开时执行，所以开关开/关的**总断言数差 1**（1037 vs 1036）；
-③ 与 ④ 都是 1036，说明两轮都是 span 关，等于**一次干净测量都没有**。
-为杜绝这类误读，测试现在开头打印一行 `kv-stream MMA prefill span: ENABLED|DISABLED`，
-并在 server-shaped / wide-query / sixteen-layer 三个用例的诊断行里带上 `mma_spans=`。
+④ 的识别方法：span 断言只在开关打开时执行，所以开关开/关的**总断言数差 1**（1037 vs 1036）；
+④ 报 1036 即与对照轮同档，等于没测到 span。测试现在开头打印
+`kv-stream MMA prefill span: ENABLED|DISABLED`，各用例诊断行带 `mma_spans=`。
 
-有依据的正面结论只有一条：**span 关掉时**，native/转换 vec partial 路径在整个
-`test-kv-stream-cuda-attn` 里都能复现非流式参考（100 对含 turbo 全过 5e-4、
-server-shaped 1.4e-4、1024-query 2.5e-4、其余 780+ 断言全绿）。
+**结论：span 是错的，不是"未验证"。** 误差随 KV 跨度增长（257 query → 3.8e-3、
+1024 query → 1.3e-2、十六层 32 个 span → 3.5e-2），而同一套用例关掉 span 后全部落在
+1.5e-4~3.4e-4。① 与 ③ 逐位相同 ⇒ 那次同卡并发**没有**污染数值，我一度把 ① 判为污染、
+把 ④ 判为干净，方向恰好相反，已更正。
 
-在拿到一次（GPU 空闲、显式 `=1`）的干净轮之前，默认保持关闭：span 只影响多 token 批
-（含 MTP 验证批）的 prefill，而"多 token 批 × turbo 流式"恰好是现场报缺陷的那条组合，
-宁可先慢不要先错。
+**已排除的两个嫌疑（别重复挖）**：
 
-> **测量纪律**：本机无 GPU，数值必须在 V100 上采；采集时该卡必须空闲。
-> 2026-09-19 那次在 llama-server 推理占卡时采到的 2e-3~1.7e-2 已在空闲复测中消失，
-> 整轮结论被推翻（详见上表）。GPU 上有其它进程时采到的数值一律不作为结论依据。
+- **partial 数量不匹配**：`launch_fattn()` 在 `output_partial` 时强制
+  `blocks_num = (ntiles_dst, 1, 1)`（`fattn-common.cuh:1557-1564`，注释写明"preserving exact
+  partial numerator/meta output"），每行**恰好一个** partial，写的是未归一化分子 + `(max, sum)`
+  （`fattn-mma-f16.cuh:1794-1803`），与 `kv_stream_accumulate_chunk_results` 的读法一致。
+  所以 `partial_count = 1`（`fattn.cu:2081`）是对的。
+- **Volta compact 内核**：`if constexpr (DKQ == 256 && DV == 256 && ncols1 == 32 && ncols2 == 2 &&
+  !output_partial)`（`fattn-mma-f16.cuh:2234`）已把 partial 变体排除，且 span 用的是
+  `<256, 256, 8, 8>`，两个条件都不成立。
+
+**计数器盲区（本次踩到的坑）**：`++resident_cache->stats.mma_prefill_attention_spans` 外面套着
+`if (resident_cache != nullptr)`（`fattn.cu:2407-2413`），所以**没有 resident cache 的 runtime
+即使跑了 span 也报 0** —— native-pairs 用例正是这种 runtime，它那 16 个失败的行一度显示
+`mma=0`，把人引向"span 与此无关"。测试已改为同时打印开关状态（`span=ON|off`）与该计数器，
+并以开关为准。
+
+默认继续保持关。仍然开着的是"span 在 sm_70 + 流式分页下的具体错因"——partial 约定已核对过，
+下一步要么在同一颗内核上做 `GGML_CUDA_VOLTA_FA_COMPACT` / 单 span 最短回归的二分，要么先按
+"小批走 vec、大批才允许 span"收窄它。**span 只影响多 token 批（含 MTP 验证批）的 prefill**，
+而"多 token 批 × 流式"正是现场报缺陷的那条组合，所以关掉它同时也是一个可能的修复动作。
+
+> **测量纪律**：本机无 GPU，数值必须在 V100 上采，且该卡必须空闲。
+> 另：**判读配置是否真的生效，别只看"跑起来了"** —— 断言总数、stats 计数器、开关的自述输出
+> 都要对一遍（本轮两个坑都出在这里）。
 
 
 ## 6. 需要 V100 确认的清单
@@ -301,18 +320,14 @@ server-shaped 1.4e-4、1024-query 2.5e-4、其余 780+ 断言全绿）。
    另外注意 **prefill 在 direct 下仍然会转 f16**（走 `use_mma_prefill` 的 MMA 内核），
    所以 prefill 的收益预期为 0，收益只可能出现在 decode / resident 一侧。
 5. **回归**：`test-kv-stream-cuda-set-rows` 全绿（本机已跑，见 §5.2）。
-6. **span 的 A/B（先确认这张卡没有别的进程在用）**：
-
-   ```bat
-   test-kv-stream-cuda-attn.exe
-   set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 && test-kv-stream-cuda-attn.exe
-   ```
-
-   两轮都应 0 failures；第二轮断言数多 1 且在 server-shaped / wide-query / sixteen-layer
-   的诊断行里 `mma_spans` 非 0（开头那行会打印 span 是 ENABLED 还是 DISABLED，据此确认
-   配置真的生效）。**若第二轮出现这三处的数值失败**，就是 span 的 partial 合并有实错，
-   按 `max_abs` 与 KV 跨度的关系定位（见 §4）。若干净轮通过，可把默认改回开启——
-   那是一个独立的性能决策，需要先有 tok/s 对比。见 §5.4。
+6. **span 已定性，不用再跑 A/B**：见 §5.4——span 开 = 23 failures（可复现），span 关 = 全绿。
+   剩下的是**错因定位**，候选步骤：
+   (a) 用 `set GGML_CUDA_VOLTA_FA_COMPACT=0` 复跑 span 开那一轮，排除/坐实 Volta compact 相关路径；
+   (b) 最短回归：1 层 + 单 span + 单个 256-token 页 + 少量 query，二分"分页 × MMA partial 合并"
+       与"内核本身"；
+   (c) 或者先按"小批走 vec、只有真正 prefill 尺寸才允许 span"收窄（`Q->ne[1] > 1` 抬到 prefill 阈值），
+       这样 MTP 的 4-token 验证批回到 vec，收益只留给 prefill。
+   收益评估要等修好之后再做：span 只影响 prefill，decode 不受影响。
 
 ## 7. 改动文件
 

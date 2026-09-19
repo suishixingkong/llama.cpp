@@ -406,6 +406,18 @@ std::vector<float> run_attention_layers(
 
 } // namespace
 
+// The MMA prefill span is opt-in, and two different things describe whether a run used it:
+//   - the switch below, which is what decides (mirrors kv_stream_mma_prefill_enabled() in fattn.cu)
+//   - stats.mma_prefill_attention_spans, which counts actual span launches
+// The counter is NOT a reliable mirror of the switch: fattn.cu only increments it when the span
+// has a resident cache (`if (resident_cache != nullptr) ...`), so a runtime built without one -
+// the native-pair case below - reports 0 even while the span is running and changing the numbers.
+// Print both, and treat the switch as the authority on what the run was asked to do.
+static bool kv_stream_mma_prefill_requested() {
+    const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
+    return value != nullptr && atoi(value) != 0;
+}
+
 int main() {
     testing t;
 
@@ -413,10 +425,10 @@ int main() {
     // assertion counts differ by one between the two settings, which is far too easy to miss.
     {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
-        const bool enabled = value != nullptr && atoi(value) != 0;
         std::fprintf(stderr,
             "kv-stream MMA prefill span: %s (GGML_CUDA_KV_STREAM_MMA_PREFILL=%s)\n",
-            enabled ? "ENABLED" : "DISABLED", value == nullptr ? "<unset>" : value);
+            kv_stream_mma_prefill_requested() ? "ENABLED" : "DISABLED",
+            value == nullptr ? "<unset>" : value);
     }
 
     t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
@@ -551,18 +563,22 @@ int main() {
                 for (size_t i = 0; i < expected.size(); ++i) {
                     max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
                 }
-                // This case builds its runtime without a resident cache, so the MMA prefill span
-                // can never engage here (mma_prefill_attention_spans stays 0) and every reading
-                // below is a vector-path reading: 5e-4 is the vector-path tolerance. The span is
-                // exercised by the wider cases further down this suite.
-                const bool used_mma_span = stats.mma_prefill_attention_spans > 0;
+                // This case builds its runtime without a resident cache, so the span *counter*
+                // below stays 0 whether or not the span ran (see kv_stream_mma_prefill_requested
+                // above) - a run that asked for the span and failed here used to print mma=0 and
+                // hide that. With the span requested, 16 of these pairs land at 5e-4..3e-3 against
+                // this 5e-4 tolerance and the wider cases in this suite go up to 3.5e-2; that is
+                // the span, not the pairs. All 100 pairs pass with the span off.
                 const float tolerance = 5e-4f;
                 if (!std::isfinite(max_abs) || max_abs > tolerance ||
                         stats.asynchronous_page_uploads == 0) {
                     std::fprintf(stderr,
-                        "native pair K=%s V=%s mode=%s mma=%d max_abs=%g tol=%g async_uploads=%llu\n",
+                        "native pair K=%s V=%s mode=%s span=%s mma_counter=%llu max_abs=%g tol=%g "
+                        "async_uploads=%llu\n",
                         ggml_type_name(type_k), ggml_type_name(type_v), mode_name,
-                        used_mma_span ? 1 : 0, max_abs, tolerance,
+                        kv_stream_mma_prefill_requested() ? "ON" : "off",
+                        (unsigned long long) stats.mma_prefill_attention_spans,
+                        max_abs, tolerance,
                         (unsigned long long) stats.asynchronous_page_uploads);
                 }
                 t.assert_true("native pair executes streamed attention",
@@ -751,10 +767,11 @@ int main() {
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, 2, 256, true);
 
 
-        // GGML_CUDA_KV_STREAM_MMA_PREFILL=1 is the opt-in for the MMA span; the assertion below
-        // only applies when the span is enabled (it is off by default because it is inaccurate).
-        const char * mma_env = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
-        const bool mma_prefill_enabled = mma_env != nullptr && atoi(mma_env) != 0;
+        // GGML_CUDA_KV_STREAM_MMA_PREFILL=1 is the opt-in for the MMA span. This runtime has a
+        // resident cache, so its counter does track the span - unlike the native-pair case above.
+        // Disabled by default: with the span on this case reports max_abs ~1.7e-2 against a 3e-4
+        // assertion while the vector path reproduces the reference to 1.4e-4.
+        const bool mma_prefill_enabled = kv_stream_mma_prefill_requested();
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         if (mma_prefill_enabled) {
             t.assert_true("multi-token streamed spans use MMA partial attention",

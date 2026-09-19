@@ -926,25 +926,23 @@ static int kv_stream_parts_per_chunk() {
     return parts;
 }
 
-// Opt-in only: the span has no trustworthy measurement yet, in either direction.
+// Opt-in only: measured wrong, not merely unvalidated.
 //
-// It is a fork optimization that was unreachable while the direct route was dead, so it has never
-// been validated against the non-streamed reference on a GPU. The one span-enabled run to date
-// (V100, 2026-09-19) reported 23 numerical failures - 5e-4 up to 1.7e-2, growing with the KV span
-// - but it was taken while a llama-server was serving inference on the same device, so it is
-// evidence about that machine's contended state, not about the span. The immediate clean re-runs
-// could not settle it either: both resolved to span-off (see below), i.e. the span still has zero
-// clean coverage in this suite.
+// The span is a fork optimization that was unreachable while the direct route was dead, so it has
+// never been validated against the non-streamed reference on a GPU. On a V100, this suite with the
+// span enabled reports 23 numerical failures (2e-3 up to 3.5e-2, growing with the KV span),
+// reproduced bit-for-bit in two independent runs; with it off every case lands within 3.4e-4. The
+// first of those runs was taken alongside a llama-server, but the idle re-run reproduced the same
+// max_abs values to eight digits, so the numbers were never contention.
 //
-// Two things are established and are the reason the default stays conservative rather than
-// flipping back on the strength of the retracted run: with the span off, the native/converted
-// vector partial kernels reproduce the non-streamed reference within 5e-4 on every case of the
-// streamed attention suite (100 pairs including turbo, server-shaped 1.4e-4, 1024-query 2.5e-4),
-// and the span is only reachable in multi-token batches - which is exactly the shape (MTP
-// verification batches) that the field report of garbage output involves.
+// Ruled out while looking for the cause: a mismatch in the partial count (launch_fattn forces one
+// block per tile when output_partial, and the partial output is the unnormalized numerator plus
+// (max, sum) meta, which is exactly what kv_stream_accumulate_chunk_results consumes) and the Volta
+// compact specialization (already excluded when output_partial).
 //
-// Set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 to exercise it. test-kv-stream-cuda-attn prints which way
-// a run resolved, so an A/B cannot be misread as a result about the span.
+// Set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 to exercise it. test-kv-stream-cuda-attn prints which way a
+// run resolved, so an A/B cannot be misread. Note stats.mma_prefill_attention_spans is only
+// incremented when the span has a resident cache, so it reads 0 for a runtime built without one.
 static bool kv_stream_mma_prefill_enabled() {
     static const bool enabled = []() {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MMA_PREFILL");
