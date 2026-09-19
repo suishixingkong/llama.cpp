@@ -1609,6 +1609,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
+    // Set by the combine step below (np > 1 only) and read by the epilogue: output_partial has to
+    // publish (max, rowsum) for the streamed chunk merge, but the combine step overwrites the meta
+    // slot with the per-warp scale exp(warp max - combined max), which is not the max.
+    [[maybe_unused]] float KQ_max_combined    = 0.0f;
+    [[maybe_unused]] float KQ_rowsum_combined = 0.0f;
+
     if (np > 1) {
         constexpr int nmeta = np*cols_per_warp >= warp_size ? np*cols_per_warp/warp_size : 1;
 
@@ -1655,6 +1661,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     KQ_crs += __shfl_xor_sync(0xFFFFFFFF, KQ_crs, offset, warp_size);
                 }
             }
+
+            // Keep the combined max and rowsum for the epilogue: for output_partial it has to
+            // publish (max, rowsum), but the write-back below puts the per-warp *scale*
+            // exp(warp max - combined max) into the meta slot the epilogue would otherwise read.
+            KQ_max_combined = KQ_cmn;
+            KQ_rowsum_combined = KQ_crs;
         }
 
         __syncthreads();
@@ -1797,9 +1809,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                                 dstk_val.x /= KQ_rowsum_j;
                                 dstk_val.y /= KQ_rowsum_j;
                             }
-                        } else if (k00 == 0 && k == 0) {
+                        } else if (k00 == 0 && k == 0 && (np == 1 || threadIdx.y % np == 0)) {
+                            // output_partial publishes (max, rowsum) for the streamed chunk merge
+                            // (kv_stream_accumulate_chunk_results weights each chunk by
+                            // exp(meta.x - global max)). With np > 1 the meta slot holds the
+                            // per-warp *scale* after the combine step, which would make every
+                            // weight ~1 and merge the chunks unweighted - so publish the combined
+                            // max the numerator and rowsum are actually relative to. Only the
+                            // threads that ran the combine have those values.
                             const int row = (jt*ncols1 + j_dst)*ne02 + c_dst;
-                            dstk_fixup[row] = make_float2(meta_j[0], meta_j[1]);
+                            dstk_fixup[row] = np > 1
+                                ? make_float2(KQ_max_combined, KQ_rowsum_combined)
+                                : make_float2(meta_j[0], meta_j[1]);
                         }
 
                         if (is_fixup) {

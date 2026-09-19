@@ -340,9 +340,12 @@ partner 的 partial 实例（上游的通用选择器是把 F32 映射到 F16 ca
      这也是 span 关时全绿的原因。
 
    验证/修复步骤（按顺序，每步都能证伪上一步）：
-   (a) 修法：把 partial 收尾改成写**合并后的 max**（`np > 1` 时写 `make_float2(KQ_cmn, KQ_crs)`，
-       并保证只有跑过组合的线程（`threadIdx.y % np == 0`）写这一行；`np == 1` 保持原样）。
+   (a) **修法已实现（待真机验证）**：partial 收尾在 `np > 1` 时写**合并后的 max**
+       —— 即组合步骤算出的 `KQ_cmn` / `KQ_crs`（`fattn-mma-f16.cuh` 里保存为
+       `KQ_max_combined` / `KQ_rowsum_combined`），并只让跑过组合的线程
+       （`threadIdx.y % np == 0`）写这一行；`np == 1` 仍读 `meta_j`（那时槽里就是 max）。
        这段只在 `output_partial` 分支里，上游不使用该分支，风险局限于流式 span。
+       本机 nvcc 12.4 / sm_70 编译通过，无新增警告。
    (b) 真机：`set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 && test-kv-stream-cuda-attn.exe`，
        期望 23 failures → **0**，且各 `max_abs` 掉到 vec 同量级（1e-4）；若仍失败，
        下一步查 numerator 的约定（`FATTN_KQ_MAX_OFFSET` 与 `KQ_cmr`）。
