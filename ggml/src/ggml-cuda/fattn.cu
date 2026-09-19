@@ -935,10 +935,13 @@ static int kv_stream_parts_per_chunk() {
 // kv_stream_accumulate_chunk_results needs to weight each chunk. Every weight then evaluated to ~1
 // and the chunks merged unweighted, losing the difference between chunk maxima.
 //
-// Fixed: the output_partial epilogue now publishes KQ_cmr (the finished per-column (max, rowsum) held
-// in registers, identical to the slot's content for np == 1) rather than the overwritten slot. The
-// np > 1 combine's (scale, combined_rowsum) write-back is untouched because the numerator combination
-// still needs the per-warp scale. With it off every case lands within 3.4e-4.
+// Fixing the max alone was not enough: publishing the per-thread KQ_cmr instead only repaired the max
+// and left the rowsum a single warp's partial (np warps split the KV range per column), which roughly
+// halved it and made the error worse. The correct value is the *combined* (max, rowsum) the np > 1
+// combine already computes. The epilogue now publishes (slot[2], slot[1]) where slot[1] holds the
+// combined rowsum (KQ_crs) and the combine stashes the combined max (KQ_cmn) in the next padding float
+// of the same Q column - slot[0] stays the per-warp scale the numerator combination consumes. For
+// np == 1 the slot already holds the complete per-column (max, rowsum).
 //
 // Set GGML_CUDA_KV_STREAM_MMA_PREFILL=1 to exercise it. test-kv-stream-cuda-attn prints which way a
 // run resolved, so an A/B cannot be misread. Note stats.mma_prefill_attention_spans is only

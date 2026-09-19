@@ -1541,16 +1541,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr bool combine_needs_sync = swz_K || swz_V;
 
-    // Per-column (max, rowsum) for this thread's Q column, accumulated over the whole KV loop.
-    // Hoisted to function scope so the output_partial epilogue can publish it as the chunk's
-    // (max, rowsum) meta without reading the tile_Q slot the np>1 combine overwrites with the
-    // per-warp *scale* (which is what the numerator combination needs, not the chunk merge).
-    float2 KQ_cmr = make_float2(0.0f, 0.0f);
-
     if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
         const int jc_cwm = threadIdx.y*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
-        KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
+        const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
 
         if constexpr (combine_needs_sync) {
             __syncthreads();
@@ -1580,15 +1574,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
 #if defined(TURING_MMA_AVAILABLE)
         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
-        KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
+        const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(0);
-        KQ_cmr = make_float2(KQ_max[0], KQ_rowsum[0]);
+        const float2 KQ_cmr = make_float2(KQ_max[0], KQ_rowsum[0]);
         const bool thread_should_write = threadIdx.x / 16 < cols_per_thread;
 #else // Volta
         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_KQ::get_i(threadIdx.x & 2);
-        KQ_cmr = make_float2(KQ_max[(threadIdx.x & 2) / 2], KQ_rowsum[(threadIdx.x & 2) / 2]);
+        const float2 KQ_cmr = make_float2(KQ_max[(threadIdx.x & 2) / 2], KQ_rowsum[(threadIdx.x & 2) / 2]);
         const bool thread_should_write = T_C_KQ::J == 8 || T_C_KQ::get_j(threadIdx.x & 2) < 8;
 #endif // defined(TURING_MMA_AVAILABLE)
 
@@ -1672,6 +1666,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 if (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp) {
                     // Combined KQ max scale + rowsum.
                     meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
+                    // The output_partial epilogue must publish the chunk's combined KQ *max*, but
+                    // slot[0] above now holds the per-warp *scale* that the numerator combination
+                    // still consumes. Stash the combined max in the next padding float of the same
+                    // Q column (slots [2]/[3] are unused; the column has 4 padding floats).
+                    ((float *) meta_ptr)[imeta * warp_size * tile_stride + 2] = KQ_cmn;
                 }
             }
 
@@ -1805,12 +1804,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                             }
                         } else if (k00 == 0 && k == 0) {
                             const int row = (jt*ncols1 + j_dst)*ne02 + c_dst;
-                            // Publish the per-column (max, rowsum) for the streamed chunk merge.
-                            // np > 1 leaves the tile_Q meta slot holding the per-warp *scale* (the
-                            // numerator combination needs it), so read KQ_cmr from registers instead -
-                            // it is the finished per-column (max, rowsum) for this thread's Q column.
-                            // np == 1 is unchanged: KQ_cmr equals the slot's (max, rowsum) there.
-                            dstk_fixup[row] = KQ_cmr;
+                            // Publish the chunk's (max, rowsum) for kv_stream_accumulate_chunk_results.
+                            // np == 1: the tile_Q slot holds the complete per-column (max, rowsum).
+                            // np  > 1: the combine step overwrote slot[0] with the per-warp *scale*
+                            //          (the numerator combination above still needs it) and stashed the
+                            //          combined max in slot[2]; slot[1] already holds the combined
+                            //          rowsum. Only combined (max, rowsum) makes the chunk weights
+                            //          exp(max - global_max) meaningful; the per-warp partial would
+                            //          halve the rowsum and lose the inter-warp rescaling.
+                            dstk_fixup[row] = np == 1 ? make_float2(meta_j[0], meta_j[1])
+                                                      : make_float2(meta_j[2], meta_j[1]);
                         }
 
                         if (is_fixup) {
