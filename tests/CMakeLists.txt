@@ -362,8 +362,11 @@ if (NOT GGML_BACKEND_DL)
     # TurboQuant CPU round-trip test (standalone, links ggml only)
     add_executable(test-turbo-quant test-turbo-quant.c)
     target_link_libraries(test-turbo-quant PRIVATE ggml)
-    # needs ggml.h for ggml_get_type_traits() / ggml_type_traits (registration check)
-    target_include_directories(test-turbo-quant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include)
+    # needs ggml.h for ggml_get_type_traits() / ggml_type_traits (registration check) and
+    # ggml/src for ggml-turbo-tcq-tables.h (the TCQ codebooks the library compiles in)
+    target_include_directories(test-turbo-quant PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
     add_test(NAME test-turbo-quant COMMAND test-turbo-quant)
 endif()
 

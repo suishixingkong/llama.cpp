@@ -22,6 +22,7 @@
 
 /* Forward declarations for GGML_API symbols defined in this file (satisfies
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
+GGML_API void turbo_cpu_fwht(float * x, int group_size);
 GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
@@ -217,7 +218,7 @@ static const float turbo_cpu_s2[128] = {
 
 /* ---------- CPU forward WHT (in-place, group_size elements) ---------- */
 
-static void turbo_cpu_fwht(float * x, int group_size) {
+GGML_API void turbo_cpu_fwht(float * x, int group_size) {
     const float * s1 = turbo_cpu_s1;
     const float * s2 = turbo_cpu_s2;
     const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
@@ -1125,28 +1126,204 @@ size_t quantize_turbo8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ---------- TURBO3_TCQ / TURBO2_TCQ / TURBO1_TCQ (CPU stubs) ---------- */
-/* The encode is a Viterbi search over a 512/256/256-state right-shift trellis that
- * only exists on the CUDA/Metal path; the decode is an O(1) bit-window lookup there.
- * The CPU refs exist so the type_traits function pointers are non-null and the code
- * links; the types are rejected on backends without TurboQuant support. */
+/* ---------- TURBO3_TCQ / TURBO2_TCQ: CPU reference codec ---------- */
+/* Trellis-Coded Quantization on a right-shift bitshift trellis with a free initial state.
+ *
+ * Per 128-element rotation group (the block IS the rotation group, as for turbo8):
+ *   1. grp_norm = L2(x); x /= grp_norm;  fwht(x)          -- same FWHT as turbo2/3/4
+ *   2. Viterbi over nstates states emitting k bits/step:
+ *        cost_new[s] = min{ cost[prev] : prev in the 2^k predecessors of s }
+ *                      + (x[t] - cb[s])^2
+ *      A state is the sliding window of the last W emitted symbols (W*k bits), the
+ *      recurrence is ns = (prev >> k) | (sym << k*(W-1)), so the best predecessor
+ *      depends only on s's low k*(W-1) bits: one 2^k-way scan per state group.
+ *   3. Backtrack from the cheapest final state; the state left over after the last
+ *      backstep is the state *before* step 0.
+ *   4. corrected_norm = grp_norm / ||cb[state_t]||_2  (reconstruction is renormalized)
+ *   5. Bitstream = (W-1)*k init bits (the pre-step-0 state's low bits) followed by
+ *      128 k-bit symbols, LSB-first, zero-padded to the block's byte count.
+ *
+ * Decode is an O(1) sliding-window lookup: value_t = cb[bits[t*k .. t*k + W*k - 1]] * norm.
+ * Like turbo2/3/4, the decode deliberately stays in the WHT-rotated domain (the graph
+ * rotates Q as well), so no inverse FWHT is applied.
+ *
+ * This is the reference the CUDA kernels must reproduce bit-for-bit. The trellis cost
+ * uses strictly-less comparisons, i.e. ties resolve to the lowest predecessor and the
+ * lowest final state; the CUDA kernels' shuffle reductions resolve ties the same way.
+ *
+ * Known deviations from buun (see BUUN_MERGE_PLAN.md): buun ships separately trained K/V
+ * codebooks (numerically within ~2% of each other) and a decode-side V gain
+ * (TURBO_TCQ_ALPHA_V_* = 1.02/1.06 for t3/t2). Neither is taken: this codec is exactly
+ * self-consistent (encode norm == decode norm), and the tuning needs a GPU to validate. */
+
+/* TCQ trellis codebooks -- single source of truth, shared with the CUDA kernels. */
+#define TURBO_TCQ_TABLE static const
+#include "ggml-turbo-tcq-tables.h"
+
+typedef struct {
+    int           k;        /* bits per trellis symbol (3 / 2) */
+    int           nstates;  /* 2^(k*w) */
+    int           w;        /* symbols in the reconstruction window (3 / 4) */
+    int           nbytes;   /* trellis bitstream payload bytes */
+    const float * cb;
+} turbo_tcq_geom;
+
+static const turbo_tcq_geom TURBO_TCQ3_GEOM = { 3, 512, 3, 49, TURBO_TCQ3_CODEBOOK };
+static const turbo_tcq_geom TURBO_TCQ2_GEOM = { 2, 256, 4, 33, TURBO_TCQ2_CODEBOOK };
+
+/* Decode one 128-element group. Mirrors the CUDA per-element trellis lookup. */
+static void turbo_tcq_decode_group(const uint8_t * GGML_RESTRICT qs, const turbo_tcq_geom * g,
+                                   float norm, float * GGML_RESTRICT out) {
+    const int k = g->k;
+    const int mask = (1 << (k * g->w)) - 1;
+
+    for (int t = 0; t < 128; t++) {
+        const int bit_pos  = t * k;
+        const int byte_idx = bit_pos >> 3;
+        const int bit_off  = bit_pos & 7;
+        const uint16_t raw = (uint16_t) qs[byte_idx] | ((uint16_t) qs[byte_idx + 1] << 8);
+        out[t] = g->cb[(raw >> bit_off) & mask] * norm;
+    }
+}
+
+/* Encode one 128-element group: Viterbi + renormalize + bitpack. */
+static void turbo_tcq_encode_group(const float * GGML_RESTRICT x, const turbo_tcq_geom * g,
+                                   uint8_t * GGML_RESTRICT qs, float * norm_out) {
+    const int k        = g->k;
+    const int nstates  = g->nstates;
+    const int w        = g->w;
+    const int npre     = nstates >> k;   /* predecessor groups */
+    const int mask     = npre - 1;
+    const int shift    = k * (w - 1);    /* == prefix_bits */
+    const int sym_mask = (1 << k) - 1;
+
+    float buf[128];
+    double norm_sq = 0.0;
+    for (int i = 0; i < 128; i++) {
+        buf[i]  = x[i];
+        norm_sq += (double) buf[i] * (double) buf[i];
+    }
+    const float grp_norm = (float) sqrt(norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+    for (int i = 0; i < 128; i++) {
+        buf[i] *= inv_norm;
+    }
+
+    turbo_cpu_fwht(buf, 128);
+
+    /* Viterbi forward pass, double-buffered. t even: read cost, write cost_b; odd: swap.
+     * After 128 steps the final costs live in cost[]. */
+    float   cost[512];
+    float   cost_b[512];
+    float   pred_min[64];
+    uint8_t bt[128 * 64];
+
+    for (int s = 0; s < nstates; s++) {
+        cost[s] = 0.0f;   /* free initial state */
+    }
+
+    for (int t = 0; t < 128; t++) {
+        const float * cr = (t & 1) ? cost_b : cost;
+        float *       cw = (t & 1) ? cost   : cost_b;
+        const float   xt = buf[t];
+
+        for (int pid = 0; pid < npre; pid++) {
+            const int base = pid << k;
+            float best   = cr[base];
+            int   best_p = 0;
+            for (int p = 1; p < (1 << k); p++) {
+                const float c = cr[base | p];
+                if (c < best) {
+                    best   = c;
+                    best_p = p;
+                }
+            }
+            bt[t * npre + pid] = (uint8_t) best_p;
+            pred_min[pid]      = best;
+        }
+
+        for (int s = 0; s < nstates; s++) {
+            const float d = xt - g->cb[s];
+            cw[s] = pred_min[s & mask] + d * d;
+        }
+    }
+
+    /* Cheapest final state; ties resolve to the lowest state index. */
+    int best_state = 0;
+    for (int s = 1; s < nstates; s++) {
+        if (cost[s] < cost[best_state]) {
+            best_state = s;
+        }
+    }
+
+    /* Backtrack. outputs[t] is the symbol emitted at step t; the state left after the
+     * final backstep is the state before step 0 (call it the initial state). */
+    uint8_t outputs[128];
+    int state = best_state;
+    for (int t = 127; t >= 0; t--) {
+        outputs[t] = (uint8_t) (state >> shift);
+        const int p = bt[t * npre + (state & mask)];
+        state = ((state & mask) << k) | p;
+    }
+    const int initial_state = state;
+
+    /* Reconstruction norm: ||cb[state_t]||_2 over the group. For t < w-1 the state is
+     * replayed from the initial state (it includes the virtual pre-group symbols). */
+    double recon_sq = 0.0;
+    for (int t = 0; t < 128; t++) {
+        int cur;
+        if (t < w - 1) {
+            cur = initial_state;
+            for (int u = 0; u <= t; u++) {
+                cur = (cur >> k) | ((int) outputs[u] << shift);
+            }
+        } else {
+            cur = 0;
+            for (int b = 0; b < w; b++) {
+                cur |= ((int) outputs[t - (w - 1) + b] & sym_mask) << (b * k);
+            }
+        }
+        const float c = g->cb[cur];
+        recon_sq += (double) c * (double) c;
+    }
+    const float recon_norm = (float) sqrt(recon_sq);
+    *norm_out = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+
+    /* Bitpack: shift bits (the pre-step-0 state's low bits), then the 128 symbols. */
+    const int init_bits  = (initial_state >> k) & ((1 << shift) - 1);
+    const int total_bits = shift + 128 * k;
+
+    memset(qs, 0, (size_t) g->nbytes);
+    for (int pos = 0; pos < total_bits; pos++) {
+        int v;
+        if (pos < shift) {
+            v = (init_bits >> pos) & 1;
+        } else {
+            const int sb = pos - shift;
+            v = (outputs[sb / k] >> (sb % k)) & 1;
+        }
+        qs[pos >> 3] |= (uint8_t) (v << (pos & 7));
+    }
+}
 
 void quantize_row_turbo3_tcq_ref(const float * GGML_RESTRICT x, block_turbo3_tcq * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO3_TCQ == 0);
-    const int nb = k / QK_TURBO3_TCQ;
-    for (int i = 0; i < nb; i++) {
-        float norm = 0.0f;
-        for (int j = 0; j < QK_TURBO3_TCQ; j++) norm += x[i*QK_TURBO3_TCQ + j] * x[i*QK_TURBO3_TCQ + j];
-        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-        y[i].pad = 0;
+    const int64_t nb = k / QK_TURBO3_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        float norm;
+        turbo_tcq_encode_group(x + b * QK_TURBO3_TCQ, &TURBO_TCQ3_GEOM, y[b].qs, &norm);
+        y[b].norm = GGML_FP32_TO_FP16(norm);
+        y[b].pad  = 0;
     }
 }
 
 void dequantize_row_turbo3_tcq(const block_turbo3_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    GGML_UNUSED(x);
     assert(k % QK_TURBO3_TCQ == 0);
-    memset(y, 0, (size_t) k * sizeof(float)); /* stub; real decode is the CUDA trellis lookup */
+    const int64_t nb = k / QK_TURBO3_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        turbo_tcq_decode_group(x[b].qs, &TURBO_TCQ3_GEOM, GGML_FP16_TO_FP32(x[b].norm),
+                               y + b * QK_TURBO3_TCQ);
+    }
 }
 
 size_t quantize_turbo3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
@@ -1167,20 +1344,22 @@ size_t quantize_turbo3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT
 
 void quantize_row_turbo2_tcq_ref(const float * GGML_RESTRICT x, block_turbo2_tcq * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO2_TCQ == 0);
-    const int nb = k / QK_TURBO2_TCQ;
-    for (int i = 0; i < nb; i++) {
-        float norm = 0.0f;
-        for (int j = 0; j < QK_TURBO2_TCQ; j++) norm += x[i*QK_TURBO2_TCQ + j] * x[i*QK_TURBO2_TCQ + j];
-        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
-        memset(y[i].qs, 0, sizeof(y[i].qs));
-        y[i].pad = 0;
+    const int64_t nb = k / QK_TURBO2_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        float norm;
+        turbo_tcq_encode_group(x + b * QK_TURBO2_TCQ, &TURBO_TCQ2_GEOM, y[b].qs, &norm);
+        y[b].norm = GGML_FP32_TO_FP16(norm);
+        y[b].pad  = 0;
     }
 }
 
 void dequantize_row_turbo2_tcq(const block_turbo2_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    GGML_UNUSED(x);
     assert(k % QK_TURBO2_TCQ == 0);
-    memset(y, 0, (size_t) k * sizeof(float)); /* stub */
+    const int64_t nb = k / QK_TURBO2_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        turbo_tcq_decode_group(x[b].qs, &TURBO_TCQ2_GEOM, GGML_FP16_TO_FP32(x[b].norm),
+                               y + b * QK_TURBO2_TCQ);
+    }
 }
 
 size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
@@ -1198,6 +1377,14 @@ size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT
     }
     return nrows * row_size;
 }
+
+/* ---------- TURBO1_TCQ: CPU stubs (intentionally not implemented yet) ---------- */
+/* turbo1_tcq uses the same right-shift trellis (k=1, w=8, 256 states, 7-bit init prefix)
+ * and the generic core above would handle it, but buun's *decode* convention for this
+ * tier is not settled: its FA path carries two decoders, one emitting the stored rotated
+ * coefficients and one applying a per-row inverse FWHT, selected at runtime. Guessing
+ * wrong would ship a reference that disagrees with the GPU. Left as a stub until the
+ * convention is pinned down with GPU measurements (see BUUN_MERGE_PLAN.md). */
 
 void quantize_row_turbo1_tcq_ref(const float * GGML_RESTRICT x, block_turbo1_tcq * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO1_TCQ == 0);

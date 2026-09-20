@@ -19,11 +19,27 @@
 
 extern void quantize_row_turbo3_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo3_0(const void * x, float * y, long long k);
+extern void quantize_row_turbo2_0_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo2_0(const void * x, float * y, long long k);
 extern void quantize_row_turbo4_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo4_0(const void * x, float * y, long long k);
 extern void quantize_row_turbo8_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo8_0(const void * x, float * y, long long k);
+extern void turbo_cpu_fwht(float * x, int group_size);
 extern void turbo_cpu_fwht_inverse(float * x, int group_size);
+
+extern void quantize_row_turbo3_tcq_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo3_tcq(const void * x, float * y, long long k);
+extern void quantize_row_turbo2_tcq_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo2_tcq(const void * x, float * y, long long k);
+extern void quantize_row_turbo1_tcq_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo1_tcq(const void * x, float * y, long long k);
+
+/* The TCQ trellis codebooks, taken from the very same data file the library compiles in,
+ * so the test can verify the encoder's chosen path cost without inventing a second
+ * source of truth for the quantizer. */
+#define TURBO_TCQ_TABLE static const
+#include "ggml-turbo-tcq-tables.h"
 
 #define QK_TURBO8   128
 #define MAX_BLOCKS  8
@@ -33,6 +49,11 @@ typedef struct {
     unsigned short norm;
     unsigned char  qs[QK_TURBO8];
 } blk_turbo8_mirror;
+
+/* Mirror the three TCQ block layouts from ggml-common.h. */
+typedef struct { unsigned short norm; unsigned char qs[49]; unsigned char pad; } blk_t3tcq_mirror; /* 52 B */
+typedef struct { unsigned short norm; unsigned char qs[33]; unsigned char pad; } blk_t2tcq_mirror; /* 36 B */
+typedef struct { unsigned short norm; unsigned char qs[17]; unsigned char pad; } blk_t1tcq_mirror; /* 20 B */
 
 static int g_checks = 0;
 static int g_fail   = 0;
@@ -95,6 +116,158 @@ static void roundtrip8(const float * in, float * out, int n, unsigned char * scr
     for (int b = 0; b < n / QK_TURBO8; b++) {
         turbo_cpu_fwht_inverse(out + b * QK_TURBO8, QK_TURBO8);
     }
+}
+
+/* ---------- TCQ (trellis-coded quantization) helpers ---------- */
+
+typedef void (*tcq_quant_fn)  (const float * x, void * y, long long k);
+typedef void (*tcq_dequant_fn)(const void  * x, float * y, long long k);
+
+/* Sliding nbits-wide window of the trellis bitstream at element t (LSB-first). */
+static int tcq_window(const unsigned char * qs, int t, int k, int nbits) {
+    const int bit_pos  = t * k;
+    const int byte_idx = bit_pos >> 3;
+    const int bit_off  = bit_pos & 7;
+    const unsigned int raw = (unsigned int) qs[byte_idx] | ((unsigned int) qs[byte_idx + 1] << 8);
+    return (int) ((raw >> bit_off) & ((1u << nbits) - 1u));
+}
+
+/* Cost of the path the encoder actually wrote, replayed from its own bitstream. */
+static double tcq_written_path_cost(const unsigned char * qs, const float * xrot,
+                                    const float * cb, int k, int w) {
+    const int shift = k * (w - 1);
+    int init_bits = 0;
+    for (int pos = 0; pos < shift; pos++) {
+        init_bits |= ((qs[pos >> 3] >> (pos & 7)) & 1) << pos;
+    }
+    /* The pre-group state's low k bits never reach an emitted state, so zero them. */
+    int cur = init_bits << k;
+    double total = 0.0;
+    for (int t = 0; t < 128; t++) {
+        const int sym = tcq_window(qs, t, k, k * w) >> shift;
+        cur = (cur >> k) | (sym << shift);
+        const double d = (double) xrot[t] - (double) cb[cur];
+        total += d * d;
+    }
+    return total;
+}
+
+/* Independent optimum: enumerate (prev, sym) forwards instead of enumerating each
+ * state's 2^k predecessors, so a bug in the encoder's grouping cannot hide. */
+static double tcq_optimal_path_cost(const float * xrot, const float * cb, int k, int w) {
+    const int shift = k * (w - 1);
+    const int nn    = 1 << (k * w);
+    static double cost[512], ncost[512];
+
+    for (int s = 0; s < nn; s++) { cost[s] = 0.0; }
+    for (int t = 0; t < 128; t++) {
+        for (int s = 0; s < nn; s++) { ncost[s] = 1e300; }
+        for (int prev = 0; prev < nn; prev++) {
+            const double c0 = cost[prev];
+            for (int sym = 0; sym < (1 << k); sym++) {
+                const int ns   = (prev >> k) | (sym << shift);
+                const double d = (double) xrot[t] - (double) cb[ns];
+                const double c = c0 + d * d;
+                if (c < ncost[ns]) { ncost[ns] = c; }
+            }
+        }
+        for (int s = 0; s < nn; s++) { cost[s] = ncost[s]; }
+    }
+    double best = 1e300;
+    for (int s = 0; s < nn; s++) { if (cost[s] < best) { best = cost[s]; } }
+    return best;
+}
+
+/* Rotate a 128-element group exactly like the reference encoders do. */
+static void tcq_rotate_group(const float * in, float * out, double * grp_norm) {
+    double ns = 0.0;
+    for (int i = 0; i < 128; i++) { out[i] = in[i]; ns += (double) in[i] * (double) in[i]; }
+    const float gn  = (float) sqrt(ns);
+    const float inv = (gn > 1e-10f) ? 1.0f / gn : 0.0f;
+    for (int i = 0; i < 128; i++) { out[i] *= inv; }
+    turbo_cpu_fwht(out, 128);
+    *grp_norm = (double) gn;
+}
+
+static union {
+    blk_t3tcq_mirror b3;
+    blk_t2tcq_mirror b2;
+    blk_t1tcq_mirror b1;
+    unsigned char    bytes[52];
+} tstore;
+
+/* Constructive bitstream test: build a block from a KNOWN symbol sequence and check the
+ * decoder reproduces cb[state_t] for the state_t the trellis definition implies. */
+static void tcq_check_layout(const char * name, int k, int w, int nbytes,
+                             const float * cb, tcq_dequant_fn deq) {
+    const int shift = k * (w - 1);
+    const int nsym  = 1 << k;
+    const int init_state = 0x15A % (1 << (k * w));   /* low k bits are not representable */
+
+    memset(&tstore, 0, sizeof(tstore));
+    tstore.b3.norm = 0x3C00;                          /* fp16 1.0 */
+    unsigned char * qs = tstore.bytes + 2;            /* bitstream starts after the norm */
+
+    const int init_bits = (init_state >> k) & ((1 << shift) - 1);
+    for (int pos = 0; pos < shift; pos++) {
+        if ((init_bits >> pos) & 1) { qs[pos >> 3] |= (unsigned char) (1u << (pos & 7)); }
+    }
+    int sym[128];
+    for (int t = 0; t < 128; t++) {
+        sym[t] = t % nsym;
+        for (int b = 0; b < k; b++) {
+            const int pos = shift + t * k + b;
+            if ((sym[t] >> b) & 1) { qs[pos >> 3] |= (unsigned char) (1u << (pos & 7)); }
+        }
+    }
+    (void) nbytes;
+
+    float dec[128];
+    deq(&tstore, dec, 128);
+
+    int cur = init_state, wrong = 0;
+    double maxerr = 0.0;
+    for (int t = 0; t < 128; t++) {
+        cur = (cur >> k) | (sym[t] << shift);
+        const double e = fabs((double) dec[t] - (double) cb[cur]);
+        if (e > maxerr) { maxerr = e; }
+        if (e > 1e-6)   { wrong++; }
+    }
+    char nm[96];
+    snprintf(nm, sizeof nm, "%s layout: elements disagreeing with the trellis definition", name);
+    check_eq_i(nm, wrong, 0);
+    snprintf(nm, sizeof nm, "%s layout max abs err", name);
+    check_le(nm, maxerr, 1e-6);
+}
+
+/* End-to-end: encode -> decode -> inverse FWHT -> compare with the input, plus a
+ * proof that the encoder's path cost equals the independent DP optimum. */
+static void tcq_full_case(const char * name, int k, int w,
+                          const float * cb, tcq_quant_fn q, tcq_dequant_fn deq,
+                          const float * in, double cos_min) {
+    static float dec[128], xrot[128];
+    double mse, cos, in_norm, out_norm, grp_norm, wcost, ocost;
+
+    memset(&tstore, 0, sizeof(tstore));
+    q(in, &tstore, 128);
+    deq(&tstore, dec, 128);
+    turbo_cpu_fwht_inverse(dec, 128);           /* decode stays rotated; undo for comparison */
+    stats(in, dec, 128, &mse, &cos, &in_norm, &out_norm);
+
+    tcq_rotate_group(in, xrot, &grp_norm);
+    wcost = tcq_written_path_cost(tstore.bytes + 2, xrot, cb, k, w);
+    ocost = tcq_optimal_path_cost(xrot, cb, k, w);
+
+    printf("  %s: cosine=%.6f |out|/|in|=%.6f  path cost=%.6e optimum=%.6e\n",
+           name, cos, out_norm / in_norm, wcost, ocost);
+
+    char nm[96];
+    snprintf(nm, sizeof nm, "%s round-trip cosine", name);
+    check_ge(nm, cos, cos_min);
+    snprintf(nm, sizeof nm, "%s |out|/|in| - 1", name);
+    check_le(nm, fabs(out_norm / in_norm - 1.0), 0.02);
+    snprintf(nm, sizeof nm, "%s encoder path cost == DP optimum (rel)", name);
+    check_le(nm, fabs(wcost - ocost) / ocost, 1e-6);
 }
 
 int main(void) {
@@ -320,6 +493,155 @@ int main(void) {
             if (memcmp(ref, disp + (size_t) r * 130, 130) != 0) { same = 0; }
         }
         check_eq_i("dispatch output identical to ref encoder", same, 1);
+        printf("\n");
+    }
+
+    /* ---------------------------------------------------------------
+     * TCQ (trellis-coded quantization) codecs
+     * --------------------------------------------------------------- */
+    printf("--- TurboQuant TCQ trellis codecs ---\n\n");
+
+    printf("Test 12: TCQ block layout & registration\n");
+    check_eq_i("sizeof(block_turbo3_tcq) mirror", (long long) sizeof(blk_t3tcq_mirror), 52);
+    check_eq_i("sizeof(block_turbo2_tcq) mirror", (long long) sizeof(blk_t2tcq_mirror), 36);
+    check_eq_i("sizeof(block_turbo1_tcq) mirror", (long long) sizeof(blk_t1tcq_mirror), 20);
+    {
+        const struct { enum ggml_type t; const char * name; long long tsize; } tcqs[3] = {
+            { GGML_TYPE_TURBO3_TCQ, "turbo3_tcq", 52 },
+            { GGML_TYPE_TURBO2_TCQ, "turbo2_tcq", 36 },
+            { GGML_TYPE_TURBO1_TCQ, "turbo1_tcq", 20 },
+        };
+        for (int i = 0; i < 3; i++) {
+            char nm[80];
+            const struct ggml_type_traits * tr = ggml_get_type_traits(tcqs[i].t);
+            if (tr == NULL) {
+                g_checks++; g_fail++;
+                printf("  [FAIL] ggml_get_type_traits(%s) returned NULL\n", tcqs[i].name);
+                continue;
+            }
+            snprintf(nm, sizeof nm, "%s blck_size", tcqs[i].name);
+            check_eq_i(nm, (long long) tr->blck_size, 128);
+            snprintf(nm, sizeof nm, "%s type_size", tcqs[i].name);
+            check_eq_i(nm, (long long) tr->type_size, tcqs[i].tsize);
+            snprintf(nm, sizeof nm, "%s public name", tcqs[i].name);
+            check_eq_i(nm, strcmp(ggml_type_name(tcqs[i].t), tcqs[i].name) == 0 ? 1 : 0, 1);
+            snprintf(nm, sizeof nm, "%s codec hooks set", tcqs[i].name);
+            check_eq_i(nm, (tr->from_float_ref != NULL && tr->to_float != NULL) ? 1 : 0, 1);
+        }
+    }
+    printf("\n");
+
+    printf("Test 13: TCQ bitstream layout (constructive, from known symbols)\n");
+    tcq_check_layout("t3_tcq", 3, 3, 52, TURBO_TCQ3_CODEBOOK, dequantize_row_turbo3_tcq);
+    tcq_check_layout("t2_tcq", 2, 4, 36, TURBO_TCQ2_CODEBOOK, dequantize_row_turbo2_tcq);
+    printf("\n");
+
+    printf("Test 14: TCQ3 (3.25 bpv) encode/decode + Viterbi optimality\n");
+    for (int i = 0; i < d; i++) { input[i] = sinf(i * 0.37f + 1.1f) * 7.0f; }
+    tcq_full_case("t3_tcq smooth", 3, 3, TURBO_TCQ3_CODEBOOK,
+                  quantize_row_turbo3_tcq_ref, dequantize_row_turbo3_tcq, input, 0.98);
+    for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+    tcq_full_case("t3_tcq random", 3, 3, TURBO_TCQ3_CODEBOOK,
+                  quantize_row_turbo3_tcq_ref, dequantize_row_turbo3_tcq, input, 0.98);
+    printf("\n");
+
+    printf("Test 15: TCQ2 (2.25 bpv) encode/decode + Viterbi optimality\n");
+    for (int i = 0; i < d; i++) { input[i] = sinf(i * 0.37f + 1.1f) * 7.0f; }
+    tcq_full_case("t2_tcq smooth", 2, 4, TURBO_TCQ2_CODEBOOK,
+                  quantize_row_turbo2_tcq_ref, dequantize_row_turbo2_tcq, input, 0.95);
+    for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+    tcq_full_case("t2_tcq random", 2, 4, TURBO_TCQ2_CODEBOOK,
+                  quantize_row_turbo2_tcq_ref, dequantize_row_turbo2_tcq, input, 0.95);
+    printf("\n");
+
+    printf("Test 16: TCQ edge cases\n");
+    {
+        static float zdec[128];
+        memset(input, 0, sizeof(float) * d);
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo3_tcq_ref(input, &tstore, d);
+        dequantize_row_turbo3_tcq(&tstore, zdec, d);
+        double mx = 0.0;
+        for (int i = 0; i < d; i++) { mx = fmax(mx, fabs((double) zdec[i])); }
+        check_le("t3_tcq zero vector max |out|", mx, 0.0);
+
+        /* multi-block row: three groups must not interfere */
+        static float mout[384];
+        for (int i = 0; i < 384; i++) { input[i] = rnd() * 2.0f; }
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo3_tcq_ref(input, &tstore, 384);
+        dequantize_row_turbo3_tcq(&tstore, mout, 384);
+        for (int g = 0; g < 3; g++) { turbo_cpu_fwht_inverse(mout + g * 128, 128); }
+        stats(input, mout, 384, &mse, &cosv, &in_norm, &out_norm);
+        check_ge("t3_tcq 3-block row cosine", cosv, 0.98);
+    }
+    printf("\n");
+
+    printf("Test 17: TCQ ggml_quantize_chunk dispatch\n");
+    {
+        static unsigned char disp[3 * 52];
+        const int nrows = 3, nper = 128;
+        for (int i = 0; i < nrows * nper; i++) { input[i] = rnd() * 1.5f; }
+
+        const size_t got3 = ggml_quantize_chunk(GGML_TYPE_TURBO3_TCQ, input, disp, 0, nrows, nper, NULL);
+        check_eq_i("t3_tcq dispatched byte count", (long long) got3, (long long) (nrows * 52));
+        int same = 1;
+        for (int r = 0; r < nrows; r++) {
+            memset(&tstore, 0, sizeof(tstore));
+            quantize_row_turbo3_tcq_ref(input + r * nper, &tstore, nper);
+            if (memcmp(&tstore, disp + (size_t) r * 52, 52) != 0) { same = 0; }
+        }
+        check_eq_i("t3_tcq dispatch output identical to ref encoder", same, 1);
+
+        const size_t got2 = ggml_quantize_chunk(GGML_TYPE_TURBO2_TCQ, input, disp, 0, nrows, nper, NULL);
+        check_eq_i("t2_tcq dispatched byte count", (long long) got2, (long long) (nrows * 36));
+        printf("\n");
+    }
+
+    /* ---------------------------------------------------------------
+     * Test 18: the TCQ codecs must beat the scalar codec of the same bit tier on
+     * identical data. This is buun's headline claim (its scalar turbo3 median KLD
+     * 0.00279 vs 0.00163 for turbo3_tcq) expressed as something a CPU test can check.
+     * Bit cost: turbo3_0 50 B vs turbo3_tcq 52 B; turbo2_0 34 B vs turbo2_tcq 36 B.
+     * --------------------------------------------------------------- */
+    printf("Test 18: TCQ vs the scalar codec on identical data\n");
+    {
+        static float sc[128], tc[128];
+        double m1, c1, n1, o1, m2, c2, n2, o2;
+
+        for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo3_0_ref(input, &tstore, d);
+        dequantize_row_turbo3_0(&tstore, sc, d);
+        turbo_cpu_fwht_inverse(sc, d);
+        stats(input, sc, d, &m1, &c1, &n1, &o1);
+
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo3_tcq_ref(input, &tstore, d);
+        dequantize_row_turbo3_tcq(&tstore, tc, d);
+        turbo_cpu_fwht_inverse(tc, d);
+        stats(input, tc, d, &m2, &c2, &n2, &o2);
+
+        printf("  turbo3_0   (50 B/128, scalar): cosine=%.6f\n", c1);
+        printf("  turbo3_tcq (52 B/128, trellis): cosine=%.6f\n", c2);
+        check_eq_i("t3_tcq cosine beats scalar turbo3_0", c2 > c1 ? 1 : 0, 1);
+
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo2_0_ref(input, &tstore, d);
+        dequantize_row_turbo2_0(&tstore, sc, d);
+        turbo_cpu_fwht_inverse(sc, d);
+        stats(input, sc, d, &m1, &c1, &n1, &o1);
+
+        memset(&tstore, 0, sizeof(tstore));
+        quantize_row_turbo2_tcq_ref(input, &tstore, d);
+        dequantize_row_turbo2_tcq(&tstore, tc, d);
+        turbo_cpu_fwht_inverse(tc, d);
+        stats(input, tc, d, &m2, &c2, &n2, &o2);
+
+        printf("  turbo2_0   (34 B/128, scalar): cosine=%.6f\n", c1);
+        printf("  turbo2_tcq (36 B/128, trellis): cosine=%.6f\n", c2);
+        check_eq_i("t2_tcq cosine beats scalar turbo2_0", c2 > c1 ? 1 : 0, 1);
         printf("\n");
     }
 
