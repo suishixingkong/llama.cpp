@@ -25,6 +25,10 @@ uint32_t llama_kv_cache_padded_head_dim(ggml_type type, uint32_t head_dim) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             return ((head_dim + 127)/128)*128;
         default:
             return head_dim;
@@ -33,7 +37,8 @@ uint32_t llama_kv_cache_padded_head_dim(ggml_type type, uint32_t head_dim) {
 
 ggml_type llama_kv_cache_resolve_type_k(ggml_type type_k, ggml_type type_v, const llama_hparams & hparams) {
     const bool k_is_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
-        type_k == GGML_TYPE_TURBO4_0;
+        type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO8_0 || type_k == GGML_TYPE_TURBO3_TCQ ||
+        type_k == GGML_TYPE_TURBO2_TCQ || type_k == GGML_TYPE_TURBO1_TCQ;
     if (!k_is_turbo) {
         return type_k;
     }

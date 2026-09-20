@@ -183,12 +183,14 @@ static int test_vec_dot_q(bool verbose) {
             continue;
         }
 
-        // TurboQuant KV-cache types (TURBO2_0/TURBO3_0/TURBO4_0) intentionally keep
-        // their dequantized output in the WHT-rotated domain; the inverse WHT is
-        // applied separately via GGML_OP_TURBO_WHT in the attention graph. They do
-        // not round-trip through float space, so the total/reference/dot-product
-        // error tests in this harness are not applicable.
-        if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+        // TurboQuant KV-cache types intentionally keep their dequantized output in the
+        // WHT-rotated domain; the inverse WHT is applied separately via GGML_OP_TURBO_WHT
+        // in the attention graph. They do not round-trip through float space, so the
+        // total/reference/dot-product error tests in this harness are not applicable.
+        // TCQ types additionally have no CPU encode path at all (Viterbi is CUDA-only).
+        if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+            type == GGML_TYPE_TURBO8_0 || type == GGML_TYPE_TURBO3_TCQ || type == GGML_TYPE_TURBO2_TCQ ||
+            type == GGML_TYPE_TURBO1_TCQ) {
             printf("Testing %s (skipped: rotated-domain KV quant)\n", ggml_type_name(type));
             continue;
         }

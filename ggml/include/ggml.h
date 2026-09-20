@@ -437,7 +437,15 @@ extern "C" {
         GGML_TYPE_TURBO4_0 = 45, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
         GGML_TYPE_TQ3_1S  = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        GGML_TYPE_COUNT   = 48,
+        // TurboQuant TCQ / 8-bit KV cache types (ported from buun-llama-cpp).
+        // Appended after the last id so GGUF files produced before this port stay compatible.
+        // NOTE: these are appended, NOT placed at buun's original ids (46/47/48/52) because
+        // ids 46/47 are already taken by TQ3_1S/TQ4_1S in this tree.
+        GGML_TYPE_TURBO8_0   = 48, // TurboQuant 8-bit KV cache: FWHT + 256-level Lloyd-Max grid, no QJL
+        GGML_TYPE_TURBO3_TCQ = 49, // TurboQuant 3-bit KV cache: TCQ (right-shift trellis, k=3, L=9, 512 states)
+        GGML_TYPE_TURBO2_TCQ = 50, // TurboQuant 2-bit KV cache: TCQ (right-shift trellis, k=2, L=8, 256 states)
+        GGML_TYPE_TURBO1_TCQ = 51, // TurboQuant 1-bit KV cache: TCQ (right-shift trellis, k=1, L=8, 256 states)
+        GGML_TYPE_COUNT   = 52,
     };
 
     // [TAG_GGML_PREC]

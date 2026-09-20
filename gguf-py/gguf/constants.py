@@ -5800,6 +5800,13 @@ class GGMLQuantizationType(IntEnum):
     TURBO4_0 = 45
     TQ3_1S  = 46
     TQ4_1S  = 47
+    # TurboQuant 8-bit / TCQ KV cache types (ported from buun-llama-cpp).
+    # Appended after the last id; buun's original ids (46/47/48/52) are NOT used
+    # because 46/47 are already taken by TQ3_1S/TQ4_1S in this tree.
+    TURBO8_0   = 48
+    TURBO3_TCQ = 49
+    TURBO2_TCQ = 50
+    TURBO1_TCQ = 51
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6005,6 +6012,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TURBO2_0: (128, 2 + 128 // 4),
     GGMLQuantizationType.TURBO3_0: (128, 2 + 128 // 4 + 128 // 8),
     GGMLQuantizationType.TURBO4_0: (128, 2 + 2 + 128 // 2),
+    # TurboQuant 8-bit / TCQ KV-cache types (ported from buun-llama-cpp).
+    GGMLQuantizationType.TURBO8_0:   (128, 2 + 128),
+    GGMLQuantizationType.TURBO3_TCQ: (128, 2 + 49 + 1),
+    GGMLQuantizationType.TURBO2_TCQ: (128, 2 + 33 + 1),
+    GGMLQuantizationType.TURBO1_TCQ: (128, 2 + 17 + 1),
 }
 
 

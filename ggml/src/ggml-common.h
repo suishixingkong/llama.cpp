@@ -379,6 +379,60 @@ typedef struct {
 static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
 //
+// TurboQuant TCQ / 8-bit KV cache blocks (ported from buun-llama-cpp)
+//
+// Only the three TCQ codecs and turbo8 are ported. buun's block_turbo2_0/3_0/4_0 are
+// NOT taken (this tree already has its own turbo2_0/3_0/4_0 with a different block
+// geometry), and buun's reserved turbo1 / turbo1_nsn / turbo1_cq slots are dead
+// codecs (removed upstream in buun) and are intentionally not ported.
+// The bit packing / centroid / rotation are the same family as this tree's turbo types.
+
+// TurboQuant 3-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=3, L=9)
+// One block = one 128-element rotation group. Bitstream: 6 zero-prefix + 128x3-bit = 390 bits = 49 bytes.
+// Decode: state_t = read_9_bits(qs, t*3), recon_t = codebook[state_t] * norm
+// = 52 bytes per 128 values (3.25 bpv)
+#define QK_TURBO3_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[49];                  // 49 bytes: 390-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_turbo3_tcq;                     // 52 bytes total for 128 values (3.25 bpv)
+static_assert(sizeof(block_turbo3_tcq) == sizeof(ggml_half) + 50, "wrong turbo3_tcq block size/padding");
+
+// TurboQuant 2-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=2, L=8)
+// One block = one 128-element rotation group. Bitstream: 6 prefix + 128x2-bit = 262 bits = 33 bytes.
+// Decode: state_t = read_8_bits(qs, t*2), recon_t = codebook[state_t] * norm
+// = 36 bytes per 128 values (2.25 bpv)
+#define QK_TURBO2_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[33];                  // 33 bytes: 262-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_turbo2_tcq;                     // 36 bytes total for 128 values (2.25 bpv)
+static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_tcq block size/padding");
+
+// TurboQuant 1-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=1, L=8, 256 states)
+// One block = one 128-element FWHT-rotated group. Bitstream: 7 init-prefix + 128x1-bit = 135 bits = 17 bytes.
+// Decode: state_t = read_8_bits(qs, t*1), recon_t = codebook[state_t] * norm, then per-row inverse FWHT
+// = 20 bytes per 128 values (1.25 bpv)
+#define QK_TURBO1_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[17];                  // 17 bytes: 135-bit trellis bitstream (1 padding bit)
+    uint8_t    pad;                     //  1 byte:  alignment padding (struct rounds to 2)
+} block_turbo1_tcq;                     // 20 bytes total for 128 values (1.25 bpv)
+static_assert(sizeof(block_turbo1_tcq) == sizeof(ggml_half) + 18, "wrong turbo1_tcq block size/padding");
+
+// TurboQuant 8-bit: uniform 256-level grid centroid[i]=(i-127.5)/127.5 + per-block absmax scale, no QJL.
+// Per block: norm(fp16) + 8-bit indices (128 bytes) = 130 bytes per 128 values (8.125 bpv)
+#define QK_TURBO8 128
+typedef struct {
+    ggml_half  norm;                    //   2 bytes: L2 norm for rescaling
+    uint8_t    qs[QK_TURBO8];           // 128 bytes: 8-bit codebook indices (1 per byte)
+} block_turbo8_0;                       // 130 bytes total
+static_assert(sizeof(block_turbo8_0) == sizeof(ggml_half) + QK_TURBO8, "wrong turbo8_0 block size/padding");
+
+//
 // Super-block quantization structures
 //
 

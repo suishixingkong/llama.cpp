@@ -4219,9 +4219,30 @@ llama_context * llama_init_from_model(
     // would otherwise reject the combination outright.
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
-         params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+         params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ ||
+         params.type_k == GGML_TYPE_TURBO1_TCQ ||
+         params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 ||
+         params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ ||
+         params.type_v == GGML_TYPE_TURBO1_TCQ)) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn - enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // The TurboQuant TCQ KV types (turbo3_tcq / turbo2_tcq / turbo1_tcq) have no CPU
+    // encode path at all: the Viterbi trellis encode only exists in the CUDA/Metal
+    // kernels, and the CPU reference deliberately zeroes the indices. Running them on a
+    // backend that falls back to the CPU reference would silently produce zeroed KV, so
+    // reject them outright until the CUDA kernels are ported.
+    {
+        const bool k_is_tcq = params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ ||
+                              params.type_k == GGML_TYPE_TURBO1_TCQ;
+        const bool v_is_tcq = params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ ||
+                              params.type_v == GGML_TYPE_TURBO1_TCQ;
+        if (k_is_tcq || v_is_tcq) {
+            LLAMA_LOG_ERROR("%s: TCQ KV cache type %s requires the CUDA TurboQuant kernels, which are not available in this build\n",
+                    __func__, ggml_type_name(k_is_tcq ? params.type_k : params.type_v));
+            return nullptr;
+        }
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
@@ -4239,7 +4260,11 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
-                                 params.type_k == GGML_TYPE_TURBO4_0);
+                                 params.type_k == GGML_TYPE_TURBO4_0 ||
+                                 params.type_k == GGML_TYPE_TURBO8_0 ||
+                                 params.type_k == GGML_TYPE_TURBO3_TCQ ||
+                                 params.type_k == GGML_TYPE_TURBO2_TCQ ||
+                                 params.type_k == GGML_TYPE_TURBO1_TCQ);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to the next multiple of 128 in llama-kv-cache.cpp
@@ -4258,7 +4283,11 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
-                                 params.type_v == GGML_TYPE_TURBO4_0);
+                                 params.type_v == GGML_TYPE_TURBO4_0 ||
+                                 params.type_v == GGML_TYPE_TURBO8_0 ||
+                                 params.type_v == GGML_TYPE_TURBO3_TCQ ||
+                                 params.type_v == GGML_TYPE_TURBO2_TCQ ||
+                                 params.type_v == GGML_TYPE_TURBO1_TCQ);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_v = model->hparams.n_embd_head_v(il);

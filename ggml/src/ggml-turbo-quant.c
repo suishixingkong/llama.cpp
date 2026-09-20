@@ -1028,3 +1028,291 @@ size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     }
     return nrows * row_size;
 }
+
+/* =====================================================================
+ * TurboQuant 8-bit / TCQ KV cache types (ported from buun-llama-cpp)
+ *
+ * Conventions (IMPORTANT):
+ *  - dequantize_* below stay in the ROTATED domain (no inverse FWHT), matching
+ *    this tree's turbo2_0/3_0/4_0 convention: the graph applies the forward WHT
+ *    to Q (GGML_OP_TURBO_WHT) and the inverse WHT to the attention output.
+ *    buun's own CPU refs apply an inverse rotation in dequant instead; that is
+ *    NOT this tree's convention and is deliberately not followed here.
+ *  - The turbo*_tcq CPU refs are stubs, exactly as in buun: the real encode is a
+ *    Viterbi search that only exists on the CUDA/Metal path, and turbo-typed KV
+ *    is rejected on backends without TurboQuant support (llama-kv-cache guard).
+ * ===================================================================== */
+
+static const float CENTROIDS_8BIT[256] = {
+    -0.34189706f, -0.29884648f, -0.27157635f, -0.25121314f, -0.23484838f, -0.22114745f, -0.20937878f, -0.19909346f,
+    -0.19000012f, -0.18188631f, -0.17459596f, -0.16801505f, -0.16205003f, -0.15662252f, -0.15166721f, -0.14712896f,
+    -0.14295785f, -0.13910911f, -0.13554055f, -0.13222068f, -0.12912571f, -0.12622918f, -0.12350196f, -0.12092574f,
+    -0.11848717f, -0.11616507f, -0.11394363f, -0.11181760f, -0.10977627f, -0.10780649f, -0.10590563f, -0.10406567f,
+    -0.10227606f, -0.10053416f, -0.09883731f, -0.09718554f, -0.09557616f, -0.09400389f, -0.09246874f, -0.09096270f,
+    -0.08947787f, -0.08801425f, -0.08657184f, -0.08515064f, -0.08375065f, -0.08237188f, -0.08101431f, -0.07967795f,
+    -0.07836547f, -0.07707417f, -0.07580144f, -0.07454460f, -0.07330103f, -0.07206804f, -0.07084568f, -0.06963391f,
+    -0.06843275f, -0.06724219f, -0.06606225f, -0.06489290f, -0.06373417f, -0.06258603f, -0.06144851f, -0.06032158f,
+    -0.05920527f, -0.05810222f, -0.05700977f, -0.05592792f, -0.05485668f, -0.05379604f, -0.05274602f, -0.05170659f,
+    -0.05067778f, -0.04965957f, -0.04864930f, -0.04764700f, -0.04664999f, -0.04565829f, -0.04467189f, -0.04369080f,
+    -0.04271500f, -0.04174452f, -0.04077933f, -0.03981945f, -0.03886486f, -0.03791293f, -0.03696631f, -0.03602498f,
+    -0.03508631f, -0.03415029f, -0.03321957f, -0.03229416f, -0.03137139f, -0.03045128f, -0.02953382f, -0.02861901f,
+    -0.02770950f, -0.02680265f, -0.02589845f, -0.02499689f, -0.02409534f, -0.02319644f, -0.02230284f, -0.02141190f,
+    -0.02052095f, -0.01963266f, -0.01874701f, -0.01786137f, -0.01697838f, -0.01609804f, -0.01522035f, -0.01434266f,
+    -0.01346497f, -0.01258993f, -0.01171755f, -0.01084516f, -0.00997278f, -0.00910304f, -0.00823331f, -0.00736357f,
+    -0.00649649f, -0.00562941f, -0.00476233f, -0.00389524f, -0.00302816f, -0.00216373f, -0.00129930f, -0.00043487f,
+     0.00043222f,  0.00129930f,  0.00216373f,  0.00302816f,  0.00389524f,  0.00476233f,  0.00562941f,  0.00649649f,
+     0.00736357f,  0.00823331f,  0.00910304f,  0.00997278f,  0.01084516f,  0.01171755f,  0.01258993f,  0.01346497f,
+     0.01434266f,  0.01522035f,  0.01609804f,  0.01697838f,  0.01786137f,  0.01874701f,  0.01963266f,  0.02052095f,
+     0.02141190f,  0.02230284f,  0.02319644f,  0.02409534f,  0.02499689f,  0.02589845f,  0.02680265f,  0.02770950f,
+     0.02861901f,  0.02953382f,  0.03045128f,  0.03137139f,  0.03229416f,  0.03321957f,  0.03415029f,  0.03508631f,
+     0.03602498f,  0.03696631f,  0.03791293f,  0.03886486f,  0.03981945f,  0.04077933f,  0.04174452f,  0.04271500f,
+     0.04369080f,  0.04467189f,  0.04565829f,  0.04664999f,  0.04764700f,  0.04864930f,  0.04965957f,  0.05067778f,
+     0.05170659f,  0.05274602f,  0.05379604f,  0.05485668f,  0.05592792f,  0.05700977f,  0.05810222f,  0.05920527f,
+     0.06032158f,  0.06144851f,  0.06258603f,  0.06373417f,  0.06489290f,  0.06606225f,  0.06724219f,  0.06843275f,
+     0.06963391f,  0.07084568f,  0.07206804f,  0.07330103f,  0.07454460f,  0.07580144f,  0.07707417f,  0.07836547f,
+     0.07967795f,  0.08101431f,  0.08237188f,  0.08375065f,  0.08515064f,  0.08657184f,  0.08801425f,  0.08947787f,
+     0.09096270f,  0.09246874f,  0.09400389f,  0.09557616f,  0.09718554f,  0.09883731f,  0.10053416f,  0.10227606f,
+     0.10406567f,  0.10590563f,  0.10780649f,  0.10977627f,  0.11181760f,  0.11394363f,  0.11616507f,  0.11848717f,
+     0.12092574f,  0.12350196f,  0.12622918f,  0.12912571f,  0.13222068f,  0.13554055f,  0.13910911f,  0.14295785f,
+     0.14712896f,  0.15166721f,  0.15662252f,  0.16205003f,  0.16801505f,  0.17459596f,  0.18188631f,  0.19000012f,
+     0.19909346f,  0.20937878f,  0.22114745f,  0.23484838f,  0.25121314f,  0.27157635f,  0.29884648f,  0.34189706f,
+};
+
+static const float MIDPOINTS_8BIT[255] = {
+    -0.32037177f, -0.28521142f, -0.26139474f, -0.24303076f, -0.22799792f, -0.21526312f, -0.20423612f, -0.19454679f,
+    -0.18594321f, -0.17824113f, -0.17130551f, -0.16503254f, -0.15933627f, -0.15414486f, -0.14939809f, -0.14504341f,
+    -0.14103348f, -0.13732483f, -0.13388062f, -0.13067319f, -0.12767744f, -0.12486557f, -0.12221385f, -0.11970645f,
+    -0.11732612f, -0.11505435f, -0.11288061f, -0.11079693f, -0.10879138f, -0.10685606f, -0.10498565f, -0.10317087f,
+    -0.10140511f, -0.09968573f, -0.09801143f, -0.09638085f, -0.09479002f, -0.09323631f, -0.09171572f, -0.09022028f,
+    -0.08874606f, -0.08729305f, -0.08586124f, -0.08445065f, -0.08306126f, -0.08169309f, -0.08034613f, -0.07902171f,
+    -0.07771982f, -0.07643781f, -0.07517302f, -0.07392282f, -0.07268454f, -0.07145686f, -0.07023979f, -0.06903333f,
+    -0.06783747f, -0.06665222f, -0.06547757f, -0.06431353f, -0.06316010f, -0.06201727f, -0.06088505f, -0.05976343f,
+    -0.05865375f, -0.05755599f, -0.05646884f, -0.05539230f, -0.05432636f, -0.05327103f, -0.05222630f, -0.05119219f,
+    -0.05016867f, -0.04915443f, -0.04814815f, -0.04714850f, -0.04615414f, -0.04516509f, -0.04418135f, -0.04320290f,
+    -0.04222976f, -0.04126192f, -0.04029939f, -0.03934216f, -0.03838890f, -0.03743962f, -0.03649565f, -0.03555565f,
+    -0.03461830f, -0.03368493f, -0.03275686f, -0.03183277f, -0.03091134f, -0.02999255f, -0.02907641f, -0.02816426f,
+    -0.02725608f, -0.02635055f, -0.02544767f, -0.02454612f, -0.02364589f, -0.02274964f, -0.02185737f, -0.02096642f,
+    -0.02007680f, -0.01918983f, -0.01830419f, -0.01741987f, -0.01653821f, -0.01565919f, -0.01478150f, -0.01390381f,
+    -0.01302745f, -0.01215374f, -0.01128136f, -0.01040897f, -0.00953791f, -0.00866818f, -0.00779844f, -0.00693003f,
+    -0.00606295f, -0.00519587f, -0.00432878f, -0.00346170f, -0.00259595f, -0.00173151f, -0.00086708f, -0.00000133f,
+     0.00086576f,  0.00173151f,  0.00259595f,  0.00346170f,  0.00432878f,  0.00519587f,  0.00606295f,  0.00693003f,
+     0.00779844f,  0.00866818f,  0.00953791f,  0.01040897f,  0.01128136f,  0.01215374f,  0.01302745f,  0.01390381f,
+     0.01478150f,  0.01565919f,  0.01653821f,  0.01741987f,  0.01830419f,  0.01918983f,  0.02007680f,  0.02096642f,
+     0.02185737f,  0.02274964f,  0.02364589f,  0.02454612f,  0.02544767f,  0.02635055f,  0.02725608f,  0.02816426f,
+     0.02907641f,  0.02999255f,  0.03091134f,  0.03183277f,  0.03275686f,  0.03368493f,  0.03461830f,  0.03555565f,
+     0.03649565f,  0.03743962f,  0.03838890f,  0.03934216f,  0.04029939f,  0.04126192f,  0.04222976f,  0.04320290f,
+     0.04418135f,  0.04516509f,  0.04615414f,  0.04714850f,  0.04814815f,  0.04915443f,  0.05016867f,  0.05119219f,
+     0.05222630f,  0.05327103f,  0.05432636f,  0.05539230f,  0.05646884f,  0.05755599f,  0.05865375f,  0.05976343f,
+     0.06088505f,  0.06201727f,  0.06316010f,  0.06431353f,  0.06547757f,  0.06665222f,  0.06783747f,  0.06903333f,
+     0.07023979f,  0.07145686f,  0.07268454f,  0.07392282f,  0.07517302f,  0.07643781f,  0.07771982f,  0.07902171f,
+     0.08034613f,  0.08169309f,  0.08306126f,  0.08445065f,  0.08586124f,  0.08729305f,  0.08874606f,  0.09022028f,
+     0.09171572f,  0.09323631f,  0.09479002f,  0.09638085f,  0.09801143f,  0.09968573f,  0.10140511f,  0.10317087f,
+     0.10498565f,  0.10685606f,  0.10879138f,  0.11079693f,  0.11288061f,  0.11505435f,  0.11732612f,  0.11970645f,
+     0.12221385f,  0.12486557f,  0.12767744f,  0.13067319f,  0.13388062f,  0.13732483f,  0.14103348f,  0.14504341f,
+     0.14939809f,  0.15414486f,  0.15933627f,  0.16503254f,  0.17130551f,  0.17824113f,  0.18594321f,  0.19454679f,
+     0.20423612f,  0.21526312f,  0.22799792f,  0.24303076f,  0.26139474f,  0.28521142f,  0.32037177f,
+};
+
+static int nearest_centroid_8bit(float val) {
+    /* 256 monotonic centroids, binary search on 255 midpoints */
+    int lo = 0, hi = 255;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (val < MIDPOINTS_8BIT[mid]) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
+/* ---------- TURBO8_0: 8-bit Lloyd-Max, no QJL ---------- */
+
+void quantize_row_turbo8_0_ref(const float * GGML_RESTRICT x, block_turbo8_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO8 == 0);
+
+    // Same WHT group-size plumbing as turbo3_0/turbo2_0 above: the CPU SET_ROWS handler
+    // stores the graph's group size in a global before each call.
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
+
+    const int n_groups = k / group_size;
+    const int blocks_per_group = group_size / QK_TURBO8;
+
+    for (int g = 0; g < n_groups; g++) {
+        const float * grp_src = x + g * group_size;
+        block_turbo8_0 * grp_dst = y + g * blocks_per_group;
+
+        float norm_sq = 0.0f;
+        float buf[128];  // max group_size
+        for (int j = 0; j < group_size; j++) {
+            buf[j] = grp_src[j];
+            norm_sq += buf[j] * buf[j];
+        }
+        const float grp_norm = sqrtf(norm_sq);
+        const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+        for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
+
+        /* Forward WHT rotation (matches the CUDA set_rows path). */
+        turbo_cpu_fwht(buf, group_size);
+
+        float recon_sq = 0.0f;
+        for (int b = 0; b < blocks_per_group; b++) {
+            block_turbo8_0 * blk = &grp_dst[b];
+            const int off = b * QK_TURBO8;
+            for (int j = 0; j < QK_TURBO8; j++) {
+                const int idx = nearest_centroid_8bit(buf[off + j]);
+                blk->qs[j] = (uint8_t) idx;
+                recon_sq += CENTROIDS_8BIT[idx] * CENTROIDS_8BIT[idx];
+            }
+        }
+
+        /* Corrected norm: grp_norm / recon_norm (matches the CUDA kernel) */
+        const float recon_norm = sqrtf(recon_sq);
+        const float corrected = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+        for (int b = 0; b < blocks_per_group; b++) {
+            grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
+        }
+    }
+}
+
+void dequantize_row_turbo8_0(const block_turbo8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO8 == 0);
+    const int nb = k / QK_TURBO8;
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        /* No inverse WHT: dequant stays in the rotated domain (Q is rotated by the graph). */
+        for (int i = 0; i < QK_TURBO8; i++) {
+            y[block * QK_TURBO8 + i] = CENTROIDS_8BIT[x[block].qs[i]] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO8 == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO8) * sizeof(block_turbo8_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo8_0_ref(
+            src + row * n_per_row,
+            (block_turbo8_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+/* ---------- TURBO3_TCQ / TURBO2_TCQ / TURBO1_TCQ (CPU stubs) ---------- */
+/* The encode is a Viterbi search over a 512/256/256-state right-shift trellis that
+ * only exists on the CUDA/Metal path; the decode is an O(1) bit-window lookup there.
+ * The CPU refs exist so the type_traits function pointers are non-null and the code
+ * links; the types are rejected on backends without TurboQuant support. */
+
+void quantize_row_turbo3_tcq_ref(const float * GGML_RESTRICT x, block_turbo3_tcq * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3_TCQ == 0);
+    const int nb = k / QK_TURBO3_TCQ;
+    for (int i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TURBO3_TCQ; j++) norm += x[i*QK_TURBO3_TCQ + j] * x[i*QK_TURBO3_TCQ + j];
+        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        y[i].pad = 0;
+    }
+}
+
+void dequantize_row_turbo3_tcq(const block_turbo3_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x);
+    assert(k % QK_TURBO3_TCQ == 0);
+    memset(y, 0, (size_t) k * sizeof(float)); /* stub; real decode is the CUDA trellis lookup */
+}
+
+size_t quantize_turbo3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO3_TCQ == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO3_TCQ) * sizeof(block_turbo3_tcq);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo3_tcq_ref(
+            src + row * n_per_row,
+            (block_turbo3_tcq *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+void quantize_row_turbo2_tcq_ref(const float * GGML_RESTRICT x, block_turbo2_tcq * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2_TCQ == 0);
+    const int nb = k / QK_TURBO2_TCQ;
+    for (int i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < QK_TURBO2_TCQ; j++) norm += x[i*QK_TURBO2_TCQ + j] * x[i*QK_TURBO2_TCQ + j];
+        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        y[i].pad = 0;
+    }
+}
+
+void dequantize_row_turbo2_tcq(const block_turbo2_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x);
+    assert(k % QK_TURBO2_TCQ == 0);
+    memset(y, 0, (size_t) k * sizeof(float)); /* stub */
+}
+
+size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO2_TCQ == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO2_TCQ) * sizeof(block_turbo2_tcq);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo2_tcq_ref(
+            src + row * n_per_row,
+            (block_turbo2_tcq *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+void quantize_row_turbo1_tcq_ref(const float * GGML_RESTRICT x, block_turbo1_tcq * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO1_TCQ == 0);
+    const int nb = k / QK_TURBO1_TCQ;
+    for (int b = 0; b < nb; b++) {
+        const float * src = x + b * QK_TURBO1_TCQ;
+        float ns = 0.0f;
+        for (int i = 0; i < QK_TURBO1_TCQ; i++) ns += src[i] * src[i];
+        /* buun scales by 1/sqrt(128) here so the norm matches the FWHT-domain convention */
+        y[b].norm = GGML_FP32_TO_FP16(sqrtf(ns) * 0.08838834764831845f);
+        memset(y[b].qs, 0, sizeof(y[b].qs));
+        y[b].pad = 0;
+    }
+}
+
+void dequantize_row_turbo1_tcq(const block_turbo1_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x);
+    assert(k % QK_TURBO1_TCQ == 0);
+    memset(y, 0, (size_t) k * sizeof(float)); /* stub */
+}
+
+size_t quantize_turbo1_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO1_TCQ == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO1_TCQ) * sizeof(block_turbo1_tcq);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo1_tcq_ref(
+            src + row * n_per_row,
+            (block_turbo1_tcq *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}

@@ -316,6 +316,13 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    // TurboQuant 8-bit / TCQ KV cache types (ported from buun-llama-cpp).
+    // TCQ types need the CUDA/Metal trellis kernels; turbo-typed KV is rejected
+    // on backends without TurboQuant support.
+    GGML_TYPE_TURBO8_0,
+    GGML_TYPE_TURBO3_TCQ,
+    GGML_TYPE_TURBO2_TCQ,
+    GGML_TYPE_TURBO1_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

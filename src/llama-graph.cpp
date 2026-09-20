@@ -2641,8 +2641,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with a different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
@@ -2719,8 +2719,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
@@ -2912,7 +2912,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q so it matches the WHT-rotated K held in the cache.
     // Zero-padded models (head_dim not a multiple of 128) need Q padded to match K first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -2930,7 +2930,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // padded head_dim - extract the original one after the inverse WHT applied in
     // build_attn_mha. NOTE: gate on v->type (not k->type) so asymmetric configs
     // (e.g. K=q8_0, V=turbo) are handled too.
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -3037,7 +3037,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q so it matches the WHT-rotated K held in the cache.
     // Zero-padded models (head_dim not a multiple of 128) need Q padded to match K first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3055,7 +3055,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // padded head_dim - extract the original one after the inverse WHT applied in
     // build_attn_mha. NOTE: gate on v->type (not k->type) so asymmetric configs
     // (e.g. K=q8_0, V=turbo) are handled too.
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
         const int64_t orig_v_head = v_cur->ne[0];
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -3156,7 +3156,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q so it matches the WHT-rotated K held in the cache.
     // Zero-padded models (head_dim not a multiple of 128) need Q padded to match K first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3174,7 +3174,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // padded head_dim - extract the original one after the inverse WHT applied in
     // build_attn_mha. NOTE: gate on v->type (not k->type) so asymmetric configs
     // (e.g. K=q8_0, V=turbo) are handled too.
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
         const int64_t orig_v_head = v_cur->ne[0];
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -3269,7 +3269,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q so it matches the WHT-rotated K held in the cache.
     // Zero-padded models (head_dim not a multiple of 128) need Q padded to match K first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3287,7 +3287,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // padded head_dim - extract the original one after the inverse WHT applied in
     // build_attn_mha. NOTE: gate on v->type (not k->type) so asymmetric configs
     // (e.g. K=q8_0, V=turbo) are handled too.
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -3374,7 +3374,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q so it matches the WHT-rotated K held in the cache.
     // Zero-padded models (head_dim not a multiple of 128) need Q padded to match K first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO8_0 || k->type == GGML_TYPE_TURBO3_TCQ || k->type == GGML_TYPE_TURBO2_TCQ || k->type == GGML_TYPE_TURBO1_TCQ) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -3392,7 +3392,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // padded head_dim - extract the original one after the inverse WHT applied in
     // build_attn_mha. NOTE: gate on v->type (not k->type) so asymmetric configs
     // (e.g. K=q8_0, V=turbo) are handled too.
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ) {
         const int64_t orig_v_head = v_cur->ne[0];
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
