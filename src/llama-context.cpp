@@ -4228,18 +4228,28 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
-    // The TurboQuant TCQ KV types (turbo3_tcq / turbo2_tcq / turbo1_tcq) have no CPU
-    // encode path at all: the Viterbi trellis encode only exists in the CUDA/Metal
-    // kernels, and the CPU reference deliberately zeroes the indices. Running them on a
-    // backend that falls back to the CPU reference would silently produce zeroed KV, so
-    // reject them outright until the CUDA kernels are ported.
+    // TurboQuant TCQ KV types: the CUDA path is ported (CPU reference codec + CUDA Viterbi
+    // encode, trellis decode, convert, and the FA vec kernels), but the types are still
+    // refused here, deliberately, until two things land:
+    //   (a) turbo1_tcq has no codec at all -- buun's FA path carries two decoders for it
+    //       (rotated and per-row inverse FWHT) and the live convention is unresolved, so
+    //       this tree still has a CPU stub that zeroes the indices. Running it would
+    //       silently produce zeroed KV.
+    //   (b) turbo3_tcq / turbo2_tcq need a backend-capability gate before they can be
+    //       enabled. This tree has no equivalent of buun's VBR backend registry
+    //       (llama_vbr_backend_devs_for_buft), and a CPU fallback would call a CPU
+    //       attention path with no turbo vec_dot. Enabling them without that gate risks a
+    //       crash instead of a clear error.
+    // Once (a)/(b) are settled -- and after the required GPU validation -- this becomes a
+    // capability query rather than an unconditional refusal.
     {
         const bool k_is_tcq = params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ ||
                               params.type_k == GGML_TYPE_TURBO1_TCQ;
         const bool v_is_tcq = params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ ||
                               params.type_v == GGML_TYPE_TURBO1_TCQ;
         if (k_is_tcq || v_is_tcq) {
-            LLAMA_LOG_ERROR("%s: TCQ KV cache type %s requires the CUDA TurboQuant kernels, which are not available in this build\n",
+            LLAMA_LOG_ERROR("%s: TCQ KV cache type %s is not enabled in this build yet "
+                    "(codec ported for CUDA, backend-capability gate pending)\n",
                     __func__, ggml_type_name(k_is_tcq ? params.type_k : params.type_v));
             return nullptr;
         }
