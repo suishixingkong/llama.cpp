@@ -441,7 +441,7 @@ extern "C" {
         // Appended after the last id so GGUF files produced before this port stay compatible.
         // NOTE: these are appended, NOT placed at buun's original ids (46/47/48/52) because
         // ids 46/47 are already taken by TQ3_1S/TQ4_1S in this tree.
-        GGML_TYPE_TURBO8_0   = 48, // TurboQuant 8-bit KV cache: FWHT + 256-level Lloyd-Max grid, no QJL
+        GGML_TYPE_TURBO8_0   = 48, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
         GGML_TYPE_TURBO3_TCQ = 49, // TurboQuant 3-bit KV cache: TCQ (right-shift trellis, k=3, L=9, 512 states)
         GGML_TYPE_TURBO2_TCQ = 50, // TurboQuant 2-bit KV cache: TCQ (right-shift trellis, k=2, L=8, 256 states)
         GGML_TYPE_TURBO1_TCQ = 51, // TurboQuant 1-bit KV cache: TCQ (right-shift trellis, k=1, L=8, 256 states)

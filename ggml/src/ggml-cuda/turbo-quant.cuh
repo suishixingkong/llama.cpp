@@ -420,6 +420,44 @@ static __device__ __forceinline__ float turbo2_dequant_element(
     return TURBO_CENTROIDS_2BIT[idx] * norm;
 }
 
+// ---- Turbo8: 8-bit UNIFORM grid (buun's production format) ----
+// centroid[i] = (i - 127.5) / 127.5 in the Hadamard-rotated domain, with a per-block
+// absmax scale folded into `norm` (blk.norm = fp16(L2norm * absmax_of_rotated)).
+// There is deliberately NO fixed-Gaussian codebook here: after the WHT the coordinates are
+// well-behaved and a uniform grid avoids tail clamping. buun's own CPU reference used a
+// 256-entry Lloyd-Max table and disagrees with this; we follow the CUDA format.
+#define QR_TURBO8 1  // Each dequantize call produces 2 consecutive elements
+
+static __device__ __forceinline__ float turbo8_uniform_centroid(int idx) {
+    return ((float) idx - 127.5f) / 127.5f;
+}
+
+// ---- Per-block quantize for turbo8 (128 elements, expects already-rotated input) ----
+// Used by set_rows after the WHT rotation. `block_l2` is the L2 norm of the *pre-rotation*
+// block; the stored norm folds in the post-rotation absmax scale.
+static __device__ void quantize_f32_turbo8_0_block(const float * __restrict__ src,
+                                                    block_turbo8_0 * __restrict__ dst,
+                                                    const float block_l2) {
+    float absmax = 0.0f;
+    for (int j = 0; j < QK_TURBO8; j++) absmax = fmaxf(absmax, fabsf(src[j]));
+    const float scale = absmax > 1e-10f ? absmax : 1e-10f;
+    const float inv_scale = 1.0f / scale;
+
+    for (int j = 0; j < QK_TURBO8; j++) {
+        int idx = (int) lrintf(src[j] * inv_scale * 127.5f + 127.5f);
+        idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+        dst->qs[j] = (uint8_t) idx;
+    }
+    dst->norm = __float2half(block_l2 * scale);
+}
+
+// ---- Inline dequant helper: extract one float from a turbo8 block ----
+
+static __device__ __forceinline__ float turbo8_dequant_element(
+        const block_turbo8_0 * __restrict__ x, int j, float norm) {
+    return turbo8_uniform_centroid(x->qs[j]) * norm;
+}
+
 // ============================================================================
 // Weight compression types (TQ3_1S, TQ4_1S)
 // These use N(0,1) centroids (NOT N(0,1/128) like KV cache types)
