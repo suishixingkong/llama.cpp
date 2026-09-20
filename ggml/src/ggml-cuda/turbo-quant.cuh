@@ -82,6 +82,13 @@ static __constant__ float TURBO_WHT_SIGNS2_64[64] = {
     1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
 
+// ---- TCQ trellis codebooks (turbo3_tcq / turbo2_tcq) ----
+// The very same data file the CPU reference codec compiles in, so the two can never
+// drift apart. A codebook is indexed by the full trellis state and therefore holds
+// exactly 2^(k*w) entries -- the same count as the encoder's thread count.
+#define TURBO_TCQ_TABLE static __constant__
+#include "ggml-turbo-tcq-tables.h"
+
 // ---- Fast Walsh-Hadamard Transform (in-place, normalized) ----
 // O(n log n) = 896 ops for n=128
 
@@ -456,6 +463,33 @@ static __device__ void quantize_f32_turbo8_0_block(const float * __restrict__ sr
 static __device__ __forceinline__ float turbo8_dequant_element(
         const block_turbo8_0 * __restrict__ x, int j, float norm) {
     return turbo8_uniform_centroid(x->qs[j]) * norm;
+}
+
+// ---- TCQ trellis decode (turbo3_tcq / turbo2_tcq) ----
+//
+// Decode is an O(1) sliding-window lookup over the trellis bitstream: element t reads the
+// k*w bits starting at bit t*k (LSB-first) and that value indexes the codebook directly.
+// The bitstream is (w-1)*k init bits followed by 128 k-bit symbols, so element 0's window
+// already spans the init prefix plus the first symbol. Unlike turbo1_tcq there is no
+// inverse WHT here: the output stays in the rotated domain, exactly like turbo2/3/4/8.
+
+#define QR_TURBO3_TCQ 1  // Each dequantize call produces 2 consecutive elements
+#define QR_TURBO2_TCQ 1
+
+static __device__ __forceinline__ float turbo3_tcq_dequant_element(
+        const block_turbo3_tcq * __restrict__ x, int t, float norm) {
+    const int bit_pos  = t * 3;
+    const int bit_off  = bit_pos & 7;
+    const uint16_t raw = (uint16_t) x->qs[bit_pos >> 3] | ((uint16_t) x->qs[(bit_pos >> 3) + 1] << 8);
+    return TURBO_TCQ3_CODEBOOK[(raw >> bit_off) & 0x1FF] * norm;
+}
+
+static __device__ __forceinline__ float turbo2_tcq_dequant_element(
+        const block_turbo2_tcq * __restrict__ x, int t, float norm) {
+    const int bit_pos  = t * 2;
+    const int bit_off  = bit_pos & 7;
+    const uint16_t raw = (uint16_t) x->qs[bit_pos >> 3] | ((uint16_t) x->qs[(bit_pos >> 3) + 1] << 8);
+    return TURBO_TCQ2_CODEBOOK[(raw >> bit_off) & 0xFF] * norm;
 }
 
 // ============================================================================

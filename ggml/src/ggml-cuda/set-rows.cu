@@ -1316,6 +1316,307 @@ static void set_rows_cuda_turbo8(
     }
 }
 
+// TurboQuant TCQ (turbo3_tcq / turbo2_tcq): trellis-coded quantization.
+//
+// One block per 128-element rotation group (the block IS the rotation group, as for
+// turbo2/3/4/8), one thread per trellis state (512 for K=3, 256 for K=2). This kernel
+// reproduces ggml-turbo-quant.c's turbo_tcq_encode_group exactly:
+//
+//   grp_norm = L2(x); x /= grp_norm; fwht(x)
+//   Viterbi, W symbols of the sliding state window, right-shift recurrence
+//       ns = (prev >> K) | (sym << K*(W-1))
+//       cost_new[s] = min over s's 2^K predecessors + (x[t] - cb[s])^2
+//   backtrack from the cheapest final state (ties -> lowest state index)
+//   corrected_norm = grp_norm / ||cb[path]||_2
+//   bitstream = K*(W-1) init bits then 128 K-bit symbols, LSB-first
+//
+// The DP steps are parallelized one-thread-per-state; the argmin, the backtrack, the
+// reconstruction norm and the bitpack run on thread 0. They are cheap next to the 128
+// double-buffered barriers of the DP, and this ordering is what the CPU reference
+// implements, so keeping it serial removes a class of untestable divergence.
+//
+// The codebook goes to shared memory rather than being read from __constant__ through a
+// pointer: the state count is exactly the codebook length, and a direct index avoids any
+// question about taking the address of a __constant__ variable.
+template <typename idx_t, int K, int W>
+__launch_bounds__(1 << (K * W))
+static __global__ void k_set_rows_turbo_tcq(
+        const float * __restrict__ src0,
+        const idx_t * __restrict__ src1,
+        char * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne10,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t ne13,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3,
+        const int64_t dst_row_base,
+        const int64_t blk_bytes) {
+
+    constexpr int NS      = 1 << (K * W);   // trellis states, == blockDim.x
+    constexpr int NPRE    = NS >> K;        // predecessor groups
+    constexpr int MASK    = NPRE - 1;
+    constexpr int SHIFT   = K * (W - 1);    // == init-prefix bit count
+    constexpr int SYMMASK = (1 << K) - 1;
+    constexpr int QKB     = 128;            // block == rotation group
+    constexpr int PAYLOAD = (SHIFT + QKB * K + 7) / 8;
+    static_assert(NS == 512 || NS == 256, "unsupported TCQ state count");
+
+    const int j = threadIdx.x;
+
+    // Decode blockIdx.x -> (i_blk, i01, i02, i03), same index math as the turbo4 kernel.
+    const int64_t n_blocks_per_row = ne00 / QKB;
+    const int64_t g     = blockIdx.x;
+    const int64_t i_blk = g % n_blocks_per_row;
+    int64_t       tmp   = g / n_blocks_per_row;
+    const int64_t i01   = tmp % ne01;
+    tmp                 = tmp / ne01;
+    const int64_t i02   = tmp % ne12;
+    const int64_t i03   = tmp / ne12;
+
+    const int64_t i12 = i02;
+    const int64_t i11 = i01 % ne11;
+    const int64_t i10 = i01;
+
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - dst_row_base;
+    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+
+    // block_turbo{3,2}_tcq is { fp16 norm; uint8 qs[PAYLOAD]; uint8 pad }, so qs sits at
+    // byte offset 2 and the pad at offset 2+PAYLOAD. Both block sizes are even, so the
+    // half-word store below is 2-byte aligned whenever the row start is.
+    char * blk_ptr = (char *)dst + dst_row*s1 + i02*s2 + i03*s3 + i_blk*blk_bytes;
+    __half * norm_out = (__half *) blk_ptr;
+    uint8_t * qs_out  = (uint8_t *)(blk_ptr + 2);
+
+    __shared__ float   x[QKB];
+    __shared__ float   cb_s[NS];            // == the type's codebook, 1 thread per entry
+    __shared__ float   cost[NS];
+    __shared__ float   cost_b[NS];
+    __shared__ float   pred_min[NPRE];
+    __shared__ uint8_t bt[128 * NPRE];
+    __shared__ uint8_t sym[128];
+    __shared__ float   s_grp_norm;
+
+    // ---- codebook ----
+    if constexpr (K == 3) { cb_s[j] = TURBO_TCQ3_CODEBOOK[j]; }
+    else                  { cb_s[j] = TURBO_TCQ2_CODEBOOK[j]; }
+
+    // ---- load the group and reduce its L2 norm ----
+    if (j < QKB) x[j] = src_row[i_blk * QKB + j];
+    __syncthreads();
+
+    constexpr int n_warps = NS / WARP_SIZE;
+    __shared__ float warp_accum[n_warps];
+    float v2 = (j < QKB) ? x[j] * x[j] : 0.0f;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        v2 += __shfl_xor_sync(0xffffffffu, v2, off);
+    }
+    if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v2;
+    __syncthreads();
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
+        s_grp_norm = sqrtf(total);
+    }
+    __syncthreads();
+
+    const float grp_norm = s_grp_norm;
+    const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+    // ---- normalize + forward WHT (signs1 -> butterfly -> signs2, normalized) ----
+    // s1/s2 are +/-1, so folding inv_norm into the s1 multiply is exact.
+    if (j < QKB) x[j] *= inv_norm * TURBO_WHT_SIGNS1[j];
+    __syncthreads();
+
+#define TCQ_WHT_STAGE(h) \
+    if (j < QKB && j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    __syncthreads();
+
+    TCQ_WHT_STAGE(1)
+    TCQ_WHT_STAGE(2)
+    TCQ_WHT_STAGE(4)
+    TCQ_WHT_STAGE(8)
+    TCQ_WHT_STAGE(16)
+    TCQ_WHT_STAGE(32)
+    TCQ_WHT_STAGE(64)
+#undef TCQ_WHT_STAGE
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (j < QKB) x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
+    __syncthreads();
+
+    // ---- Viterbi forward pass, double-buffered ----
+    cost[j] = 0.0f;   // free initial state
+    __syncthreads();
+
+    for (int t = 0; t < 128; t++) {
+        float *       cr = (t & 1) ? cost_b : cost;
+        float *       cw = (t & 1) ? cost   : cost_b;
+        const float   xt = x[t];
+
+        if (j < NPRE) {
+            const int base = j << K;
+            float best   = cr[base];
+            int   best_p = 0;
+#pragma unroll
+            for (int p = 1; p < (1 << K); p++) {
+                const float c = cr[base | p];
+                if (c < best) { best = c; best_p = p; }
+            }
+            bt[t * NPRE + j] = (uint8_t) best_p;
+            pred_min[j]      = best;
+        }
+        __syncthreads();
+
+        const float d = xt - cb_s[j];
+        cw[j] = pred_min[j & MASK] + d * d;
+        __syncthreads();
+    }
+    // 128 steps is an even count, so the final costs are in cost[].
+
+    if (j == 0) {
+        // ---- cheapest final state; ties resolve to the lowest state index ----
+        float best       = cost[0];
+        int   best_state = 0;
+        for (int s = 1; s < NS; s++) {
+            if (cost[s] < best) { best = cost[s]; best_state = s; }
+        }
+
+        // ---- backtrack ----
+        int state = best_state;
+        for (int t = 127; t >= 0; t--) {
+            sym[t] = (uint8_t)(state >> SHIFT);
+            const int p = bt[t * NPRE + (state & MASK)];
+            state = ((state & MASK) << K) | p;
+        }
+        const int initial_state = state;
+
+        // ---- reconstruction norm: ||cb[state_t]||_2 over the group ----
+        double recon_sq = 0.0;
+        for (int t = 0; t < 128; t++) {
+            int cur;
+            if (t < W - 1) {
+                cur = initial_state;
+                for (int u = 0; u <= t; u++) {
+                    cur = (cur >> K) | ((int) sym[u] << SHIFT);
+                }
+            } else {
+                cur = 0;
+                for (int b = 0; b < W; b++) {
+                    cur |= ((int) sym[t - (W - 1) + b] & SYMMASK) << (b * K);
+                }
+            }
+            const float c = cb_s[cur];
+            recon_sq += (double) c * (double) c;
+        }
+        const float recon_norm = sqrtf((float) recon_sq);
+        const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+
+        // ---- bitpack: shift init bits, then the 128 symbols, LSB-first ----
+        const int init_bits  = (initial_state >> K) & ((1 << SHIFT) - 1);
+        const int total_bits = SHIFT + 128 * K;
+
+        for (int i = 0; i < PAYLOAD; i++) qs_out[i] = 0;
+        for (int pos = 0; pos < total_bits; pos++) {
+            int v;
+            if (pos < SHIFT) {
+                v = (init_bits >> pos) & 1;
+            } else {
+                const int sb = pos - SHIFT;
+                v = (sym[sb / K] >> (sb % K)) & 1;
+            }
+            qs_out[pos >> 3] |= (uint8_t)(v << (pos & 7));
+        }
+        qs_out[PAYLOAD] = 0;                 // the layout's alignment pad
+
+        *norm_out = __float2half(corrected);
+    }
+
+    GGML_UNUSED(ne10);
+    GGML_UNUSED(ne13);
+}
+
+template<typename idx_t>
+static void set_rows_cuda_turbo3_tcq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
+
+    const float * src0_d = (const float *)src0->data;
+    const idx_t * src1_d = (const idx_t *)src1->data;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_blocks = ne00 / QK_TURBO3_TCQ;
+
+    const int64_t s01 = nb01/sizeof(float);
+    const int64_t s02 = nb02/sizeof(float);
+    const int64_t s03 = nb03/sizeof(float);
+    const int64_t s10 = nb10/sizeof(idx_t);
+    const int64_t s11 = nb11/sizeof(idx_t);
+    const int64_t s12 = nb12/sizeof(idx_t);
+
+    if (n_blocks > 0) {
+        const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
+        k_set_rows_turbo_tcq<idx_t, 3, 3><<<(int)ne_total, 512, 0, stream>>>(
+            src0_d, src1_d, (char *)dst->data,
+            ne00, ne01, ne10, ne11, ne12, ne13,
+            s01, s02, s03, s10, s11, s12,
+            nb1, nb2, nb3, dst_row_base,
+            (int64_t)sizeof(block_turbo3_tcq));
+    }
+}
+
+template<typename idx_t>
+static void set_rows_cuda_turbo2_tcq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
+
+    const float * src0_d = (const float *)src0->data;
+    const idx_t * src1_d = (const idx_t *)src1->data;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_blocks = ne00 / QK_TURBO2_TCQ;
+
+    const int64_t s01 = nb01/sizeof(float);
+    const int64_t s02 = nb02/sizeof(float);
+    const int64_t s03 = nb03/sizeof(float);
+    const int64_t s10 = nb10/sizeof(idx_t);
+    const int64_t s11 = nb11/sizeof(idx_t);
+    const int64_t s12 = nb12/sizeof(idx_t);
+
+    if (n_blocks > 0) {
+        const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
+        k_set_rows_turbo_tcq<idx_t, 2, 4><<<(int)ne_total, 256, 0, stream>>>(
+            src0_d, src1_d, (char *)dst->data,
+            ne00, ne01, ne10, ne11, ne12, ne13,
+            s01, s02, s03, s10, s11, s12,
+            nb1, nb2, nb3, dst_row_base,
+            (int64_t)sizeof(block_turbo2_tcq));
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -1425,6 +1726,10 @@ static void set_rows_cuda(
         set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else if (dst->type == GGML_TYPE_TURBO8_0) {
         set_rows_cuda_turbo8<idx_t>(ctx, src0, src1, dst, dst_row_base);
+    } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
+        set_rows_cuda_turbo3_tcq<idx_t>(ctx, src0, src1, dst, dst_row_base);
+    } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
+        set_rows_cuda_turbo2_tcq<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
