@@ -1212,6 +1212,10 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             result.classified = true;
             break;
         default:
@@ -1235,6 +1239,11 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        // turbo8 / TCQ use k_set_rows_turbo8 / k_set_rows_turbo_tcq (Viterbi) on device too.
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             result.online_write = true;
             break;
         default:
@@ -1273,6 +1282,10 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             result.decode_f16 = true;
             break;
         default:
