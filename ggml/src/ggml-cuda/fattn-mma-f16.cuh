@@ -2340,6 +2340,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 
+    // The dispatch above is supposed to pick a tile that fits this device's shared memory.
+    // If it does not (e.g. a new head_dim / tile combination on an arch with a small opt-in
+    // limit like sm_70's 96 KB), cudaFuncSetAttribute(MaxDynamicSharedMemorySize, ...) below
+    // would fail with an opaque cudaErrorInvalidValue. Fail loudly here instead, naming the
+    // overflowing configuration, so the dispatch heuristic gets fixed rather than triaged as
+    // a driver error.
+    if (nbytes_shared_total > ggml_cuda_info().devices[id].smpbo) {
+        GGML_ABORT("fatal error: flash_attn_ext_f16<%d,%d,%d,%d> needs %zu bytes of dynamic shared memory, "
+                   "exceeding device %d's %zu-byte limit; the dispatch chose a tile too wide for this GPU\n",
+                   DKQ, DV, ncols1, ncols2, nbytes_shared_total, id, ggml_cuda_info().devices[id].smpbo);
+    }
+
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
