@@ -325,6 +325,8 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
+    # CUDA-vs-CPU parity of the TurboQuant KV encoders (SET_ROWS). Needs no model file.
+    llama_build_and_test(test-turbo-cuda-parity.cpp LABEL cuda)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
