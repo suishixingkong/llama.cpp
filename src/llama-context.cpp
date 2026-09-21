@@ -4228,27 +4228,14 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
-    // TurboQuant TCQ KV types (turbo1_tcq / turbo2_tcq / turbo3_tcq). All three now have a
-    // full codec: CPU reference (Viterbi + trellis decode) and the CUDA path (Viterbi encode
-    // in SET_ROWS, trellis decode in GET_ROWS/convert, and the FA vec kernels). They are
-    // still refused here, deliberately, for one reason: this tree has no backend-capability
-    // gate for them. buun does the equivalent check against its VBR backend registry
-    // (llama_vbr_backend_devs_for_buft) at KV-buffer allocation; without one, a CPU fallback
-    // reaches a CPU attention path that has no turbo vec_dot, i.e. a crash rather than a
-    // clear error. This should become a capability query, not an unconditional refusal --
-    // after the required GPU validation.
-    {
-        const bool k_is_tcq = params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ ||
-                              params.type_k == GGML_TYPE_TURBO1_TCQ;
-        const bool v_is_tcq = params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ ||
-                              params.type_v == GGML_TYPE_TURBO1_TCQ;
-        if (k_is_tcq || v_is_tcq) {
-            LLAMA_LOG_ERROR("%s: TCQ KV cache type %s is not enabled in this build yet "
-                    "(codec ported for CUDA, backend-capability gate pending)\n",
-                    __func__, ggml_type_name(k_is_tcq ? params.type_k : params.type_v));
-            return nullptr;
-        }
-    }
+    // TurboQuant TCQ KV types (turbo1_tcq / turbo2_tcq / turbo3_tcq) are enabled. Both
+    // paths a turbo KV cache needs are present:
+    //   - CPU: ggml's CPU flash attention is generic -- it needs type_traits_cpu[K].vec_dot
+    //     and type_traits[V].to_float, nothing else -- and all three types register both,
+    //     so a TCQ KV cache runs on the CPU backend.
+    //   - CUDA: dedicated Viterbi encode in SET_ROWS plus trellis decode in the FA vec
+    //     kernels. Those numerics are compile-checked only; no GPU was available to
+    //     validate them. See VALIDATE_TURBO_GPU.md.
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {

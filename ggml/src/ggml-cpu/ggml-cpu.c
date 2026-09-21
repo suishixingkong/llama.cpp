@@ -226,6 +226,15 @@ static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
 static void ggml_vec_dot_turbo8_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo3_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo2_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo1_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
 static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
@@ -465,8 +474,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     // TurboQuant 8-bit / TCQ KV cache types (ported from buun-llama-cpp).
-    // KV-cache-only types: no CPU vec_dot (the CPU encode/decode is a stub by design;
-    // turbo-typed KV is rejected on backends without TurboQuant support).
+    // These are KV-cache-only types, but they are fully usable on the CPU backend: the
+    // CPU reference codec is a real codec (not a stub), and ggml's CPU flash attention is
+    // generic -- it only needs type_traits_cpu[K].vec_dot and type_traits[V].to_float.
+    // Both are registered below, so a TCQ KV cache works on CPU with flash attention.
     [GGML_TYPE_TURBO8_0] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo8_0_ref,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo8_0_f32,
@@ -475,14 +486,20 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_TURBO3_TCQ] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo3_tcq_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_tcq_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_TURBO2_TCQ] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo2_tcq_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo2_tcq_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_TURBO1_TCQ] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo1_tcq_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo1_tcq_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
 };
@@ -3634,6 +3651,55 @@ static void ggml_vec_dot_turbo8_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
     }
     free(tmp);
     *s = sum;
+}
+
+// TurboQuant TCQ vec_dot: dequantize the trellis block to f32 and dot with the f32
+// operand. This is the K side of flash attention, and it is what makes the TCQ types
+// usable on the CPU backend: ggml's CPU flash attention is generic -- it needs
+// type_traits_cpu[K].vec_dot for K and type_traits[V].to_float for V, and nothing else.
+//
+// No inverse WHT here. Like turbo2/3/4/8, the TCQ decoder stays in the rotated domain;
+// Q is rotated by the graph (GGML_OP_TURBO_WHT) and the inverse WHT is applied to the
+// attention output, so the dot product is taken between two rotated vectors, which is
+// what the WHT being orthogonal makes equivalent to the unrotated one.
+static void ggml_vec_dot_turbo_tcq_f32(enum ggml_type type, int n, float * GGML_RESTRICT s,
+                                        const void * GGML_RESTRICT vx,
+                                        const void * GGML_RESTRICT vy) {
+    float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(type)->to_float(vx, tmp, n);
+
+    const float * y = (const float *)vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += tmp[i] * y[i];
+    }
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo3_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_vec_dot_turbo_tcq_f32(GGML_TYPE_TURBO3_TCQ, n, s, vx, vy);
+}
+
+static void ggml_vec_dot_turbo2_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_vec_dot_turbo_tcq_f32(GGML_TYPE_TURBO2_TCQ, n, s, vx, vy);
+}
+
+static void ggml_vec_dot_turbo1_tcq_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_vec_dot_turbo_tcq_f32(GGML_TYPE_TURBO1_TCQ, n, s, vx, vy);
 }
 
 // TQ3_1S vec_dot: dequantize tq3_1s block to f32, then dot with q8_0.

@@ -370,6 +370,12 @@ if (NOT GGML_BACKEND_DL)
         ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
     add_test(NAME test-turbo-quant COMMAND test-turbo-quant)
+
+    # End-to-end CPU-backend flash attention with a TurboQuant TCQ KV cache.
+    # Links ggml only (no llama), and uses the CPU backend, so it needs no GPU.
+    add_executable(test-turbo-tcq-cpu-fa test-turbo-tcq-cpu-fa.cpp)
+    target_link_libraries(test-turbo-tcq-cpu-fa PRIVATE ggml)
+    add_test(NAME test-turbo-tcq-cpu-fa COMMAND test-turbo-tcq-cpu-fa)
 endif()
 
 # libmtmd
