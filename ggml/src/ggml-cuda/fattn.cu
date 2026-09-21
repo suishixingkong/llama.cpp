@@ -2553,6 +2553,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
+    // Volta (sm_70) only: the 64-column D=576 tile needs ~101 KB of dynamic shared memory
+    // (Q = 64*(576/2+4)*4 = 74752 B, KV = 32*tile_stride(160)*4 = 20992 B, mask = 5120 B,
+    //  total = 100864 B), which exceeds V100's 96 KB opt-in limit, so
+    // cudaFuncSetAttribute(MaxDynamicSharedMemorySize) fails with cudaErrorInvalidValue.
+    // Newer archs hold this comfortably (A100 163 KB, Hopper 227 KB), so only Volta is
+    // capped, at ncols=32 (~61 KB). Mirrors the D=640 cap in ggml_cuda_flash_attn_ext_mma_f16.
+    if (volta_mma_available(cc) && DKQ == 576) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
