@@ -100,14 +100,14 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
     // Turbo3 uses the float Q path (like f16/bf16), not q8_1 integer path
-    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO8_0 || type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ);
-    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ);
-    constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO8_0 || type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ);
+    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO8_0 || type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ);
+    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ);
+    constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO8_0 || type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ);
     // Turbo KQ dot does byte extraction + centroid lookup + scalar mul, not vectorized f16 loads.
     // nthreads_KQ=1: each thread computes a full KQ product alone — eliminates warp_reduce_sum
     // shuffle and halves KQ loop iterations. Each thread holds full Q vector in registers.
     constexpr int nthreads_KQ = K_is_turbo ? 1 : (K_is_unquantized ? nthreads_f : nthreads_KQ_q);
-    constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ);
+    constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ);
     // Turbo V dequant is scalar (byte extract + LUT), not vectorized loads.
     // Halve nthreads_V to double V_cols_per_iter (process 2 V rows per loop iteration),
     // reducing loop overhead and improving ILP in the V aggregation phase.
@@ -118,7 +118,7 @@ static __global__ void flash_attn_ext_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) ? 4 : 2*cpy_ne) : 4;
+    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) ? 4 : 2*cpy_ne) : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
@@ -1160,3 +1160,47 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_TCQ);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_TCQ);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_TCQ);
+
+
+// TurboQuant TCQ1 (1.25 bpv) -- the bottom rung of the VBR ladder. Mixed pairs on both
+// sides of every other tier are included because K and V are chosen independently.
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO1_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO3_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO3_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO3_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO1_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_F16);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO1_TCQ);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO1_TCQ);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO1_TCQ);

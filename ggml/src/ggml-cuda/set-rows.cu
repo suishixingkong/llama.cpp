@@ -1406,9 +1406,10 @@ static __global__ void k_set_rows_turbo_tcq(
     __shared__ uint8_t sym[128];
     __shared__ float   s_grp_norm;
 
-    // ---- codebook ----
-    if constexpr (K == 3) { cb_s[j] = TURBO_TCQ3_CODEBOOK[j]; }
-    else                  { cb_s[j] = TURBO_TCQ2_CODEBOOK[j]; }
+    // ---- codebook (its length always equals the state count NS) ----
+    if constexpr (K == 3)      { cb_s[j] = TURBO_TCQ3_CODEBOOK[j]; }
+    else if constexpr (K == 2) { cb_s[j] = TURBO_TCQ2_CODEBOOK[j]; }
+    else                       { cb_s[j] = TURBO_TCQ1_CODEBOOK[j]; }
 
     // ---- load the group and reduce its L2 norm ----
     if (j < QKB) x[j] = src_row[i_blk * QKB + j];
@@ -1617,6 +1618,42 @@ static void set_rows_cuda_turbo2_tcq(
     }
 }
 
+template<typename idx_t>
+static void set_rows_cuda_turbo1_tcq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        const int64_t dst_row_base) {
+
+    const float * src0_d = (const float *)src0->data;
+    const idx_t * src1_d = (const idx_t *)src1->data;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 % QK_TURBO1_TCQ == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_blocks = ne00 / QK_TURBO1_TCQ;
+
+    const int64_t s01 = nb01/sizeof(float);
+    const int64_t s02 = nb02/sizeof(float);
+    const int64_t s03 = nb03/sizeof(float);
+    const int64_t s10 = nb10/sizeof(idx_t);
+    const int64_t s11 = nb11/sizeof(idx_t);
+    const int64_t s12 = nb12/sizeof(idx_t);
+
+    if (n_blocks > 0) {
+        const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
+        k_set_rows_turbo_tcq<idx_t, 1, 8><<<(int)ne_total, 256, 0, stream>>>(
+            src0_d, src1_d, (char *)dst->data,
+            ne00, ne01, ne10, ne11, ne12, ne13,
+            s01, s02, s03, s10, s11, s12,
+            nb1, nb2, nb3, dst_row_base,
+            (int64_t)sizeof(block_turbo1_tcq));
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -1730,6 +1767,8 @@ static void set_rows_cuda(
         set_rows_cuda_turbo3_tcq<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         set_rows_cuda_turbo2_tcq<idx_t>(ctx, src0, src1, dst, dst_row_base);
+    } else if (dst->type == GGML_TYPE_TURBO1_TCQ) {
+        set_rows_cuda_turbo1_tcq<idx_t>(ctx, src0, src1, dst, dst_row_base);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

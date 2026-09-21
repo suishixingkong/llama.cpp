@@ -1161,15 +1161,16 @@ size_t quantize_turbo8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 #include "ggml-turbo-tcq-tables.h"
 
 typedef struct {
-    int           k;        /* bits per trellis symbol (3 / 2) */
+    int           k;        /* bits per trellis symbol (3 / 2 / 1) */
     int           nstates;  /* 2^(k*w) */
-    int           w;        /* symbols in the reconstruction window (3 / 4) */
+    int           w;        /* symbols in the reconstruction window (3 / 4 / 8) */
     int           nbytes;   /* trellis bitstream payload bytes */
     const float * cb;
 } turbo_tcq_geom;
 
 static const turbo_tcq_geom TURBO_TCQ3_GEOM = { 3, 512, 3, 49, TURBO_TCQ3_CODEBOOK };
 static const turbo_tcq_geom TURBO_TCQ2_GEOM = { 2, 256, 4, 33, TURBO_TCQ2_CODEBOOK };
+static const turbo_tcq_geom TURBO_TCQ1_GEOM = { 1, 256, 8, 17, TURBO_TCQ1_CODEBOOK };
 
 /* Decode one 128-element group. Mirrors the CUDA per-element trellis lookup. */
 static void turbo_tcq_decode_group(const uint8_t * GGML_RESTRICT qs, const turbo_tcq_geom * g,
@@ -1213,10 +1214,10 @@ static void turbo_tcq_encode_group(const float * GGML_RESTRICT x, const turbo_tc
 
     /* Viterbi forward pass, double-buffered. t even: read cost, write cost_b; odd: swap.
      * After 128 steps the final costs live in cost[]. */
-    float   cost[512];
+    float   cost[512];          /* >= nstates (512 for k=3) */
     float   cost_b[512];
-    float   pred_min[64];
-    uint8_t bt[128 * 64];
+    float   pred_min[128];      /* >= npre = nstates >> k (128 for k=1) */
+    uint8_t bt[128 * 128];      /* 128 steps x npre backpointers */
 
     for (int s = 0; s < nstates; s++) {
         cost[s] = 0.0f;   /* free initial state */
@@ -1378,32 +1379,44 @@ size_t quantize_turbo2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT
     return nrows * row_size;
 }
 
-/* ---------- TURBO1_TCQ: CPU stubs (intentionally not implemented yet) ---------- */
-/* turbo1_tcq uses the same right-shift trellis (k=1, w=8, 256 states, 7-bit init prefix)
- * and the generic core above would handle it, but buun's *decode* convention for this
- * tier is not settled: its FA path carries two decoders, one emitting the stored rotated
- * coefficients and one applying a per-row inverse FWHT, selected at runtime. Guessing
- * wrong would ship a reference that disagrees with the GPU. Left as a stub until the
- * convention is pinned down with GPU measurements (see BUUN_MERGE_PLAN.md). */
+/* ---------- TURBO1_TCQ (1.25 bpv) ---------- */
+/* Same right-shift trellis, k=1, w=8, 256 states, 7-bit init prefix, so the generic core
+ * above handles it unchanged.
+ *
+ * Convention resolved from the graph, not from the fork. buun's FA path carries TWO
+ * decoders for this tier: one applying a per-row inverse FWHT (emitting the original
+ * domain) and one emitting the stored rotated coefficients. Which one is correct is not a
+ * property of the codec -- the stored bits are identical either way -- it follows from how
+ * the graph compensates the rotation:
+ *
+ *   this tree (llama-graph.cpp): Q is rotated FORWARD and K stays rotated in the cache, so
+ *   the scores need no un-rotation; V stays rotated too and the graph applies the INVERSE
+ *   WHT to the attention output (both the FA output and the non-FA `kqv`). Both gates
+ *   already list GGML_TYPE_TURBO1_TCQ.
+ *
+ * So this tier decodes in the ROTATED domain here, exactly like turbo2/3_tcq and
+ * turbo2/3/4/8 -- i.e. buun's `..._dequant_f16_rot` variant, whose own comment says it
+ * mirrors the turbo2/3_tcq contract. buun's inverse-FWHT-at-dequant variant belongs to a
+ * different graph configuration and is deliberately not taken. */
 
 void quantize_row_turbo1_tcq_ref(const float * GGML_RESTRICT x, block_turbo1_tcq * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO1_TCQ == 0);
-    const int nb = k / QK_TURBO1_TCQ;
-    for (int b = 0; b < nb; b++) {
-        const float * src = x + b * QK_TURBO1_TCQ;
-        float ns = 0.0f;
-        for (int i = 0; i < QK_TURBO1_TCQ; i++) ns += src[i] * src[i];
-        /* buun scales by 1/sqrt(128) here so the norm matches the FWHT-domain convention */
-        y[b].norm = GGML_FP32_TO_FP16(sqrtf(ns) * 0.08838834764831845f);
-        memset(y[b].qs, 0, sizeof(y[b].qs));
-        y[b].pad = 0;
+    const int64_t nb = k / QK_TURBO1_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        float norm;
+        turbo_tcq_encode_group(x + b * QK_TURBO1_TCQ, &TURBO_TCQ1_GEOM, y[b].qs, &norm);
+        y[b].norm = GGML_FP32_TO_FP16(norm);
+        y[b].pad  = 0;
     }
 }
 
 void dequantize_row_turbo1_tcq(const block_turbo1_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    GGML_UNUSED(x);
     assert(k % QK_TURBO1_TCQ == 0);
-    memset(y, 0, (size_t) k * sizeof(float)); /* stub */
+    const int64_t nb = k / QK_TURBO1_TCQ;
+    for (int64_t b = 0; b < nb; b++) {
+        turbo_tcq_decode_group(x[b].qs, &TURBO_TCQ1_GEOM, GGML_FP16_TO_FP32(x[b].norm),
+                               y + b * QK_TURBO1_TCQ);
+    }
 }
 
 size_t quantize_turbo1_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,

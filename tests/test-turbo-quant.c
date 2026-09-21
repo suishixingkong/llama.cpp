@@ -202,7 +202,9 @@ static void tcq_check_layout(const char * name, int k, int w, int nbytes,
                              const float * cb, tcq_dequant_fn deq) {
     const int shift = k * (w - 1);
     const int nsym  = 1 << k;
-    const int init_state = 0x15A % (1 << (k * w));   /* low k bits are not representable */
+    /* Force the low k bits to 1: that is the part of the pre-group state the bitstream
+     * cannot represent, so it must not influence any decoded element. */
+    const int init_state = (0x15A % (1 << (k * w))) | ((1 << k) - 1);
 
     memset(&tstore, 0, sizeof(tstore));
     tstore.b3.norm = 0x3C00;                          /* fp16 1.0 */
@@ -534,6 +536,7 @@ int main(void) {
     printf("Test 13: TCQ bitstream layout (constructive, from known symbols)\n");
     tcq_check_layout("t3_tcq", 3, 3, 52, TURBO_TCQ3_CODEBOOK, dequantize_row_turbo3_tcq);
     tcq_check_layout("t2_tcq", 2, 4, 36, TURBO_TCQ2_CODEBOOK, dequantize_row_turbo2_tcq);
+    tcq_check_layout("t1_tcq", 1, 8, 20, TURBO_TCQ1_CODEBOOK, dequantize_row_turbo1_tcq);
     printf("\n");
 
     printf("Test 14: TCQ3 (3.25 bpv) encode/decode + Viterbi optimality\n");
@@ -552,6 +555,15 @@ int main(void) {
     for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
     tcq_full_case("t2_tcq random", 2, 4, TURBO_TCQ2_CODEBOOK,
                   quantize_row_turbo2_tcq_ref, dequantize_row_turbo2_tcq, input, 0.95);
+    printf("\n");
+
+    printf("Test 15b: TCQ1 (1.25 bpv) encode/decode + Viterbi optimality\n");
+    for (int i = 0; i < d; i++) { input[i] = sinf(i * 0.37f + 1.1f) * 7.0f; }
+    tcq_full_case("t1_tcq smooth", 1, 8, TURBO_TCQ1_CODEBOOK,
+                  quantize_row_turbo1_tcq_ref, dequantize_row_turbo1_tcq, input, 0.70);
+    for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+    tcq_full_case("t1_tcq random", 1, 8, TURBO_TCQ1_CODEBOOK,
+                  quantize_row_turbo1_tcq_ref, dequantize_row_turbo1_tcq, input, 0.70);
     printf("\n");
 
     printf("Test 16: TCQ edge cases\n");
@@ -642,6 +654,40 @@ int main(void) {
         printf("  turbo2_0   (34 B/128, scalar): cosine=%.6f\n", c1);
         printf("  turbo2_tcq (36 B/128, trellis): cosine=%.6f\n", c2);
         check_eq_i("t2_tcq cosine beats scalar turbo2_0", c2 > c1 ? 1 : 0, 1);
+        printf("\n");
+    }
+
+    /* ---------------------------------------------------------------
+     * Test 19: within the TCQ family, more bits per value must give a better
+     * reconstruction. There is no scalar 1-bit codec in this tree to compare
+     * against (buun's reserved turbo1 / turbo1_nsn / turbo1_cq slots are dead
+     * codecs), so the check is that fidelity is monotone in the bit rate.
+     * --------------------------------------------------------------- */
+    printf("Test 19: TCQ family fidelity is monotone in the bit rate\n");
+    {
+        static float dec[128];
+        double mse, cos, in_norm, out_norm;
+        double cs[3];
+        const struct {
+            const char * name; int k, w, bytes;
+            const float * cb; tcq_quant_fn q; tcq_dequant_fn dq;
+        } fam[3] = {
+            { "t1_tcq", 1, 8, 20, TURBO_TCQ1_CODEBOOK, quantize_row_turbo1_tcq_ref, dequantize_row_turbo1_tcq },
+            { "t2_tcq", 2, 4, 36, TURBO_TCQ2_CODEBOOK, quantize_row_turbo2_tcq_ref, dequantize_row_turbo2_tcq },
+            { "t3_tcq", 3, 3, 52, TURBO_TCQ3_CODEBOOK, quantize_row_turbo3_tcq_ref, dequantize_row_turbo3_tcq },
+        };
+        for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+        for (int f = 0; f < 3; f++) {
+            memset(&tstore, 0, sizeof(tstore));
+            fam[f].q(input, &tstore, d);
+            fam[f].dq(&tstore, dec, d);
+            turbo_cpu_fwht_inverse(dec, d);
+            stats(input, dec, d, &mse, &cos, &in_norm, &out_norm);
+            cs[f] = cos;
+            printf("  %s (%2d B/128): cosine=%.6f\n", fam[f].name, fam[f].bytes, cos);
+        }
+        check_eq_i("t2_tcq fidelity beats t1_tcq", cs[1] > cs[0] ? 1 : 0, 1);
+        check_eq_i("t3_tcq fidelity beats t2_tcq", cs[2] > cs[1] ? 1 : 0, 1);
         printf("\n");
     }
 

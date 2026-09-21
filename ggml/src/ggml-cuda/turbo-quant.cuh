@@ -465,16 +465,18 @@ static __device__ __forceinline__ float turbo8_dequant_element(
     return turbo8_uniform_centroid(x->qs[j]) * norm;
 }
 
-// ---- TCQ trellis decode (turbo3_tcq / turbo2_tcq) ----
+// ---- TCQ trellis decode (turbo1_tcq / turbo2_tcq / turbo3_tcq) ----
 //
 // Decode is an O(1) sliding-window lookup over the trellis bitstream: element t reads the
 // k*w bits starting at bit t*k (LSB-first) and that value indexes the codebook directly.
 // The bitstream is (w-1)*k init bits followed by 128 k-bit symbols, so element 0's window
-// already spans the init prefix plus the first symbol. Unlike turbo1_tcq there is no
-// inverse WHT here: the output stays in the rotated domain, exactly like turbo2/3/4/8.
+// already spans the init prefix plus the first symbol. There is no inverse WHT here for any
+// of them: the output stays in the rotated domain, exactly like turbo2/3/4/8, because this
+// tree rotates Q forward and un-rotates the attention output (see llama-graph.cpp).
 
 #define QR_TURBO3_TCQ 1  // Each dequantize call produces 2 consecutive elements
 #define QR_TURBO2_TCQ 1
+#define QR_TURBO1_TCQ 1
 
 static __device__ __forceinline__ float turbo3_tcq_dequant_element(
         const block_turbo3_tcq * __restrict__ x, int t, float norm) {
@@ -482,6 +484,14 @@ static __device__ __forceinline__ float turbo3_tcq_dequant_element(
     const int bit_off  = bit_pos & 7;
     const uint16_t raw = (uint16_t) x->qs[bit_pos >> 3] | ((uint16_t) x->qs[(bit_pos >> 3) + 1] << 8);
     return TURBO_TCQ3_CODEBOOK[(raw >> bit_off) & 0x1FF] * norm;
+}
+
+// 1-bit: k=1 and w=8, so one bit per element and the 8-bit window is just 8 consecutive bits.
+static __device__ __forceinline__ float turbo1_tcq_dequant_element(
+        const block_turbo1_tcq * __restrict__ x, int t, float norm) {
+    const int bit_off  = t & 7;
+    const uint16_t raw = (uint16_t) x->qs[t >> 3] | ((uint16_t) x->qs[(t >> 3) + 1] << 8);
+    return TURBO_TCQ1_CODEBOOK[(raw >> bit_off) & 0xFF] * norm;
 }
 
 static __device__ __forceinline__ float turbo2_tcq_dequant_element(

@@ -155,7 +155,7 @@ static __device__ __forceinline__ void dequantize_turbo8_0(const void * vx, cons
     v.y = turbo8_dequant_element(&x[ib], iqs + 1, norm);
 }
 
-// TCQ trellis types: 3-bit / 2-bit, block size 128. Both stay in the rotated domain.
+// TCQ trellis types: 1/2/3-bit, block size 128. All stay in the rotated domain.
 static __device__ __forceinline__ void dequantize_turbo3_tcq(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_turbo3_tcq * x = (const block_turbo3_tcq *) vx;
     const float norm = __half2float(x[ib].norm);
@@ -168,6 +168,13 @@ static __device__ __forceinline__ void dequantize_turbo2_tcq(const void * vx, co
     const float norm = __half2float(x[ib].norm);
     v.x = turbo2_tcq_dequant_element(&x[ib], iqs + 0, norm);
     v.y = turbo2_tcq_dequant_element(&x[ib], iqs + 1, norm);
+}
+
+static __device__ __forceinline__ void dequantize_turbo1_tcq(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo1_tcq * x = (const block_turbo1_tcq *) vx;
+    const float norm = __half2float(x[ib].norm);
+    v.x = turbo1_tcq_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = turbo1_tcq_dequant_element(&x[ib], iqs + 1, norm);
 }
 
 // TQ4_1S: 4-bit weight type with inverse WHT, block size 32, dual half-block scales
