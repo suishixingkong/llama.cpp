@@ -2,6 +2,7 @@
 #include "convert.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-turbo.cuh"
 #include "fattn-q8-volta.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -11,20 +12,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
-
-// Compile coverage for the TurboQuant MMA tile loader (BUUN_MERGE_PLAN.md section 1.4a). The
-// runtime dispatch that reaches flash_attn_ext_turbo_load_tile lands with the turbo launcher;
-// until then this keeps the loader body syntax- and codegen-checked whenever the turbo8 or
-// turbo3_tcq combination is part of GGML_CUDA_FA_QUANTS.
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
-static __global__ void flash_attn_ext_turbo_load_tile_compile_check(
-        const half2 * KV, half2 * tile, int stride_KV_bytes, int elem0) {
-    flash_attn_ext_turbo_load_tile<GGML_TYPE_TURBO8_0, 132, false, 8, 64, false, false>
-        (KV, tile, 64, stride_KV_bytes, elem0, 0, 64, nullptr);
-    flash_attn_ext_turbo_load_tile<GGML_TYPE_TURBO3_TCQ, 132, false, 8, 64, false, false>
-        (KV, tile, 64, stride_KV_bytes, elem0, 0, 64, nullptr);
-}
-#endif // GGML_CUDA_FA_TURBO8_0_TURBO8_0
 #include <unordered_map>
 #include <vector>
 
@@ -3068,6 +3055,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_TURBO = 350,
     BEST_FATTN_KERNEL_VOLTA_Q8_W4 = 500,
 };
 
@@ -3101,6 +3089,68 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
             return true;
         default:
             return false;
+    }
+}
+
+// Opt-in gate for the TurboQuant tensor-core FA path (B+ Stage 1c L1, BUUN_MERGE_PLAN.md
+// section 1.4a). Enabled via GGML_CUDA_TURBO_MMA=1 (value-based, 0 = off) for A/B benchmarking
+// against the regular kernel selection below. Returns true only for shapes that have compiled
+// instances: symmetric turbo pairs, head dims 128/256, and only when the pair's
+// GGML_CUDA_FA_<K>_<V> macro says the instances were compiled (GGML_CUDA_FA_QUANTS). Anything
+// else keeps the regular VEC/TILE/MMA_F16 selection, i.e. an uncompiled pair silently falls back.
+static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * dst) {
+    static const bool turbo_mma_enabled = [] {
+        const char * env = std::getenv("GGML_CUDA_TURBO_MMA");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!turbo_mma_enabled) {
+        return false;
+    }
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (K->type != V->type) {
+        return false; // only symmetric pairs are instantiated
+    }
+    switch (dst->src[0]->ne[0]) { // head dim == DKQ for the non-view shapes we instantiate
+        case 128:
+        case 256:
+            break;
+        default:
+            return false;
+    }
+    switch (K->type) {
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+        case GGML_TYPE_TURBO8_0:
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+        case GGML_TYPE_TURBO3_TCQ:
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+        case GGML_TYPE_TURBO2_TCQ:
+#endif
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+        case GGML_TYPE_TURBO1_TCQ:
+#endif
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    switch (Q->ne[0]) {
+        case 128:
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128>(ctx, dst);
+            break;
+        case 256:
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256>(ctx, dst);
+            break;
+        default:
+            // ggml_cuda_flash_attn_ext_mma_turbo_selectable() only lets 128/256 through.
+            GGML_ABORT("fatal error: no TurboQuant MMA instances for head dim %d", (int) Q->ne[0]);
     }
 }
 
@@ -3274,6 +3324,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Opt-in TurboQuant tensor-core path (GGML_CUDA_TURBO_MMA=1). When enabled it takes
+        // precedence over VEC/TILE/MMA_F16 for the shapes with compiled instances, so the
+        // env var gives a clean A/B against whatever the regular selection below would pick.
+        if (ggml_cuda_flash_attn_ext_mma_turbo_selectable(dst)) {
+            return BEST_FATTN_KERNEL_MMA_TURBO;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -3365,6 +3421,9 @@ static void ggml_cuda_flash_attn_ext_needs_f16(
             *need_f16_K = true;
             *need_f16_V = true;
             break;
+        // TurboQuant MMA decodes turbo KV tiles in-kernel; nothing is converted to f16.
+        case BEST_FATTN_KERNEL_MMA_TURBO:
+            break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             *need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -3412,6 +3471,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_TURBO:
+            ggml_cuda_flash_attn_ext_mma_turbo(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
             ggml_q8v::launch(ctx, dst);
