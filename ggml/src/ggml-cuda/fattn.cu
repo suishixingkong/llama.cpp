@@ -2562,9 +2562,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
+    // On Volta the mma kernel body itself rejects a tile narrower than 32 columns:
+    // fattn-mma-f16.cuh compiles that case to NO_DEVICE_CODE (the
+    // "#ifdef VOLTA_MMA_AVAILABLE / ncols1*ncols2 < 32" guard). So the rungs below that would
+    // pick ncols1*ncols2 of 8 or 16 must be skipped on Volta -- selecting them launches a
+    // kernel that has no device code for this arch, which surfaces as
+    //   "CUDA kernel flash_attn_ext_f16 has no device code compatible with CUDA arch 700"
+    // followed by "unspecified launch failure". 32/ncols2 * ncols2 is always 32, so the
+    // 32-column tile is the narrowest one Volta accepts and is safe to fall through to.
+    const bool requires_ncols_ge_32 = volta_mma_available(cc);
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
-        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+        // a sparse tile is ncols == ncols2 (8 or 16), below Volta's minimum
+        if (!requires_ncols_ge_32 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
@@ -2579,7 +2590,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] <= 16/ncols2) {
+        if (!requires_ncols_ge_32 && Q->ne[1] <= 16/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
