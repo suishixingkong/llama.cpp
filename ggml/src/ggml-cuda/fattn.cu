@@ -1111,6 +1111,42 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, TURBO4_0)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO3_0)
 
+    // TurboQuant turbo8 / TCQ (ported from buun-llama-cpp): same treatment as turbo2/3/4 above.
+    // DECL_FATTN_VEC_CASE already instantiates the streamed partial case alongside the regular
+    // one for every pair that has an instance file, so no extra kernel work is needed here --
+    // the native streamed attention path becomes available for these types too. Pairs whose
+    // instance was not compiled are skipped by the `if constexpr (GGML_CUDA_FA_*)` gate, which
+    // keeps this list in sync with what ggml_cuda_flash_attn_ext_vec_partial_case can find.
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, TURBO8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,      TURBO8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,     TURBO8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, TURBO4_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO8_0)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_TCQ, TURBO2_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, TURBO2_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_TCQ, TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,        TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,        TURBO2_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_TCQ, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,       TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,       TURBO2_TCQ)
+
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO1_TCQ, TURBO1_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, TURBO1_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_TCQ, TURBO1_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO1_TCQ, TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO1_TCQ, TURBO2_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(F16,        TURBO1_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO1_TCQ, F16)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q8_0,       TURBO1_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO1_TCQ, Q8_0)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0,   TURBO1_TCQ)
+
     // Base K/V types.
     KV_STREAM_NATIVE_PARTIAL_CASE(F16,  F16)
     KV_STREAM_NATIVE_PARTIAL_CASE(Q4_0, F16)
@@ -1304,9 +1340,15 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // the same ggml_cuda_flash_attn_ext_vec_partial_case <K,V> instance that non-streamed
         // turbo attention uses. The forward WHT on Q and the inverse rotation on the attention
         // output are graph ops (llama-graph.cpp), so they are unaffected by which FA kernel runs.
+        // turbo8 / TCQ are included because DECL_FATTN_VEC_CASE instantiates their streamed
+        // partial case as well; kv_stream_resolve_native_partial() below lists the valid pairs.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             result.direct_attention = true;
             break;
         default:
