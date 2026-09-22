@@ -35,6 +35,10 @@ extern void dequantize_row_turbo2_tcq(const void * x, float * y, long long k);
 extern void quantize_row_turbo1_tcq_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo1_tcq(const void * x, float * y, long long k);
 
+/* q8_0 reference codec, for the turbo8-vs-q8_0 quality comparison (both 8-bit). */
+extern void quantize_row_q8_0_ref(const float * x, void * y, long long k);
+extern void dequantize_row_q8_0(const void * x, float * y, long long k);
+
 /* The TCQ trellis codebooks, taken from the very same data file the library compiles in,
  * so the test can verify the encoder's chosen path cost without inventing a second
  * source of truth for the quantizer. */
@@ -688,6 +692,52 @@ int main(void) {
         }
         check_eq_i("t2_tcq fidelity beats t1_tcq", cs[1] > cs[0] ? 1 : 0, 1);
         check_eq_i("t3_tcq fidelity beats t2_tcq", cs[2] > cs[1] ? 1 : 0, 1);
+        printf("\n");
+    }
+
+    /* ---------------------------------------------------------------
+     * Test 20: turbo8 vs q8_0 on identical data. Both are 8-bit, so this is the
+     * quality question at the same bit rate tier: turbo8 rotates first (WHT spreads
+     * outliers across the block) but quantises a whole 128-element block with one
+     * absmax scale; q8_0 does not rotate but uses a per-32 block scale, i.e. finer
+     * scale granularity.
+     * Bit cost: q8_0 = 34 B / 32 values = 8.5 bpv; turbo8 = 130 B / 128 = 8.125 bpv.
+     * turbo8's decode stays in the rotated domain, so the inverse WHT is applied before
+     * comparing against the input; q8_0 needs no rotation.
+     * --------------------------------------------------------------- */
+    printf("Test 20: turbo8 vs q8_0 reconstruction quality (identical data)\n");
+    {
+        static unsigned char q8buf[512];
+        static float t8[128], q8[128];
+        double m1, c1, n1, o1, m2, c2, n2, o2;
+        double sum_t8 = 0.0, sum_q8 = 0.0;
+        double mse_t8 = 0.0, mse_q8 = 0.0;
+        const int ntrials = 32;
+
+        for (int trial = 0; trial < ntrials; trial++) {
+            for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+
+            memset(&tstore, 0, sizeof(tstore));
+            quantize_row_turbo8_0_ref(input, &tstore, d);
+            dequantize_row_turbo8_0(&tstore, t8, d);
+            turbo_cpu_fwht_inverse(t8, d);
+            stats(input, t8, d, &m1, &c1, &n1, &o1);
+            sum_t8 += c1; mse_t8 += m1 / (n1 * n1 / d);
+
+            memset(q8buf, 0, sizeof(q8buf));
+            quantize_row_q8_0_ref(input, q8buf, d);
+            dequantize_row_q8_0(q8buf, q8, d);
+            stats(input, q8, d, &m2, &c2, &n2, &o2);
+            sum_q8 += c2; mse_q8 += m2 / (n2 * n2 / d);
+        }
+        sum_t8 /= ntrials; sum_q8 /= ntrials;
+        mse_t8 /= ntrials; mse_q8 /= ntrials;
+
+        printf("  turbo8 (8.125 bpv, WHT + per-block absmax): mean cosine=%.6f  rel-MSE=%.3e\n", sum_t8, mse_t8);
+        printf("  q8_0   (8.5   bpv, no WHT, per-32 scale)  : mean cosine=%.6f  rel-MSE=%.3e\n", sum_q8, mse_q8);
+        printf("  -> higher cosine / lower rel-MSE is better; bit rates are within 4.4%% of each other\n");
+        check_ge("turbo8 mean cosine is sane", sum_t8, 0.99);
+        check_ge("q8_0 mean cosine is sane", sum_q8, 0.99);
         printf("\n");
     }
 
