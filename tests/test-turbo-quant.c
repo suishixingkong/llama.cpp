@@ -741,6 +741,94 @@ int main(void) {
         printf("\n");
     }
 
+    /* ---------------------------------------------------------------
+     * Test 21: measured bpv (VRAM) and reconstruction fidelity for every KV-cache-capable
+     * type, on identical data. Uses ggml's own registered traits, so the number reported is
+     * what the library actually does. Rotated-domain (turbo) types get the inverse WHT
+     * before comparison; the others are compared in place.
+     * --------------------------------------------------------------- */
+    printf("Test 21: bpv (VRAM) vs measured fidelity, all KV types, identical data\n");
+    {
+        static const enum ggml_type kv_types[] = {
+            GGML_TYPE_F16,
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q5_0,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_TURBO8_0,
+            GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO3_0,
+            GGML_TYPE_TURBO2_0,
+            GGML_TYPE_TURBO3_TCQ,
+            GGML_TYPE_TURBO2_TCQ,
+            GGML_TYPE_TURBO1_TCQ,
+        };
+        enum { KV_N = (int) (sizeof(kv_types)/sizeof(kv_types[0])) };
+        static unsigned char buf[4096];
+        static float out[128];
+        double bpv[KV_N], relmse[2][KV_N], bpv_sorted[KV_N];
+        const int ntrials = 32;
+
+        /* Two data distributions. "uniform" is well behaved and favours the codec with the
+         * finer scale granularity; "outliers" reproduces the KV-cache reality of a few
+         * high-magnitude channels (attention sinks / massive activations), which is exactly
+         * what turbo's WHT rotation exists to spread. Reporting only the first would make
+         * turbo look strictly worse than the standard quants, which is a property of the
+         * distribution, not of the codec. */
+        static const char * mode_name[2] = { "uniform", "outliers" };
+
+        for (int t = 0; t < KV_N; t++) {
+            bpv[t] = 8.0 * (double) ggml_type_size(kv_types[t]) / (double) ggml_blck_size(kv_types[t]);
+        }
+
+        for (int mode = 0; mode < 2; mode++) {
+            for (int t = 0; t < KV_N; t++) {
+                const struct ggml_type_traits * tr = ggml_get_type_traits(kv_types[t]);
+                const int is_turbo =
+                    kv_types[t] == GGML_TYPE_TURBO8_0   || kv_types[t] == GGML_TYPE_TURBO4_0 ||
+                    kv_types[t] == GGML_TYPE_TURBO3_0   || kv_types[t] == GGML_TYPE_TURBO2_0 ||
+                    kv_types[t] == GGML_TYPE_TURBO3_TCQ || kv_types[t] == GGML_TYPE_TURBO2_TCQ ||
+                    kv_types[t] == GGML_TYPE_TURBO1_TCQ;
+
+                double acc = 0.0;
+                for (int trial = 0; trial < ntrials; trial++) {
+                    double m, c, n, o;
+                    for (int i = 0; i < d; i++) { input[i] = rnd() * 3.0f; }
+                    if (mode == 1) {
+                        /* a handful of high-magnitude channels, the rest small */
+                        for (int i = 0; i < d; i++) {
+                            const int is_outlier = (i < 2) || (i >= 61 && i < 66);
+                            input[i] = is_outlier ? input[i] * 20.0f : input[i] * 0.15f;
+                        }
+                    }
+
+                    memset(buf, 0, sizeof(buf));
+                    tr->from_float_ref(input, buf, d);
+                    tr->to_float(buf, out, d);
+                    if (is_turbo) { turbo_cpu_fwht_inverse(out, d); }
+                    stats(input, out, d, &m, &c, &n, &o);
+                    acc += m / (n * n / d);
+                }
+                relmse[mode][t] = acc / ntrials;
+            }
+        }
+
+        /* print sorted by bit rate, ascending */
+        for (int t = 0; t < KV_N; t++) { bpv_sorted[t] = bpv[t]; }
+        printf("  %-12s %8s %14s %14s\n", "type", "bpv", mode_name[0], mode_name[1]);
+        for (int rank = 0; rank < KV_N; rank++) {
+            int best = -1;
+            for (int t = 0; t < KV_N; t++) {
+                if (bpv_sorted[t] < 0.0) { continue; }
+                if (best < 0 || bpv_sorted[t] < bpv_sorted[best]) { best = t; }
+            }
+            printf("  %-12s %8.3f %14.3e %14.3e\n",
+                   ggml_type_name(kv_types[best]), bpv[best], relmse[0][best], relmse[1][best]);
+            bpv_sorted[best] = -1.0;
+        }
+        printf("  (rel-MSE, lower = better fidelity; bpv x 128 = bytes per 128 values)\n");
+        printf("\n");
+    }
+
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
