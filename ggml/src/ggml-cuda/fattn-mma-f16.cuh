@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 #include "fattn-swizzle.cuh"
+#include "turbo-quant.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -568,6 +569,115 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
+// TurboQuant KV tile loader: identical tile layout and warp work distribution as the
+// synchronous path of flash_attn_ext_f16_load_tile, but the rows are raw TurboQuant blocks and
+// every element is dequantized on the fly. cp.async cannot transform data in flight, which is
+// why the turbo instantiations force nstages == 0 and always take this synchronous loader.
+//
+// Differences from the f16 loader:
+//   - stride_KV is the row stride in BYTES (quantized rows are not half2-addressable);
+//   - KV points at the row base (the caller must not pre-advance it);
+//   - elem0 is the element offset of the first 16-element chunk within that row.
+// Every TurboQuant KV type quantizes 128 elements per block, and any 16-aligned 16-element
+// chunk stays inside one block, so per-element decode is block-boundary safe.
+template<ggml_type type, int stride_tile, bool swz, int nwarps, int nbatch_fa, bool oob_check, bool use_sparse>
+static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
+        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
+        const int elem0, const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int elems_per_chunk = 16;  // 8 half2, same granularity as the f16 loader
+    constexpr int block_elems     = 128; // every TurboQuant KV type uses 128-element blocks
+    static_assert(type != GGML_TYPE_F16, "use flash_attn_ext_f16_load_tile for f16 KV");
+
+    const char * const rows = (const char *) KV;
+    const int chunks_per_row = D2 / (elems_per_chunk/2);
+
+    auto load = [&] __device__ (const int n) {
+        const int stride_k = 32 >> n;
+        const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+        const int k0_stop  =                      chunks_per_row - chunks_per_row % (1*stride_k);
+        const int stride_i = warp_size / stride_k;
+
+        if (k0_start == k0_stop) {
+            return;
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+            const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+            if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) {
+                break;
+            }
+
+            const char * row;
+            if constexpr (use_sparse) {
+                const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                row = index >= 0 ? rows + (int64_t) index*stride_KV : nullptr;
+            } else {
+                row = !oob_check || i < i_sup ? rows + (int64_t)(k_VKQ_0 + i)*stride_KV : nullptr;
+            }
+
+#pragma unroll
+            for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                half2 buf[elems_per_chunk/2];
+                if (row == nullptr) {
+#pragma unroll
+                    for (int t = 0; t < elems_per_chunk/2; ++t) {
+                        buf[t] = {0.0f, 0.0f};
+                    }
+                } else {
+#pragma unroll
+                    for (int t = 0; t < elems_per_chunk; ++t) {
+                        const int   e   = elem0 + k*elems_per_chunk + t;
+                        const int   ib  = e / block_elems;
+                        const int   j   = e % block_elems;
+                        float val = 0.0f;
+                        if constexpr (type == GGML_TYPE_TURBO8_0) {
+                            const block_turbo8_0 * blk = (const block_turbo8_0 *) (row + (size_t) ib*sizeof(block_turbo8_0));
+                            val = turbo8_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO4_0) {
+                            const block_turbo4_0 * blk = (const block_turbo4_0 *) (row + (size_t) ib*sizeof(block_turbo4_0));
+                            val = turbo4_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO3_0) {
+                            const block_turbo3_0 * blk = (const block_turbo3_0 *) (row + (size_t) ib*sizeof(block_turbo3_0));
+                            val = turbo3_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO2_0) {
+                            const block_turbo2_0 * blk = (const block_turbo2_0 *) (row + (size_t) ib*sizeof(block_turbo2_0));
+                            val = turbo2_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO3_TCQ) {
+                            const block_turbo3_tcq * blk = (const block_turbo3_tcq *) (row + (size_t) ib*sizeof(block_turbo3_tcq));
+                            val = turbo3_tcq_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO2_TCQ) {
+                            const block_turbo2_tcq * blk = (const block_turbo2_tcq *) (row + (size_t) ib*sizeof(block_turbo2_tcq));
+                            val = turbo2_tcq_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_TURBO1_TCQ) {
+                            const block_turbo1_tcq * blk = (const block_turbo1_tcq *) (row + (size_t) ib*sizeof(block_turbo1_tcq));
+                            val = turbo1_tcq_dequant_element(blk, j, __half2float(blk->norm));
+                        } else {
+                            static_assert(type == GGML_TYPE_TURBO1_TCQ, "unsupported TurboQuant KV type");
+                        }
+                        if (t % 2 == 0) {
+                            buf[t/2].x = val;
+                        } else {
+                            buf[t/2].y = val;
+                        }
+                    }
+                }
+
+                if constexpr (swz) {
+                    ggml_cuda_memcpy_1<16>((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(i, k*(elems_per_chunk/2)), buf);
+                } else {
+                    ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, buf);
+                }
+            }
+        }
+    };
+    ggml_cuda_unroll<6>{}(load);
+}
+
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -696,7 +806,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2        = nbatch_K2_override > 0 ? nbatch_K2_override : nbatch_K2_config;
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
+    // cp.async cannot dequantize in flight, so TurboQuant KV tiles always load synchronously.
+    constexpr int  nstages         = (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) ?
+        ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse) : 0;
 
     // swizzle the tile stride for K and V based on the batch size.
     constexpr int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2);
@@ -742,8 +854,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            if constexpr (type_K == GGML_TYPE_F16) {
+                flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            } else {
+                flash_attn_ext_turbo_load_tile<type_K, stride_tile_K, swz_K, nwarps, nbatch_fa, oob_check, use_sparse>
+                    (K_h2, tile_K, k0_diff, stride_K, 2*k0_start, k_VKQ_0, k_VKQ_sup, indices);
+            }
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1079,8 +1196,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            if constexpr (type_K == GGML_TYPE_F16) {
+                flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            } else {
+                flash_attn_ext_turbo_load_tile<type_K, stride_tile_K, swz_K, nwarps, nbatch_fa, oob_check, use_sparse>
+                    (K_h2, tile_K, nbatch_K2, stride_K, 0, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            }
         }
     }
 
@@ -1095,8 +1217,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                if constexpr (type_V == GGML_TYPE_F16) {
+                    flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                        (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                } else {
+                    flash_attn_ext_turbo_load_tile<type_V, stride_tile_V, swz_V, nwarps, nbatch_fa, oob_check, use_sparse>
+                        (V_h2, tile_V, i0_diff/2, stride_V, i0_start, k_VKQ_0, k_VKQ_sup, indices);
+                }
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1297,7 +1424,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
+    // cp.async cannot dequantize in flight, so TurboQuant KV tiles always load synchronously.
+    constexpr int  nstages         = (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) ?
+        ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse) : 0;
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -1968,10 +2097,13 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    const int stride_K    = nb11 / sizeof(half2);
+    // For TurboQuant KV types the row stride is in BYTES (quantized rows are not half2
+    // addressable); flash_attn_ext_turbo_load_tile interprets it accordingly.
+    const int stride_K    = type_K == GGML_TYPE_F16 ? nb11 / sizeof(half2) : (int) nb11;
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+    const int stride_V = V_is_K_view ? stride_K :
+        (type_V == GGML_TYPE_F16 ? nb21 / sizeof(half2) : (int) nb21);
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;

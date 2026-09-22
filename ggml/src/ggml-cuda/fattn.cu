@@ -11,6 +11,20 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+
+// Compile coverage for the TurboQuant MMA tile loader (BUUN_MERGE_PLAN.md section 1.4a). The
+// runtime dispatch that reaches flash_attn_ext_turbo_load_tile lands with the turbo launcher;
+// until then this keeps the loader body syntax- and codegen-checked whenever the turbo8 or
+// turbo3_tcq combination is part of GGML_CUDA_FA_QUANTS.
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+static __global__ void flash_attn_ext_turbo_load_tile_compile_check(
+        const half2 * KV, half2 * tile, int stride_KV_bytes, int elem0) {
+    flash_attn_ext_turbo_load_tile<GGML_TYPE_TURBO8_0, 132, false, 8, 64, false, false>
+        (KV, tile, 64, stride_KV_bytes, elem0, 0, 64, nullptr);
+    flash_attn_ext_turbo_load_tile<GGML_TYPE_TURBO3_TCQ, 132, false, 8, 64, false, false>
+        (KV, tile, 64, stride_KV_bytes, elem0, 0, 64, nullptr);
+}
+#endif // GGML_CUDA_FA_TURBO8_0_TURBO8_0
 #include <unordered_map>
 #include <vector>
 
