@@ -1062,6 +1062,23 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// Ops whose landing on the CPU while a GPU backend is registered is almost always a
+// capability-list bug rather than an intentional split: these are the ops a KV-cache quant
+// type has to be registered with (the attention kernels, the turbo rotation, the KV
+// read/write, and the matmuls that consume the cache).
+static bool ggml_backend_sched_op_is_perf_critical(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_TURBO_WHT:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL_MAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1288,10 +1305,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
         // if the node is still unassigned, assign it to the first backend that supports it
+        const bool was_unassigned = *cur_backend_id == -1;
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+
+        // Performance safety net: the node reached this fallback unassigned and the first
+        // backend that accepts it is the CPU (the lowest-priority, always-last backend), while a
+        // GPU backend is registered. No GPU backend supports the op, and there is no error for
+        // that - the op just silently runs on the CPU (and its inputs get copied to the host).
+        // For a quantized KV cache this is typically a type missing from a backend capability
+        // list (e.g. ggml_cuda_fattn_kv_type_supported, which gates FLASH_ATTN_EXT as a whole).
+        // Say so loudly, so it is not misread as "this quant type is just slow".
+        if (was_unassigned && sched->n_backends > 1 && *cur_backend_id == sched->n_backends - 1 &&
+                ggml_backend_sched_op_is_perf_critical(node->op)) {
+            GGML_LOG_WARN("%s: %s \"%s\" (%s) is scheduled on the CPU because no higher-priority "
+                          "backend supports it - throughput will suffer. For a quantized KV cache "
+                          "this usually means the type is missing from a backend capability list; "
+                          "it does not mean the type itself is slow.\n",
+                          __func__, ggml_op_name(node->op), node->name,
+                          ggml_type_name(node->type));
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied

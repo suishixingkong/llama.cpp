@@ -3062,6 +3062,17 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        // TurboQuant 8-bit / TCQ KV cache types (buun fork): they have VEC kernel
+        // instances too (fattn-vec-instance-<K>-<V>.cu). This function is the gate that
+        // decides whether ggml_backend_cuda_supports_op() accepts GGML_OP_FLASH_ATTN_EXT
+        // at all -- a type missing here does NOT fall back to an f16 kernel on the GPU,
+        // it makes the scheduler run the entire attention (and the KV writes feeding it)
+        // on the CPU, which is ~2x slower and pins every CPU core. Keep it in sync with
+        // the instance files and with is_turbo_kv below.
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
             return true;
         default:
             return false;
@@ -3159,7 +3170,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // TurboQuant KV cache types: VEC kernels are instantiated for D in {64, 128, 256} only.
     const auto is_turbo_kv = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO3_TCQ ||
+               t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ;
     };
     if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && K->ne[0] % 64 != 0) {
         return BEST_FATTN_KERNEL_NONE;
