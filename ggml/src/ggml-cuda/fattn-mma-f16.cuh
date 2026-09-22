@@ -418,6 +418,42 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// Dynamic shared memory flash_attn_ext_f16 will request for this (DKQ, DV, ncols1, ncols2)
+// combination on this arch. Host-side single source of truth: ggml_cuda_flash_attn_ext_mma_f16_case_impl
+// uses it for its cudaFuncSetAttribute() call, and the dispatch in fattn.cu uses it to avoid
+// selecting a tile wider than the device's opt-in shared-memory limit (sm_70 has only 96 KB, so a
+// too-wide tile makes cudaFuncSetAttribute fail with cudaErrorInvalidValue).
+static size_t ggml_cuda_fattn_mma_f16_shared_bytes(
+        const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
+    const int ncols          = ncols1*ncols2;
+    const int nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
+    const int nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa_layout(DKQ, DV, ncols1, ncols2, cc);
+    const int nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
+    const int nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg      = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+    const int nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
+
+    const int cols_per_warp  = std::min(ncols, get_cols_per_warp(cc));
+    const int warp_size_host = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int nwarps         = nthreads / warp_size_host;
+
+    const bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+
+    const int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
+    const int stride_tile_V = V_is_K_view ? stride_tile_K : ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
+
+    const size_t nbytes_shared_KV = nbatch_fa * (nstages <= 1 ? std::max(stride_tile_K, stride_tile_V) :
+                                                                stride_tile_K + stride_tile_V) * sizeof(half2);
+    const size_t nbytes_shared_Q  = ncols  * (DKQ/2 + 4)               * sizeof(half2);
+    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4)       * sizeof(half2);
+    const size_t nbytes_shared_combine = nwarps*cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+
+    return std::max(nbytes_shared_combine, Q_in_reg ?
+        std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) :
+                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 
 template<int stride_tile, bool swz, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
@@ -2234,9 +2270,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
-    const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
 
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
@@ -2325,20 +2359,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case_impl(
         }
     }
 
-    // KV tile strides must match flash_attn_ext_f16_iter / _process_tile.
-    const int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2, cc);
-    const int stride_tile_V = V_is_K_view ? stride_tile_K : ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_V2, cc);
-    const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
-    const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
-    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
-    const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
-
-    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
-
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
-        std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
-                 nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+    // Shared-memory requirement, computed by the shared host helper so that the dispatch in
+    // fattn.cu can pick a tile that fits this device before getting here.
+    const size_t nbytes_shared_total = ggml_cuda_fattn_mma_f16_shared_bytes(DKQ, DV, ncols1, ncols2, cc);
 
     // The dispatch above is supposed to pick a tile that fits this device's shared memory.
     // If it does not (e.g. a new head_dim / tile combination on an arch with a small opt-in

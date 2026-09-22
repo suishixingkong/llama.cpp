@@ -48,18 +48,23 @@ ggml_type llama_kv_cache_resolve_type_k(ggml_type type_k, ggml_type type_v, cons
     const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
 
     const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
-    const bool disabled = (env && env[0] == '0');
+    const bool enabled = (env && env[0] == '1');
 
     // Turbo K quantization error gets amplified by the GQA broadcast factor.
     // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
     // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
-    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
-    if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
+    // Threshold: GQA ratio >= 6 would trigger the upgrade.
+    //
+    // This is OPT-IN: it silently overrides the KV type the user asked for (turboK -> q8_0), which
+    // also changes the VRAM the cache takes and which FA instance gets selected, so it must be
+    // requested explicitly with TURBO_AUTO_ASYMMETRIC=1. By default the requested type is used
+    // as-is -- a user who asked for turbo K gets turbo K, and can compare it against q8_0.
+    if (enabled && gqa_ratio >= 6 && type_k == type_v) {
         // the tag is spelled out on purpose: the rule moved into this helper, but the log
         // line has to keep reading "llama_kv_cache: ..."
         LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
-                       "upgrading K from %s to q8_0 to prevent quality degradation. "
-                       "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
+                       "upgrading K from %s to q8_0 to prevent quality degradation "
+                       "(TURBO_AUTO_ASYMMETRIC=1)\n",
                        "llama_kv_cache", gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
         return GGML_TYPE_Q8_0;
     }

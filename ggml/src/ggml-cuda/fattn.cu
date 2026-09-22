@@ -2608,13 +2608,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
-    // Volta (sm_70) only: the 64-column D=576 tile needs ~101 KB of dynamic shared memory
-    // (Q = 64*(576/2+4)*4 = 74752 B, KV = 32*tile_stride(160)*4 = 20992 B, mask = 5120 B,
-    //  total = 100864 B), which exceeds V100's 96 KB opt-in limit, so
-    // cudaFuncSetAttribute(MaxDynamicSharedMemorySize) fails with cudaErrorInvalidValue.
-    // Newer archs hold this comfortably (A100 163 KB, Hopper 227 KB), so only Volta is
-    // capped, at ncols=32 (~61 KB). Mirrors the D=640 cap in ggml_cuda_flash_attn_ext_mma_f16.
-    if (volta_mma_available(cc) && DKQ == 576) {
+    // Prefer the wider 64-column tile, but only when it actually fits the device's opt-in
+    // shared-memory limit. On sm_70 that limit is only 96 KB, and some head dims exceed it at
+    // ncols=64 (measured: D=320 needs 135168 B, D=576 needs 100864 B), which would otherwise
+    // make cudaFuncSetAttribute fail with cudaErrorInvalidValue. Use the 32-column tile, which
+    // fits (D=320: 67584 B, D=576: 60928 B), instead of selecting a tile too wide for the GPU.
+    // The limit is queried per device, so archs with more shared memory keep the wide tile.
+    if (32/ncols2 >= 1 &&
+            ggml_cuda_fattn_mma_f16_shared_bytes(DKQ, DV, 64/ncols2, ncols2, cc) >
+                ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
