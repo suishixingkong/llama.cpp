@@ -32,7 +32,9 @@ if (MUSAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_MUSA "../ggml-cuda/*.cu")
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+    # Only the f16 MMA instances are globbed unconditionally; the TurboQuant MMA instances
+    # (fattn-mma-<k>-<v>-instance-*.cu) follow the GGML_CUDA_FA_QUANTS selection below.
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma-f16*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
@@ -44,6 +46,9 @@ if (MUSAToolkit_FOUND)
     endif()
 
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+    list(APPEND GGML_SOURCES_MUSA ${SRCS})
+
+    ggml_cuda_fattn_mma_turbo_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda GGML_FA_COMBINATIONS SRCS)
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
 
     set_source_files_properties(${GGML_SOURCES_MUSA} PROPERTIES LANGUAGE CXX)

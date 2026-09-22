@@ -1,3 +1,6 @@
+#pragma once
+// (guard added: fattn.cu includes this header both directly and via fattn-mma-turbo.cuh)
+
 #include "common.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"

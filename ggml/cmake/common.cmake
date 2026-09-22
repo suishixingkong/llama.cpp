@@ -121,4 +121,24 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
     endforeach()
 
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
+    # Expose the selected K-V combinations (e.g. "q8_0-q8_0", "turbo3_tcq-turbo3_tcq") so other
+    # instance families can follow the same GGML_CUDA_FA_QUANTS selection. Currently consumed by
+    # ggml_cuda_fattn_mma_turbo_instances() below.
+    set(GGML_FA_COMBINATIONS "${FA_COMBINATIONS}" PARENT_SCOPE)
+endfunction()
+
+# Determines which TurboQuant MMA FlashAttention template instances to compile, returns them in
+# OUT_SRCS. The turbo MMA instances follow the vec instances: a symmetric pair is only compiled
+# when its <type_K>-<type_V> combination was selected via GGML_CUDA_FA_QUANTS (or exists under
+# GGML_CUDA_FA_QUANTS=all). Combinations without any instance files are silently skipped, and the
+# FA dispatch in fattn.cu guards every turbo case reference with the same GGML_CUDA_FA_<K>_<V>
+# macros that this selection defines, so an uncompiled pair falls back to the regular kernels
+# instead of failing to link.
+function(ggml_cuda_fattn_mma_turbo_instances DIR COMBINATIONS OUT_SRCS)
+    set(SRCS "")
+    foreach (COMBINATION IN LISTS ${COMBINATIONS})
+        file(GLOB TURBO_MMA_SRCS "${DIR}/template-instances/fattn-mma-${COMBINATION}-instance-*.cu")
+        list(APPEND SRCS ${TURBO_MMA_SRCS})
+    endforeach()
+    set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
 endfunction()
