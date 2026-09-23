@@ -1464,9 +1464,9 @@ bool ggml_cuda_kv_stream_workspace_bytes(
         head_dim_k, head_dim_v, head_count, page_tokens, workspace_bytes);
 }
 
-bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {
+const char * ggml_cuda_flash_attn_ext_streamed_reject_reason(const ggml_tensor * dst, size_t stage_bytes) {
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
-        return false;
+        return "node is not a FLASH_ATTN_EXT";
     }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -1474,22 +1474,70 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    return Q != nullptr && K != nullptr && V != nullptr &&
-        Q->type == GGML_TYPE_F32 &&
-        ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED &&
-        Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
-        Q->ne[1] >= 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
-        K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
-        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        K->nb[0] == ggml_element_size(K) && V->nb[0] == ggml_element_size(V) &&
-        K->nb[1] >= ggml_row_size(K->type, K->ne[0]) &&
-        V->nb[1] >= ggml_row_size(V->type, V->ne[0]) &&
-        K->nb[1] == ggml_row_size(K->type, K->ne[0])*K->ne[2] &&
-        K->nb[2] == ggml_row_size(K->type, K->ne[0]) &&
-        V->nb[1] == ggml_row_size(V->type, V->ne[0])*V->ne[2] &&
-        V->nb[2] == ggml_row_size(V->type, V->ne[0]) &&
-        (mask == nullptr || (mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask))) &&
-        sinks == nullptr && kv_stream_block_tokens(dst, stage_bytes) > 0;
+    if (Q == nullptr || K == nullptr || V == nullptr) {
+        return "missing Q, K or V operand";
+    }
+    if (Q->type != GGML_TYPE_F32) {
+        return "Q is not F32";
+    }
+    if (ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) ==
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED) {
+        return "this (K,V) type pair has no streamed attention mode";
+    }
+    if (Q->ne[0] != KV_STREAM_HEAD_DIM) {
+        return "Q head dim is not KV_STREAM_HEAD_DIM (256)";
+    }
+    if (V->ne[0] != KV_STREAM_HEAD_DIM) {
+        return "V head dim is not KV_STREAM_HEAD_DIM (256)";
+    }
+    if (Q->ne[1] < 1) {
+        return "Q has no queries";
+    }
+    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
+        return "batch dim (ne[3]) is not 1 for Q, K or V";
+    }
+    if (K->ne[1] != V->ne[1]) {
+        return "K and V have different token counts";
+    }
+    if (K->ne[2] != V->ne[2]) {
+        return "K and V have different head counts";
+    }
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return "KV token count is not a multiple of FATTN_KQ_STRIDE (256)";
+    }
+    if (K->nb[0] != ggml_element_size(K) || V->nb[0] != ggml_element_size(V)) {
+        return "K or V nb[0] is not the element size (not tightly packed)";
+    }
+    if (K->nb[1] < ggml_row_size(K->type, K->ne[0]) ||
+        V->nb[1] < ggml_row_size(V->type, V->ne[0])) {
+        return "K or V row stride is smaller than one row";
+    }
+    if (K->nb[1] != ggml_row_size(K->type, K->ne[0])*K->ne[2]) {
+        return "K nb[1] != row_size * head_count (not the streamed page layout)";
+    }
+    if (K->nb[2] != ggml_row_size(K->type, K->ne[0])) {
+        return "K nb[2] != one row (not the streamed page layout)";
+    }
+    if (V->nb[1] != ggml_row_size(V->type, V->ne[0])*V->ne[2]) {
+        return "V nb[1] != row_size * head_count (not the streamed page layout)";
+    }
+    if (V->nb[2] != ggml_row_size(V->type, V->ne[0])) {
+        return "V nb[2] != one row (not the streamed page layout)";
+    }
+    if (mask != nullptr && !(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask))) {
+        return "mask is not a contiguous F16 tensor";
+    }
+    if (sinks != nullptr) {
+        return "attention sinks are not supported by the streamed path";
+    }
+    if (kv_stream_block_tokens(dst, stage_bytes) <= 0) {
+        return "stage is too small to hold one FATTN_KQ_STRIDE block of K+V";
+    }
+    return nullptr;
+}
+
+bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {
+    return ggml_cuda_flash_attn_ext_streamed_reject_reason(dst, stage_bytes) == nullptr;
 }
 
 namespace {

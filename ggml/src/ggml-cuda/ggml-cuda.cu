@@ -2365,7 +2365,32 @@ static bool ggml_cuda_kv_stream_fattn_fits(const ggml_tensor * dst) {
 
 static void ggml_cuda_kv_stream_fattn(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_ASSERT(ggml_cuda_kv_stream_fattn_fits(dst));
+    // The dispatch site only checks that K/V carry a kv-stream runtime, which is weaker than
+    // what the streamed kernel needs. Explain the exact reason once and fall back to the
+    // regular FA path: aborting the server on a configuration that would otherwise work is
+    // worse than running that graph slowly, and the printed reason is what identifies the
+    // (K,V) pair to fix or to drop from the kv-stream type set.
+    if (!ggml_cuda_kv_stream_fattn_fits(dst)) {
+        const ggml_tensor * k = dst->src[1];
+        const ggml_tensor * v = dst->src[2];
+        auto * k_runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
+        auto * v_runtime = ggml_cuda_kv_stream_runtime_from_tensor(v);
+        const char * reason = (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime)
+            ? "K and V do not share one kv-stream runtime"
+            : ggml_cuda_flash_attn_ext_streamed_reject_reason(dst, k_runtime->stage_bytes);
+
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: the streamed FlashAttention path does not accept this graph, "
+                    "falling back to the regular path: %s (K=%s, V=%s, stage_bytes=%zu)\n",
+                    __func__, reason, ggml_type_name(k->type), ggml_type_name(v->type),
+                    k_runtime != nullptr ? k_runtime->stage_bytes : size_t(0));
+        }
+
+        ggml_cuda_flash_attn_ext(ctx, dst);
+        return;
+    }
 
     const ggml_tensor * k = dst->src[1];
     auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);

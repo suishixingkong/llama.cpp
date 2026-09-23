@@ -109,6 +109,12 @@ bool ggml_cuda_kv_stream_workspace_bytes(
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 
+// Human-readable reason the streamed path rejects this node, or nullptr when it accepts it.
+// ggml_cuda_flash_attn_ext_streamed_supported() is exactly "reason == nullptr"; both come from
+// the same check chain so they cannot disagree. Used by the dispatch to explain a fallback
+// instead of aborting.
+const char * ggml_cuda_flash_attn_ext_streamed_reject_reason(const ggml_tensor * dst, size_t stage_bytes);
+
 void ggml_cuda_flash_attn_ext_streamed(
     ggml_backend_cuda_context & ctx,
     ggml_tensor * dst,
