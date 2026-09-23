@@ -26,6 +26,26 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1)/alignment*alignment;
 }
 
+// Every case from "server-shaped causal prefill" down hand-builds a streamed runtime for this
+// file's default Q8_0/Q4_0 KV pair and then asserts bit-identity against ordinary CUDA attention
+// plus exact pipeline counters. Those assertions only describe the native (DIRECT) route: the
+// f16-conversion route rounds differently and disables the span coalescing that the counters
+// count. Which route a pair takes is a build property - GGML_CUDA_FA_QUANTS decides whether
+// ggml_cuda_flash_attn_ext_vec_partial_case<Q8_0,Q4_0> exists (the if constexpr gate in
+// kv_stream_resolve_native_partial) - and the F16 route additionally needs
+// params.conversion_bytes, without which runtime_new leaves conversion_data == nullptr and the
+// streamed entry asserts mid-run. Report the missing pair as a skip instead of aborting the whole
+// binary: the fix is one entry in GGML_CUDA_FA_QUANTS, not a code change.
+bool require_direct_default_pair(testing & t) {
+    if (ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) ==
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT) {
+        return true;
+    }
+    t.skip("Q8_0/Q4_0 is not on the native streamed route in this build - add \"q8_0-q4_0\" to "
+           "GGML_CUDA_FA_QUANTS and reconfigure to run this case");
+    return false;
+}
+
 struct attention_inputs {
     ggml_type type_k = GGML_TYPE_Q8_0;
     ggml_type type_v = GGML_TYPE_Q4_0;
@@ -767,6 +787,10 @@ int main() {
     });
 
     t.test("server-shaped causal prefill pipelines four Q8/Q4 blocks through two slots", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -841,6 +865,10 @@ int main() {
     });
 
     t.test("one-page causal prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 256;
         constexpr int64_t n_batch = 5;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -875,6 +903,10 @@ int main() {
     });
 
     t.test("fully resident multi-page prefill stays bit-identical to ordinary CUDA attention", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -912,6 +944,10 @@ int main() {
     });
 
     t.test("four-query page-boundary prefill remains finite and equivalent", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -960,6 +996,10 @@ int main() {
     });
 
     t.test("wide causal prefills remain equivalent across the 256-query boundary", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 1024;
         const int64_t query_counts[] = { 257, 512, 513, 1024 };
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1019,6 +1059,10 @@ int main() {
     });
 
     t.test("resident pages survive between evaluations while the tail is refreshed", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
@@ -1073,6 +1117,10 @@ int main() {
     });
 
     t.test("one-row decode refreshes only the changed resident K and V rows", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1118,6 +1166,10 @@ int main() {
     });
 
     t.test("resident SET_ROWS mirrors changing decode slots without page refreshes", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1264,6 +1316,10 @@ int main() {
     });
 
     t.test("resident graph reloads after authoritative cache replacement", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1303,6 +1359,10 @@ int main() {
     });
 
     t.test("decode batches contiguous streamed pages without changing logits", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 1536;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1350,6 +1410,10 @@ int main() {
     });
 
     t.test("decode pipelines bounded attention chunks and samples every immutable copy batch", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 41*256;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1404,6 +1468,10 @@ int main() {
     });
 
     t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1463,6 +1531,10 @@ int main() {
     });
 
     t.test("one shared ring prefetches across attention layers", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 768;
         // Cross-layer prefetch is a decode optimization. A one-token batch
         // also guarantees that only the mutable tail page is changed by the
@@ -1560,6 +1632,10 @@ int main() {
     });
 
     t.test("decode layout permits multiple streaming waves through a small ring", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
@@ -1590,6 +1666,10 @@ int main() {
     });
 
     t.test("decode layout and ring boundary publish as one reconfiguration", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
@@ -1623,6 +1703,10 @@ int main() {
 
 
     t.test("decode layout spreads an oversized streamed deficit across enough layers", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 768;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1687,6 +1771,10 @@ int main() {
     });
 
     t.test("decode layout bounds layer concentration by the transfer ring", [](testing & t) {
+        if (!require_direct_default_pair(t)) {
+            return;
+        }
+
         constexpr int64_t n_kv = 768;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));

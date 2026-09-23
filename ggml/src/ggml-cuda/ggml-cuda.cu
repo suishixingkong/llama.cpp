@@ -2365,20 +2365,36 @@ static bool ggml_cuda_kv_stream_fattn_fits(const ggml_tensor * dst) {
 
 static void ggml_cuda_kv_stream_fattn(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    auto * k_runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
+    auto * v_runtime = ggml_cuda_kv_stream_runtime_from_tensor(v);
+
     // The dispatch site only checks that K/V carry a kv-stream runtime, which is weaker than
     // what the streamed kernel needs. Explain the exact reason once and fall back to the
     // regular FA path: aborting the server on a configuration that would otherwise work is
     // worse than running that graph slowly, and the printed reason is what identifies the
     // (K,V) pair to fix or to drop from the kv-stream type set.
+    const char * reason = nullptr;
     if (!ggml_cuda_kv_stream_fattn_fits(dst)) {
-        const ggml_tensor * k = dst->src[1];
-        const ggml_tensor * v = dst->src[2];
-        auto * k_runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
-        auto * v_runtime = ggml_cuda_kv_stream_runtime_from_tensor(v);
-        const char * reason = (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime)
+        reason = (k_runtime == nullptr || v_runtime == nullptr || k_runtime != v_runtime)
             ? "K and V do not share one kv-stream runtime"
             : ggml_cuda_flash_attn_ext_streamed_reject_reason(dst, k_runtime->stage_bytes);
+    } else if (k_runtime->conversion_bytes == 0 &&
+            ggml_backend_cuda_kv_stream_get_attention_mode(k->type, v->type) ==
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
+        // A pair without a native kernel reads its pages through the f16-conversion route, which
+        // needs the runtime's conversion workspace: runtime_new() leaves the transfer ring's
+        // conversion_data at nullptr when the caller passed conversion_bytes == 0, and the
+        // streamed entry asserts on that in the middle of a run, once pages are already staged.
+        // The graph builder always asks ggml_backend_cuda_kv_stream_workspace_bytes() for the
+        // pair geometry, so an unprovisioned ring means the runtime was built outside that path
+        // (a test harness, or a caller that assumed its pairs were native).
+        reason = "the (K,V) pair only has the f16-conversion route but the runtime has no "
+                 "conversion workspace (params.conversion_bytes was 0)";
+    }
 
+    if (reason != nullptr) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -2392,8 +2408,7 @@ static void ggml_cuda_kv_stream_fattn(
         return;
     }
 
-    const ggml_tensor * k = dst->src[1];
-    auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(k);
+    auto * runtime = k_runtime;
     GGML_ASSERT(runtime->device == ctx.device);
     ggml_cuda_flash_attn_ext_streamed(
         ctx, dst, runtime->transfer_ring, runtime->resident_cache);
