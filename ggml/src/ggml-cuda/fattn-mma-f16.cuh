@@ -572,25 +572,57 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
-// TurboQuant KV tile loader: identical tile layout and warp work distribution as the
-// synchronous path of flash_attn_ext_f16_load_tile, but the rows are raw TurboQuant blocks and
-// every element is dequantized on the fly. cp.async cannot transform data in flight, which is
-// why the turbo instantiations force nstages == 0 and always take this synchronous loader.
+// Block size in elements of a non-f16 KV tile source type. TurboQuant types quantize
+// 128-element rotation groups; the standard quantized KV types use 32-element blocks; bf16
+// has no block structure (one pseudo-block spanning the largest supported head dim). Every
+// 16-element chunk of the loader is 16-aligned, so it always stays inside one block of any
+// of these types, which is what makes the shared per-chunk addressing valid for all of them.
+static constexpr __host__ __device__ int ggml_cuda_fattn_kv_tile_block_elems(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
+            return 128;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return 32;
+        case GGML_TYPE_BF16:
+            return 256;
+        default:
+            return 0; // f16 uses flash_attn_ext_f16_load_tile; nothing else is instantiated
+    }
+}
+
+// General KV tile loader: identical tile layout and warp work distribution as the
+// synchronous path of flash_attn_ext_f16_load_tile, but the rows are raw quantized blocks
+// and every element is dequantized on the fly. cp.async cannot transform data in flight,
+// which is why every non-f16 instantiation forces nstages == 0 and always takes this
+// synchronous loader. Despite the historical name it is not turbo-only: it covers the
+// standard quantized KV types and bf16 as well.
 //
 // Differences from the f16 loader:
 //   - stride_KV is the row stride in BYTES (quantized rows are not half2-addressable);
 //   - KV points at the row base (the caller must not pre-advance it);
 //   - elem0 is the element offset of the first 16-element chunk within that row.
-// Every TurboQuant KV type quantizes 128 elements per block, and any 16-aligned 16-element
-// chunk stays inside one block, so per-element decode is block-boundary safe.
+// Every supported type quantizes whole 32- or 128-element blocks, and any 16-aligned
+// 16-element chunk stays inside one block, so per-element decode is block-boundary safe.
 template<ggml_type type, int stride_tile, bool swz, int nwarps, int nbatch_fa, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
         const int elem0, const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int elems_per_chunk = 16;  // 8 half2, same granularity as the f16 loader
-    constexpr int block_elems     = 128; // every TurboQuant KV type uses 128-element blocks
+    constexpr int block_elems     = ggml_cuda_fattn_kv_tile_block_elems(type);
     static_assert(type != GGML_TYPE_F16, "use flash_attn_ext_f16_load_tile for f16 KV");
+    static_assert(block_elems % (2*elems_per_chunk) == 0 || block_elems == 256,
+        "block size must be a multiple of the 32-element chunk granularity");
 
     const char * const rows = (const char *) KV;
     const int chunks_per_row = D2 / (elems_per_chunk/2);
@@ -659,8 +691,34 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
                         } else if constexpr (type == GGML_TYPE_TURBO1_TCQ) {
                             const block_turbo1_tcq * blk = (const block_turbo1_tcq *) (row + (size_t) ib*sizeof(block_turbo1_tcq));
                             val = turbo1_tcq_dequant_element(blk, j, __half2float(blk->norm));
+                        } else if constexpr (type == GGML_TYPE_Q8_0) {
+                            const block_q8_0 * blk = (const block_q8_0 *) (row + (size_t) ib*sizeof(block_q8_0));
+                            val = __half2float(blk->d) * (float) blk->qs[j];
+                        } else if constexpr (type == GGML_TYPE_Q4_0) {
+                            const block_q4_0 * blk = (const block_q4_0 *) (row + (size_t) ib*sizeof(block_q4_0));
+                            const uint8_t q = j < 16 ? (uint8_t) (blk->qs[j] & 0xF) : (uint8_t) (blk->qs[j - 16] >> 4);
+                            val = __half2float(blk->d) * ((float) q - 8.0f);
+                        } else if constexpr (type == GGML_TYPE_Q4_1) {
+                            const block_q4_1 * blk = (const block_q4_1 *) (row + (size_t) ib*sizeof(block_q4_1));
+                            const uint8_t q = j < 16 ? (uint8_t) (blk->qs[j] & 0xF) : (uint8_t) (blk->qs[j - 16] >> 4);
+                            val = __half2float(blk->dm.x) * (float) q + __half2float(blk->dm.y);
+                        } else if constexpr (type == GGML_TYPE_Q5_0) {
+                            const block_q5_0 * blk = (const block_q5_0 *) (row + (size_t) ib*sizeof(block_q5_0));
+                            const uint8_t q = j < 16 ? (uint8_t) (blk->qs[j] & 0xF) : (uint8_t) (blk->qs[j - 16] >> 4);
+                            const int h = ((blk->qh[j >> 3] >> (j & 7)) & 1) << 4;
+                            val = __half2float(blk->d) * ((float) (q | h) - 16.0f);
+                        } else if constexpr (type == GGML_TYPE_Q5_1) {
+                            const block_q5_1 * blk = (const block_q5_1 *) (row + (size_t) ib*sizeof(block_q5_1));
+                            const uint8_t q = j < 16 ? (uint8_t) (blk->qs[j] & 0xF) : (uint8_t) (blk->qs[j - 16] >> 4);
+                            const int h = ((blk->qh[j >> 3] >> (j & 7)) & 1) << 4;
+                            val = __half2float(blk->dm.x) * (float) (q | h) + __half2float(blk->dm.y);
+                        } else if constexpr (type == GGML_TYPE_BF16) {
+                            uint16_t raw;
+                            memcpy(&raw, row + (size_t) e*sizeof(raw), sizeof(raw));
+                            const uint32_t bits = (uint32_t) raw << 16; // bf16 is the top half of f32
+                            memcpy(&val, &bits, sizeof(val));
                         } else {
-                            static_assert(type == GGML_TYPE_TURBO1_TCQ, "unsupported TurboQuant KV type");
+                            static_assert((int) type < 0, "unsupported KV tile type for the general loader");
                         }
                         if (t % 2 == 0) {
                             buf[t/2].x = val;

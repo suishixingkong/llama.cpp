@@ -1127,6 +1127,13 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, TURBO4_0)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO8_0)
 
+    // Mixed turbo8 / standard-quant / TCQ pairs (same set as the vec case table above):
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, Q5_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO8_0, Q4_1)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q5_1,     TURBO3_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(Q4_1,     TURBO3_TCQ)
+
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, TURBO3_TCQ)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_TCQ, TURBO2_TCQ)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_TCQ, TURBO2_TCQ)
@@ -2138,13 +2145,16 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_flash_attn_ext_needs_f16(dst, &need_f16_K, &need_f16_V);
     const bool f16_scratch_reserved = need_f16_K && need_f16_V;
 
-    // The MMA prefill span is type agnostic: it calls launch_fattn() with need_f16_K/V = true, so
-    // its inputs are converted into the reserved f16 scratch exactly like the unstreamed MMA_F16
-    // route does (ggml_get_to_fp16_cuda/_nc_cuda cover the turbo types too). What it does need is
-    // for that scratch to exist, hence f16_scratch_reserved: a direct pair whose unstreamed kernel
-    // would have been VEC never reserved it.
+    // The MMA prefill span calls launch_fattn() with need_f16_K/V = true, so its inputs are
+    // converted into the reserved f16 scratch exactly like the unstreamed MMA_F16 route does
+    // (ggml_get_to_fp16_cuda/_nc_cuda cover the turbo types too). What it needs is for that
+    // scratch to exist, hence f16_scratch_reserved: a direct pair whose unstreamed kernel
+    // would have been VEC never reserved it. Exception: pairs whose TYPED turbo MMA partial
+    // kernel is compiled (fattn-mma-turbo -partial instances) consume the raw staged blocks
+    // directly and need no f16 scratch at all.
+    const bool turbo_mma_partial = ggml_cuda_flash_attn_ext_mma_turbo_partial_available(K->type, V->type);
     const bool use_mma_prefill = kv_stream_mma_prefill_enabled() && !convert_to_f16 &&
-        f16_scratch_reserved &&
+        (f16_scratch_reserved || turbo_mma_partial) &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
@@ -2474,8 +2484,14 @@ void ggml_cuda_flash_attn_ext_streamed(
             query_dst.src[3] = query_mask_ptr;
 
             if (use_mma_prefill) {
-                ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
-                    ctx, &query_dst, parts.ptr, meta.ptr);
+                // Typed turbo MMA partial kernel: decodes the raw staged turbo blocks directly.
+                // Only pairs whose -partial instance was compiled reach this; everything else
+                // (including all f16-converted routes) falls back to the generic f16 kernel.
+                if (!ggml_cuda_flash_attn_ext_mma_turbo_partial_case_typed<256, 256, 8, 8>(
+                        ctx, &query_dst, parts.ptr, meta.ptr)) {
+                    ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
+                        ctx, &query_dst, parts.ptr, meta.ptr);
+                }
                 if (resident_cache != nullptr) {
                     ++resident_cache->stats.mma_prefill_attention_spans;
                 }
@@ -3027,6 +3043,14 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, Q8_0)
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO1_TCQ)
 
+    // Mixed turbo8 / standard-quant / TCQ pairs (VBR mixed-precision caches): each side's
+    // K-dot and V-decode already exist for other pairs, these are combination holes only.
+    FATTN_VEC_CASES_ALL_D(TURBO8_0, TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(TURBO8_0, Q5_1)
+    FATTN_VEC_CASES_ALL_D(TURBO8_0, Q4_1)
+    FATTN_VEC_CASES_ALL_D(Q5_1,     TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(Q4_1,     TURBO3_TCQ)
+
     return nullptr;
 }
 
@@ -3096,9 +3120,11 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 // Opt-in gate for the TurboQuant tensor-core FA path (B+ Stage 1c L1, BUUN_MERGE_PLAN.md
 // section 1.4a). Enabled via GGML_CUDA_TURBO_MMA=1 (value-based, 0 = off) for A/B benchmarking
 // against the regular kernel selection below. Returns true only for shapes that have compiled
-// instances: symmetric turbo pairs, head dims 128/256, and only when the pair's
-// GGML_CUDA_FA_<K>_<V> macro says the instances were compiled (GGML_CUDA_FA_QUANTS). Anything
-// else keeps the regular VEC/TILE/MMA_F16 selection, i.e. an uncompiled pair silently falls back.
+// instances per the pair table in fattn-mma-turbo.cuh (13 symmetric pairs across turbo and
+// standard quantized KV types, plus turbo8_0-turbo3_tcq and f16-turbo8_0), head dims 128/256,
+// and only when the pair's GGML_CUDA_FA_<K>_<V> macro says the instances were compiled
+// (GGML_CUDA_FA_QUANTS). Anything else keeps the regular VEC/TILE/MMA_F16 selection, i.e. an
+// uncompiled pair silently falls back.
 static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * dst) {
     static const bool turbo_mma_enabled = [] {
         const char * env = std::getenv("GGML_CUDA_TURBO_MMA");
@@ -3111,33 +3137,10 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * ds
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    if (K->type != V->type) {
-        return false; // only symmetric pairs are instantiated
+    if (dst->src[0]->ne[0] != 128 && dst->src[0]->ne[0] != 256) {
+        return false; // head dim == DKQ for the non-view shapes we instantiate
     }
-    switch (dst->src[0]->ne[0]) { // head dim == DKQ for the non-view shapes we instantiate
-        case 128:
-        case 256:
-            break;
-        default:
-            return false;
-    }
-    switch (K->type) {
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
-        case GGML_TYPE_TURBO8_0:
-#endif
-#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
-        case GGML_TYPE_TURBO3_TCQ:
-#endif
-#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
-        case GGML_TYPE_TURBO2_TCQ:
-#endif
-#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
-        case GGML_TYPE_TURBO1_TCQ:
-#endif
-            return true;
-        default:
-            return false;
-    }
+    return ggml_cuda_fattn_mma_turbo_pair_compiled(K->type, V->type);
 }
 
 // Opt-in TurboQuant MMA FA dispatch counter (BUUN_MERGE_PLAN.md section 10.9). Exported via

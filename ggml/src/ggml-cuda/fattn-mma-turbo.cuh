@@ -1,4 +1,5 @@
-// TurboQuant KV-cache tensor-core FlashAttention launcher (BUUN_MERGE_PLAN.md section 1.4a).
+// TurboQuant / general quantized KV-cache tensor-core FlashAttention launcher
+// (BUUN_MERGE_PLAN.md sections 1.4a / 10.9 / 10.10).
 //
 // Stage 1c L1: the MMA FA kernel body (fattn-mma-f16.cuh) was made type-generic (type_K/type_V
 // threaded through flash_attn_ext_f16/_process_tile/_iter, with flash_attn_ext_turbo_load_tile
@@ -6,22 +7,27 @@
 //   - a shared-memory size helper that reflects the forced-synchronous (nstages == 0) pipeline
 //     the kernel runs for non-f16 KV (cp.async cannot dequantize in flight),
 //   - the per-(DKQ, DV, ncols1, ncols2, type_K, type_V) launcher, which hands raw (non-converted)
-//     K/V to launch_fattn(need_f16_K/V = false) so the kernel decodes turbo blocks in place,
+//     K/V to launch_fattn(need_f16_K/V = false) so the kernel decodes blocks in place,
 //   - the dispatch ladder, mirroring ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1/2 in
-//     fattn.cu but restricted to tiles Volta can run (ncols1*ncols2 >= 32, no sparse variant).
+//     fattn.cu but restricted to tiles Volta can run (ncols1*ncols2 >= 32, no sparse variant),
+//   - the (K,V) pair table: which pairs have instances, and the pair-resolving typed dispatch.
 //
 // Instance files: template-instances/fattn-mma-<type_K>-<type_V>-instance-dkq<D>-ncols1_<A>-ncols2_<B>.cu
 // Which of them are compiled follows the vec instances (GGML_CUDA_FA_QUANTS -> FA_COMBINATIONS),
-// see ggml_cuda_fattn_mma_turbo_instances() in ggml/cmake/common.cmake. The dispatch in fattn.cu
-// guards every reference to these cases with the same GGML_CUDA_FA_<K>_<V> macros that gate the
-// vec instances, so an uncompiled pair silently keeps the regular kernel selection.
+// see ggml_cuda_fattn_mma_turbo_instances() in ggml/cmake/common.cmake. Every reference to these
+// cases is guarded with the same GGML_CUDA_FA_<K>_<V> macros that gate the vec instances, so an
+// uncompiled pair silently keeps the regular kernel selection.
+//
+// The streamed span prefill (kv-stream) additionally uses the partial-output variant
+// (ggml_cuda_flash_attn_ext_mma_turbo_partial_case) for the (D=256, tile 8x8) shape so that
+// DIRECT turbo pairs skip the f16 conversion entirely; see the -partial instance files.
 
 #pragma once
 
 #include "common.cuh"
 #include "fattn-mma-f16.cuh"
 
-// Dynamic shared memory the MMA FA kernel requests for a turbo (DKQ, DV, ncols1, ncols2)
+// Dynamic shared memory the MMA FA kernel requests for a non-f16 (DKQ, DV, ncols1, ncols2)
 // combination on this arch. Same formula as ggml_cuda_fattn_mma_f16_shared_bytes(), but with
 // nstages forced to 0: the kernel hardcodes the synchronous single-buffered pipeline for
 // non-f16 KV (constexpr in flash_attn_ext_f16_process_tile/_iter), so the double-buffered
@@ -56,15 +62,17 @@ static size_t ggml_cuda_fattn_mma_turbo_shared_bytes(
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 }
 
-// Launcher for one (DKQ, DV, ncols1, ncols2, type_K, type_V) TurboQuant MMA case. Explicitly
-// instantiated by the fattn-mma-<k>-<v>-instance-*.cu files; fattn.cu only references these
-// instantiations (via ggml_cuda_fattn_mma_turbo_case_typed below) when the pair's
+// Launcher for one (DKQ, DV, ncols1, ncols2, type_K, type_V) non-f16 MMA case. Explicitly
+// instantiated by the fattn-mma-<k>-<v>-instance-*.cu files; the dispatch in fattn.cu only
+// references these instantiations (via the pair table below) when the pair's
 // GGML_CUDA_FA_<K>_<V> macro says the instance was compiled, so there is never a dangling
 // reference for pairs that GGML_CUDA_FA_QUANTS left out.
-template<int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
-void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static_assert(type_K != GGML_TYPE_F16 && type_V != GGML_TYPE_F16,
-        "turbo MMA cases are for TurboQuant KV types; use ggml_cuda_flash_attn_ext_mma_f16_case for f16 KV");
+template<int DKQ, int DV, int ncols1, int ncols2, bool output_partial, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta) {
+    static_assert(type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16,
+        "the general MMA tile launcher is for non-f16 KV; use ggml_cuda_flash_attn_ext_mma_f16_case for f16 KV");
 
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -76,7 +84,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const int warp_size_host = ggml_cuda_info().devices[id].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
-    static_assert(DKQ != 576, "no turbo MMA instances for Deepseek-style V-is-K-view shapes");
+    static_assert(DKQ != 576, "no general-tile MMA instances for Deepseek-style V-is-K-view shapes");
 
     const size_t nbytes_shared_total = ggml_cuda_fattn_mma_turbo_shared_bytes(DKQ, DV, ncols1, ncols2, cc);
 
@@ -84,7 +92,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     // limit. Fail loudly here instead of surfacing an opaque cudaErrorInvalidValue from
     // cudaFuncSetAttribute below.
     if (nbytes_shared_total > ggml_cuda_info().devices[id].smpbo) {
-        GGML_ABORT("fatal error: flash_attn_ext_f16<turbo %d,%d,%d,%d> needs %zu bytes of dynamic shared memory, "
+        GGML_ABORT("fatal error: flash_attn_ext_f16<non-f16 %d,%d,%d,%d> needs %zu bytes of dynamic shared memory, "
                    "exceeding device %d's %zu-byte limit; the dispatch chose a tile too wide for this GPU\n",
                    DKQ, DV, ncols1, ncols2, nbytes_shared_total, id, ggml_cuda_info().devices[id].smpbo);
     }
@@ -101,10 +109,10 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, false, false, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, false, output_partial, type_K, type_V>;
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, false, false, type_K, type_V>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false, false, output_partial, type_K, type_V>;
     }
 
     static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -114,50 +122,291 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         shared_memory_limit_raised[id] = true;
     }
 
-    // need_f16_K/V == false: launch_fattn passes the raw TurboQuant K/V blocks through and the
+    // need_f16_K/V == false: launch_fattn passes the raw quantized K/V blocks through and the
     // kernel decodes them tile-by-tile via flash_attn_ext_turbo_load_tile.
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false,
+         !output_partial, false, warp_size_host, partial_dst, partial_meta);
+}
+
+template<int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, false, type_K, type_V>(
+        ctx, dst, nullptr, nullptr);
+}
+
+template<int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_mma_turbo_partial_case(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta) {
+    GGML_ASSERT(partial_dst != nullptr && partial_meta != nullptr);
+    ggml_cuda_flash_attn_ext_mma_turbo_case_impl<DKQ, DV, ncols1, ncols2, true, type_K, type_V>(
+        ctx, dst, partial_dst, partial_meta);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-#define DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, ncols1, ncols2, type_K, type_V)                                        \
-    template void ggml_cuda_flash_attn_ext_mma_turbo_case                                                         \
+template<int DKQ, int DV, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_mma_turbo_partial_case(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta);
+
+#define DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, ncols1, ncols2, type_K, type_V)                        \
+    template void ggml_cuda_flash_attn_ext_mma_turbo_case                                         \
     <DKQ, DV, ncols1, ncols2, GGML_TYPE_##type_K, GGML_TYPE_##type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
-// Instantiates the case for whichever symmetric turbo pair was compiled into this build.
-// The GGML_CUDA_FA_<K>_<V> macros are defined for every pair by ggml_cuda_fattn_vec_instances()
-// in ggml/cmake/common.cmake (same values that gate the vec instance compilation).
+#define DECL_FATTN_MMA_TURBO_PARTIAL_CASE(DKQ, DV, ncols1, ncols2, type_K, type_V)                \
+    template void ggml_cuda_flash_attn_ext_mma_turbo_partial_case                                 \
+    <DKQ, DV, ncols1, ncols2, GGML_TYPE_##type_K, GGML_TYPE_##type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float *, float2 *)
+
+// The (K,V) pair table: pairs with MMA tile instances in this repository. A pair participates
+// in the dispatch only when its GGML_CUDA_FA_<K>_<V> macro says the instances were compiled
+// (same values that gate the vec instance compilation, set from GGML_CUDA_FA_QUANTS), so an
+// uncompiled pair silently keeps the regular kernel selection instead of failing to link.
+static bool ggml_cuda_fattn_mma_turbo_pair_compiled(ggml_type type_k, ggml_type type_v) {
+#define TURBO_MMA_PAIR_TEST(tk, tv) \
+    if (type_k == GGML_TYPE_##tk && type_v == GGML_TYPE_##tv) { return true; }
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+    TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO8_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+    TURBO_MMA_PAIR_TEST(TURBO3_TCQ, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+    TURBO_MMA_PAIR_TEST(TURBO2_TCQ, TURBO2_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+    TURBO_MMA_PAIR_TEST(TURBO1_TCQ, TURBO1_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+    TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0
+    TURBO_MMA_PAIR_TEST(F16, TURBO8_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0
+    TURBO_MMA_PAIR_TEST(TURBO4_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0
+    TURBO_MMA_PAIR_TEST(TURBO3_0, TURBO3_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0
+    TURBO_MMA_PAIR_TEST(TURBO2_0, TURBO2_0)
+#endif
+#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0
+    TURBO_MMA_PAIR_TEST(Q8_0, Q8_0)
+#endif
+#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0
+    TURBO_MMA_PAIR_TEST(Q5_0, Q5_0)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+    TURBO_MMA_PAIR_TEST(Q5_1, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0
+    TURBO_MMA_PAIR_TEST(Q4_0, Q4_0)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+    TURBO_MMA_PAIR_TEST(Q4_1, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16
+    TURBO_MMA_PAIR_TEST(BF16, BF16)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+    TURBO_MMA_PAIR_TEST(TURBO8_0, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+    TURBO_MMA_PAIR_TEST(TURBO8_0, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+    TURBO_MMA_PAIR_TEST(Q5_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+    TURBO_MMA_PAIR_TEST(Q4_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+    TURBO_MMA_PAIR_TEST(Q5_1, Q4_1)
+#endif
+#undef TURBO_MMA_PAIR_TEST
+    return false;
+}
+
+// Instantiates the case for whichever compiled (K,V) pair the tensors hold. Pairs without a
+// compiled instance never reach this (the selection in fattn.cu checks
+// ggml_cuda_fattn_mma_turbo_pair_compiled first).
 template <int DKQ, int DV, int ncols1, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_turbo_case_typed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_type type_K = dst->src[1]->type;
-    switch (type_K) {
+    const ggml_type type_V = dst->src[2]->type;
+
+#define TURBO_MMA_PAIR_CALL(tk, tv)                                                                     \
+    if (type_K == GGML_TYPE_##tk && type_V == GGML_TYPE_##tv) {                                         \
+        ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_##tk, GGML_TYPE_##tv>(ctx, dst); \
+        return;                                                                                         \
+    }
 #if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
-        case GGML_TYPE_TURBO8_0:
-            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO8_0>(ctx, dst);
-            return;
+    TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO8_0)
 #endif
 #if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
-        case GGML_TYPE_TURBO3_TCQ:
-            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ>(ctx, dst);
-            return;
+    TURBO_MMA_PAIR_CALL(TURBO3_TCQ, TURBO3_TCQ)
 #endif
 #if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
-        case GGML_TYPE_TURBO2_TCQ:
-            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ>(ctx, dst);
-            return;
+    TURBO_MMA_PAIR_CALL(TURBO2_TCQ, TURBO2_TCQ)
 #endif
 #if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
-        case GGML_TYPE_TURBO1_TCQ:
-            ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ>(ctx, dst);
-            return;
+    TURBO_MMA_PAIR_CALL(TURBO1_TCQ, TURBO1_TCQ)
 #endif
-        default:
-            GGML_ABORT("fatal error: no TurboQuant MMA instance compiled for K/V type %s (add it to GGML_CUDA_FA_QUANTS)",
-                       ggml_type_name(type_K));
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+    TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0
+    TURBO_MMA_PAIR_CALL(F16, TURBO8_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0
+    TURBO_MMA_PAIR_CALL(TURBO4_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0
+    TURBO_MMA_PAIR_CALL(TURBO3_0, TURBO3_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0
+    TURBO_MMA_PAIR_CALL(TURBO2_0, TURBO2_0)
+#endif
+#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0
+    TURBO_MMA_PAIR_CALL(Q8_0, Q8_0)
+#endif
+#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0
+    TURBO_MMA_PAIR_CALL(Q5_0, Q5_0)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+    TURBO_MMA_PAIR_CALL(Q5_1, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0
+    TURBO_MMA_PAIR_CALL(Q4_0, Q4_0)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+    TURBO_MMA_PAIR_CALL(Q4_1, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16
+    TURBO_MMA_PAIR_CALL(BF16, BF16)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+    TURBO_MMA_PAIR_CALL(TURBO8_0, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+    TURBO_MMA_PAIR_CALL(TURBO8_0, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+    TURBO_MMA_PAIR_CALL(Q5_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+    TURBO_MMA_PAIR_CALL(Q4_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+    TURBO_MMA_PAIR_CALL(Q5_1, Q4_1)
+#endif
+#undef TURBO_MMA_PAIR_CALL
+    GGML_ABORT("fatal error: no non-f16 MMA instance compiled for K/V types %s-%s (add the pair to GGML_CUDA_FA_QUANTS)",
+               ggml_type_name(type_K), ggml_type_name(type_V));
+}
+
+// Typed partial dispatch for the streamed span prefill. Returns false (without doing anything)
+// when the pair's partial instance was not compiled, so the caller can keep its f16 route.
+template <int DKQ, int DV, int ncols1, int ncols2>
+static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_case_typed(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * partial_dst, float2 * partial_meta) {
+    const ggml_type type_K = dst->src[1]->type;
+    const ggml_type type_V = dst->src[2]->type;
+
+#define TURBO_MMA_PARTIAL_CALL(tk, tv)                                                                  \
+    if (type_K == GGML_TYPE_##tk && type_V == GGML_TYPE_##tv) {                                         \
+        ggml_cuda_flash_attn_ext_mma_turbo_partial_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_##tk, GGML_TYPE_##tv>(ctx, dst, partial_dst, partial_meta); \
+        return true;                                                                                    \
     }
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+    TURBO_MMA_PARTIAL_CALL(TURBO8_0, TURBO8_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_CALL(TURBO3_TCQ, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+    TURBO_MMA_PARTIAL_CALL(TURBO2_TCQ, TURBO2_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+    TURBO_MMA_PARTIAL_CALL(TURBO1_TCQ, TURBO1_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_CALL(TURBO8_0, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+    TURBO_MMA_PARTIAL_CALL(TURBO8_0, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+    TURBO_MMA_PARTIAL_CALL(TURBO8_0, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_CALL(Q5_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_CALL(Q4_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+    TURBO_MMA_PARTIAL_CALL(Q5_1, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+    TURBO_MMA_PARTIAL_CALL(Q5_1, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+    TURBO_MMA_PARTIAL_CALL(Q4_1, Q4_1)
+#endif
+#undef TURBO_MMA_PARTIAL_CALL
+    return false;
+}
+
+// Whether the streamed span prefill can route this pair to a typed non-f16 MMA partial kernel
+// (the partial instances exist for the D=256 / tile 8x8 shape of these pairs only). Pairs whose
+// macro is 0 report false so the span keeps its f16-conversion route.
+static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_available(ggml_type type_k, ggml_type type_v) {
+#define TURBO_MMA_PARTIAL_TEST(tk, tv) \
+    if (type_k == GGML_TYPE_##tk && type_v == GGML_TYPE_##tv) { return true; }
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+    TURBO_MMA_PARTIAL_TEST(TURBO8_0, TURBO8_0)
+#endif
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_TEST(TURBO3_TCQ, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+    TURBO_MMA_PARTIAL_TEST(TURBO2_TCQ, TURBO2_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+    TURBO_MMA_PARTIAL_TEST(TURBO1_TCQ, TURBO1_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_TEST(TURBO8_0, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+    TURBO_MMA_PARTIAL_TEST(TURBO8_0, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+    TURBO_MMA_PARTIAL_TEST(TURBO8_0, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_TEST(Q5_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+    TURBO_MMA_PARTIAL_TEST(Q4_1, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+    TURBO_MMA_PARTIAL_TEST(Q5_1, Q5_1)
+#endif
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+    TURBO_MMA_PARTIAL_TEST(Q5_1, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+    TURBO_MMA_PARTIAL_TEST(Q4_1, Q4_1)
+#endif
+#undef TURBO_MMA_PARTIAL_TEST
+    return false;
 }
 
 // Volta-only ladder. Mirrors ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 (fattn.cu) with the
@@ -174,7 +423,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_c
     }
 
     // Prefer the wider 64-column tile, but only when it fits the device's opt-in shared-memory
-    // limit (sm_70 has only 96 KB). The turbo helper (nstages == 0) sizes the synchronous
+    // limit (sm_70 has only 96 KB). The helper (nstages == 0) sizes the synchronous
     // pipeline the kernel will actually run.
     if (32/ncols2 >= 1 &&
             ggml_cuda_fattn_mma_turbo_shared_bytes(DKQ, DV, 64/ncols2, ncols2, cc) >
@@ -227,3 +476,64 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     }
     ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1>(ctx, dst);
 }
+
+// Explicit instantiation DECLARATIONS for every (pair, shape) the dispatch can reach. Like the
+// f16 DECL block above, the extern suppresses implicit instantiation in the including TUs
+// (notably fattn.cu): the kernel code is emitted only by the fattn-mma-<k>-<v>-instance-*.cu
+// files' non-extern DECL definitions, whose compilation is gated on GGML_CUDA_FA_QUANTS.
+// Pairs whose macro is 0 never reference their declarations, so a missing instance is fine.
+#define DECL_FATTN_MMA_TURBO_CASE_EXTERN(DKQ, DV, ncols1, ncols2, type_K, type_V) \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, ncols1, ncols2, type_K, type_V)
+
+#define DECL_FATTN_MMA_TURBO_PAIR_SHAPES(type_K, type_V)             \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128, 32, 1, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128, 64, 1, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128, 16, 2, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128, 32, 2, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128,  8, 4, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128, 16, 4, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128,  4, 8, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(128, 128,  8, 8, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256, 32, 1, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256, 64, 1, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256, 16, 2, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256, 32, 2, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256,  8, 4, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256, 16, 4, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256,  4, 8, type_K, type_V); \
+    DECL_FATTN_MMA_TURBO_CASE_EXTERN(256, 256,  8, 8, type_K, type_V);
+
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  TURBO8_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO3_TCQ, TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO2_TCQ, TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO1_TCQ, TURBO1_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(F16,       TURBO8_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO4_0,  TURBO4_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO3_0,  TURBO3_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO2_0,  TURBO2_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q8_0,      Q8_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_0,      Q5_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_1,      Q5_1)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q4_0,      Q4_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q4_1,      Q4_1)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(BF16,      BF16)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  Q5_1)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  Q4_1)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_1,      TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q4_1,      TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_1,      Q4_1)
+
+// Streamed span prefill uses exactly this shape (D=256, tile 8x8):
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO8_0,  TURBO8_0);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO3_TCQ, TURBO3_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO2_TCQ, TURBO2_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO1_TCQ, TURBO1_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO8_0,  TURBO3_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO8_0,  Q5_1);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO8_0,  Q4_1);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, Q5_1,      TURBO3_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, Q4_1,      TURBO3_TCQ);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, Q5_1,      Q5_1);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, Q5_1,      Q4_1);
+extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, Q4_1,      Q4_1);

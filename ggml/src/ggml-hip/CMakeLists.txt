@@ -65,7 +65,7 @@ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 # Only the f16 MMA instances are globbed unconditionally; the TurboQuant MMA instances
 # (fattn-mma-<k>-<v>-instance-*.cu) follow the GGML_CUDA_FA_QUANTS selection below.
-file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma-f16*.cu")
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma-f16-instance-*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
