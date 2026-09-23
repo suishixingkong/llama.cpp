@@ -618,7 +618,11 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
         const int elem0, const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
-    constexpr int elems_per_chunk = 16;  // 8 half2, same granularity as the f16 loader
+    // 8 elements = 4 half2 = 16 bytes, i.e. exactly the chunk granularity of the f16 loader
+    // (h2_per_chunk = 16/sizeof(half2)). It must match it: the surrounding loop bounds
+    // (stride_k = 32 >> n, k0_start/k0_stop) and the tile write offsets (k*4 half2,
+    // ggml_cuda_memcpy_1<16>) are expressed in f16-loader chunks and are shared verbatim.
+    constexpr int elems_per_chunk = 8;   // 4 half2
     constexpr int block_elems     = ggml_cuda_fattn_kv_tile_block_elems(type);
     static_assert(type != GGML_TYPE_F16, "use flash_attn_ext_f16_load_tile for f16 KV");
     static_assert(block_elems % (2*elems_per_chunk) == 0 || block_elems == 256,

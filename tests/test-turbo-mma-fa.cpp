@@ -210,6 +210,9 @@ int main(int argc, char ** argv) {
         ggml_type v;
     };
     const kv_pair pairs[] = {
+        // f16 K/V goes through the original f16 loader: this is the control that separates
+        // "test harness + MMA path" from "the general non-f16 tile loader".
+        {GGML_TYPE_F16,       GGML_TYPE_F16},
         {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO8_0},
         {GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ},
