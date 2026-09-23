@@ -481,22 +481,40 @@ llama_kv_cache::llama_kv_cache(
         //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
+        // Block KV streaming needs one K/V type pair for every attention layer: llama-context sizes
+        // the arena and the transfer-ring page from a single pair (and refuses a non-uniform one),
+        // while the streamed attention path refuses a layer whose K+V page does not fit that page.
+        // A refused layer then neither streams nor gets the staged SET_ROWS rows the streamed span
+        // would have flushed, so mixing per-layer types with streaming is not sound.
+        const bool kv_stream_active = kv_stream_stage_bytes != 0 && !hparams.no_alloc;
         {
-            static const int adaptive_mode = [&]() {
+            const int adaptive_mode = [&]() {
                 const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
+                const int requested = env != nullptr ? atoi(env) : 0;
                 // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
+                const int mode = requested > 0 ? requested :
+                    (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8 ? 7 : 0);
+                if (mode == 0) {
+                    return 0;
                 }
-                return 0;
+                if (kv_stream_active) {
+                    if (il == 0) {
+                        LLAMA_LOG_WARN("%s: layer-adaptive mode %d assigns per-layer K/V types, which "
+                                       "block KV streaming cannot serve (it has one page geometry for "
+                                       "every layer) - keeping uniform K/V; set "
+                                       "TURBO_LAYER_ADAPTIVE=0 or disable block KV streaming to use it\n",
+                                       __func__, mode);
+                    }
+                    return 0;
+                }
+                if (il == 0) {
+                    if (requested > 0) {
+                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+                    } else {
+                        LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+                    }
+                }
+                return mode;
             }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
@@ -531,6 +549,14 @@ llama_kv_cache::llama_kv_cache(
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
                 }
+            }
+            if (kv_stream_active && (layer_type_k != type_k || layer_type_v != type_v)) {
+                throw std::runtime_error(
+                    "block KV streaming requires uniform K/V types across attention layers, but layer " +
+                    std::to_string(il) + " wants K=" + ggml_type_name(layer_type_k) +
+                    " V=" + ggml_type_name(layer_type_v) +
+                    " while the streamed runtime was sized for K=" + ggml_type_name(type_k) +
+                    " V=" + ggml_type_name(type_v));
             }
         }
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
