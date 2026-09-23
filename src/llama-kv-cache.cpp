@@ -116,6 +116,10 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // upstream; the copy that used to live here is gone. The fork's
 // GGML_HINT_SRC0_IS_HADAMARD hint is applied in the llama-impl.h version.
 
+// TurboQuant mean-sub: file-backed per-(layer, channel) KV means (see the header for the format
+// and for why V must be restored in the graph but K need not be).
+#include "ggml-turbo-meansub.h"
+
 // InnerQ: cross-TU shared state for CUDA per-channel equalization.
 // These are defined in ggml-cuda/turbo-innerq.cu (when CUDA is enabled).
 // When CUDA is not available, we provide stub implementations.
@@ -586,6 +590,21 @@ llama_kv_cache::llama_kv_cache(
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
+
+        // TurboQuant mean-sub: V mean table (width x n_layer), created once when a table file is
+        // loaded and its width matches this cache's V row width. Loaded here (idempotent) because
+        // the cache is built before any set_rows call runs. The tap is only meaningful for a
+        // WHT-rotated (turbo) V, and no table / mismatched width leaves turbo_vmean_table null,
+        // which makes both the encode tap and the graph restore no-ops.
+        ggml_turbo_meansub_load_env();
+        const bool v_is_turbo_type = (layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO8_0 ||
+                                      layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO2_0);
+        if (turbo_vmean_table == nullptr && has_v && v_is_turbo_type && ggml_turbo_meansub_ready() &&
+            (int64_t) ggml_turbo_meansub_width() == n_embd_v_gqa_eff) {
+            turbo_vmean_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                   ggml_turbo_meansub_width(), n_layer);
+            ggml_format_name(turbo_vmean_table, "turbo_vmean_table");
+        }
     }
 
     if (reuse) {
@@ -664,6 +683,26 @@ llama_kv_cache::llama_kv_cache(
             }
 
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
+        }
+
+        // Fill the V mean table from the loaded file, one row per layer. Idempotent (the guard
+        // above is re-evaluated per layer), and a no-op when no table was requested.
+        if (turbo_vmean_table != nullptr && turbo_vmean_table->buffer != nullptr) {
+            const int width = ggml_turbo_meansub_width();
+            std::vector<float> mu((size_t) width, 0.0f);
+            for (uint32_t l = 0; l < n_layer; l++) {
+                const float * row = ggml_turbo_meansub_v((int) l);
+                if (row != nullptr) {
+                    std::memcpy(mu.data(), row, (size_t) width * sizeof(float));
+                } else {
+                    std::memset(mu.data(), 0, (size_t) width * sizeof(float));
+                }
+                ggml_backend_tensor_set(turbo_vmean_table, mu.data(),
+                                        (size_t) l * width * sizeof(float),
+                                        (size_t) width * sizeof(float));
+            }
+            LLAMA_LOG_INFO("%s: TurboQuant V mean-sub table filled (%d layers x %d channels)\n",
+                           __func__, (int) n_layer, width);
         }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -2072,6 +2111,19 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
         v_cur = ggml_pad(ctx, v_cur, pad_amount, 0, 0, 0);
         n_embd_head = v_cur->ne[0];  // now 128-aligned
+    }
+
+    // TurboQuant mean-sub (V): subtract the per-(layer, channel) mean before the WHT encode. The
+    // matching restore happens in the graph right after the inverse rotation (build_attn_mha).
+    // Applied only when the table width matches the (possibly padded) V row.
+    if (turbo_vmean_table != nullptr) {
+        const int64_t width = turbo_vmean_table->ne[0];
+        if (width == n_embd_head * n_head) {
+            ggml_tensor * mu = ggml_view_2d(ctx, turbo_vmean_table, width, 1, width * sizeof(float),
+                                            (size_t) il * width * sizeof(float));
+            mu = ggml_reshape_3d(ctx, mu, n_embd_head, n_head, 1);
+            v_cur = ggml_sub(ctx, v_cur, mu);
+        }
     }
 
     int64_t n_embd_gqa = n_embd_head * n_head;
@@ -3545,6 +3597,10 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_vmean_table() const {
+    return kv->get_turbo_vmean_table();
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

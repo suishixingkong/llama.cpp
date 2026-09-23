@@ -208,6 +208,9 @@ public:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
+    // TurboQuant mean-sub: (width x n_layer) table of per-layer V means, or nullptr
+    ggml_tensor * get_turbo_vmean_table() const { return turbo_vmean_table; }
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -380,6 +383,11 @@ private:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
 
+    // TurboQuant mean-sub: (width, n_layer) table of per-layer V means. Created only when a
+    // TURBO_MEANSUB table is loaded with a matching width; the encode side subtracts row il and
+    // the graph adds it back after the attention.
+    ggml_tensor * turbo_vmean_table = nullptr;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -489,6 +497,9 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+
+    // TurboQuant mean-sub: per-layer V mean table (see ggml-turbo-meansub.h)
+    ggml_tensor * get_turbo_vmean_table() const override;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

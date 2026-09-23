@@ -2649,6 +2649,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
                 cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+
+                // TurboQuant mean-sub restore (V): the V cache holds (v - mu_v), so the attention
+                // output is sum_i w_i v_i - mu_v * sum_i w_i and mu_v has to go back in now that we
+                // are in the head domain again. Exact when the real-token weights sum to one, and a
+                // no-op when no TURBO_MEANSUB table is loaded (ggml/include/ggml-turbo-meansub.h).
+                if (mctx != nullptr) {
+                    ggml_tensor * vmean = mctx->get_turbo_vmean_table();
+                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1] &&
+                        cur->ne[0] * cur->ne[1] == vmean->ne[0]) {
+                        ggml_tensor * mu = ggml_view_2d(ctx0, vmean, vmean->ne[0], 1,
+                                                        vmean->ne[0] * sizeof(float),
+                                                        (size_t) il * vmean->ne[0] * sizeof(float));
+                        mu = ggml_reshape_3d(ctx0, mu, cur->ne[0], cur->ne[1], 1);
+                        cur = ggml_add(ctx0, cur, mu);
+                    }
+                }
             }
         }
 
@@ -2727,6 +2743,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
                 ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
                 kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, innerq_scale);
+
+                // TurboQuant mean-sub restore (V) - same reasoning as in the FA path above.
+                if (mctx != nullptr) {
+                    ggml_tensor * vmean = mctx->get_turbo_vmean_table();
+                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1] &&
+                        kqv->ne[0] * kqv->ne[1] == vmean->ne[0]) {
+                        ggml_tensor * mu = ggml_view_2d(ctx0, vmean, vmean->ne[0], 1,
+                                                        vmean->ne[0] * sizeof(float),
+                                                        (size_t) il * vmean->ne[0] * sizeof(float));
+                        mu = ggml_reshape_3d(ctx0, mu, kqv->ne[0], kqv->ne[1], 1);
+                        kqv = ggml_add(ctx0, kqv, mu);
+                    }
+                }
             }
         }
 

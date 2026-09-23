@@ -2,7 +2,169 @@
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
 
+#include "ggml-turbo-meansub.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
+
+// ─── TurboQuant mean-sub: capture + K affine tap ─────────────────────────────────────────────
+// See ggml/include/ggml-turbo-meansub.h. Both features are dormant unless requested:
+//
+//   * capture: TURBO_MEANSUB_CAPTURE=<n_layer>,<rows>,<prefix> accumulates per-(layer, head,
+//     channel) sums of the RAW (pre-tap) K and V values seen by every turbo4 store, and writes
+//     <prefix>_k.bin and <prefix>_v.bin once the counter of the last layer reaches <rows>.
+//     This is the producer for the offline table the loader consumes.
+//   * K tap: when a table is loaded (TURBO_MEANSUB=<file>), the K store subtracts mu_k before
+//     the WHT rotation. V is deliberately NOT tapped here: V is tapped and restored in the
+//     graph, which keeps the CPU and CUDA paths consistent for the same cache
+//     (MERGE_TURBO234_UPSTREAM.md section 4).
+namespace {
+
+struct meansub_capture {
+    bool    inited   = false;
+    bool    armed    = false;
+    bool    done     = false;
+    int     n_layer  = 0;
+    int     target   = 0;
+    int     width    = 0;   // n_head_kv * head_dim, learned from the first launch
+    char    prefix[400] = {0};
+    float * dev_sum[2]  = {nullptr, nullptr};   // [MAX_LAYER][MAX_WIDTH], 0 = K, 1 = V
+    int   * dev_cnt     = nullptr;              // [2 * MAX_LAYER]
+};
+
+meansub_capture g_meansub_cap;
+
+void meansub_capture_init() {
+    if (g_meansub_cap.inited) {
+        return;
+    }
+    g_meansub_cap.inited = true;
+
+    const char * env = getenv("TURBO_MEANSUB_CAPTURE");
+    if (env == nullptr || env[0] == '\0') {
+        return;
+    }
+
+    // <n_layer>,<rows>,<prefix>
+    const char * c1 = strchr(env, ',');
+    if (c1 == nullptr) { goto bad; }
+    const char * c2 = strchr(c1 + 1, ',');
+    if (c2 == nullptr) { goto bad; }
+    if (c2 - c1 - 1 <= 0 || c2[1] == '\0') { goto bad; }
+    {
+        char nl[32] = {0}, rows[32] = {0};
+        const size_t n1 = (size_t)(c1 - env), n2 = (size_t)(c2 - c1 - 1);
+        if (n1 == 0 || n1 >= sizeof(nl) || n2 >= sizeof(rows)) { goto bad; }
+        memcpy(nl, env, n1);
+        memcpy(rows, c1 + 1, n2);
+        g_meansub_cap.n_layer = atoi(nl);
+        g_meansub_cap.target  = atoi(rows);
+    }
+    if (g_meansub_cap.n_layer <= 0 || g_meansub_cap.n_layer > GGML_TURBO_MEANSUB_MAX_LAYER ||
+        g_meansub_cap.target  <= 0) {
+        goto bad;
+    }
+    snprintf(g_meansub_cap.prefix, sizeof(g_meansub_cap.prefix), "%s", c2 + 1);
+
+    {
+        const size_t n_elem = (size_t) GGML_TURBO_MEANSUB_MAX_LAYER * GGML_TURBO_MEANSUB_MAX_WIDTH;
+        if (cudaMalloc(&g_meansub_cap.dev_sum[0], n_elem * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&g_meansub_cap.dev_sum[1], n_elem * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&g_meansub_cap.dev_cnt, 2 * GGML_TURBO_MEANSUB_MAX_LAYER * sizeof(int)) != cudaSuccess) {
+            fprintf(stderr, "%s: cudaMalloc failed, capture disabled\n", __func__);
+            return;
+        }
+        cudaMemset(g_meansub_cap.dev_sum[0], 0, n_elem * sizeof(float));
+        cudaMemset(g_meansub_cap.dev_sum[1], 0, n_elem * sizeof(float));
+        cudaMemset(g_meansub_cap.dev_cnt,     0, 2 * GGML_TURBO_MEANSUB_MAX_LAYER * sizeof(int));
+    }
+
+    g_meansub_cap.armed = true;
+    fprintf(stderr, "%s: capturing K/V means for %d layers, %d rows -> '%s.bin'\n", __func__,
+            g_meansub_cap.n_layer, g_meansub_cap.target, g_meansub_cap.prefix);
+    return;
+
+bad:
+    fprintf(stderr, "%s: bad TURBO_MEANSUB_CAPTURE='%s' (want <n_layer>,<rows>,<prefix>), disabled\n",
+            __func__, env);
+}
+
+// Gather both sides and write the table files. Called once, at the end of the calibration run.
+void meansub_capture_dump() {
+    if (!g_meansub_cap.armed || g_meansub_cap.done) {
+        return;
+    }
+    g_meansub_cap.done = true;
+
+    const int L = g_meansub_cap.n_layer;
+    const int W = g_meansub_cap.width;
+    if (W <= 0) {
+        fprintf(stderr, "%s: no launch observed, nothing written\n", __func__);
+        return;
+    }
+
+    const size_t n = (size_t) L * (size_t) W;
+    std::vector<float> hk(n, 0.0f), hv(n, 0.0f);
+    std::vector<int>   hc(2 * GGML_TURBO_MEANSUB_MAX_LAYER, 0);
+
+    const size_t stride = (size_t) GGML_TURBO_MEANSUB_MAX_WIDTH;
+    const size_t n_elem = (size_t) GGML_TURBO_MEANSUB_MAX_LAYER * stride;
+
+    std::vector<float> tmp(n_elem, 0.0f);
+    cudaMemcpy(tmp.data(), g_meansub_cap.dev_sum[0], n_elem * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int l = 0; l < L; l++) {
+        memcpy(hk.data() + (size_t) l * W, tmp.data() + (size_t) l * stride, (size_t) W * sizeof(float));
+    }
+    cudaMemcpy(tmp.data(), g_meansub_cap.dev_sum[1], n_elem * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int l = 0; l < L; l++) {
+        memcpy(hv.data() + (size_t) l * W, tmp.data() + (size_t) l * stride, (size_t) W * sizeof(float));
+    }
+    cudaMemcpy(hc.data(), g_meansub_cap.dev_cnt, 2 * GGML_TURBO_MEANSUB_MAX_LAYER * sizeof(int),
+               cudaMemcpyDeviceToHost);
+
+    long tot_k = 0, tot_v = 0;
+    for (int l = 0; l < L; l++) {
+        const int ck = hc[l], cv = hc[GGML_TURBO_MEANSUB_MAX_LAYER + l];
+        const float ik = ck > 0 ? 1.0f / (float) ck : 0.0f;
+        const float iv = cv > 0 ? 1.0f / (float) cv : 0.0f;
+        for (int c = 0; c < W; c++) {
+            hk[(size_t) l * W + c] *= ik;
+            hv[(size_t) l * W + c] *= iv;
+        }
+        tot_k += ck;
+        tot_v += cv;
+        if (l < 4 || l == L - 1) {
+            fprintf(stderr, "%s: layer %2d: k rows=%d v rows=%d\n", __func__, l, ck, cv);
+        }
+    }
+
+    // Only export the sides that were actually written: with an asymmetric cache (e.g. K=turbo4,
+    // V=q8_0) one counter stays at zero and its all-zero slab must not look like a real table.
+    unsigned flags = 0;
+    if (tot_k > 0) { flags |= GGML_TURBO_MEANSUB_FLAG_K; }
+    if (tot_v > 0) { flags |= GGML_TURBO_MEANSUB_FLAG_V; }
+    if (flags == 0) {
+        fprintf(stderr, "%s: no rows captured, nothing written\n", __func__);
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s.bin", g_meansub_cap.prefix);
+    const bool ok = ggml_turbo_meansub_write(path, L, W, (int) flags,
+                                             (flags & GGML_TURBO_MEANSUB_FLAG_K) ? hk.data() : nullptr,
+                                             (flags & GGML_TURBO_MEANSUB_FLAG_V) ? hv.data() : nullptr);
+
+    fprintf(stderr, "%s: wrote %d-layer x %d-channel means to '%s' (k=%s v=%s) -- %s\n", __func__,
+            L, W, path, (flags & GGML_TURBO_MEANSUB_FLAG_K) ? "yes" : "no",
+            (flags & GGML_TURBO_MEANSUB_FLAG_V) ? "yes" : "no", ok ? "ok" : "FAILED");
+}
+
+} // namespace
+
 
 // Generic quantized set_rows kernel template
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
@@ -978,7 +1140,11 @@ static __global__ void k_set_rows_turbo4(
         const int64_t s1,
         const int64_t s2,
         const int64_t s3,
-        const int64_t dst_row_base) {
+        const int64_t dst_row_base,
+        const float * __restrict__ tap_k,   // per-layer K mean row (n_head_kv*head_dim) or null
+        float * __restrict__ cap_sum,       // capture accumulator for this side (or null)
+        int   * __restrict__ cap_cnt,       // [MAX_LAYER] capture row counters (or null)
+        const int64_t cap_layer) {          // destination layer index, -1 when unknown
 
     // blockIdx.x = flat block index; threadIdx.x = element within block (0..127)
     const int j = threadIdx.x;
@@ -1005,6 +1171,23 @@ static __global__ void k_set_rows_turbo4(
     // ---- Step 1: Load element j (coalesced) ----
     __shared__ float x[128];
     x[j] = src_row[i_blk * QK_TURBO4 + j];
+    __syncthreads();
+
+    // ---- TurboQuant mean-sub: capture the raw value, then apply the K tap ----
+    // The capture must see the pre-tap value; V is never tapped here (the graph does it).
+    if (cap_sum != nullptr && cap_cnt != nullptr && cap_layer >= 0 &&
+        cap_layer < GGML_TURBO_MEANSUB_MAX_LAYER) {
+        const int64_t c = i02 * ne00 + j;
+        if (c < GGML_TURBO_MEANSUB_MAX_WIDTH) {
+            atomicAdd(&cap_sum[(size_t) cap_layer * GGML_TURBO_MEANSUB_MAX_WIDTH + c], x[j]);
+        }
+        if (j == 0 && i_blk == 0) {
+            atomicAdd(&cap_cnt[cap_layer], 1);
+        }
+    }
+    if (tap_k != nullptr) {
+        x[j] -= tap_k[i02 * ne00 + j];
+    }
     __syncthreads();
 
     // ---- InnerQ: calibrate on original (unscaled) values ----
@@ -1140,13 +1323,49 @@ static void set_rows_cuda_turbo4(
     // InnerQ: check/finalize calibration before kernel launch
     turbo_innerq_check_finalize(QK_TURBO4, ne00);
 
+    // ---- TurboQuant mean-sub (see ggml-turbo-meansub.h) ----
+    static const bool meansub_env_loaded = [] { ggml_turbo_meansub_load_env(); return true; }();
+    GGML_UNUSED(meansub_env_loaded);
+    meansub_capture_init();
+
+    // The KV cache tensors are named "cache_%sk_l%d" (llama-kv-cache.cpp), so both the layer
+    // index and the K/V side fall out of the destination name without extra plumbing.
+    const bool is_cache = (strncmp(dst->name, "cache_k_l", 9) == 0 ||
+                           strncmp(dst->name, "cache_v_l", 9) == 0);
+    const bool is_k     = is_cache && dst->name[6] == 'k';
+    const int  layer    = is_cache ? atoi(dst->name + 9) : -1;
+
+    // K tap only: V is tapped and restored by the graph. Requires a row of matching width.
+    const float * tap_k = nullptr;
+    if (is_k && layer >= 0 && ggml_turbo_meansub_width() == (int) (ne00 * ne02)) {
+        tap_k = ggml_turbo_meansub_k(layer);
+    }
+
+    const bool cap_here = g_meansub_cap.armed && is_cache && layer >= 0;
+    if (cap_here) {
+        g_meansub_cap.width = (int) (ne00 * ne02);
+    }
+    float * cap_sum = cap_here ? g_meansub_cap.dev_sum[is_k ? 0 : 1] : nullptr;
+    int   * cap_cnt = cap_here ? g_meansub_cap.dev_cnt +
+                                 (is_k ? 0 : GGML_TURBO_MEANSUB_MAX_LAYER) : nullptr;
+
     if (n_blocks > 0) {
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
         k_set_rows_turbo4<idx_t><<<(int)ne_total, 128, 0, stream>>>(
             src0_d, src1_d, (block_turbo4_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
-            nb1, nb2, nb3, dst_row_base);
+            nb1, nb2, nb3, dst_row_base,
+            tap_k, cap_sum, cap_cnt, layer);
+    }
+
+    // Capture: once the last layer has accumulated <target> rows, every earlier layer has too.
+    if (cap_here && !g_meansub_cap.done && layer == g_meansub_cap.n_layer - 1) {
+        int cnt = 0;
+        if (cudaMemcpy(&cnt, cap_cnt + layer, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
+            cnt >= g_meansub_cap.target) {
+            meansub_capture_dump();
+        }
     }
 }
 

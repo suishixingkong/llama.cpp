@@ -76,6 +76,12 @@ struct llama_memory_context_i {
     // TurboQuant InnerQ: per-channel scale_inv tensor for Q/V equalization.
     // Null when InnerQ is not active.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
+
+    // TurboQuant mean-sub: table of per-layer V means, shape (width, n_layer), where
+    // width == n_head_kv * head_dim. Null when no TURBO_MEANSUB table is loaded.
+    // The cache stores (v - mu_v) and the graph adds mu_v back after the attention.
+    // See ggml/include/ggml-turbo-meansub.h.
+    virtual ggml_tensor * get_turbo_vmean_table() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

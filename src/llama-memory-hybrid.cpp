@@ -296,3 +296,7 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
 ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
     return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv() : nullptr;
 }
+
+ggml_tensor * llama_memory_hybrid_context::get_turbo_vmean_table() const {
+    return ctx_attn ? ctx_attn->get_turbo_vmean_table() : nullptr;
+}
