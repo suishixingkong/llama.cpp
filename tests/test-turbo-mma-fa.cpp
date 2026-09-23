@@ -1,24 +1,32 @@
 // Differential test for the opt-in TurboQuant MMA FlashAttention path (Stage 1c L1,
 // BUUN_MERGE_PLAN.md sections 1.4a / 10.9).
 //
-// What it verifies, per (turbo KV type, shape):
+// What it verifies, per (K/V type pair, shape):
 //   1. Dispatch: with GGML_CUDA_TURBO_MMA=1 every case below must increment the
 //      ggml_backend_cuda_get_turbo_mma_fa_invocations() counter (i.e. the op really ran on
-//      the turbo MMA kernel, not silently on the regular VEC/TILE/MMA_F16 path). Without the
+//      the non-f16 MMA kernel, not silently on the regular VEC/TILE/MMA_F16 path). Without the
 //      env var ("fallback" mode) the counter must stay at 0.
-//   2. Numerics: the MMA kernel decodes the same TurboQuant KV blocks the CPU reference
+//   2. Numerics: the MMA kernel decodes the same quantized KV blocks the CPU reference
 //      decodes, so the two outputs may only differ by in-kernel fp16 tile rounding and
 //      accumulation order -- asserted to stay far below quantization-error scale, and far
 //      below what a wrong tile/group addressing bug (O(1) garbage) would produce.
 //
-// The shapes cover every tile the Volta dispatch ladder can select for D in {128, 256}:
-// gqa 8/4/2/1 -> ncols2 8/4/2/1, small and large nq -> 32-column and 64-column rungs, and a
-// no-mask case -> the ncols2=1 non-GQA path. No model file needed.
+// The pairs cover every non-f16 MMA instantiation set (13 symmetric pairs: turbo scalar/TCQ,
+// standard quantized, bf16; plus the mixed pairs); the shapes cover every tile the Volta
+// dispatch ladder can select for D in {128, 256}: gqa 8/4/2/1 -> ncols2 8/4/2/1, small and
+// large nq -> 32-column and 64-column rungs, and a no-mask case -> the ncols2=1 non-GQA path.
+// No model file needed.
 //
-// Usage: test-turbo-mma-fa [fallback]
+// Usage: test-turbo-mma-fa [fallback] [--only <substr>]
 //   (default)  sets GGML_CUDA_TURBO_MMA=1 and asserts the MMA counter advances.
 //   fallback   leaves the env var off and asserts the counter never advances; the numeric
 //              comparison still runs against whatever regular kernel the backend picks.
+//   --only     runs only the cases whose name contains <substr> (fast device iteration).
+//
+// Each case reports nan(cpu/cuda) and sentinel_left; an output element still holding the
+// pre-compute sentinel was never written by the kernel. Both are asserted to be 0 -- without
+// them a NaN output would silently "pass" (every diff comparison against NaN is false, so a
+// naive max_diff stays 0).
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -90,15 +98,30 @@ std::vector<uint8_t> gen_mask_f16(int64_t nq, int64_t nkv) {
     return m;
 }
 
-// Builds and runs one FLASH_ATTN_EXT with turbo-quantized K/V on `backend`, returns the f32 output.
+// Simple run statistics that make NaN/uninitialized outputs impossible to miss. A bare
+// max-diff is blind here: any NaN element makes every comparison false, so max_diff stays 0
+// and a completely unwritten/NaN output would look like a perfect match.
+//   n_nan      : NaN elements in the output (must be 0)
+//   n_sentinel : elements still holding the pre-compute sentinel, i.e. never written
+struct run_stats {
+    size_t n_nan      = 0;
+    size_t n_sentinel = 0;
+};
+
+// Builds and runs one FLASH_ATTN_EXT on `backend`, returns the f32 output plus run_stats.
+// `prefill_sentinel` (when not NaN) is written into the output tensor before the compute so
+// that unwritten elements can be told apart from written NaN.
 std::vector<float> run_fa(
         ggml_backend_t backend,
-        ggml_type kv_type,
+        ggml_type type_k,
+        ggml_type type_v,
         const fa_shape & s,
         const std::vector<float> & q_src,
         const std::vector<uint8_t> & k_bytes,
         const std::vector<uint8_t> & v_bytes,
-        const std::vector<uint8_t> * mask_bytes) {
+        const std::vector<uint8_t> * mask_bytes,
+        float prefill_sentinel,
+        run_stats * stats) {
     constexpr size_t N_TENSORS = 16;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
@@ -108,8 +131,8 @@ std::vector<float> run_fa(
     GGML_ASSERT(ctx);
 
     ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32,  s.D, s.nq, s.nhq, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), kv_type,        s.D, NKV, s.nhkv, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), kv_type,        s.D, NKV, s.nhkv, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), type_k,         s.D, NKV, s.nhkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), type_v,         s.D, NKV, s.nhkv, 1);
     ggml_tensor * mask = mask_bytes ?
         ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, NKV, s.nq, 1, 1) : nullptr;
 
@@ -126,6 +149,10 @@ std::vector<float> run_fa(
     if (mask_bytes) {
         ggml_backend_tensor_set(mask, mask_bytes->data(), 0, mask_bytes->size());
     }
+    if (!std::isnan(prefill_sentinel)) {
+        const std::vector<float> sentinel(ggml_nelements(kqvb), prefill_sentinel);
+        ggml_backend_tensor_set(kqvb, sentinel.data(), 0, sentinel.size()*sizeof(float));
+    }
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), N_TENSORS, false);
     ggml_build_forward_expand(graph, kqvb);
@@ -135,6 +162,16 @@ std::vector<float> run_fa(
     std::vector<float> out(ggml_nelements(kqvb));
     GGML_ASSERT(ggml_is_contiguous(kqvb));
     ggml_backend_tensor_get(kqvb, out.data(), 0, out.size()*sizeof(float));
+
+    if (stats != nullptr) {
+        for (float f : out) {
+            if (std::isnan(f) || std::isinf(f)) {
+                ++stats->n_nan;
+            } else if (!std::isnan(prefill_sentinel) && f == prefill_sentinel) {
+                ++stats->n_sentinel;
+            }
+        }
+    }
     return out;
 }
 
@@ -162,19 +199,60 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr cpu_backend(ggml_backend_cpu_init());
     GGML_ASSERT(cpu_backend);
 
-    const ggml_type types[] = {
-        GGML_TYPE_TURBO8_0,
-        GGML_TYPE_TURBO3_TCQ,
-        GGML_TYPE_TURBO2_TCQ,
-        GGML_TYPE_TURBO1_TCQ,
+    // K/V type pairs: every non-f16 MMA pair instantiated by the current GGML_CUDA_FA_QUANTS
+    // selection -- the 13 symmetric pairs (turbo scalar/TCQ, standard quantized, bf16) plus the
+    // mixed pairs. This exercises every general-loader decode branch (turbo 128-element rotation
+    // groups, q4_0/q4_1/q5_0/q5_1/q8_0 32-element blocks, bf16 pseudo-blocks) and the asymmetric
+    // combinations, not only the original turbo pairs. All pairs are in GGML_CUDA_FA_QUANTS, so
+    // the dispatch-counter assertions apply to every case.
+    struct kv_pair {
+        ggml_type k;
+        ggml_type v;
+    };
+    const kv_pair pairs[] = {
+        {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO8_0},
+        {GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ},
+        {GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ},
+        {GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ},
+        {GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO4_0},
+        {GGML_TYPE_TURBO3_0,  GGML_TYPE_TURBO3_0},
+        {GGML_TYPE_TURBO2_0,  GGML_TYPE_TURBO2_0},
+        {GGML_TYPE_Q8_0,      GGML_TYPE_Q8_0},
+        {GGML_TYPE_Q5_0,      GGML_TYPE_Q5_0},
+        {GGML_TYPE_Q5_1,      GGML_TYPE_Q5_1},
+        {GGML_TYPE_Q4_0,      GGML_TYPE_Q4_0},
+        {GGML_TYPE_Q4_1,      GGML_TYPE_Q4_1},
+        {GGML_TYPE_BF16,      GGML_TYPE_BF16},
+        {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO3_TCQ},
+        {GGML_TYPE_F16,       GGML_TYPE_TURBO8_0},
+        {GGML_TYPE_TURBO8_0,  GGML_TYPE_Q5_1},
+        {GGML_TYPE_TURBO8_0,  GGML_TYPE_Q4_1},
+        {GGML_TYPE_Q5_1,      GGML_TYPE_TURBO3_TCQ},
+        {GGML_TYPE_Q4_1,      GGML_TYPE_TURBO3_TCQ},
+        {GGML_TYPE_Q5_1,      GGML_TYPE_Q4_1},
     };
 
-    for (ggml_type kv_type : types) {
+    // Optional case filter for fast iteration on the device: --only <substr> matches the case
+    // name (e.g. --only "turbo8-turbo8 D=128" or --only q5_0).
+    std::string only;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--only" && i + 1 < argc) {
+            only = argv[i + 1];
+        }
+    }
+
+    for (const kv_pair & p : pairs) {
         for (const fa_shape & s : shapes) {
-            std::string name = std::string(ggml_type_name(kv_type)) + " " + s.label;
+            std::string name = std::string(ggml_type_name(p.k)) + "-" +
+                ggml_type_name(p.v) + " " + s.label;
+            if (!only.empty() && name.find(only) == std::string::npos) {
+                continue;
+            }
             t.test(name.c_str(), [&](testing & tt) {
-                const size_t kv_row_bytes = ggml_row_size(kv_type, s.D);
-                const size_t kv_bytes     = kv_row_bytes*(size_t)(NKV*s.nhkv);
+                const size_t k_row_bytes = ggml_row_size(p.k, s.D);
+                const size_t v_row_bytes = ggml_row_size(p.v, s.D);
+                const size_t k_bytes_len = k_row_bytes*(size_t)(NKV*s.nhkv);
+                const size_t v_bytes_len = v_row_bytes*(size_t)(NKV*s.nhkv);
 
                 // Identical quantized KV bytes are fed to both backends: the comparison is
                 // purely between the two decoders (CPU f32 reference vs in-kernel MMA decode).
@@ -182,12 +260,12 @@ int main(int argc, char ** argv) {
                 const std::vector<float> k_src = gen_f32((size_t)(s.D*NKV*s.nhkv), 0x1234u);
                 const std::vector<float> v_src = gen_f32((size_t)(s.D*NKV*s.nhkv), 0x5678u);
 
-                std::vector<uint8_t> k_bytes(kv_bytes);
-                std::vector<uint8_t> v_bytes(kv_bytes);
-                GGML_ASSERT(ggml_quantize_chunk(kv_type, k_src.data(), k_bytes.data(),
-                                                0, NKV*s.nhkv, s.D, nullptr) == kv_bytes);
-                GGML_ASSERT(ggml_quantize_chunk(kv_type, v_src.data(), v_bytes.data(),
-                                                0, NKV*s.nhkv, s.D, nullptr) == kv_bytes);
+                std::vector<uint8_t> k_bytes(k_bytes_len);
+                std::vector<uint8_t> v_bytes(v_bytes_len);
+                GGML_ASSERT(ggml_quantize_chunk(p.k, k_src.data(), k_bytes.data(),
+                                                0, NKV*s.nhkv, s.D, nullptr) == k_bytes_len);
+                GGML_ASSERT(ggml_quantize_chunk(p.v, v_src.data(), v_bytes.data(),
+                                                0, NKV*s.nhkv, s.D, nullptr) == v_bytes_len);
 
                 std::vector<uint8_t> mask_bytes;
                 const std::vector<uint8_t> * mask_ptr = nullptr;
@@ -196,12 +274,19 @@ int main(int argc, char ** argv) {
                     mask_ptr = &mask_bytes;
                 }
 
+                run_stats cpu_stats;
                 const std::vector<float> cpu_out = run_fa(
-                    cpu_backend.get(), kv_type, s, q_src, k_bytes, v_bytes, mask_ptr);
+                    cpu_backend.get(), p.k, p.v, s, q_src, k_bytes, v_bytes, mask_ptr,
+                    std::nanf(""), &cpu_stats);
 
+                // Sentinel: 1234.5 is not a value the attention of our inputs can produce, so any
+                // element that still holds it after the compute was never written by the kernel.
+                constexpr float SENTINEL = 1234.5f;
+                run_stats cuda_stats;
                 const uint64_t inv_before = ggml_backend_cuda_get_turbo_mma_fa_invocations();
                 const std::vector<float> cuda_out = run_fa(
-                    cuda_backend.get(), kv_type, s, q_src, k_bytes, v_bytes, mask_ptr);
+                    cuda_backend.get(), p.k, p.v, s, q_src, k_bytes, v_bytes, mask_ptr,
+                    SENTINEL, &cuda_stats);
                 const uint64_t inv_delta =
                     ggml_backend_cuda_get_turbo_mma_fa_invocations() - inv_before;
 
@@ -209,36 +294,58 @@ int main(int argc, char ** argv) {
                 if (mma_mode) {
                     tt.assert_true("opt-in MMA dispatch counter advanced (GGML_CUDA_TURBO_MMA=1)",
                                    inv_delta >= 1);
+                    if (inv_delta == 0) {
+                        printf("    (MMA path not selected: is \"%s-%s\" in this build's "
+                               "GGML_CUDA_FA_QUANTS, and is the device Volta?)\n",
+                               ggml_type_name(p.k), ggml_type_name(p.v));
+                    }
                 } else {
                     tt.assert_true("MMA dispatch counter stayed at 0 without the env var",
                                    inv_delta == 0);
                 }
 
-                // 2. Numerics vs the CPU reference decode of the same blocks.
+                // 2. Output sanity: NaN/Inf and unwritten elements must never survive a compute.
+                //    Without this, a NaN output makes every diff comparison false and the case
+                //    would pass with max_diff == 0 (a false PASS).
+                tt.assert_true("CPU reference output is finite", cpu_stats.n_nan == 0);
+                tt.assert_true("CUDA output is finite (no NaN/Inf)", cuda_stats.n_nan == 0);
+                tt.assert_true("CUDA output was fully written (no sentinel left)",
+                               cuda_stats.n_sentinel == 0);
+
+                // 3. Numerics vs the CPU reference decode of the same blocks.
                 double max_out = 0.0;
                 for (float f : cpu_out) {
-                    max_out = std::max(max_out, std::abs((double) f));
+                    if (std::isfinite(f)) {
+                        max_out = std::max(max_out, std::abs((double) f));
+                    }
                 }
                 double max_diff = 0.0;
                 double sum_diff = 0.0;
                 size_t arg = 0;
+                size_t n_cmp = 0;
                 for (size_t i = 0; i < cpu_out.size(); ++i) {
+                    if (!std::isfinite(cpu_out[i]) || !std::isfinite(cuda_out[i])) {
+                        continue; // reported by the finiteness assertions above
+                    }
                     const double d = std::abs((double) cuda_out[i] - (double) cpu_out[i]);
                     sum_diff += d;
+                    ++n_cmp;
                     if (d > max_diff) {
                         max_diff = d;
                         arg = i;
                     }
                 }
-                const double mean_diff = sum_diff/(double) cpu_out.size();
+                const double mean_diff = n_cmp > 0 ? sum_diff/(double) n_cmp : 0.0;
                 // The kernel decodes K/V into fp16 tiles (rel. rounding ~5e-4) and Q enters the
                 // MMA as fp16 as well, so ~1e-3 relative is expected fp noise; a wrong tile or
                 // rotation-group addressing bug would produce O(|out|) garbage instead.
                 const double tol = 2e-2*max_out + 1e-4;
-                printf("    invocations=%llu max_diff=%.3e (at %zu) mean_diff=%.3e max|out|=%.3f tol=%.3e\n",
-                       (unsigned long long) inv_delta, max_diff, arg, mean_diff, max_out, tol);
+                printf("    invocations=%llu nan(cpu/cuda)=%zu/%zu sentinel_left=%zu "
+                       "max_diff=%.3e (at %zu) mean_diff=%.3e max|out|=%.3f tol=%.3e\n",
+                       (unsigned long long) inv_delta, cpu_stats.n_nan, cuda_stats.n_nan,
+                       cuda_stats.n_sentinel, max_diff, arg, mean_diff, max_out, tol);
                 tt.assert_true("MMA output matches the CPU reference decode within fp16 tile noise",
-                               max_diff <= tol);
+                               max_diff <= tol && cuda_stats.n_nan == 0 && cuda_stats.n_sentinel == 0);
             });
         }
     }
