@@ -316,14 +316,15 @@ static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TUR
 
 #if TURBO4_USE_4BIT
 // 4-bit PolarQuant: 16 optimal centroids, nibble packed, no QJL
-// Per block: norm(fp16) + rnorm(fp16, reserved) + 4-bit indices (64 bytes)
-// = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16
+// Per block: norm(fp16) + 4-bit indices (64 bytes)
+// = 66 bytes per 128 values = 4.125 bits/value → 3.88× compression vs fp16
+// The rnorm field of the legacy 3-bit+QJL variant is not stored in 4-bit mode; dropping it
+// reclaims 0.125 bpv (taken from the same change in the upstream turboquant fork).
 typedef struct {
     ggml_half  norm;                    //  2 bytes
-    ggml_half  rnorm;                   //  2 bytes (reserved, unused in 4-bit mode)
     uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit PolarQuant indices (nibble packed)
-} block_turbo4_0;                       // 68 bytes total
-static_assert(sizeof(block_turbo4_0) == 68, "wrong turbo4_0 block size");
+} block_turbo4_0;                       // 66 bytes total
+static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
 #else
 // Legacy 3-bit PolarQuant + 1-bit QJL (original paper design)
 // Per block: norm(fp16) + rnorm(fp16) + 3-bit indices (48 bytes) + 1-bit QJL signs (16 bytes)

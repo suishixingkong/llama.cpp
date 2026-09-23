@@ -1101,10 +1101,10 @@ static __global__ void k_set_rows_turbo4(
     const float recon_norm     = sqrtf(s_recon_sq);
     const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
 
-    // ---- Step 8: Write corrected norm and zero rnorm (one thread) ----
+    // ---- Step 8: Write corrected norm (one thread) ----
+    // No rnorm write: the 4-bit block layout has no such field (66 B, 4.125 bpv).
     if (j == 0) {
         blk->norm  = __float2half(corrected_norm);
-        blk->rnorm = __float2half(0.0f);
     }
 
     GGML_UNUSED(ne10);
