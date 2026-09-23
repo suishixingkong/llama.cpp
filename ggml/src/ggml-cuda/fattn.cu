@@ -10,6 +10,7 @@
 #include "kv-stream-span-tuner.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include <unordered_map>
@@ -3139,8 +3140,20 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * ds
     }
 }
 
+// Opt-in TurboQuant MMA FA dispatch counter (BUUN_MERGE_PLAN.md section 10.9). Exported via
+// ggml_backend_cuda_get_turbo_mma_fa_invocations() so tests and A/B runs can verify this path
+// was actually taken: a delta of 0 around a compute means the regular kernels served the op.
+static std::atomic<uint64_t> g_turbo_mma_fa_invocations{0};
+
+uint64_t ggml_backend_cuda_get_turbo_mma_fa_invocations(void) {
+    return g_turbo_mma_fa_invocations.load(std::memory_order_relaxed);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
+
+    g_turbo_mma_fa_invocations.fetch_add(1, std::memory_order_relaxed);
+
     switch (Q->ne[0]) {
         case 128:
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128>(ctx, dst);

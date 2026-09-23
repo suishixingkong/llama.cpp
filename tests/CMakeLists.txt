@@ -327,6 +327,10 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
     # CUDA-vs-CPU parity of the TurboQuant KV encoders (SET_ROWS). Needs no model file.
     llama_build_and_test(test-turbo-cuda-parity.cpp LABEL cuda)
+    # Differential test of the opt-in TurboQuant MMA FlashAttention path (GGML_CUDA_TURBO_MMA=1).
+    # Run twice on the device: default = mma mode (counter must advance), "fallback" = env off
+    # (counter must stay 0). See BUUN_MERGE_PLAN.md section 10.9.
+    llama_build_and_test(test-turbo-mma-fa.cpp LABEL cuda)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
