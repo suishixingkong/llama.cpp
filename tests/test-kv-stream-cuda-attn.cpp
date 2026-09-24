@@ -722,9 +722,13 @@ int main() {
                 t.assert_true("phase arena compute slice carves", false);
                 return;
             }
-            ggml_backend_buffer_type_t arena_buft =
-                ggml_backend_cuda_phase_arena_buffer_type(arena);
-
+            // The KV cache tensors must live in the RUNTIME's buffer type (host-pinned pages,
+            // exactly what llama-kv-cache.cpp gets from buffer_type_fn(runtime)), not in the
+            // arena's own buft: the arena only backs the ring/pool and the compute slice. With
+            // the KV in arena (device) memory the cache is fully resident, async page uploads
+            // never happen, and the engagement assertion below fails on a numerically perfect
+            // (max_abs=0) run - which is exactly what the first version of this test did. The
+            // reference run stays on the default device buft.
             ggml_backend_cuda_kv_stream_params params{};
             params.device           = 0;
             params.stage_bytes      = page_bytes;
@@ -738,7 +742,8 @@ int main() {
             }
 
             const std::vector<float> actual = run_attention(
-                backend.get(), inputs, arena_buft, n_kv, n_batch);
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch);
             const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
             ggml_backend_cuda_kv_stream_runtime_free(runtime);
             ggml_backend_cuda_phase_arena_free(arena);
@@ -1597,7 +1602,12 @@ int main() {
             params.device                = 0;
             params.stage_bytes           = page_bytes;
             params.stage_slots           = 4;
-            params.pool_bytes            = 5*page_bytes;
+            // Pairs not compiled into this build (e.g. turbo8-turbo8 under a narrow
+            // GGML_CUDA_FA_QUANTS) resolve to the F16 conversion mode, and the runtime refuses
+            // pool_bytes <= scratch + conversion_bytes (ggml-cuda.cu runtime_new_impl). Size the
+            // pool for the conversion workspace too; for DIRECT pairs conversion_bytes is 0 and
+            // this is the old 5-page pool.
+            params.pool_bytes            = 5*page_bytes + conversion_bytes;
             params.resident_layer_count  = 1;
             params.page_tokens           = 256;
             params.conversion_bytes      = conversion_bytes;
