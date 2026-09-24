@@ -126,3 +126,73 @@ llama-server -m <MTP 模型> --mmproj <投影器> --spec-type draft-mtp --spec-d
 - 若需要外部 drafter 也参与交换，需先量「重新加载 drafter 的代价」是否值得；
 - 若要移植 auto-fit 相位感知页边距，需先合入 buun 的 `recurrent_expansion` / `n_parallel_user` 体系
   （或在本树的 fit 路径上另写等价物）。
+
+## 7. 测试步骤（有卡机器）
+
+### 7.1 参数清单
+
+| 分组 | 参数 | 说明 |
+|---|---|---|
+| **本特性** | `--mmproj-gpu-swap` | 无值开关。**只在 `llama-server` 注册**（`LLAMA_EXAMPLE_SERVER`）——`llama-cli`/`llama-bench`/`llama-perplexity` 传它会报未知参数。无环境变量。 |
+| **必需前提** | `-mm` / `--mmproj FILE` | 不给则 `has_mmproj` 为假，整段逻辑不执行（静默） |
+| | `--spec-type draft-mtp` | **交换只对纯 MTP 生效**（`!has_draft && spec_mtp`） |
+| | ❌ `--spec-draft-model` | **不要给**。外部 drafter ⇒ 触发 `requires the MTP draft context` 警告并**禁用**交换 |
+| | `-c N` | **建议显式给**：本移植未含 auto-fit 相位感知页边距（§2），自动 fit 的页边距不考虑投影器 |
+| **相关可选** | `-mmdev` / `--mmproj-device` | 投影器换到 GPU 时用的设备（默认跟随 `--device`） |
+| | `--spec-draft-n-max N` | MTP 草稿长度，同时决定 MTP 上下文大小（要腾出的显存量） |
+| | `--mmproj-offload` / `--no-mmproj-offload` | **不用手动设**：交换启用时起始位置强制为 CPU，由本特性接管 |
+
+### 7.2 三步
+
+```bat
+:: 第 0 步：确认二进制含本特性（未重建时应无输出）
+llama-server.exe --help 2>&1 | findstr /C:"mmproj-gpu-swap"
+
+:: 第 1 步：启动冒烟（不需要图片）
+llama-server.exe ^
+  -m "<MTP 模型>.gguf" -mm "<匹配的投影器>.gguf" ^
+  -c 32768 -np 1 -ngl all -fa on -t 16 --device CUDA0 ^
+  --spec-type draft-mtp --spec-draft-n-max 3 ^
+  -ctk turbo4 -ctv turbo4 ^
+  --mmproj-gpu-swap --host 0.0.0.0 --port 8080
+```
+
+启动日志只可能有两种结果，这是**第一个判据**：
+
+- ✅ `loaded multimodal model on CPU (GPU swap enabled), '<投影器>'` ⇒ 交换已启用（投影器不占显存）；
+- ❌ `mmproj GPU swap requires the MTP draft context; keeping the projector and the drafter resident`
+  ⇒ 条件不满足（多半是给了 `--spec-draft-model`，或 MTP 没生效），交换**不会**发生。
+
+```powershell
+# 第 2 步：端到端 —— 另开一个 PowerShell 发图（内联 base64，无需额外启动参数）
+$b64  = [Convert]::ToBase64String([IO.File]::ReadAllBytes('D:\images\cat.png'))
+$body = @{
+  messages   = @(@{ role = 'user'; content = @(
+      @{ type = 'image_url'; image_url = @{ url = "data:image/png;base64,$b64" } },
+      @{ type = 'text'; text = '描述这张图' }) })
+  max_tokens = 64
+} | ConvertTo-Json -Depth 10
+Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
+  -Body $body -ContentType 'application/json' | ConvertTo-Json -Depth 6
+```
+
+> 替代方案：启动时加 `--media-path D:\images\`，请求里写 `image_url.url = "file://cat.png"`
+> （`file://` 必须配 `--media-path`；三种来源 `http(s)://` / `file://` / `data:` 的分发在
+> `server-common.cpp:1088/1105/1123`，函数 `handle_media`）。
+> 同时开一个 `nvidia-smi --query-gpu=memory.used --format=csv -l 1` 观察显存相位变化。
+
+### 7.3 判读表
+
+| 观察 | 含义 | 下一步 |
+|---|---|---|
+| 启动即出现 `requires the MTP draft context` 警告 | 不是纯 MTP 配置 | 去掉 `--spec-draft-model`，确认 `--spec-type draft-mtp` 生效 |
+| 有 `on CPU (GPU swap enabled)`，但发图后**没有** `swapping MTP out` | `needs_mmproj_swap` 未成立（该 slot 的 batch 里没认出 media chunk） | 确认请求真带图；确认该 slot 的 prompt 里有图像占位 token |
+| `swapping MTP out` → 随后 `failed to load mmproj to GPU` + `falling back to CPU` | 腾出的显存不够放投影器 | 降 `-c` / 降 `--spec-draft-n-max`；用 nvidia-smi 确认 MTP 真被释放 |
+| `MTP->mmproj swap done` 与 `mmproj->MTP swap done` **成对**出现 | ✅ 往返成功 | 继续文本对话，确认投机恢复（见下条） |
+| `continuing without speculative decoding after the mmproj swap` | MTP 重建失败，已 fail-open | 输出仍正确，但失去投机；查显存占用 |
+| `failed to load the multimodal projector during the GPU swap` + 该请求报错 | 投影器 GPU/CPU 都加载失败 | 查投影器文件与 `-mmdev` |
+
+**预期内的「退化」**：交换期间与交换后，**其它 slot** 缓存的草稿状态被丢弃（§3.3），
+它们会退化为纯目标解码。表现是 `n_draft_accepted` / `n_draft_verif_steps` 暂时停滞 ——
+这是**设计行为，不是 bug**，输出正确性不受影响，重新生成草稿后会自行恢复。
+
