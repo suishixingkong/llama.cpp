@@ -294,13 +294,22 @@ int main(int argc, char ** argv) {
                     ggml_backend_cuda_get_turbo_mma_fa_invocations() - inv_before;
 
                 // 1. Dispatch sanity: the counter proves which kernel family ran.
+                //    f16 K/V is the control - it goes through the original f16 loader, so the
+                //    TurboQuant MMA path must NOT claim it. Every other pair must be claimed,
+                //    which is what separates "harness + MMA path" from the non-f16 tile loader.
+                const bool expect_turbo_mma = !(p.k == GGML_TYPE_F16 && p.v == GGML_TYPE_F16);
                 if (mma_mode) {
-                    tt.assert_true("opt-in MMA dispatch counter advanced (GGML_CUDA_TURBO_MMA=1)",
-                                   inv_delta >= 1);
-                    if (inv_delta == 0) {
-                        printf("    (MMA path not selected: is \"%s-%s\" in this build's "
-                               "GGML_CUDA_FA_QUANTS, and is the device Volta?)\n",
-                               ggml_type_name(p.k), ggml_type_name(p.v));
+                    if (expect_turbo_mma) {
+                        tt.assert_true("opt-in MMA dispatch counter advanced (GGML_CUDA_TURBO_MMA=1)",
+                                       inv_delta >= 1);
+                        if (inv_delta == 0) {
+                            printf("    (MMA path not selected: is \"%s-%s\" in this build's "
+                                   "GGML_CUDA_FA_QUANTS, and is the device Volta?)\n",
+                                   ggml_type_name(p.k), ggml_type_name(p.v));
+                        }
+                    } else {
+                        tt.assert_true("control pair f16/f16 keeps the original f16 loader",
+                                       inv_delta == 0);
                     }
                 } else {
                     tt.assert_true("MMA dispatch counter stayed at 0 without the env var",
