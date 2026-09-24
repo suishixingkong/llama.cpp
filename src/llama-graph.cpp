@@ -2588,6 +2588,48 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// TurboQuant mean-sub V restore. The V cache stores (v - mu_v) per KV-head channel (cpy_v),
+// so the attention output of every Q head h is
+//     y_h = sum_i w_i (v_i - mu_kv(h)) = y_true_h - mu_kv(h)
+// (real-token softmax weights sum to one; Qwen has no attention sinks) and mu has to be
+// added back per Q head, where Q head h belongs to KV head h / group - the same GQA mapping
+// the flash attention kernels use (fattn: zt_Q = z_KV*gqa_ratio + j).
+//
+// Neither buun's original nor the first port of this restore was correct for GQA: buun's
+// guard (vmean->ne[0] >= cur->ne[0]) only holds for MHA models, and the ported equality
+// guard (cur->ne[0]*cur->ne[1] == width) never held anywhere - with a table loaded the V
+// side silently lost -mu_v per channel (measured on 27B turbo4: KLD 0.050 -> 0.082).
+//
+// cur:   [head_dim, n_head_q, n_tokens] - the FA output layout; the non-FA mul_mat path
+//        produces the same. head_dim is the padded one, matching the table width.
+// vmean: [width = n_head_kv*head_dim, n_layer], head-major per layer.
+// Returns cur unchanged when the shapes do not match the tapped layout (the encoder did
+// not tap either, so there is nothing to restore).
+static ggml_tensor * build_turbo_vmean_restore(
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * vmean, int il) {
+    const int64_t hd    = cur->ne[0];
+    const int64_t nh_q  = cur->ne[1];
+    const int64_t width = vmean->ne[0];
+    if (width % hd != 0) {
+        return cur;
+    }
+    const int64_t nh_kv = width / hd;
+    if (nh_q < nh_kv || nh_q % nh_kv != 0) {
+        return cur;
+    }
+
+    ggml_tensor * mu = ggml_view_2d(ctx0, vmean, width, 1,
+            vmean->ne[0] * sizeof(float), (size_t) il * vmean->ne[0] * sizeof(float));
+    mu = ggml_reshape_3d(ctx0, mu, hd, 1, nh_kv);              // [hd, 1, nh_kv]
+    if (nh_q > nh_kv) {
+        // tile the KV-head axis into (j, kv) order so the head-major flatten below
+        // yields h_q = kv*group + j
+        mu = ggml_repeat_4d(ctx0, mu, hd, nh_q / nh_kv, nh_kv, 1);  // [hd, group, nh_kv]
+    }
+    mu = ggml_reshape_3d(ctx0, mu, hd, nh_q, 1);               // [hd, nh_q, 1]
+    return ggml_add(ctx0, cur, mu);                            // broadcast over tokens
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2654,15 +2696,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 // output is sum_i w_i v_i - mu_v * sum_i w_i and mu_v has to go back in now that we
                 // are in the head domain again. Exact when the real-token weights sum to one, and a
                 // no-op when no TURBO_MEANSUB table is loaded (ggml/include/ggml-turbo-meansub.h).
-                if (mctx != nullptr) {
+                // Only the types cpy_v actually taps (turbo2/3/4) need the restore - turbo8 and
+                // the TCQ formats are tap-gated and store raw V.
+                if (mctx != nullptr &&
+                        (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0)) {
                     ggml_tensor * vmean = mctx->get_turbo_vmean_table();
-                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1] &&
-                        cur->ne[0] * cur->ne[1] == vmean->ne[0]) {
-                        ggml_tensor * mu = ggml_view_2d(ctx0, vmean, vmean->ne[0], 1,
-                                                        vmean->ne[0] * sizeof(float),
-                                                        (size_t) il * vmean->ne[0] * sizeof(float));
-                        mu = ggml_reshape_3d(ctx0, mu, cur->ne[0], cur->ne[1], 1);
-                        cur = ggml_add(ctx0, cur, mu);
+                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1]) {
+                        cur = build_turbo_vmean_restore(ctx0, cur, vmean, il);
                     }
                 }
             }
@@ -2745,15 +2785,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, innerq_scale);
 
                 // TurboQuant mean-sub restore (V) - same reasoning as in the FA path above.
-                if (mctx != nullptr) {
+                // The non-FA mul_mat path yields the same [head_dim, n_head_q, n_tokens]
+                // layout, and only turbo2/3/4 store a tapped V.
+                if (mctx != nullptr &&
+                        (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0)) {
                     ggml_tensor * vmean = mctx->get_turbo_vmean_table();
-                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1] &&
-                        kqv->ne[0] * kqv->ne[1] == vmean->ne[0]) {
-                        ggml_tensor * mu = ggml_view_2d(ctx0, vmean, vmean->ne[0], 1,
-                                                        vmean->ne[0] * sizeof(float),
-                                                        (size_t) il * vmean->ne[0] * sizeof(float));
-                        mu = ggml_reshape_3d(ctx0, mu, kqv->ne[0], kqv->ne[1], 1);
-                        kqv = ggml_add(ctx0, kqv, mu);
+                    if (vmean != nullptr && il >= 0 && il < (int) vmean->ne[1]) {
+                        kqv = build_turbo_vmean_restore(ctx0, kqv, vmean, il);
                     }
                 }
             }
