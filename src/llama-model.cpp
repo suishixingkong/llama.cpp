@@ -2621,6 +2621,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
                     } else {
+                        // Block KV streaming is validated for the target context only:
+                        // llama_kv_stream_config_validate() rejects anything but
+                        // LLAMA_CONTEXT_TYPE_DEFAULT ("supports only the target context, not
+                        // MTP/draft contexts"). The MTP draft context reaches this same
+                        // constructor, so it has to be gated out explicitly - otherwise it
+                        // registers a second streaming runtime on the shared phase arena, and
+                        // the two contexts then contend for the same pool and transfer ring.
+                        const bool kv_stream_ok = arch == LLM_ARCH_QWEN35 &&
+                            params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2639,9 +2648,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* kv stream stage   */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_stage_bytes : 0,
-                            /* kv stream arena   */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_phase_arena : nullptr,
-                            /* kv stream maximum */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_maximum_pool_bytes : 0);
+                            /* kv stream stage   */ kv_stream_ok ? params.kv_stream_stage_bytes : 0,
+                            /* kv stream arena   */ kv_stream_ok ? params.kv_stream_phase_arena : nullptr,
+                            /* kv stream maximum */ kv_stream_ok ? params.kv_stream_maximum_pool_bytes : 0);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
