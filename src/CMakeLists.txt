@@ -33,6 +33,18 @@ set(LLAMA_CORE_SOURCES
     llama-sha256.h
     llama-vbr-codec.cpp
     llama-vbr-codec.h
+    llama-vbr-checkpoint-types.h
+    llama-vbr-controller-id.cpp
+    llama-vbr-controller-id.h
+    llama-vbr-generation-types.h
+    llama-cache-accounting.cpp
+    llama-cache-accounting.h
+    llama-cache-budget.cpp
+    llama-cache-budget.h
+    llama-cache-authority.cpp
+    llama-cache-authority.h
+    llama-memory-tree.cpp
+    llama-memory-tree.h
     llama-kv-stream-plan.cpp
     llama-kv-stream-plan.h
     llama-kv-stream-softmax.cpp
