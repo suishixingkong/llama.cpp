@@ -792,6 +792,10 @@ extern "C" {
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
 
+    // TurboQuant KV-cache codec family (turbo2/3/4/8 + the TCQ tiers). These types are only
+    // usable as KV-cache tensors on a backend exporting the VBR interface (see ggml-vbr.h).
+    GGML_API bool    ggml_is_turbo_kv_type(enum ggml_type type);
+
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
 

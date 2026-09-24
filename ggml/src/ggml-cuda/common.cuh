@@ -1458,6 +1458,15 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_vbr_transcode_workspace {
+    uint8_t * cuda_buf  = nullptr;
+    size_t    cuda_size = 0;
+
+    ggml_vbr_vmm_pool * vmm    = nullptr;
+    size_t              vmm_va = 0;
+    size_t              vmm_hw = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1473,6 +1482,11 @@ struct ggml_backend_cuda_context {
     // When non-zero, quantized Volta prefill GEMMs reuse one converted weight
     // while submitting independent output-column tiles of this size to cuBLAS.
     uint32_t prefill_reuse = 0;
+
+    // Dedicated VBR side backends enqueue multiple transcodes on one stream. Their temporary
+    // planes can therefore reuse one context-owned, grow-only physical workspace without using
+    // the generic pool (whose growth is fatal and cannot be projected by the KV controller).
+    ggml_cuda_vbr_transcode_workspace vbr_transcode_workspace;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

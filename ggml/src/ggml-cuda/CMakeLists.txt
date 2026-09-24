@@ -101,6 +101,9 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+    # vbr-vmm-policy.h is a plain .h (not .cuh) and so is not covered by the glob above
+    list(APPEND GGML_HEADERS_CUDA "vbr-vmm-policy.h")
+    list(APPEND GGML_HEADERS_CUDA "../../include/ggml-vbr.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")

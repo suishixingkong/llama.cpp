@@ -57,6 +57,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
+#include "ggml-cuda/vbr-transcode.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
@@ -786,6 +787,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+
+    ggml_cuda_vbr_transcode_workspace_free(*this);
 }
 
 
@@ -800,16 +803,17 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     ggml_backend_cuda_phase_arena_t arena = nullptr;
+    bool owned = true; // false for buffers wrapping externally-managed memory (VBR VMM pool)
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
+        device(device), dev_ptr(dev_ptr), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ggml_backend_cuda_buffer_context(
-            int device, void * dev_ptr, ggml_backend_cuda_phase_arena_t arena) :
-        device(device), dev_ptr(dev_ptr), arena(arena),
+            int device, void * dev_ptr, ggml_backend_cuda_phase_arena_t arena, bool owned = true) :
+        device(device), dev_ptr(dev_ptr), arena(arena), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
@@ -1173,6 +1177,18 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
+// wrap externally-managed device memory (a VMM VA range) as a first-class CUDA backend buffer.
+// The buffer does not own ptr: its context is created with owned=false so the destructor never
+// cudaFree's it — release stays with the pool that handed out the range.
+ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * ptr, size_t size) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+    if (buft == nullptr || ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, ptr, /*owned=*/false);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
 struct ggml_backend_cuda_phase_arena {
     int device = 0;
     void * data = nullptr;
@@ -1248,6 +1264,9 @@ static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_
 }
 
 ggml_backend_cuda_buffer_context::~ggml_backend_cuda_buffer_context() {
+    if (!owned) {
+        return; // wraps externally-managed memory (VBR VMM pool) — never free it here
+    }
     if (arena == nullptr) {
         CUDA_CHECK(cudaFree(dev_ptr));
         return;
@@ -5802,6 +5821,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before
+    // any capture/launch) so this graph reads the flipped tensors post-transcode. Host never blocks.
+    ggml_cuda_vbr_fence_consume(cuda_ctx->device, cuda_ctx->stream());
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -7153,8 +7176,69 @@ static void ggml_backend_cuda_set_prefill_reuse(ggml_backend_t backend, uint32_t
     ctx->prefill_reuse = n;
 }
 
+// TurboQuant/VBR KV-cache backend interface (ggml-vbr.h): every slot filled — libllama
+// resolves this vtable via GGML_VBR_BACKEND_IFACE_PROC instead of linking CUDA symbols.
+const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
+    static const auto tensor_memset_async = [](
+            ggml_backend_t backend, ggml_tensor * tensor,
+            size_t offset, size_t size) {
+        ggml_backend_cuda_context * cuda_ctx =
+            (ggml_backend_cuda_context *) backend->context;
+        ggml_backend_buffer_t buf = tensor->view_src
+            ? tensor->view_src->buffer : tensor->buffer;
+        GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+        CUDA_CHECK(cudaMemsetAsync(
+            (char *) tensor->data + offset, 0, size, cuda_ctx->stream()));
+    };
+    static const ggml_vbr_backend_iface iface = {
+        /* .get_device_count  = */ ggml_backend_cuda_get_device_count,
+        /* .buffer_type       = */ ggml_backend_cuda_buffer_type,
+        /* .get_device_memory = */ ggml_backend_cuda_get_device_memory,
+        /* .backend_init      = */ ggml_backend_cuda_init,
+        /* .sync_device       = */ ggml_backend_cuda_sync_device,
+        /* .vmm_available     = */ ggml_backend_cuda_vmm_available,
+        /* .vmm_granularity   = */ ggml_backend_cuda_vmm_granularity,
+        /* .vmm_pool_init     = */ ggml_backend_cuda_vmm_pool_init,
+        /* .vmm_pool_free     = */ ggml_backend_cuda_vmm_pool_free,
+        /* .vmm_pool_base     = */ ggml_backend_cuda_vmm_pool_base,
+        /* .vmm_pool_mapped   = */ ggml_backend_cuda_vmm_pool_mapped,
+        /* .vmm_pool_residency_epoch = */ ggml_backend_cuda_vmm_pool_residency_epoch,
+        /* .vmm_pool_mapped_in_range = */ ggml_backend_cuda_vmm_pool_mapped_in_range,
+        /* .vmm_pool_map      = */ ggml_backend_cuda_vmm_pool_map,
+        /* .vmm_pool_unmap    = */ ggml_backend_cuda_vmm_pool_unmap,
+        /* .vmm_pool_clear    = */ ggml_backend_cuda_vmm_pool_clear,
+        /* .buffer_from_ptr   = */ ggml_backend_cuda_buffer_from_ptr,
+        /* .kv_transcode      = */ ggml_backend_cuda_kv_transcode,
+        /* .kv_stash_capture  = */ ggml_backend_cuda_kv_stash_capture,
+        /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
+        /* .kv_dequant_scratch_reserve = */ ggml_backend_cuda_kv_dequant_scratch_reserve,
+        /* .kv_dequant_scratch_memory  = */ ggml_backend_cuda_kv_dequant_scratch_memory,
+        /* .kv_transcode_workspace_memory  = */ ggml_backend_cuda_kv_transcode_workspace_memory,
+        /* .kv_transcode_workspace_reserve = */ ggml_backend_cuda_kv_transcode_workspace_reserve,
+        /* .tensor_memset_async = */ tensor_memset_async,
+    };
+    return &iface;
+}
+
+const ggml_vbr_cross_domain_iface_v1 * ggml_backend_cuda_vbr_cross_domain_iface_v1(void) {
+    static const ggml_vbr_cross_domain_iface_v1 iface = {
+        /* .abi_version = */ GGML_VBR_CROSS_DOMAIN_IFACE_V1_VERSION,
+        /* .struct_size = */ sizeof(ggml_vbr_cross_domain_iface_v1),
+        /* .kv_cross_domain_reconstruct = */ ggml_backend_cuda_kv_cross_domain_reconstruct,
+        /* .kv_transcode_workspace_memory_v2 = */ ggml_backend_cuda_kv_transcode_workspace_memory_v2,
+        /* .kv_transcode_workspace_reserve_v2 = */ ggml_backend_cuda_kv_transcode_workspace_reserve_v2,
+    };
+    return &iface;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
+        return (void *) ggml_backend_cuda_vbr_iface;
+    }
+    if (strcmp(name, GGML_VBR_CROSS_DOMAIN_IFACE_V1_PROC) == 0) {
+        return (void *) ggml_backend_cuda_vbr_cross_domain_iface_v1;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
