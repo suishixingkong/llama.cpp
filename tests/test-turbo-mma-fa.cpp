@@ -233,6 +233,9 @@ int main(int argc, char ** argv) {
         {GGML_TYPE_Q5_1,      GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_Q4_1,      GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_Q5_1,      GGML_TYPE_Q4_1},
+        {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO4_0},
+        {GGML_TYPE_Q8_0,      GGML_TYPE_TURBO4_0},
+        {GGML_TYPE_F16,       GGML_TYPE_Q8_0},
     };
 
     // Optional case filter for fast iteration on the device: --only <substr> matches the case

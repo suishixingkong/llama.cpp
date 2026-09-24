@@ -227,6 +227,15 @@ static bool ggml_cuda_fattn_mma_turbo_pair_compiled(ggml_type type_k, ggml_type 
 #if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
     TURBO_MMA_PAIR_TEST(Q5_1, Q4_1)
 #endif
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0
+    TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0
+    TURBO_MMA_PAIR_TEST(Q8_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0
+    TURBO_MMA_PAIR_TEST(F16, Q8_0)
+#endif
 #undef TURBO_MMA_PAIR_TEST
     return false;
 }
@@ -303,6 +312,15 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_typed(ggml_backend_cuda_cont
 #endif
 #if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
     TURBO_MMA_PAIR_CALL(Q5_1, Q4_1)
+#endif
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0
+    TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0
+    TURBO_MMA_PAIR_CALL(Q8_0, TURBO4_0)
+#endif
+#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0
+    TURBO_MMA_PAIR_CALL(F16, Q8_0)
 #endif
 #undef TURBO_MMA_PAIR_CALL
     GGML_ABORT("fatal error: no non-f16 MMA instance compiled for K/V types %s-%s (add the pair to GGML_CUDA_FA_QUANTS)",
@@ -523,6 +541,9 @@ DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  Q4_1)
 DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_1,      TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q4_1,      TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q5_1,      Q4_1)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(TURBO8_0,  TURBO4_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(Q8_0,      TURBO4_0)
+DECL_FATTN_MMA_TURBO_PAIR_SHAPES(F16,       Q8_0)
 
 // Streamed span prefill uses exactly this shape (D=256, tile 8x8):
 extern DECL_FATTN_MMA_TURBO_PARTIAL_CASE(256, 256, 8, 8, TURBO8_0,  TURBO8_0);
