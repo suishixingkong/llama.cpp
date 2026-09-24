@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-from glob import glob
 import os
 
 HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
@@ -68,17 +67,45 @@ def get_short_name(long_quant_name):
     return long_quant_name.replace("GGML_TYPE_", "").lower()
 
 
-for filename in glob("*.cu"):
-    os.remove(filename)
+# The names this script (re)writes. Only these are deleted before regenerating.
+#
+# This directory is not a purely generated one: the TurboQuant/TCQ vec instances, the
+# per-pair non-f16 MMA instances (fattn-mma-<K>-<V>-instance-*.cu) and the whole
+# fattn-mma-turbo.cuh family are maintained by hand, because their type lists and shape
+# ladders do not follow TYPES_KV / HEAD_SIZES_KQ. Deleting every *.cu would silently drop
+# ~480 of those and only the next full build would notice.
+def own_names():
+    names = []
+    for head_size_kq in HEAD_SIZES_KQ:
+        head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
+        names.append(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu")
+    for type_k in TYPES_KV:
+        for type_v in TYPES_KV:
+            names.append(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu")
+    for ncols in [8, 16, 32, 64]:
+        for ncols2 in [1, 2, 4, 8, 16, 32]:
+            if ncols2 > ncols:
+                continue
+            names.append(f"fattn-mma-f16-instance-ncols1_{ncols // ncols2}-ncols2_{ncols2}.cu")
+    for type in TYPES_MMQ:
+        names.append(f"mmq-instance-{get_short_name(type)}.cu")
+    for type in range(1, 17):
+        names.append(f"mmf-instance-ncols_{type}.cu")
+    return names
+
+
+for filename in own_names():
+    if os.path.exists(filename):
+        os.remove(filename)
 
 for head_size_kq in HEAD_SIZES_KQ:
     head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
-    with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
+    with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu", "w", newline="\n") as f:
         f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v))
 
 for type_k in TYPES_KV:
     for type_v in TYPES_KV:
-        with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
+        with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w", newline="\n") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
 
 for ncols in [8, 16, 32, 64]:
@@ -86,7 +113,7 @@ for ncols in [8, 16, 32, 64]:
         if ncols2 > ncols:
             continue
         ncols1 = ncols // ncols2
-        with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
+        with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w", newline="\n") as f:
             f.write(SOURCE_FATTN_MMA_START)
 
             for head_size_kq in HEAD_SIZES_KQ + MMA_EXTRA_HEAD_SIZES_KQ:
@@ -111,9 +138,9 @@ for ncols in [8, 16, 32, 64]:
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
 for type in TYPES_MMQ:
-    with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
+    with open(f"mmq-instance-{get_short_name(type)}.cu", "w", newline="\n") as f:
         f.write(SOURCE_MMQ.format(type=type))
 
 for type in range(1, 17):
-    with open(f"mmf-instance-ncols_{type}.cu", "w") as f:
+    with open(f"mmf-instance-ncols_{type}.cu", "w", newline="\n") as f:
         f.write(SOURCE_MMF.format(type=type))
