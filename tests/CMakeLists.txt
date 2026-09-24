@@ -412,6 +412,23 @@ if (TARGET cpp-httplib)
     endif()
 endif()
 
+# VBR pure-arithmetic kernels: header-only, no dependency beyond the standard library, so they
+# build and run in every platform/configuration (unlike the tests above, which need internals that
+# are not exported). Their whole body is asserts, and Release defines NDEBUG, so /UNDEBUG is the
+# flag that keeps them from silently becoming no-ops.
+llama_build_and_test(test-vbr-policy.cpp)
+llama_build_and_test(test-vbr-physical.cpp)
+llama_build_and_test(test-vbr-transaction.cpp)
+if (MSVC)
+    target_compile_options(test-vbr-policy      PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-physical    PRIVATE /UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-vbr-policy      PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-physical    PRIVATE -UNDEBUG)
+    target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

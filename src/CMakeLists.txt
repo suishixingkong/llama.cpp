@@ -37,6 +37,9 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-controller-id.cpp
     llama-vbr-controller-id.h
     llama-vbr-generation-types.h
+    llama-vbr-policy.h
+    llama-vbr-physical.h
+    llama-vbr-transaction.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
