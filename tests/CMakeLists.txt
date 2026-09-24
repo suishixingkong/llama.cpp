@@ -429,6 +429,15 @@ else()
     target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
 endif()
 
+# VBR leaf kernels.
+
+# Self-reporting rather than assert-based: it returns a status from main and prints explicit PASS
+# lines, so unlike the three above it does not need /UNDEBUG to stay meaningful - which is also why
+# upstream only attaches that flag to the assert-based ones. It includes its header by bare name,
+# hence the src include directory.
+llama_build_and_test(test-vbr-hard-seal.cpp)
+target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

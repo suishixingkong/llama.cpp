@@ -40,6 +40,8 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-policy.h
     llama-vbr-physical.h
     llama-vbr-transaction.h
+    llama-vbr-hard-seal.cpp
+    llama-vbr-hard-seal.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
