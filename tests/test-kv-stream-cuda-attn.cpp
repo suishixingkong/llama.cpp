@@ -642,6 +642,130 @@ int main() {
         }
     });
 
+    // Server-shaped reproduction: the production path builds the streamed runtime INSIDE a phase
+    // arena (ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena), while every other case in
+    // this file hand-builds it with ggml_backend_cuda_kv_stream_runtime_new. That arena path is the
+    // one code path the unit tests never exercised - and it is exactly the difference between the
+    // server (broken: degraded output at reduced throughput with turbo4 + MTP + streaming) and the
+    // passing hand-built cases. Mirror llama-context.cpp: carve a KV slice + compute slice out of a
+    // phase arena, then build the runtime in it. turbo8-turbo4 is the control (known-good, same
+    // arena path); a divergence on the turbo4 pairs but not the control localizes the fault to the
+    // turbo4 geometry under the phase arena.
+    t.test("phase-arena streaming path reproduces the server runtime for turbo4 pairs", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        // K/V pairs a -ctk/-ctv turbo4 server run actually uses; turbo8-turbo4 is the control.
+        const ggml_type k_types[] = {GGML_TYPE_TURBO8_0, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0};
+        const ggml_type v_types[] = {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0};
+        constexpr size_t n_pairs = sizeof(k_types)/sizeof(k_types[0]);
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (size_t pi = 0; pi < n_pairs; ++pi) {
+            const ggml_type type_k = k_types[pi];
+            const ggml_type type_v = v_types[pi];
+
+            const attention_inputs inputs =
+                make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch);
+
+            const size_t k_page_bytes =
+                ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t v_page_bytes =
+                ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+
+            size_t conversion_bytes = 0;
+            {
+                using workspace_bytes_fn_t = bool (*)(ggml_type, ggml_type, uint32_t, uint32_t,
+                    uint32_t, uint32_t, size_t *);
+                ggml_backend_reg_t reg =
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+                auto * workspace_bytes_fn = (workspace_bytes_fn_t)
+                    ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
+                if (!t.assert_true("workspace geometry query is available",
+                        workspace_bytes_fn != nullptr &&
+                        workspace_bytes_fn(type_k, type_v, HEAD_DIM, HEAD_DIM, N_KV_HEAD,
+                            256, &conversion_bytes))) {
+                    return;
+                }
+            }
+
+            const auto mode = ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v);
+            if (mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED) {
+                t.skip("pair is unsupported in this build");
+                continue;
+            }
+
+            // Carve the arena the way llama-context.cpp does (fixed small ring here; the server
+            // derives minimum_ring_slots from the stream plan). KV slice first, generous compute.
+            const uint32_t minimum_ring_slots = 8;
+            const uint64_t layer_count = 1;
+            const uint64_t bootstrap_raw =
+                conversion_bytes + (layer_count + minimum_ring_slots)*page_bytes;
+            const uint64_t bootstrap = (bootstrap_raw + 127ULL) & ~127ULL;
+            const size_t arena_bytes = size_t(bootstrap) + 8*1024*1024;
+            ggml_backend_cuda_phase_arena_t arena =
+                ggml_backend_cuda_phase_arena_new(0, arena_bytes);
+            if (!t.assert_true("phase arena allocates", arena != nullptr)) {
+                return;
+            }
+            if (!ggml_backend_cuda_phase_arena_set_compute(
+                    arena, bootstrap, arena_bytes - bootstrap)) {
+                ggml_backend_cuda_phase_arena_free(arena);
+                t.assert_true("phase arena compute slice carves", false);
+                return;
+            }
+            ggml_backend_buffer_type_t arena_buft =
+                ggml_backend_cuda_phase_arena_buffer_type(arena);
+
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device           = 0;
+            params.stage_bytes      = page_bytes;
+            params.stage_slots      = 1;
+            params.conversion_bytes = conversion_bytes;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena(
+                arena, arena_bytes - bootstrap, params);
+            if (!t.assert_true("phase-arena stream runtime initializes", runtime != nullptr)) {
+                ggml_backend_cuda_phase_arena_free(arena);
+                return;
+            }
+
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, arena_buft, n_kv, n_batch);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            ggml_backend_cuda_phase_arena_free(arena);
+
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            const float tolerance = 5e-4f;
+            if (!std::isfinite(max_abs) || max_abs > tolerance ||
+                    stats.asynchronous_page_uploads == 0) {
+                std::fprintf(stderr,
+                    "phase-arena K=%s V=%s mode=%d max_abs=%g tol=%g async_uploads=%llu\n",
+                    ggml_type_name(type_k), ggml_type_name(type_v), (int) mode,
+                    max_abs, tolerance,
+                    (unsigned long long) stats.asynchronous_page_uploads);
+            }
+            t.assert_true("phase-arena pair executes streamed attention",
+                stats.asynchronous_page_uploads > 0);
+            t.assert_true("phase-arena pair remains numerically equivalent",
+                std::isfinite(max_abs) && max_abs <= tolerance);
+        }
+    });
+
     t.test("all bounded-fallback KV pairs preserve streamed prefill results", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
