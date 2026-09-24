@@ -1409,6 +1409,98 @@ int main() {
         t.assert_true("batched streamed logits remain equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("turbo decode under multi-row updates (MTP verification batch) keeps logits", [](testing & t) {
+        // Gap this closes: every decode case above calls make_inputs() with its default
+        // Q8_0/Q4_0 pair, and the cases that do sweep TurboQuant types run many queries at
+        // once. A TurboQuant cache + block KV streaming + MTP therefore had no coverage at
+        // all - MTP only exists at decode time, and its verification batch is the one place
+        // where SET_ROWS writes several rows at once (update_rows > 1 selects the staged
+        // path). Field symptom: nonsense output at reduced t/s with turbo4/3/2 + streaming
+        // + MTP, and normal behaviour with any one of the three removed.
+        constexpr int64_t n_kv        = 1536;
+        constexpr int64_t n_batch     = 1;   // decode shape
+        constexpr int64_t update_rows = 4;   // sampled token + drafts -> staged SET_ROWS
+        const ggml_type turbo_types[] = {
+            GGML_TYPE_TURBO2_0,
+            GGML_TYPE_TURBO3_0,
+            GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO8_0,
+            GGML_TYPE_TURBO3_TCQ,
+            GGML_TYPE_TURBO2_TCQ,
+            GGML_TYPE_TURBO1_TCQ,
+        };
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const ggml_type type : turbo_types) {
+            const auto mode = ggml_backend_cuda_kv_stream_get_attention_mode(type, type);
+            if (mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED) {
+                continue;   // this build did not compile the pair - nothing to compare
+            }
+            const char * mode_name =
+                mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ? "DIRECT" : "F16";
+
+            const attention_inputs inputs =
+                make_inputs(n_kv, n_batch, n_kv - n_batch, type, type);
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch, 1, update_rows);
+
+            const size_t typed_page_bytes = ggml_row_size(type, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t page_bytes = align_up(typed_page_bytes, 128) + typed_page_bytes;
+
+            size_t conversion_bytes = 0;
+            {
+                using workspace_bytes_fn_t = bool (*)(ggml_type, ggml_type, uint32_t, uint32_t,
+                    uint32_t, uint32_t, size_t *);
+                ggml_backend_reg_t reg =
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+                auto * workspace_bytes_fn = (workspace_bytes_fn_t)
+                    ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
+                if (!t.assert_true("workspace geometry query is available",
+                        workspace_bytes_fn != nullptr &&
+                        workspace_bytes_fn(type, type, HEAD_DIM, HEAD_DIM, N_KV_HEAD,
+                            256, &conversion_bytes))) {
+                    return;
+                }
+            }
+
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device                = 0;
+            params.stage_bytes           = page_bytes;
+            params.stage_slots           = 4;
+            params.pool_bytes            = 5*page_bytes;
+            params.resident_layer_count  = 1;
+            params.page_tokens           = 256;
+            params.conversion_bytes      = conversion_bytes;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("turbo decode runtime initializes", runtime != nullptr)) {
+                return;
+            }
+
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch, 1, update_rows);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            std::fprintf(stderr, "    turbo decode K=V=%s mode=%s update_rows=%d max_abs=%g\n",
+                    ggml_type_name(type), mode_name, (int) update_rows, max_abs);
+            t.assert_true("turbo decode stays equivalent under multi-row (MTP) updates",
+                std::isfinite(max_abs) && max_abs <= 3e-4f);
+        }
+    });
+
     t.test("decode pipelines bounded attention chunks and samples every immutable copy batch", [](testing & t) {
         if (!require_direct_default_pair(t)) {
             return;
