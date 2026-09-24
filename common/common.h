@@ -391,10 +391,15 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
+    bool has_type(common_speculative_type t) const {
+        return std::find(types.begin(), types.end(), t) != types.end();
+    }
+
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+        const bool needs_rs_seq = has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+                                  has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+                                  has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                                  has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
@@ -595,6 +600,7 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+    bool mmproj_gpu_swap = false;               // swap the MTP draft context out of VRAM for the duration of an image encode
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;

@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -832,6 +833,50 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     return try_decode();
 }
 
+// A projector GPU swap is a destructive two-phase transition: once the draft context has
+// been torn down to free VRAM, every exit from the media interval must restore it exactly
+// once. In particular, server_queue::yield_to_queue() may rethrow either the media work
+// exception or an exception raised by a concurrently serviced callback.
+class server_mmproj_restore_guard {
+public:
+    explicit server_mmproj_restore_guard(std::function<void()> restore) :
+        restore_(std::move(restore)) {}
+
+    server_mmproj_restore_guard(const server_mmproj_restore_guard &) = delete;
+    server_mmproj_restore_guard & operator=(const server_mmproj_restore_guard &) = delete;
+
+    ~server_mmproj_restore_guard() noexcept {
+        if (!armed_) {
+            return;
+        }
+        try {
+            restore_now();
+        } catch (const std::exception & e) {
+            SRV_ERR("mmproj restore failed: %s\n", e.what());
+        } catch (...) {
+            SRV_ERR("%s", "mmproj restore failed\n");
+        }
+    }
+
+    void arm() noexcept {
+        armed_ = true;
+    }
+
+    void restore_now() {
+        if (!armed_) {
+            return;
+        }
+        // Clear before invoking the callback. If restoration itself throws, unwinding must
+        // not attempt the same destructive transition twice.
+        armed_ = false;
+        restore_();
+    }
+
+private:
+    std::function<void()> restore_;
+    bool armed_ = false;
+};
+
 //
 // server_context_impl (private implementation)
 //
@@ -939,6 +984,11 @@ private:
 
     bool sleeping = false;
 
+    // MTP <-> mmproj GPU swap state: the MTP draft context is destroyed for the duration of
+    // a media encode so the projector can use its VRAM, then recreated
+    bool mmproj_gpu_swap   = false;
+    bool mmproj_is_on_gpu  = false;
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -955,6 +1005,160 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    // build the mtmd context params the same way load_model() does; the reload path only
+    // parameterizes device placement, everything else has to match the initial load
+    mtmd_context_params make_mmproj_params(bool use_gpu) const {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = use_gpu;
+        mparams.device           = params_base.mmproj_device;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = use_gpu; // only warm up when the projector actually lands on the GPU
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+        mparams.media_marker     = get_media_marker();
+        return mparams;
+    }
+
+    // drop the current projector and load it again on the requested device. Slot state that
+    // is derived from the projector (the mtmd batch is cached between chunks) dies with it.
+    void reload_mmproj(bool use_gpu) {
+        for (server_slot & slot : slots) {
+            slot.mbatch.reset();
+        }
+
+        mtmd_free(mctx);
+        mctx = nullptr;
+        mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, make_mmproj_params(use_gpu));
+
+        for (server_slot & slot : slots) {
+            slot.mctx                   = mctx;
+            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+        }
+    }
+
+    // point (or unpoint) every slot at a draft context and its speculative owner
+    void bind_slots_to_draft_context(llama_context * draft_context, common_speculative * shared_spec) {
+        for (server_slot & slot : slots) {
+            slot.spec    = shared_spec;
+            slot.ctx_dft = draft_context;
+            slot.mem.init(slot.ctx_tgt, draft_context);
+            if (draft_context == nullptr) {
+                // Cached draft state only carries meaning for the context that produced it.
+                // It has to go as a set: draft generation asserts that a reused partial draft
+                // comes with its checkpoint, so clearing one without the other would abort.
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+                slot.spec_ckpt.clear();
+                slot.spec_is_replay = false;
+            }
+        }
+    }
+
+    void unbind_slots_from_draft_context() {
+        bind_slots_to_draft_context(nullptr, nullptr);
+        spec.reset();
+    }
+
+    // recreate the MTP draft context and its speculative owner after the projector swap tore
+    // them down. Mirrors the speculative init block in load_model().
+    bool recreate_mtp_context() {
+        common_params params_dft = common_base_params_to_speculative(params_base);
+
+        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+        model_dft = spec_init->model();
+        ctx_dft   = spec_init->context();
+
+        if (ctx_dft == nullptr) {
+            SRV_ERR("%s", "failed to recreate the MTP context after the mmproj swap\n");
+            spec_init.reset();
+            model_dft = nullptr;
+            return false;
+        }
+
+        params_base.speculative.draft.ctx_tgt = ctx_tgt;
+        params_base.speculative.draft.ctx_dft = ctx_dft;
+
+        ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+
+        try {
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to reinitialize speculative decoding after the mmproj swap: %s\n", e.what());
+            return false;
+        }
+
+        if (!spec) {
+            SRV_ERR("%s", "failed to reinitialize speculative decoding after the mmproj swap\n");
+            return false;
+        }
+
+        bind_slots_to_draft_context(ctx_dft, spec.get());
+
+        return true;
+    }
+
+    // destroy the MTP draft context so the projector can have its VRAM, then load the
+    // projector onto the GPU. Returns false if the projector could not be brought up at all.
+    bool swap_spec_to_mmproj_gpu() noexcept {
+        SRV_INF("%s", "swapping MTP out of VRAM, loading mmproj to GPU...\n");
+        const int64_t t0 = ggml_time_us();
+
+        mmproj_is_on_gpu = false;
+
+        try {
+            // every slot must stop referring to the draft context before it is destroyed
+            unbind_slots_from_draft_context();
+            spec_init.reset();
+            ctx_dft   = nullptr;
+            model_dft = nullptr;
+            params_base.speculative.draft.ctx_dft = nullptr;
+
+            reload_mmproj(true);
+            if (mctx == nullptr) {
+                SRV_ERR("%s", "failed to load mmproj to GPU, falling back to CPU\n");
+                reload_mmproj(false);
+            } else {
+                mmproj_is_on_gpu = true;
+            }
+
+            SRV_INF("MTP->mmproj swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+            return mctx != nullptr;
+        } catch (const std::exception & e) {
+            SRV_ERR("mmproj swap-out failed: %s\n", e.what());
+        } catch (...) {
+            SRV_ERR("%s", "mmproj swap-out failed\n");
+        }
+
+        // the caller's armed restore guard reconstructs speculation; keep every slot
+        // target-only until it runs
+        unbind_slots_from_draft_context();
+        mmproj_is_on_gpu = false;
+        return false;
+    }
+
+    void swap_mmproj_to_spec() noexcept {
+        SRV_INF("%s", "unloading mmproj from the GPU, recreating MTP...\n");
+        const int64_t t0 = ggml_time_us();
+
+        mmproj_is_on_gpu = false;
+
+        try {
+            reload_mmproj(false);
+            if (!recreate_mtp_context()) {
+                SRV_ERR("%s", "continuing without speculative decoding after the mmproj swap\n");
+                return;
+            }
+            SRV_INF("mmproj->MTP swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+        } catch (const std::exception & e) {
+            SRV_ERR("mmproj swap-back failed: %s\n", e.what());
+        } catch (...) {
+            SRV_ERR("%s", "mmproj swap-back failed\n");
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1048,26 +1252,34 @@ private:
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
-        std::string & mmproj_path = params_base.mmproj.path;
-        mtmd_context_params mparams = mtmd_context_params_default();
+        const std::string & mmproj_path = params_base.mmproj.path;
+
+        // The GPU swap destroys the draft context for the duration of an image encode, which
+        // is only viable for MTP: it is recreated against the target model without reloading
+        // anything. An external draft model would have to be loaded from disk again, so the
+        // projector and such a drafter stay resident together.
+        const bool mmproj_swap_applicable = params_base.mmproj_gpu_swap && !has_draft && spec_mtp;
+        if (params_base.mmproj_gpu_swap && !mmproj_swap_applicable && has_mmproj) {
+            SRV_WRN("%s", "mmproj GPU swap requires the MTP draft context; keeping the projector and the drafter resident\n");
+        }
+
+        // with the swap enabled the projector starts on the CPU and only moves to the GPU for
+        // the duration of an image encode
+        mtmd_context_params mparams = make_mmproj_params(
+                mmproj_swap_applicable ? false : params_base.mmproj_use_gpu);
         if (has_mmproj) {
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
-            mparams.device           = params_base.mmproj_device;
-            mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
-            mparams.image_min_tokens = params_base.image_min_tokens;
-            mparams.image_max_tokens = params_base.image_max_tokens;
-            mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
-            mparams.media_marker     = get_media_marker();
+            if (!mmproj_swap_applicable) {
+                mparams.warmup = params_base.warmup;
+            }
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        // with the GPU swap the projector and the drafter are phase-exclusive, so the
+        // projector does not need a permanent reservation
+        if (has_mmproj && params_base.fit_params && !mmproj_swap_applicable) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1170,7 +1382,14 @@ private:
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            // the swap needs a live MTP context to tear down and recreate
+            mmproj_gpu_swap = mmproj_swap_applicable && ctx_dft != nullptr;
+            if (mmproj_gpu_swap) {
+                SRV_INF("loaded multimodal model on CPU (GPU swap enabled), '%s'\n", mmproj_path.c_str());
+            } else {
+                SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -3506,6 +3725,27 @@ private:
 
                     bool has_mtmd = false;
 
+                    // swap the MTP draft context out of VRAM so that the projector can run on
+                    // the GPU for the image encode, then restore it once the media interval ends
+                    const bool needs_mmproj_swap = mmproj_gpu_swap && !mmproj_is_on_gpu
+                        && slot.prompt.n_tokens() < slot.task->n_tokens()
+                        && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
+
+                    // most prompts never enter the projector/draft exchange, so the guard that
+                    // owns the restore is only constructed for an actual swap
+                    std::optional<server_mmproj_restore_guard> mmproj_restore;
+                    if (needs_mmproj_swap) {
+                        mmproj_restore.emplace([&]() { swap_mmproj_to_spec(); });
+                        mmproj_restore->arm();
+                        if (!swap_spec_to_mmproj_gpu()) {
+                            mmproj_restore->restore_now();
+                            SLT_ERR(slot, "%s", "failed to load the multimodal projector during the GPU swap\n");
+                            send_error(slot, "failed to load multimodal projector", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return; // the slot is done, skip it entirely
+                        }
+                    }
+
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -3547,6 +3787,11 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    // the media interval is over: bring the draft context back
+                    if (mmproj_restore.has_value()) {
+                        mmproj_restore->restore_now();
                     }
 
                     const auto & spans = slot.task->params.message_spans;
