@@ -430,3 +430,76 @@ tests/test-kv-stream-cuda-set-rows.cpp turbo 类型矩阵 + GPU-free 的 registr
 ggml/src/ggml-cuda/set-rows.cu        turbo2/3/4 的 SET_ROWS 内核与启动器补 dst_row_base（§7）
 tests/test-kv-stream-cuda-attn.cpp    staged 写用例加 turbo2/3/4；span 开关自述输出
 ```
+
+---
+
+# 追加（2026-09-24 14:0x）：phase arena 是服务端唯一未被测试覆盖的路径
+
+`45ed60d6d`（draft context 不流式）已确认进构建，但**症状仍在** ⇒ draft 抢占共享
+phase arena 的假设（commit message 里那条）大概率不是主因，或只是次要因素。
+
+排查收敛到的唯一结构性差异：
+
+- 测试（`test-kv-stream-cuda-attn`）全部用 `ggml_backend_cuda_kv_stream_runtime_new`
+  **手建** runtime；
+- 服务端（`llama-context.cpp`）用 `ggml_backend_cuda_kv_stream_runtime_new_in_phase_arena`
+  在 **phase arena** 里建 runtime。
+
+即：phase arena 路径是单位测试从没跑过的、服务端独有的路径——这正是「测试全绿、server 失智」
+的缺口。n_ctx 已钉死、draft gate 已排除，剩下的服务端独有差异只剩 phase arena / 64 层 /
+大 n_ctx / CUDA graph 规模，其中 phase arena 是最先该钉死的。
+
+已加 `test-kv-stream-cuda-attn.cpp` 子测试 `phase-arena streaming path reproduces the
+server runtime for turbo4 pairs`（提交 `128637299`）：
+
+- 复刻 `llama-context.cpp` 的 arena 切分（KV slice + compute slice，`set_compute`）；
+- 对 turbo4 实际会选的 (K,V) 对跑流式注意力，与**非流式基线**比（5e-4 容差）；
+- `turbo8-turbo4` 作已知良好对照，`q8_0-turbo4` / `turbo4-turbo4` 作嫌疑对。
+
+判定：
+
+| 结果 | 含义 | 下一步 |
+|---|---|---|
+| turbo4 对失败、turbo8 对照通过 | 故障在 **turbo4 几何在 phase arena 下的寻址/对齐** | 查 page_bytes_fn 对 turbo4 的返回与内核实际期望是否一致；arena 缓冲 stride |
+| 全过 | arena 路径清白 ⇒ 故障在 **多行/MTP 解码**或 **64 层 graph** | 给测试加多行 update（MTP 批）变体，或 64 层环回 |
+| arena 创建/set_compute 失败 | arena API 在 turbo4 几何下本身有问题 | 查 `ggml_backend_cuda_phase_arena_*` 实现 |
+
+补充说明：手建 runtime 的 turbo4 流式测试已全过，所以**流式注意力数学本身对 turbo4 是对的**；
+若 arena 变体失败，问题必在「KV 张量落在 arena 缓冲后的布局/寻址」这一层。
+
+---
+
+# ✅ Resolution（2026-09-24 18:4x）：已修复并经 V100 实测确认
+
+## 根因（两个，叠加）
+
+1. **`8954ede0e`（前一轮）**：turbo staged SET_ROWS 行基址——turbo KV + kv-stream + MTP
+   三条件同时成立时，staged 缓冲只有 row_count 行而 turbo2/3/4 内核曾用绝对行号索引。
+2. **`c837c1960`（本轮，主根因）**：块级流式 KV buffer 是
+   `cudaHostAlloc(Mapped | WriteCombined)` 的 **WC host 锁页内存**，而 turbo 辅助张量
+   （turbo_rotation/rotation_inv/innerq_scale_inv/vmean_table）与 KV 张量建在同一个
+   ctx/buffer → 流式时全部落进 WC 内存。K=turbo 时每层对 Q 做前向 WHT、V=turbo 时每层
+   做逆 WHT + mean 恢复（llama-graph.cpp），设备每个 token 每层零拷贝读 WC 内存
+   （读未缓存、PCIe 串行化）→ **任何 turbo K/V 在 server 上降速失智**。
+   该路径只在完整模型 graph 存在：单元测试是裸 attention（无这些 op）、perplexity
+   不进流式（张量在 VRAM）→ 测试全绿而 server 坏。
+
+## 排查历程（证伪链）
+
+- `45ed60d6d`（draft context 不流式）假设被证伪：speculative.cpp:2502 对 draft 显式清零
+  `kv_stream_arena_mib` → validator 短路返回 disabled → create_memory 收到 stage_bytes=0
+  → gate 是死代码，日志永不打（预期行为）。draft 一直是干净的。
+- phase-arena 假设被证伪：复刻服务端接线的子测试（e2a9f9539 修正后）全过——arena 里建出的
+  runtime 数值逐位正确。
+- 最终由 WC-host 辅助张量假说命中：唯一同时满足「server-only + turbo-only + 每 token」的路径。
+
+## 修复
+
+- `c837c1960`：aux_buft 捕获流式覆盖前的 device buft，rotation/innerq/vmean 三处创建点
+  改走 `ctx_for_buft(aux_buft)`（共 <1MB 进 VRAM）。非流式行为不变。
+
+## 验证
+
+- `test-kv-stream-cuda-attn`：**970 断言 0 失败**（GGML_CUDA_KV_STREAM_MMA_PREFILL 开/关
+  两态均验证），含 phase-arena 服务端接线复刻、MTP 多行（turbo2/3/4 DIRECT + turbo8/TCQ F16）。
+- 用户 V100 实测：llama-server turbo4/turbo8-turbo4 + MTP + kv-stream 降速失智消失。
