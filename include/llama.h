@@ -227,6 +227,13 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    // VBR (variable bit-rate dynamic KV) representation ladder selector.
+    // Ported from buun-llama-cpp; consumed by src/llama-vbr-codec.h.
+    enum llama_vbr_codec {
+        LLAMA_VBR_CODEC_TURBO   = 0,
+        LLAMA_VBR_CODEC_CLASSIC = 1,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id

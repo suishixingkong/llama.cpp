@@ -29,6 +29,10 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-kv-stream-config.cpp
     llama-kv-stream-config.h
+    llama-bit-ops.h
+    llama-sha256.h
+    llama-vbr-codec.cpp
+    llama-vbr-codec.h
     llama-kv-stream-plan.cpp
     llama-kv-stream-plan.h
     llama-kv-stream-softmax.cpp
