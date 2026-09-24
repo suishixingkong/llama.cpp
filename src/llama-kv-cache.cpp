@@ -626,7 +626,7 @@ llama_kv_cache::llama_kv_cache(
         const bool v_is_turbo_type = (layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO8_0 ||
                                       layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO2_0);
         if (turbo_vmean_table == nullptr && has_v && v_is_turbo_type && ggml_turbo_meansub_ready() &&
-            (int64_t) ggml_turbo_meansub_width() == n_embd_v_gqa_eff) {
+            (int64_t) ggml_turbo_meansub_width() == n_embd_v_gqa_eff && !hparams.no_alloc) {
             turbo_vmean_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                                                    ggml_turbo_meansub_width(), n_layer);
             ggml_format_name(turbo_vmean_table, "turbo_vmean_table");
@@ -713,7 +713,7 @@ llama_kv_cache::llama_kv_cache(
 
         // Fill the V mean table from the loaded file, one row per layer. Idempotent (the guard
         // above is re-evaluated per layer), and a no-op when no table was requested.
-        if (turbo_vmean_table != nullptr && turbo_vmean_table->buffer != nullptr) {
+        if (turbo_vmean_table != nullptr && turbo_vmean_table->buffer != nullptr && !hparams.no_alloc) {
             const int width = ggml_turbo_meansub_width();
             std::vector<float> mu((size_t) width, 0.0f);
             for (uint32_t l = 0; l < n_layer; l++) {
