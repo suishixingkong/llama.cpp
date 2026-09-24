@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
@@ -161,6 +162,53 @@ void meansub_capture_dump() {
     fprintf(stderr, "%s: wrote %d-layer x %d-channel means to '%s' (k=%s v=%s) -- %s\n", __func__,
             L, W, path, (flags & GGML_TURBO_MEANSUB_FLAG_K) ? "yes" : "no",
             (flags & GGML_TURBO_MEANSUB_FLAG_V) ? "yes" : "no", ok ? "ok" : "FAILED");
+}
+
+// Device-side mirror of the loaded K mean-sub table. ggml-turbo-meansub.cpp is host-only
+// (ggml-base, deliberately free of CUDA), so the row the K tap dereferences inside
+// k_set_rows_turbo4 must live in device memory -- passing the host pointer would fault with
+// an illegal access that only surfaces at the next CUDA_CHECK (e.g. inside TURBO_WHT). The
+// table is immutable for the process lifetime (see ggml-turbo-meansub.h), so upload it once
+// per device and hand out per-layer rows. Returns nullptr when the tap must stay disabled.
+static const float * meansub_k_dev_row(int layer) {
+    constexpr int max_devices = 16;
+    static float * dev[max_devices] = {};
+    static std::mutex mtx;
+
+    const int n_layer = ggml_turbo_meansub_n_layer();
+    const int width   = ggml_turbo_meansub_width();
+    if (layer < 0 || layer >= n_layer || width <= 0) {
+        return nullptr;
+    }
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= max_devices) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (dev[device] == nullptr) {
+        std::vector<float> host((size_t) n_layer * width, 0.0f);
+        for (int l = 0; l < n_layer; ++l) {
+            if (const float * row = ggml_turbo_meansub_k(l)) {
+                memcpy(host.data() + (size_t) l * width, row, (size_t) width * sizeof(float));
+            }
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, host.size() * sizeof(float)) == cudaSuccess && p != nullptr &&
+            cudaMemcpy(p, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
+            dev[device] = (float *) p;
+            fprintf(stderr, "%s: uploaded K mean-sub table (%d layers x %d channels) to device %d\n",
+                    __func__, n_layer, width, device);
+        } else {
+            if (p != nullptr) {
+                cudaFree(p);
+            }
+            fprintf(stderr, "%s: failed to upload the K mean-sub table to device %d, K tap disabled\n",
+                    __func__, device);
+        }
+    }
+    return dev[device] != nullptr ? dev[device] + (size_t) layer * width : nullptr;
 }
 
 } // namespace
@@ -1336,9 +1384,11 @@ static void set_rows_cuda_turbo4(
     const int  layer    = is_cache ? atoi(dst->name + 9) : -1;
 
     // K tap only: V is tapped and restored by the graph. Requires a row of matching width.
+    // The row must be the device mirror (meansub_k_dev_row): the table itself is host memory
+    // and dereferencing it from the kernel would fault with an illegal access.
     const float * tap_k = nullptr;
     if (is_k && layer >= 0 && ggml_turbo_meansub_width() == (int) (ne00 * ne02)) {
-        tap_k = ggml_turbo_meansub_k(layer);
+        tap_k = meansub_k_dev_row(layer);
     }
 
     const bool cap_here = g_meansub_cap.armed && is_cache && layer >= 0;
