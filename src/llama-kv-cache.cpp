@@ -324,6 +324,11 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
+        // Device buffer type for the TurboQuant aux tensors; set when the streaming buft
+        // overrides the per-layer buft (see the kv_stream branch below), otherwise null and
+        // the aux tensors stay in the same buffer as the KV cache (device memory anyway).
+        ggml_backend_buffer_type_t aux_buft = nullptr;
+
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
@@ -450,6 +455,13 @@ llama_kv_cache::llama_kv_cache(
                 }
 
                 buft = kv_stream_buft;
+                // TurboQuant aux tensors (rotation matrices, InnerQ scale, V mean table) are
+                // read by per-layer graph ops at EVERY decode step: Q-side forward WHT when K
+                // is turbo, inverse WHT + mean restore when V is turbo. The streaming buffer is
+                // mapped WRITE-COMBINED host memory (cudaHostAllocWriteCombined), whose device
+                // reads are uncached and serialize over PCIe - keep the aux tensors in device
+                // memory instead, they are under 1 MB in total.
+                aux_buft = ggml_backend_dev_buffer_type(dev);
                 dev_name = ggml_backend_buft_name(buft);
             }
         }
@@ -604,16 +616,21 @@ llama_kv_cache::llama_kv_cache(
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
 
-        // TurboQuant: create rotation matrix tensors (once, shared across layers)
+        // TurboQuant: create rotation matrix tensors (once, shared across layers). They go to
+        // the aux (device) buffer under streaming - see the aux_buft comment above.
         if (turbo_rotation == nullptr &&
             (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
-            turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            ggml_context * ctx_aux = ctx_for_buft(aux_buft != nullptr ? aux_buft : buft);
+            if (ctx_aux == nullptr) {
+                throw std::runtime_error("failed to create ggml context for turbo aux tensors");
+            }
+            turbo_rotation = ggml_new_tensor_2d(ctx_aux, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
-            turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            turbo_rotation_inv = ggml_new_tensor_2d(ctx_aux, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
 
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
-            turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
+            turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx_aux, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
 
@@ -627,7 +644,14 @@ llama_kv_cache::llama_kv_cache(
                                       layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO2_0);
         if (turbo_vmean_table == nullptr && has_v && v_is_turbo_type && ggml_turbo_meansub_ready() &&
             (int64_t) ggml_turbo_meansub_width() == n_embd_v_gqa_eff && !hparams.no_alloc) {
-            turbo_vmean_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            // Same aux placement as the rotation tensors: the V mean table is read per layer
+            // by the graph's mean-restore ggml_add, so under streaming it must not sit in the
+            // write-combined host KV buffer.
+            ggml_context * ctx_aux = ctx_for_buft(aux_buft != nullptr ? aux_buft : buft);
+            if (ctx_aux == nullptr) {
+                throw std::runtime_error("failed to create ggml context for the V mean-sub table");
+            }
+            turbo_vmean_table = ggml_new_tensor_2d(ctx_aux, GGML_TYPE_F32,
                                                    ggml_turbo_meansub_width(), n_layer);
             ggml_format_name(turbo_vmean_table, "turbo_vmean_table");
         }
