@@ -134,6 +134,12 @@ target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if (WIN32)
+        # Internal C++ implementation seams are consumed by llama-common and
+        # server-context but are not part of the installed C API. Export them
+        # from the Windows DLL without annotating them as stable LLAMA_API.
+        set_target_properties(llama PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
