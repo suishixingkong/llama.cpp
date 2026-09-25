@@ -2290,6 +2290,29 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+namespace {
+// C1 (v3 design, Sol CONCUR): decode-scope outcome owner. Constructed before any memory
+// apply; every early return/exception finishes THIS decode's pending operations FAILED by
+// construction. succeed() is called exactly once, at the successful tail. Awaiting-commit
+// records from prior submitted decodes are untouched — their terminal result belongs to the
+// scheduler fence alone.
+struct vbr_decode_txn {
+    llama_memory_i * mem = nullptr;
+    bool             ok  = false;
+
+    explicit vbr_decode_txn(llama_memory_i * memory) : mem(memory) {
+        // No promotion here: submitted evidence commits only at the real
+        // scheduler fence (synchronize). Awaiting records simply keep waiting.
+    }
+    void succeed() { ok = true; }
+    ~vbr_decode_txn() {
+        if (mem != nullptr) {
+            mem->vbr_decode_ops_finish(ok);
+        }
+    }
+};
+}  // namespace
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -2355,6 +2378,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+
+    // C1: decode-scope outcome owner — constructed before ANY memory apply; failure is the
+    // default outcome on every early return below (v3.1 amendment 4).
+    vbr_decode_txn decode_txn(memory.get());
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -2679,8 +2706,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // co-tenancy claim-complete: first successful REAL decode that produced outputs —
+    // intermediate prefill chunks run n_outputs == 0 and warmup decodes are not requests
+    // (warmup's tiny batch does not grow the compute pools, so the memory claim is NOT
+    // complete after it). Unlinking the satisfied claim is the donors' lift signal.
+    if (n_outputs > 0 && !cparams.warmup && llama_vram_demand_auto_complete_pending()) {
+        llama_vram_demand_complete();
+    }
+
+    // co-tenancy presence beat (rate-limited to one per BEAT inside): marker freshness
+    // measures responsiveness, and a decoding process is responsive by definition
+    for (const auto & busid : vram_marker_busids_) {
+        llama_vram_marker_beat(busid);
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // C1: the decode transaction succeeds exactly here; its destructor delivers
+    // finish(true) -> extents submitted, owners awaiting the synchronize fence.
+    decode_txn.succeed();
 
     return 0;
 }
@@ -3105,10 +3150,58 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else {
+        auto reserve_with_landed = [&](ggml_cgraph * graph) {
+            std::vector<size_t> before(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                before[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            }
+
+            const bool ok = ggml_backend_sched_reserve(sched.get(), graph);
+
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_t backend = backend_ptrs[i];
+                const size_t after = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                if (after > before[i]) {
+                    llama_vram_demand_alloc_landed(
+                            ggml_backend_get_device(backend), after - before[i]);
+                }
+            }
+            // reserve() resets the scheduler only on success. Its failed path
+            // leaves the split/hash state live, so calling it again without a
+            // reset builds a different, ever-growing allocation graph.
+            if (!ok) {
+                ggml_backend_sched_reset(sched.get());
+            }
+            return ok;
+        };
+
+        if (reserve_with_landed(gf)) {
+            return gf;
+        }
         GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+        // co-tenancy: before the FIRST real decode (i.e. any init-time reserve — several
+        // run during context setup), a resident donor may free room within the ledger's
+        // bounded patience. A plan-hinted load already knows every device's remaining
+        // allocation; without a hint, retain the nominal single-device fallback.
+        // Post-first-decode re-reserves keep the fast-fail wall.
+        bool held = false;
+        if (!has_evaluated_once && !model.devices.empty() && !model.devices[0].is_meta) {
+            constexpr size_t NOMINAL_COMPUTE_ASK = (size_t) LLAMA_VRAM_LEDGER_NOMINAL_ASK;
+            while (!held && llama_vram_demand_hold_plan_or(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
+                // split_graph() mutates its input graph by inserting backend
+                // copies. A failed reserve cannot safely reuse that graph;
+                // rebuild the same measurement graph for every allocation
+                // retry after donors have had a chance to make progress.
+                res->reset();
+                gf = model.build_graph(gparams);
+                held = reserve_with_landed(gf);
+            }
+        }
+        if (!held) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;
@@ -4100,6 +4193,21 @@ llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
     return ret;
 }
 
+void llama_context::vbr_import_accounting_observed() noexcept {
+    if (!memory) {
+        return;
+    }
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(memory.get(), tree)) {
+        return;
+    }
+    for (const auto & child : tree) {
+        if (child.attention != nullptr) {
+            child.attention->vbr_import_accounting_observed();
+        }
+    }
+}
+
 //
 // training
 //
@@ -4568,9 +4676,13 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_INFO("%s: n_ctx_train adjusted to %u\n", __func__, model->hparams.n_ctx_train);
         }
 
+        // co-tenancy: every planned alloc landed — a held demand (if any) flips to
+        // phase=satisfied; the claim lives until the first real decode (claim-complete)
+        llama_vram_demand_satisfied();
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+        llama_vram_demand_abandon();
     }
 
     return nullptr;
