@@ -586,7 +586,17 @@ static std::string turbo_vbr_segmented_reject_reason(const turbo_vbr_layer_polic
     if (reasons.empty()) {
         return "schedule contains malformed or unsupported bands";
     }
+
+    std::ostringstream ss;
+    for (size_t i = 0; i < reasons.size(); ++i) {
+        if (i > 0) {
+            ss << "; ";
+        }
+        ss << reasons[i];
+    }
+    return ss.str();
 }
+
 static bool turbo_vbr_env_enabled(const char * name) {
     const char * e = turbo_vbr_getenv(name);
     return e && atoi(e) != 0;
@@ -617,6 +627,45 @@ static bool turbo_vbr_parse_int_range(const std::string & s, int & lo, int & hi)
         return false;
     }
     return lo <= hi;
+}
+
+// Authoritative VBR_LAYER_SCHEDULE resolver shared by the runtime and the calibration
+// identity: trims the environment value, accepts inline schedules as well as the @path and
+// bare-path forms, and returns false only when a named file cannot be read.
+bool llama_vbr_resolve_layer_schedule(
+        const char * env,
+        std::string & schedule,
+        std::string & source) {
+    schedule.clear();
+    source = "inline";
+    if (!env || !env[0]) {
+        return true;
+    }
+
+    std::string value = turbo_vbr_trim(env);
+    std::string path;
+    if (!value.empty() && value[0] == '@') {
+        path = value.substr(1);
+    } else if (value.find('=') == std::string::npos && value.find(';') == std::string::npos) {
+        path = value;
+    }
+
+    if (!path.empty()) {
+        std::ifstream f(path);
+        if (!f) {
+            LLAMA_LOG_WARN("llama_kv_cache: could not open VBR_LAYER_SCHEDULE file %s\n", path.c_str());
+            source = path;
+            return false;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        schedule = ss.str();
+        source = path;
+        return true;
+    }
+
+    schedule = std::move(value);
+    return true;
 }
 
 static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
