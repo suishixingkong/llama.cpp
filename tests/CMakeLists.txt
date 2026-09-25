@@ -484,6 +484,13 @@ target_include_directories(test-vbr-pinned-ring PRIVATE ${PROJECT_SOURCE_DIR}/sr
 llama_build_and_test(test-vbr-artifact.cpp)
 target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Segment chain and Merkle range proofs. Self-reporting, so no /UNDEBUG. The oracle is adversarial
+# rather than arithmetic: the tree is a black box that must bind content (one differing byte changes
+# the root), stay sound (a proof fails against any other bytes) and admit nothing malformed.
+# Restriction is asserted to never widen authority rather than to return one specific status.
+llama_build_and_test(test-vbr-artifact-capture.cpp)
+target_include_directories(test-vbr-artifact-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

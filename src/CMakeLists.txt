@@ -54,6 +54,9 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-pinned-ring.cpp
     llama-vbr-pinned-ring.h
     llama-vbr-artifact.h
+    llama-vbr-generation.h
+    llama-vbr-artifact-capture.cpp
+    llama-vbr-artifact-capture.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
