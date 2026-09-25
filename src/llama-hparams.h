@@ -38,6 +38,13 @@ enum llama_non_causal_type {
 
 // forward declaration; full definition in llama-graph.h
 enum llm_ffn_op_type : int;
+// Identifies the calibrated V-mean row that corresponds to one logical model layer. Shared-KV
+// drafters can map a draft layer to a differently numbered layer owned by the target model.
+struct llama_turbo_meansub_ref {
+    int model_id = 0;
+    int layer    = -1;
+};
+
 
 struct llama_hparams_posnet {
     uint32_t n_embd;
