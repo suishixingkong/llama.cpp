@@ -2497,6 +2497,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    // Drafter caches are small and ephemeral — never arm dynamic VBR for them. The
+    // wholesale copy above inherits the base params' default-on VBR flags, and a second
+    // dynamic-VBR context trips the one-marker-per-process co-tenancy guard, failing
+    // draft-context creation outright (observed with the Muse-Glimmer day-0 drafter).
+    // Static -ctkd/-ctvd types still apply verbatim.
+    result.reset_vbr_runtime_state();
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;

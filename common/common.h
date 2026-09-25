@@ -485,6 +485,10 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // Server-side auxiliary reservations may raise fit_params_target. Dynamic VBR should retain
+    // the caller's ordinary per-device safety headroom and account auxiliaries through live free
+    // memory instead of treating their bytes as permanently unavailable a second time.
+    uint64_t fit_params_vbr_growth_headroom_bytes = 0; // 0 = derive from fit_params_target
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
@@ -592,6 +596,93 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
+    bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
+    std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO; // concrete/provisional family; never AUTO at runtime
+    bool vbr_codec_auto = true;     // resolve from model KV geometry before fit/context creation
+    bool vbr_codec_explicit = false;
+    std::string vbr_entry = "f16";       // dynamic VBR entry tier; quality-first default remains F16
+    std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
+    std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
+    std::string vbr_policy = "auto";    // VBR policy ladder JSON/path; auto checks VBR_POLICY_LADDER env
+    std::string vbr_selected_family;     // selected VBR ladder family, static or dynamic
+    std::string vbr_selected_policy;     // selected VBR measured policy/rung name
+    std::string vbr_selected_schedule;   // selected VBR schedule path
+    double vbr_min_bits_value = 0.0;     // requested aggregate floor in effective bits/value, 0 == auto/none; not a per-codec ban
+    double vbr_capacity_bits = 0.0;      // selected supported capacity floor in effective bits/value, 0 == auto/none
+    double vbr_selected_bpv = 0.0;       // measured BPV of the selected policy/rung
+    double vbr_selected_kld = 0.0;       // measured KLD of the selected policy/rung
+    uint64_t vbr_vram_budget_bytes = 0;  // explicit VBR KV VRAM budget in bytes, 0 == auto
+    bool vbr_budget_explicit = false;   // whether --vbr-budget/--vbr-bits was provided
+    bool vbr_entry_explicit = false;    // whether --vbr-entry was provided
+    bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided
+    bool vbr_vram_budget_explicit = false; // whether --vbr-vram/--vbr-vram-budget was provided
+    bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
+    // Common CLI default: dynamic VBR on both sides at the selected entry tier (F16 by default);
+    // postprocessing supplies the friendly implicit t4 floor. Explicit `-ct vbr` is tracked
+    // separately and deliberately retains the full t1 ladder when no floor was typed.
+    bool vbr_cache_type_k = true;
+    bool vbr_cache_type_v = true;
+    bool vbr_cache_type_k_explicit = false;
+    bool vbr_cache_type_v_explicit = false;
+    // dynamic VBR server policy: clear idle slots' KV before a degrade wave would land the
+    // aggregate BELOW this bits/value. 8.125 = protect the f16/t8 near-lossless band (above it,
+    // degrading beats destroying another client's re-prefillable cache); 0 = never reclaim;
+    // >= 16 = reclaim before any degrade (single-user maximal-quality profile)
+    float vbr_reclaim_floor_bpv = 8.125f;
+    // dynamic VBR server policy: when a DEGRADED conversation would keep less than this
+    // fraction of its prompt as reusable prefix anyway, drop the prefix entirely so the
+    // empty-cache lossless reset restores the entry tier (turn-N cache quality = turn-1).
+    // 0 disables the trade.
+    float vbr_reset_keep_frac = 0.25f;
+    // canonical predicates — use these instead of re-deriving the flag combinations
+    bool vbr_enabled() const {
+        return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||
+               vbr_codec_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
+               vbr_vram_budget_explicit || vbr_policy_explicit;
+    }
+    bool vbr_dynamic() const {
+        return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
+    }
+    bool vbr_explicitly_selected() const {
+        return vbr_cache_type_k_explicit || vbr_cache_type_v_explicit ||
+               vbr_budget_explicit || vbr_codec_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
+               vbr_vram_budget_explicit || vbr_policy_explicit;
+    }
+    void reset_vbr_runtime_state() {
+        vbr_budget = "dynamic";
+        vbr_codec = LLAMA_VBR_CODEC_TURBO;
+        vbr_codec_auto = true;
+        vbr_entry = "f16";
+        vbr_min_bits = "auto";
+        vbr_vram_budget = "auto";
+        vbr_policy = "auto";
+        vbr_selected_family.clear();
+        vbr_selected_policy.clear();
+        vbr_selected_schedule.clear();
+        vbr_min_bits_value = 0.0;
+        vbr_capacity_bits = 0.0;
+        vbr_selected_bpv = 0.0;
+        vbr_selected_kld = 0.0;
+        vbr_vram_budget_bytes = 0;
+        vbr_budget_explicit = false;
+        vbr_codec_explicit = false;
+        vbr_entry_explicit = false;
+        vbr_min_bits_explicit = false;
+        vbr_vram_budget_explicit = false;
+        vbr_policy_explicit = false;
+        vbr_cache_type_k = false;
+        vbr_cache_type_v = false;
+        vbr_cache_type_k_explicit = false;
+        vbr_cache_type_v_explicit = false;
+    }
+    // mixed config: a side that did NOT select the vbr alias while the other did is PINNED at
+    // its explicit type (arg.cpp warns at parse time; the runtime ladder skips it). Whole-cache
+    // turbo configs driven by --vbr-* knobs alone pin nothing — both sides degrade.
+    bool vbr_pin_k() const { return vbr_dynamic() && !vbr_cache_type_k && vbr_cache_type_v; }
+    bool vbr_pin_v() const { return vbr_dynamic() && !vbr_cache_type_v && vbr_cache_type_k; }
+
     uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
@@ -634,6 +725,9 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
+    bool    vbr_prompt_cache    = false; // resolved projected VBR host-cache publication request
+    bool    vbr_prompt_cache_explicit = false; // whether --[no-]vbr-prompt-cache was provided
+    int32_t vbr_anchor_cache_mib = 0;    // optional extra quality-anchor pool for VBR artifacts
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     bool checkpoint_recurrent_prev = false; // server: keep one recurrent rollback plane for exact replay checkpoints
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
@@ -767,12 +861,90 @@ struct common_params {
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
+enum class common_vbr_cpu_fallback_result {
+    not_needed,
+    applied,
+    explicit_vbr,
+};
+
+// Resolve a coupled-KV model after loading. Returns true when one explicit static side was
+// mirrored to the other. Explicit VBR controls cannot be honored by that static resolution and
+// are rejected instead of silently reporting a controller that never armed.
+bool common_vbr_resolve_coupled_cache_types(common_params & params, llama_context_params & cparams);
+
+enum class common_vbr_prompt_cache_mode {
+    disabled_cache_ram,
+    disabled_static,
+    disabled_explicit,
+    enabled_explicit,
+    enabled_automatic,
+};
+
+// Default prompt-cache policy. Dynamic VBR follows the ordinary nonzero --cache-ram
+// default unless the legacy VBR-specific switch was explicitly set. A zero
+// cache budget is authoritative and prevents all host-cache activation.
+common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
+    const common_params & params);
+
+// Common-layer policy seam for the implicit dynamic-VBR default. `has_gpu`
+// describes the resolved placement inventory; explicit VBR is never rewritten.
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+    common_params & params, bool has_gpu);
+
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
+
+// Resolve a codec-relative VBR floor spec (tier alias, "auto"/"none", or bits value) to an
+// aggregate floor in effective bits/value (0 == bottom rung). Throws std::invalid_argument on bad
+// input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
+double common_vbr_floor_bits(
+        const std::string & floor,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
+
+// Resolve a discrete dynamic-VBR entry tier and alias to its codec-relative ggml type.
+// Unlike the floor, the entry cannot be fractional. Throws std::invalid_argument on bad input.
+ggml_type common_vbr_entry_type(
+        const std::string & entry,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
+
+struct common_vbr_cache_choice {
+    ggml_type type = GGML_TYPE_F16;
+    bool vbr = false;
+    bool explicit_choice = false;
+
+    bool operator==(const common_vbr_cache_choice & other) const {
+        return type == other.type && vbr == other.vbr && explicit_choice == other.explicit_choice;
+    }
+};
+
+struct common_vbr_side_selection {
+    bool k = false;
+    bool v = false;
+};
+
+// Resolve which cache sides a benchmark/configuration row makes movable. Explicit `vbr` aliases
+// apply only to that matrix row and may claim an untouched F16 peer; standalone VBR options arm
+// untouched sides only when the matrix itself has no aliases.
+common_vbr_side_selection common_vbr_resolve_sides(
+        const common_vbr_cache_choice & k,
+        const common_vbr_cache_choice & v,
+        bool vbr_options_selected,
+        bool matrix_has_vbr_alias);
+
+// Fit-time representation for a cache side: never price a movable side wider than its selected
+// entry, and never alter a pinned side.
+ggml_type common_vbr_fit_price_type(
+        ggml_type entry, double floor_bpv, bool pinned,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
+double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_per_token, bool types_coupled);
+
+// Resolve a VBR VRAM budget spec ("auto"/"none" or a size with optional K/M/G[i]B suffix) to bytes
+// (0 == auto). Throws std::invalid_argument on bad input. Shared with the main CLI's parser.
+uint64_t common_vbr_vram_bytes(const std::string & vram);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
@@ -958,6 +1130,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+// Recompute codec-dependent entry/floor/runtime fields after model-aware auto selection.
+// Core llama_context_params must only ever receive the resolved Turbo or classic codec.
+void common_params_postprocess_vbr(common_params & params);
+// Resolve default/explicit auto against model metadata. Safe to call repeatedly.
+void common_params_resolve_vbr_codec_auto(common_params & params);
 
 bool common_params_should_fit_device_memory(const common_params & params);
 
@@ -1188,6 +1366,13 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // Attention-content lineage epochs at capture time. A recurrent-only checkpoint restores
+    // exact recurrent state while retaining the live attention KV. Lossless in-place retiering
+    // preserves that lineage; occupied-cell reuse, clear/reset and import do not. Both are 0 when
+    // VBR is inactive, making the restore-time check a no-op.
+    uint64_t checkpoint_epoch     = 0;
+    uint64_t checkpoint_epoch_swa = 0;
+
     std::vector<uint8_t> data_tgt;
     // ON_DEVICE checkpoints keep tensor payloads in llama_context-owned storage; data_tgt then
     // carries only the serialization envelope. logical_size preserves accounting/eviction weight.
@@ -1232,3 +1417,10 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+inline bool common_prompt_checkpoint_lineage_matches(
+        const common_prompt_checkpoint & checkpoint,
+        const llama_memory_vbr_state_data & state) noexcept {
+    return checkpoint.checkpoint_epoch == state.checkpoint_epoch &&
+           checkpoint.checkpoint_epoch_swa == state.checkpoint_epoch_swa;
+}

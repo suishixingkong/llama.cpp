@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "unicode.h"
 
+#include "../src/llama-ext.h" // staging API: llama_vram_load_begin/end/complete
+
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -392,6 +394,87 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+}
+
+common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
+        common_params & params, bool has_gpu) {
+    if (!params.vbr_enabled() ||
+        (has_gpu && params.n_gpu_layers != 0 && !params.no_kv_offload)) {
+        return common_vbr_cpu_fallback_result::not_needed;
+    }
+
+    // Only the untouched common default may fall back. Every explicit VBR
+    // selector remains armed so the core emits its existing hard refusal.
+    if (params.vbr_explicitly_selected()) {
+        return common_vbr_cpu_fallback_result::explicit_vbr;
+    }
+
+    // Reset ONLY the sides the implicit vbr alias holds. A side the user set to
+    // an explicit non-VBR type (e.g. -ctk q8_0) carries no vbr flag and must
+    // keep its type — arg.cpp's intent-preservation rule.
+    if (params.vbr_cache_type_k) {
+        params.vbr_cache_type_k = false;
+        params.cache_type_k = GGML_TYPE_F16;
+    }
+    if (params.vbr_cache_type_v) {
+        params.vbr_cache_type_v = false;
+        params.cache_type_v = GGML_TYPE_F16;
+    }
+    // Drop the derived t4 floor that was attached to the implicit aliases.
+    // It is not marked explicit, but common_context_params_to_llama transports
+    // the scalar independently and would otherwise re-arm VBR.
+    params.reset_vbr_runtime_state();
+    return common_vbr_cpu_fallback_result::applied;
+}
+
+bool common_vbr_resolve_coupled_cache_types(common_params & params, llama_context_params & cparams) {
+    const bool k_authoritative = params.cache_type_k_explicit && !params.vbr_cache_type_k;
+    const bool v_authoritative = params.cache_type_v_explicit && !params.vbr_cache_type_v;
+    const bool k_vbr_explicit = params.vbr_cache_type_k_explicit;
+    const bool v_vbr_explicit = params.vbr_cache_type_v_explicit;
+    if ((k_authoritative && v_vbr_explicit) || (v_authoritative && k_vbr_explicit)) {
+        throw std::invalid_argument(
+            "coupled-KV models cannot combine an explicit static cache side with an explicit VBR peer");
+    }
+    if (k_authoritative == v_authoritative) {
+        return false; // neither static side, or two static sides whose equality core validates
+    }
+    if (params.vbr_explicitly_selected()) {
+        throw std::invalid_argument(
+            "explicit VBR controls cannot be combined with a single static K/V type on a coupled-KV model");
+    }
+
+    const ggml_type t = k_authoritative ? cparams.type_k : cparams.type_v;
+    cparams.type_k = t;
+    cparams.type_v = t;
+    params.cache_type_k = t;
+    params.cache_type_v = t;
+    params.reset_vbr_runtime_state();
+    cparams.vbr_dynamic = false;
+    cparams.vbr_codec = LLAMA_VBR_CODEC_TURBO;
+    cparams.vbr_min_bits = 0.0;
+    cparams.vbr_vram_budget_bytes = 0;
+    cparams.vbr_growth_headroom_bytes = 0;
+    cparams.vbr_min_bits_explicit = false;
+    cparams.vbr_budget_explicit = false;
+    cparams.vbr_pin_k = false;
+    cparams.vbr_pin_v = false;
+    return true;
+}
+
+common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
+        const common_params & params) {
+    if (params.cache_ram_mib == 0) {
+        return common_vbr_prompt_cache_mode::disabled_cache_ram;
+    }
+    if (params.vbr_prompt_cache_explicit) {
+        return params.vbr_prompt_cache
+            ? common_vbr_prompt_cache_mode::enabled_explicit
+            : common_vbr_prompt_cache_mode::disabled_explicit;
+    }
+    return params.vbr_dynamic()
+        ? common_vbr_prompt_cache_mode::enabled_automatic
+        : common_vbr_prompt_cache_mode::disabled_static;
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
@@ -1287,9 +1370,68 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static void common_params_resolve_vbr_codec_auto_from_model(
+        common_params & params, const llama_model * model) {
+    if (!params.vbr_dynamic() || !params.vbr_codec_auto) {
+        return;
+    }
+
+    llama_vbr_codec resolved;
+    if (llama_model_supports_vbr_codec(model, LLAMA_VBR_CODEC_TURBO)) {
+        resolved = LLAMA_VBR_CODEC_TURBO;
+    } else if (llama_model_supports_vbr_codec(model, LLAMA_VBR_CODEC_CLASSIC)) {
+        resolved = LLAMA_VBR_CODEC_CLASSIC;
+    } else {
+        if (params.vbr_explicitly_selected()) {
+            throw std::runtime_error(
+                "model supports neither the Turbo nor classic dynamic VBR codec; "
+                "select a static KV cache type");
+        }
+        COM_WRN("%s", "VBR codec auto: model has no supported dynamic codec; using static f16 KV cache\n");
+        if (params.vbr_cache_type_k) {
+            params.cache_type_k = GGML_TYPE_F16;
+        }
+        if (params.vbr_cache_type_v) {
+            params.cache_type_v = GGML_TYPE_F16;
+        }
+        params.reset_vbr_runtime_state();
+        params.vbr_codec_auto = false;
+        return;
+    }
+
+    params.vbr_codec = resolved;
+    params.vbr_codec_auto = false;
+    // Re-resolve entry/floor/telemetry from the chosen ladder. This also emits the sole
+    // controller summary now that the parser-time placeholder is no longer provisional.
+    common_params_postprocess_vbr(params);
+    COM_INF("VBR codec auto: selected %s from model KV geometry\n",
+            resolved == LLAMA_VBR_CODEC_TURBO ? "turbo" : "classic");
+}
+
+void common_params_resolve_vbr_codec_auto(common_params & params) {
+    if (!params.vbr_dynamic() || !params.vbr_codec_auto) {
+        return;
+    }
+
+    llama_model_params probe_params = common_model_params_to_llama(params);
+    probe_params.no_alloc = true;
+    probe_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    probe_params.progress_callback = nullptr;
+    probe_params.progress_callback_user_data = nullptr;
+
+    llama_model_ptr probe(llama_model_load_from_file(params.model.path.c_str(), probe_params));
+    if (!probe) {
+        throw std::runtime_error("failed to inspect model for automatic VBR codec selection");
+    }
+    common_params_resolve_vbr_codec_auto_from_model(params, probe.get());
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
+    if (params.fit_params) {
+        common_params_resolve_vbr_codec_auto(params);
+    }
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params && !common_params_should_fit_device_memory(params)) {
@@ -1327,6 +1469,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // surface the RESOLVED placement: auto-fit decided the real offload count in mparams,
+        // and callers must key on the effective value, never the unresolved -1 sentinel
+        params.n_gpu_layers = mparams.n_gpu_layers;
+        if (common_params_apply_vbr_cpu_fallback(params, true) ==
+                common_vbr_cpu_fallback_result::applied) {
+            COM_WRN("%s", "implicit VBR auto-fit resolved to CPU KV placement; using static f16 KV cache\n");
+            cparams = common_context_params_to_llama(params);
+        }
+        if (cparams.vbr_dynamic && params.fit_params_vbr_growth_headroom_bytes != 0) {
+            cparams.vbr_growth_headroom_bytes = params.fit_params_vbr_growth_headroom_bytes;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1338,6 +1492,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    // Without fit, reuse the fully loaded model for codec selection instead of doing a
+    // second metadata-only load. Fit needs the answer earlier because it prices the floor.
+    if (!params.fit_params) {
+        common_params_resolve_vbr_codec_auto_from_model(params, model);
+        cparams = common_context_params_to_llama(params);
+    }
+
+    // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
+    // types — llama_init_from_model hard-errors on a mismatch. When exactly one side was set
+    // explicitly, mirror it to the other instead of failing; two conflicting explicit types
+    // still error at init. When the mirror leaves both sides explicit-static and no --vbr-*
+    // knob was given, dynamic VBR is disarmed (a fully pinned cache has nothing to degrade).
+    if (llama_model_kv_cache_types_coupled(model) &&
+            common_vbr_resolve_coupled_cache_types(params, cparams)) {
+        COM_WRN("model requires matching K/V cache types: mirrored %s to both sides and disabled implicit VBR\n",
+                ggml_type_name(cparams.type_k));
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1437,6 +1609,38 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    bool has_gpu = false;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            has_gpu = has_gpu || (dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    }
+    const auto vbr_fallback = model_only
+        ? common_vbr_cpu_fallback_result::not_needed
+        : common_params_apply_vbr_cpu_fallback(params, has_gpu);
+    if (vbr_fallback == common_vbr_cpu_fallback_result::applied) {
+        COM_WRN("%s", "implicit VBR requires GPU KV placement; using static f16 KV cache\n");
+    }
+    llama_vram_load_begin(false);
+    bool load_succeeded = false;
+    struct load_scope {
+        bool & succeeded;
+        bool complete_without_decode;
+        ~load_scope() {
+            llama_vram_load_end(succeeded);
+            if (succeeded && complete_without_decode) {
+                llama_vram_load_complete();
+            }
+        }
+    } load_guard { load_succeeded, model_only };
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1446,6 +1650,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (model_only) {
+        load_succeeded = true;
         return res;
     }
 
@@ -1549,6 +1754,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
+    load_succeeded = true;
     return res;
 }
 
@@ -1762,6 +1968,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.vbr_min_bits          = params.vbr_min_bits_value;
+    cparams.vbr_min_bits_explicit = params.vbr_min_bits_explicit;
+    cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
+    cparams.vbr_dynamic           = params.vbr_dynamic();
+    cparams.vbr_codec             = params.vbr_codec;
+    cparams.vbr_budget_explicit   = params.vbr_vram_budget_explicit;
+    cparams.vbr_pin_k = params.vbr_pin_k();
+    cparams.vbr_pin_v = params.vbr_pin_v();
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
 
     return cparams;
