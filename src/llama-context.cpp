@@ -712,6 +712,27 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
+        // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
+        // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
+        // and builds the graph plan with FA ops on GPU from the start.
+        {
+            const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
+            const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
+            const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
+            // Dynamic VBR may enter at F16 (so no turbo types exist yet) and later flip tensors
+            // to turbo. All dynamic entries require the same FA-only decode/VMM contract.
+            const bool needs_device_fa = cparams.offload_kqv &&
+                (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic);
+            if (needs_device_fa) {
+                if (!cparams.flash_attn) {
+                    LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires Flash Attention — enabling automatically\n", __func__);
+                    cparams.flash_attn = true;
+                }
+                cparams.auto_fa = false;  // turbo/VBR requires FA — don't let sched_reserve override
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -729,6 +750,38 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    // Co-tenancy presence: every fork process holding device memory publishes a
+    // marker - vbr:0 here for the general case (peers scale their headroom by the census:
+    // this process's lazy CUDA pools are real pressure too). A VBR cache in this process
+    // REPUBLISHES vbr:1 with offers from its scan path; publish-if-absent keeps a later
+    // non-VBR context (draft model) from downgrading it. Beats ride the decode path.
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(d.dev, &props);
+        if (props.device_id != nullptr) {
+            vram_marker_busids_.push_back(props.device_id);
+            if (!llama_vram_marker_present(props.device_id)) {
+                llama_vram_marker_fields f = {};
+                f.vbr      = 0;
+                f.serviced = llama_vram_marker_serviced_flag() ? 1u : 0u;
+                llama_vram_marker_publish(props.device_id, f);
+            }
+        }
+    }
+
+    if (memory != nullptr && memory->vbr_ledger_tree_active() && llama_vram_ledger_armed()) {
+        bool expected = false;
+        if (!g_vbr_ledger_tree_owned.compare_exchange_strong(expected, true)) {
+            throw std::runtime_error(
+                    "multiple independent dynamic-VBR contexts in one process are unsupported: "
+                    "the co-tenancy ledger has one marker identity per process");
+        }
+        vram_ledger_tree_owned_ = true;
     }
 }
 
@@ -754,6 +807,9 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    if (vram_ledger_tree_owned_) {
+        g_vbr_ledger_tree_owned.store(false);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -4374,18 +4430,51 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    // TurboQuant cache types require flash attention - auto-enable even when explicitly
-    // disabled, so this has to run before the generic quantized-V check below, which
-    // would otherwise reject the combination outright.
+    // TurboQuant / dynamic VBR cache types require flash attention - auto-enable even when
+    // explicitly disabled, so this has to run before the generic quantized-V check below,
+    // which would otherwise reject the combination outright. Dynamic VBR may enter at F16
+    // (no turbo type requested yet) and flip tensors to turbo later, so it has to be part
+    // of this condition too; VBR_LAYER_SCHEDULE arms the same contract through the env.
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
          params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ ||
          params.type_k == GGML_TYPE_TURBO1_TCQ ||
          params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 ||
          params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ ||
-         params.type_v == GGML_TYPE_TURBO1_TCQ)) {
-        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn - enabling automatically\n", __func__);
+         params.type_v == GGML_TYPE_TURBO1_TCQ ||
+         params.vbr_dynamic || turbo_vbr_layer_schedule_enabled())) {
+        LLAMA_LOG_WARN("%s: turbo/VBR cache types require flash_attn - enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    const bool vbr_active = params.vbr_dynamic ||
+        params.vbr_vram_budget_bytes > 0 || params.vbr_min_bits > 0.0;
+    if (vbr_active &&
+        params.vbr_codec != LLAMA_VBR_CODEC_TURBO &&
+        params.vbr_codec != LLAMA_VBR_CODEC_CLASSIC) {
+        LLAMA_LOG_ERROR("%s: invalid VBR codec %d\n", __func__, int(params.vbr_codec));
+        return nullptr;
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+        // Classic live retiering is currently implemented and validated for the
+        // BailingMoE3/Ling coupled cache. DSV4 retains its separate q8_0-capped
+        // policy; ordinary DSA does not thread VBR into its child caches yet.
+        if (!model->supports_classic_vbr()) {
+            LLAMA_LOG_ERROR("%s: classic VBR currently supports BailingMoE3/Ling models only\n", __func__);
+            return nullptr;
+        }
+        if (!llama_vbr_codec_contains(params.vbr_codec, params.type_k) ||
+            !llama_vbr_codec_contains(params.vbr_codec, params.type_v)) {
+            LLAMA_LOG_ERROR("%s: classic VBR entry must be f16, q8_0 or q4_0\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_TURBO &&
+            !model->supports_turbo_vbr()) {
+        LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete Turbo VBR ladder\n", __func__);
+        return nullptr;
     }
 
     // TurboQuant TCQ KV types (turbo1_tcq / turbo2_tcq / turbo3_tcq) are enabled. Both
