@@ -476,6 +476,14 @@ target_include_directories(test-vbr-extent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-pinned-ring.cpp)
 target_include_directories(test-vbr-pinned-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Unit-artifact format vocabulary: the header-only half of llama-vbr-artifact.h. Self-reporting, so
+# no /UNDEBUG. The codec (.cpp) is NOT here yet - it links against
+# vbr_generation_production_covered_set(), which only llama-vbr-generation.cpp defines, and that
+# file cannot land until artifact-validate/occupied-replacement/artifact-capture do. See
+# BUUN_MERGE_PLAN §10.35. The portable-domain ordering is pinned against a std::tuple oracle.
+llama_build_and_test(test-vbr-artifact.cpp)
+target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
