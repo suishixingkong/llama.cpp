@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstdarg>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <sstream>
 
@@ -170,10 +171,6 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
     }
 }
 
-    fflush(stderr);
-}
-
-
 uint32_t llama_crc32(const uint8_t * data, size_t n) {
     static uint32_t table[256];
     static std::once_flag once;
@@ -183,4 +180,13 @@ uint32_t llama_crc32(const uint8_t * data, size_t n) {
             for (int k = 0; k < 8; ++k) {
                 c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
             }
+            table[i] = c;
+        }
+    });
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFu;
+}
 
