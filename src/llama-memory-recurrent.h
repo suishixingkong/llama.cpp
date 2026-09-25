@@ -6,7 +6,10 @@
 
 #include <map>
 #include <set>
+#include <tuple>
 #include <vector>
+
+class vbr_recurrent_prepared_image;
 
 //
 // llama_memory_recurrent
@@ -44,7 +47,9 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id, llama_pos, llama_pos) override { return false; }
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -53,6 +58,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_fixed() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
@@ -60,11 +66,24 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    bool can_seq_rm_partial() const override { return n_rs_seq > 0; }
 
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    // cell management for speculative decoding checkpoint/restore
+    void copy_cell(int32_t i_src, int32_t i_dst);
+    int  get_cell_count(llama_seq_id seq_id) const;
+    bool vbr_capture_readiness_cells(
+            uint64_t logical_growth,
+            uint64_t & committed,
+            uint64_t & projected,
+            uint64_t & capacity) const override;
+
+    bool expand(uint32_t new_mem_size);
+    bool shrink(uint32_t new_mem_size);
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
@@ -73,10 +92,14 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
-    // per-seq rollback index
+    // per-seq rollback index and number of snapshot planes known to match the active frontier
     std::vector<uint32_t> rs_idx;
+    std::vector<uint32_t> rollback_valid_depth;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+    void reset_rollback_state(llama_seq_id seq_id);
+    void invalidate_rollback(const llama_ubatch & ubatch);
+    void commit_rollback(const llama_ubatch & ubatch);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -115,6 +138,16 @@ public:
     std::vector<ggml_tensor *> p_l;
 
 private:
+    friend class vbr_recurrent_prepared_image;
+    friend class llama_memory_recurrent_context;
+
+    // Graphs retain the concrete recurrent tensor/buffer bindings used when
+    // they were built. Artifact adoption publishes an off-side companion by
+    // replacing those bindings, so otherwise shape-identical graphs must not
+    // be reused across that publication.
+    uint64_t tensor_binding_epoch_ = 0;
+
+    void bump_tensor_binding_epoch() noexcept;
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -122,6 +155,23 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // Cell backup pairs repeat throughout speculative decoding. Keep a small
+    // device-local copy backend and graph per fixed source/destination pair so
+    // copying all recurrent layers requires one submission rather than one
+    // synchronous backend copy per tensor.
+    std::map<ggml_backend_dev_t, ggml_backend_ptr> copy_backends_;
+
+    struct copy_graph_entry {
+        ggml_context_ptr ctx;
+        ggml_cgraph * graph = nullptr;
+        ggml_backend_t backend = nullptr;
+    };
+
+    std::map<std::tuple<ggml_backend_dev_t, int32_t, int32_t>, copy_graph_entry>
+        copy_graph_cache_;
+
+    bool resize(uint32_t new_mem_size);
 
     size_t total_size() const;
 
@@ -162,6 +212,10 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    uint32_t get_max_graph_seqs() const override {
+        return status == LLAMA_MEMORY_STATUS_SUCCESS && mem != nullptr ? get_n_rs() : 0;
+    }
+
     //
     // llama_memory_recurrent_context specific API
     //
@@ -169,6 +223,7 @@ public:
     uint32_t get_n_rs() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
+    uint64_t get_tensor_binding_epoch() const;
     uint32_t get_size() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
@@ -176,6 +231,11 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // True when the state input for the first n_seqs cells is a contiguous identity gather
+    // (src0 == head + i for all i, no extra states), so build_rs can return a plain view of
+    // the state slot instead of materializing a get_rows copy. Pure: no side effects.
+    bool states_are_contiguous_identity(uint32_t n_seqs) const;
 
 private:
     const llama_memory_status status;
