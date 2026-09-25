@@ -65,8 +65,13 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-artifact-catalog.h
     llama-vbr-artifact-validate.cpp
     llama-vbr-artifact-validate.h
+    llama-vbr-explicit-capture.cpp
     llama-vbr-explicit-capture.h
+    llama-vbr-qsa-index.cpp
+    llama-vbr-qsa-index.h
+    llama-vbr-artifact-stage.cpp
     llama-vbr-artifact-stage.h
+    llama-vbr-artifact-adopt.cpp
     llama-vbr-artifact-adopt.h
     llama-vram-demand.cpp
     llama-vram-demand.h
