@@ -786,7 +786,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    // wait for any pending asynchronous copies into the output buffers before they are freed
+    // Context teardown is a terminal lifecycle boundary. Drain pending decode work while both the
+    // scheduler and memory tree are still alive, so deferred VBR work reaches its normal fence and
+    // pending asynchronous copies into the output buffers finish before those buffers are freed.
     synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
@@ -1314,6 +1316,12 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // The scheduler fence above is the per-family success boundary for the
+    // deferred append/reuse extents — promote submitted -> committed here. No new fences.
+    if (memory) {
+        memory->vbr_commit_submitted();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
