@@ -57,6 +57,15 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-generation.h
     llama-vbr-artifact-capture.cpp
     llama-vbr-artifact-capture.h
+    llama-vbr-artifact.cpp
+    llama-vbr-generation.cpp
+    llama-vbr-occupied-replacement.cpp
+    llama-vbr-occupied-replacement.h
+    llama-vbr-artifact-catalog.cpp
+    llama-vbr-artifact-catalog.h
+    llama-vbr-artifact-validate.cpp
+    llama-vbr-artifact-validate.h
+    llama-vbr-explicit-capture.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp

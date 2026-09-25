@@ -491,6 +491,13 @@ target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-artifact-capture.cpp)
 target_include_directories(test-vbr-artifact-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Artifact codec admission gates, the first test that reaches the whole artifact strongly-connected
+# component (artifact + generation + occupied-replacement + catalog + validate). Self-reporting, so
+# no /UNDEBUG. Scope is admission plus the two shared helpers; a full encode/decode round trip needs
+# a complete unit-artifact package and is still open (BUUN_MERGE_PLAN §10.38).
+llama_build_and_test(test-vbr-artifact-codec.cpp)
+target_include_directories(test-vbr-artifact-codec PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

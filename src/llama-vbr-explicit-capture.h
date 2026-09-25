@@ -1,0 +1,754 @@
+#pragma once
+
+#include "llama-vbr-artifact-catalog.h"
+#include "llama-vbr-checkpoint-types.h"
+#include "llama-vbr-generation.h"
+#include "llama-vbr-occupied-replacement.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+class llama_memory_i;
+class llama_io_write_i;
+struct vbr_target_validation_snapshot;
+struct vbr_target_empty_fingerprint;
+struct vbr_downward_policy_projection;
+struct vbr_downward_stage_reservation;
+struct vbr_validated_child_plan;
+class vbr_import_schedule_quote;
+struct vbr_import_schedule_unit;
+struct vbr_explicit_representation_identity;
+enum class vbr_import_schedule_status : uint8_t;
+
+
+// Production factory: one allocating tree/snapshot pass while the incumbent
+// remains untouched, followed by an allocation-free direct KV recheck.
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & incoming,
+    const vbr_artifact_package_view & recovery,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & output,
+    const vbr_import_schedule_quote * authenticated_incoming = nullptr,
+    const std::vector<vbr_target_companion_snapshot> * external_companions =
+        nullptr) noexcept;
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_prepare_occupied_prefix_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & incoming_parent,
+    uint64_t prefix_tokens,
+    const std::vector<vbr_artifact_prefix_cell_run> & prefix_runs,
+    const vbr_artifact_package_view & recovery,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & output,
+    const vbr_import_schedule_quote & authenticated_incoming) noexcept;
+
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_occupied_replacement_guard & guard) noexcept;
+
+// Barrier form: permits only the exact import operation that already armed
+// this same cache. The ordinary overload remains pre-arm-only.
+vbr_occupied_replacement_guard_status
+vbr_explicit_recheck_occupied_replacement_guard(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_operation_id active_import_operation,
+    vbr_occupied_replacement_guard & guard) noexcept;
+
+enum class vbr_explicit_capture_status : uint8_t {
+    ok = 0,
+    not_armed,
+    unsupported_layout,
+    slot_not_idle,
+    identity_unavailable,
+    generation_unavailable,
+    registry_busy,
+    recovery_pending,
+    // Reserved for route-level geometry diagnostics. Capture maps all
+    // private-hook geometry refusals to generation_unavailable.
+    geometry_mismatch,
+    stash_inconsistent,
+    required_companion_unavailable,
+    size_overflow,
+    ring_unavailable,
+    admission_refused,
+    cancelled,
+    transfer_failed,
+    short_read,
+    // Reserved for a backend that can report asynchronous event failure.
+    // Today's ggml completion API is void, so capture detects it by digest/length.
+    event_failed,
+    source_changed,
+    hash_mismatch,
+    dedup_validation_failed,
+    accounting_failed,
+    publication_failed,
+    internal_error,
+    _count,
+};
+
+const char * vbr_explicit_capture_status_name(
+    vbr_explicit_capture_status status) noexcept;
+
+enum class vbr_explicit_capture_phase : uint8_t {
+    validation = 0,
+    memory_tree,
+    settlement,
+    pre_capture_quiescence,
+    metadata_and_manifest,
+    pre_transfer_stability,
+    accounting_configuration,
+    reservation_preparation,
+    companion_capture,
+    unit_transfer,
+    post_transfer_stability,
+    publication,
+    complete,
+    _count,
+};
+
+const char * vbr_explicit_capture_phase_name(
+    vbr_explicit_capture_phase phase) noexcept;
+
+// Closed diagnostic for the metadata/generation half of explicit capture.
+// This is process-local observability only; it is not part of an artifact or
+// cache-plan wire format.
+enum class vbr_explicit_generation_failure : uint8_t {
+    none = 0,
+    size_pass,
+    tracker_missing,
+    tracker_unstable,
+    tracker_shadow_unavailable,
+    invalid_sequence_or_frontier,
+    invalid_stream,
+    ownership_index_missing,
+    ownership_view_missing,
+    ownership_view_unavailable,
+    ownership_rank_failed,
+    ownership_enumeration_failed,
+    ownership_cardinality_mismatch,
+    stream_capture_failed,
+    controller_capture_failed,
+    stability_reread_failed,
+    internal_error,
+    _count,
+};
+
+const char * vbr_explicit_generation_failure_name(
+    vbr_explicit_generation_failure failure) noexcept;
+
+// Closed diagnostic for the byte-geometry half of explicit capture. This
+// remains process-local observability; it is never serialized into the
+// artifact envelope.
+enum class vbr_explicit_size_failure : uint8_t {
+    none = 0,
+    not_armed,
+    tracker_missing,
+    tracker_unstable,
+    bindings_missing,
+    stream_layout,
+    policy_snapshot,
+    unit_index,
+    extents_empty,
+    extent_missing,
+    vmm_missing,
+    backend_unavailable,
+    wm_cells_zero,
+    extent_type_mismatch,
+    promote_hops_mismatch,
+    domain_mismatch,
+    shard_disagreement,
+    binding_missing,
+    topology_order,
+    bounds,
+    stash_bounds,
+    stability_reread,
+    internal_error,
+    _count,
+};
+
+const char * vbr_explicit_size_failure_name(
+    vbr_explicit_size_failure failure) noexcept;
+
+// Pure production predicate used by size-pass and its CPU regression. A
+// never-retiered F16 unit is valid when ordinary decode has established a
+// nonzero mapped watermark; the VBR side-stream backend is deliberately not
+// part of this generation predicate because capture initializes it lazily.
+vbr_explicit_size_failure vbr_explicit_capture_validate_extent_generation(
+    uint32_t wm_cells,
+    int32_t extent_type,
+    uint8_t extent_promote_hops,
+    const vbr_unit_generation & generation) noexcept;
+
+// One runtime pool-to-portable-topology binding. Device ordinals are portable
+// only within the cited topology; lane identifies the bounded D2H ring lane.
+struct vbr_explicit_capture_pool_binding {
+    vbr_controller_instance_id instance_id;
+    int device = -1;
+    uint32_t topology_index = UINT32_MAX;
+    uint16_t device_ordinal = UINT16_MAX;
+    uint32_t lane = UINT32_MAX;
+};
+
+// Internal capture discovery result. It exposes only the runtime backend binding
+// needed to build the server-owned ring and the portable pool mapping; no KV
+// bytes, masks, or ownership state cross this seam.
+struct vbr_explicit_capture_runtime_pool {
+    vbr_controller_instance_id instance_id;
+    int device = -1;
+    ggml_backend_dev_t backend_device = nullptr;
+    ggml_backend_t backend = nullptr;
+};
+
+bool vbr_explicit_capture_runtime_pools(
+    llama_memory_i & memory,
+    std::vector<vbr_explicit_capture_runtime_pool> & pools,
+    uint32_t & attention_children) noexcept;
+
+// Live-import inspection doors. They share the capture adapter's private
+// KV geometry access but are read-only: validation/staging consume the values,
+// and only vbr_adopt_empty_manifest may mutate the target.
+uint64_t vbr_explicit_import_policy_epoch(
+    llama_memory_i & memory) noexcept;
+
+enum class vbr_import_target_snapshot_status : uint8_t {
+    actionable = 0,
+    report_only,
+    unavailable,
+    _count,
+};
+static_assert(uint8_t(vbr_import_target_snapshot_status::_count) == 3);
+
+// Pure representational actionability owner for an authenticated schedule.
+// Target inspection still owns emptiness, geometry, policy projection and
+// resource evidence; this only distinguishes executable codec directions from
+// truthful report-only schedules.
+vbr_import_target_snapshot_status
+vbr_explicit_import_schedule_actionability(
+    vbr_import_schedule_status status,
+    const std::vector<vbr_import_schedule_unit> & units) noexcept;
+
+// Typed reporting seam. Upward actionability is limited to resolver-certified
+// same- or cross-domain reconstruction. Mixed and unsupported schedules return
+// their immutable quote without implying that validation, staging, or adoption
+// may proceed.
+vbr_import_target_snapshot_status
+vbr_explicit_import_target_schedule_snapshot(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    bool previously_observed,
+    uint64_t accounting_serial,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    vbr_target_validation_snapshot & output,
+    vbr_downward_policy_projection & downward_projection,
+    bool & downward_required,
+    vbr_import_schedule_quote & schedule_quote,
+    uint64_t selected_frontier = 0) noexcept;
+
+// Final transform-currency barrier shared by downward and the supported
+// same- and cross-domain upward reconstruction paths. The authenticated
+// schedule remains the sole representation/destination authority.
+bool vbr_explicit_import_transform_projection_recheck(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_artifact_package_view & package,
+    const std::vector<llama_vbr_artifact_domain_binding> & bindings,
+    const vbr_import_schedule_quote & authenticated_schedule,
+    const void * representation_context,
+    vbr_explicit_representation_identity_fn representation_identity,
+    std::array<uint8_t, 32> & tree_digest) noexcept;
+bool vbr_explicit_import_target_recheck(
+    llama_memory_i & memory,
+    llama_seq_id destination,
+    const vbr_target_empty_fingerprint & expected) noexcept;
+bool vbr_explicit_import_reserve_transform(
+    llama_memory_i & memory,
+    const std::vector<vbr_validated_child_plan> & plans,
+    llama_cache_acct_ledger & ledger,
+    const llama_cache_budget_config & budget,
+    vbr_downward_stage_reservation & output) noexcept;
+
+struct vbr_explicit_representation_identity {
+    uint32_t codec_id = 0;
+    uint32_t codec_version = 0;
+    std::array<uint8_t, 32> codebook_digest = {};
+    std::array<uint8_t, 32> rotation_digest = {};
+    std::array<uint8_t, 32> meansub_digest = {};
+    bool meansub_baked = false;
+};
+
+// Server policy input to the library-owned codec identity recipe. The build
+// identity distinguishes compiled-in codebooks; file overrides, rotations,
+// and mean-subtraction state are discovered and hashed by the codec layer.
+struct vbr_explicit_representation_policy {
+    const char * build_identity = nullptr;
+    size_t build_identity_len = 0;
+};
+
+struct vbr_explicit_representation_identity_diagnostics {
+    uint64_t baked_table_hashes = 0;
+};
+
+vbr_explicit_representation_identity_diagnostics
+vbr_explicit_representation_identity_diagnostics_snapshot() noexcept;
+
+bool vbr_explicit_capture_representation_identity(
+    const void * context,
+    int32_t current_type,
+    bool value_side,
+    int32_t meansub_model_id,
+    vbr_explicit_representation_identity & output) noexcept;
+
+struct vbr_explicit_companion_provider {
+    using capture_fn = bool (*)(
+        const void * context,
+        llama_seq_id sequence,
+        std::vector<uint8_t> & output) noexcept;
+    using size_fn = bool (*)(
+        const void * context,
+        llama_seq_id sequence,
+        uint64_t & output) noexcept;
+    using capture_stream_fn = bool (*)(
+        const void * context,
+        llama_seq_id sequence,
+        llama_io_write_i & output);
+    using terminal_position_fn = bool (*)(
+        const void * context,
+        llama_seq_id sequence,
+        llama_pos & output) noexcept;
+
+    vbr_artifact_companion_kind kind =
+        vbr_artifact_companion_kind::typed_accelerator;
+    uint32_t format_version = 1;
+    std::array<uint8_t, 32> build_identity_digest = {};
+    vbr_artifact_portable_domain domain;
+    bool required = true;
+    const void * context = nullptr;
+    size_fn size = nullptr;
+    capture_fn capture = nullptr;
+    // Preferred bounded path. The writer owns <=1 MiB cancellation quanta
+    // and appends directly to the immutable segment chain. Legacy whole-
+    // vector capture remains only for small CPU companion images.
+    capture_stream_fn capture_stream = nullptr;
+    // Required for any injected stateful image whose serialized state owns a
+    // frontier (currently recurrent and DFlash ring companions). It prevents
+    // checkpoint metadata from relabeling bytes from a different frontier.
+    terminal_position_fn terminal_position = nullptr;
+};
+
+// Canonical codec identity used by both the live recurrent serializer and a
+// checkpoint-backed provider for an earlier exact frontier.
+std::array<uint8_t, 32>
+vbr_explicit_recurrent_companion_build_identity() noexcept;
+
+bool vbr_explicit_recurrent_companion_terminal(
+    const void * data, size_t size, llama_pos & output) noexcept;
+
+// Exact-capture byte/resource observation produced after the canonical size,
+// schema, and companion-size passes and before the first retained payload
+// allocation or D2H byte. The host-resident value is conservative:
+// content-addressed catalog dedup may shrink it after transfer, but may not
+// make it grow.
+struct vbr_explicit_capture_pretransfer_quote {
+    uint64_t payload_bytes = 0;
+    uint64_t stash_bytes = 0;
+    uint64_t companion_bytes = 0;
+    uint64_t metadata_bytes = 0;
+    uint64_t planned_packed_bytes = 0;
+    uint64_t conservative_host_resident_bytes = 0;
+    uint32_t controllers = 0;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+};
+
+// Pure fail-closed invariant shared by production admission and CPU tests.
+// max_packed_bytes == 0 means the explicit/manual caller did not impose a
+// scheduler runway; automatic host capture always supplies a nonzero bound.
+bool vbr_explicit_capture_pretransfer_quote_admissible(
+    const vbr_explicit_capture_pretransfer_quote & quote,
+    uint64_t max_packed_bytes) noexcept;
+
+struct vbr_explicit_capture_request {
+    using representation_identity_fn =
+        vbr_explicit_representation_identity_fn;
+    using pretransfer_admit_fn = bool (*)(
+        void * context,
+        const vbr_explicit_capture_pretransfer_quote & quote) noexcept;
+    using continue_transfer_fn = bool (*)(void * context) noexcept;
+
+    llama_seq_id sequence = -1;
+    vbr_checkpoint_frontier_fields frontier;
+    vbr_artifact_identity_block identity;
+    std::vector<llama_token> token_block;
+    // Optional expected canonical digest. Zero asks the library to derive it
+    // from frontier + ordered memory-tree child policy; a nonzero value must
+    // match exactly.
+    std::array<uint8_t, 32> identity_policy_order_digest = {};
+    bool idle_decode_thread = false;
+    vbr_pinned_chunk_ring * ring = nullptr;
+    std::vector<vbr_artifact_portable_topology> topologies;
+    std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
+    std::vector<vbr_explicit_companion_provider> companions;
+    const void * representation_context = nullptr;
+    representation_identity_fn representation_identity = nullptr;
+    // Scheduler-admitted aggregate attention + stash + companion D2H runway.
+    // Checked before accounting preparation, ring acquisition, companion
+    // allocation, or unit transfer. Zero is retained only for explicit/manual
+    // callers that intentionally use the accounting budget as their sole cap.
+    uint64_t max_packed_bytes = 0;
+    // Final scalar admission at the exact pre-D2H boundary. The callback may
+    // prepare scheduler-owned host-cache capacity but cannot retain the quote
+    // or mutate the source.
+    void * pretransfer_context = nullptr;
+    pretransfer_admit_fn pretransfer_admit = nullptr;
+    // Synchronous cancellation probe checked before companion work, between
+    // recurrent <=1 MiB writes, and before every attention ring chunk.
+    void * continue_context = nullptr;
+    continue_transfer_fn continue_transfer = nullptr;
+};
+
+struct vbr_explicit_capture_accounting {
+    using prepare_fn = bool (*)(
+        void * context,
+        const vbr_artifact_package & package) noexcept;
+
+    const llama_cache_budget_config * budget = nullptr;
+    llama_cache_transaction_fault fault;
+    void * context = nullptr;
+    // Called after the exact package accounting manifest exists and before
+    // begin_capture. A catalog binding/configuration adapter lives here
+    // rather than weakening the generic sink interface.
+    prepare_fn prepare = nullptr;
+};
+
+struct vbr_explicit_capture_result {
+    vbr_explicit_capture_status status =
+        vbr_explicit_capture_status::internal_error;
+    vbr_explicit_capture_phase phase =
+        vbr_explicit_capture_phase::validation;
+    // Populated when a sink/ring/catalog boundary supplies a more specific
+    // terminal. `_count` means the phase failed before such a boundary.
+    vbr_capture_stream_status inner_stream_status =
+        vbr_capture_stream_status::_count;
+    vbr_explicit_generation_failure generation_failure =
+        vbr_explicit_generation_failure::none;
+    vbr_explicit_size_failure size_failure =
+        vbr_explicit_size_failure::none;
+    vbr_capture_begin_diagnostics begin_diagnostics;
+    vbr_capture_sink_result sink;
+    vbr_explicit_capture_pretransfer_quote pretransfer;
+    uint32_t controllers = 0;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint32_t companion_failure_index = UINT32_MAX;
+    vbr_artifact_companion_kind companion_failure_kind =
+        vbr_artifact_companion_kind::_count;
+    uint64_t payload_bytes = 0;
+    uint64_t stash_bytes = 0;
+    uint64_t companion_bytes = 0;
+    uint64_t chunks = 0;
+    uint64_t backpressure_waits = 0;
+    uint64_t event_completions = 0;
+    uint64_t synchronous_fallbacks = 0;
+};
+
+// Move-only exact-capture transaction. Preparation samples and authenticates
+// the live source, admits the complete byte/resource quote, and opens the
+// private catalog build without moving a payload byte. Transfer may then run
+// on a bounded worker. Publication remains a distinct scheduler-owned
+// terminal; abandoning the operation drops all private staging and claims.
+class vbr_explicit_capture_operation {
+public:
+    vbr_explicit_capture_operation() noexcept;
+    vbr_explicit_capture_operation(
+        vbr_explicit_capture_operation && other) noexcept;
+    vbr_explicit_capture_operation & operator=(
+        vbr_explicit_capture_operation && other) noexcept;
+    ~vbr_explicit_capture_operation();
+
+    vbr_explicit_capture_operation(
+        const vbr_explicit_capture_operation &) = delete;
+    vbr_explicit_capture_operation & operator=(
+        const vbr_explicit_capture_operation &) = delete;
+
+    bool ready_for_transfer() const noexcept;
+    bool ready_for_publication() const noexcept;
+    void reset() noexcept;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+    friend vbr_explicit_capture_result vbr_prepare_explicit_manifest(
+        llama_memory_i &, vbr_explicit_capture_request,
+        vbr_unit_version_sink &, const vbr_explicit_capture_accounting &,
+        vbr_explicit_capture_operation &) noexcept;
+    friend vbr_explicit_capture_result vbr_transfer_explicit_manifest(
+        vbr_explicit_capture_operation &) noexcept;
+    friend vbr_explicit_capture_result vbr_publish_explicit_manifest(
+        vbr_explicit_capture_operation &) noexcept;
+};
+
+vbr_explicit_capture_result vbr_prepare_explicit_manifest(
+    llama_memory_i & memory,
+    vbr_explicit_capture_request request,
+    vbr_unit_version_sink & sink,
+    const vbr_explicit_capture_accounting & accounting,
+    vbr_explicit_capture_operation & operation) noexcept;
+
+vbr_explicit_capture_result vbr_transfer_explicit_manifest(
+    vbr_explicit_capture_operation & operation) noexcept;
+
+vbr_explicit_capture_result vbr_publish_explicit_manifest(
+    vbr_explicit_capture_operation & operation) noexcept;
+
+vbr_explicit_capture_result vbr_capture_explicit_manifest(
+    llama_memory_i & memory,
+    const vbr_explicit_capture_request & request,
+    vbr_unit_version_sink & sink,
+    const vbr_explicit_capture_accounting & accounting) noexcept;
+
+// Automatic projected-capture boundary. One scheduler batch is capped well
+// below the generic artifact arenas and is bound to one live memory tree. Semantic
+// identity and token storage are owned values; no caller-owned string pointer
+// is retained by the sealed projection.
+constexpr uint32_t VBR_PROJECTED_CAPTURE_MAX_MANIFESTS = 8;
+constexpr uint32_t VBR_PROJECTED_CAPTURE_MAX_TOKEN_IDS = 1048576;
+
+enum class vbr_projected_capture_frontier_mode : uint8_t {
+    exact = 0,
+    // Select the longest complete dense-attention prefix that fits the
+    // caller's packed-byte runway. This first implementation is deliberately
+    // limited to one text-only manifest, one unified attention child, and no
+    // recurrent companion state.
+    longest_attention_stem,
+    _count,
+};
+
+enum class vbr_projected_capture_frontier_status : uint8_t {
+    exact = 0,
+    stem_selected,
+    stem_below_minimum,
+    stem_unsupported,
+    _count,
+};
+
+struct vbr_projected_capture_frontier_policy {
+    vbr_projected_capture_frontier_mode mode =
+        vbr_projected_capture_frontier_mode::exact;
+    // A stem shorter than this is refused before projection or D2H.
+    uint64_t minimum_tokens = 0;
+    // Hard prompt-cache limits used only to choose a feasible stem frontier.
+    // Zero means unlimited. When a byte limit is configured, the cache derives
+    // its effective token limit from resident bytes; max_host_tokens is the
+    // independent ceiling only for a token-only cache.
+    uint64_t max_host_resident_bytes = 0;
+    uint64_t max_host_tokens = 0;
+};
+
+struct vbr_attention_stem_prefix_plan {
+    vbr_projected_capture_frontier_status status =
+        vbr_projected_capture_frontier_status::stem_unsupported;
+    uint64_t selected_token_count = 0;
+    llama_pos selected_next_position = -1;
+    uint64_t planned_packed_bytes = 0;
+    uint64_t projected_host_resident_bytes = 0;
+    uint64_t surveyed_cells = 0;
+};
+
+// Pure bounded planner shared by production capture and its CPU scale tests.
+// Placement order is irrelevant; duplicate or out-of-frontier logical rows
+// fail closed. A structurally valid prefix below minimum_tokens returns true
+// with stem_below_minimum so the caller can preserve typed diagnostics.
+bool vbr_plan_attention_stem_prefix(
+    uint64_t requested_token_count,
+    const vbr_artifact_cell_placement * cells,
+    size_t cell_count,
+    uint64_t bytes_per_logical_row,
+    uint64_t max_packed_bytes,
+    uint64_t projected_units,
+    const vbr_projected_capture_frontier_policy & policy,
+    vbr_attention_stem_prefix_plan & output) noexcept;
+
+struct vbr_projected_capture_manifest_request {
+    uint64_t manifest_id = 0;
+    llama_seq_id sequence = -1;
+    vbr_artifact_identity_block identity;
+    std::vector<llama_token> token_block;
+    // Zero derives the canonical frontier/policy digest. A nonzero value must
+    // match, exactly as in explicit capture.
+    std::array<uint8_t, 32> identity_policy_order_digest = {};
+    // Asserted by the trusted caller from the source token representation.
+    // Stem planning refuses media-bearing prefixes; exact capture ignores
+    // this field for backward compatibility.
+    bool text_only = false;
+    // Optional exact state images already authenticated by the caller for this
+    // manifest frontier. These use the same provider contract as explicit
+    // capture, but the attention payload is still narrowed to the manifest's
+    // owned physical rows. A supplied recurrent image replaces the live
+    // recurrent serializer one-for-one; draft/DFlash/logit companions are
+    // additional typed state in the same atomic artifact.
+    std::vector<vbr_explicit_companion_provider> companions;
+};
+
+struct vbr_projected_capture_batch_request {
+    using representation_identity_fn =
+        vbr_explicit_capture_request::representation_identity_fn;
+
+    struct pretransfer_quote {
+        struct staging_row {
+            vbr_artifact_portable_domain domain;
+            uint64_t bytes = 0;
+        };
+        struct durable_manifest {
+            uint64_t manifest_id = 0;
+            // Conservative complete catalog rows for this manifest at the
+            // currently projected physical union. Content-addressed dedup
+            // may repartition these rows downward after D2H, never upward.
+            std::vector<vbr_artifact_portable_accounting_row> accounting;
+            // Unit-payload subset whose first immutable allocation is owned
+            // by this manifest. The complete accounting above remains the
+            // conservative final shape; unlisted unit bytes are reference
+            // placeholders and reserve no duplicate physical capacity.
+            std::vector<vbr_artifact_portable_accounting_row>
+                reserve_accounting;
+            uint64_t requested_token_count = 0;
+            uint64_t selected_token_count = 0;
+            llama_pos selected_next_position = -1;
+            bool stemmed = false;
+        };
+
+        uint64_t planned_packed_bytes = 0;
+        // Conservative compact prompt-cache footprint for the complete
+        // projected batch: every manifest-local non-unit row plus the
+        // first-owner physical unit union. Existing-catalog content dedup may
+        // shrink this after D2H; it can never grow.
+        uint64_t projected_host_resident_bytes = 0;
+        uint64_t union_cells = 0;
+        uint32_t manifests = 0;
+        uint32_t projected_units = 0;
+        // Exact physical transport payload grouped by accounting domain.
+        // The synchronous store converts these rows into one split-phase
+        // transfer-staging reservation before companion/attention D2H.
+        std::vector<staging_row> staging;
+        // Final manifest shapes plus first-allocation ownership for one
+        // batch-level durable fence. Dependency-local shrink repartitions
+        // this inventory; final assembly partitions independent terminals.
+        std::vector<durable_manifest> durable;
+    };
+    using pretransfer_prepare_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
+    using pretransfer_admit_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
+    using pretransfer_shrink_fn = bool (*)(
+        void * context, const pretransfer_quote & quote) noexcept;
+    using continue_transfer_fn = bool (*)(void * context) noexcept;
+
+    bool idle_decode_thread = false;
+    // Scheduler-admitted aggregate pageable payload runway for this batch.
+    // Required and checked before the first D2H byte.
+    uint64_t max_packed_bytes = 0;
+    vbr_projected_capture_frontier_policy frontier;
+    std::vector<vbr_projected_capture_manifest_request> manifests;
+    vbr_pinned_chunk_ring * ring = nullptr;
+    std::vector<vbr_artifact_portable_topology> topologies;
+    std::vector<vbr_explicit_capture_pool_binding> pool_bindings;
+    const void * representation_context = nullptr;
+    representation_identity_fn representation_identity = nullptr;
+    // Optional fallible preparation before the persistent ring operation is
+    // acquired. It is invoked at most once with the final selected frontier
+    // and physical quote; refusal performs no D2H and acquires no ring token.
+    void * pretransfer_prepare_context = nullptr;
+    pretransfer_prepare_fn pretransfer_prepare = nullptr;
+    // Invoked exactly once after the initial bounded projection is priced and
+    // before companion or attention D2H begins. For nonzero work the
+    // batch-long ring operation is already held; the canonical zero-work quote
+    // requires none. The synchronous caller may refuse when queued work or a
+    // scheduler-owned reservation changed while planning. Dependency-local
+    // companion failures may later shrink the admitted union; they never grow
+    // it or invoke this callback again. Refusal returns admission_refused with
+    // zero unit transfers and releases any ring operation.
+    void * pretransfer_context = nullptr;
+    pretransfer_admit_fn pretransfer_admit = nullptr;
+    // Optional store-owned reservation shrink after a dependency-local
+    // companion failure removes rows from the admitted union. It may only
+    // replace the original claim with a smaller one and never re-enters the
+    // scheduler policy callback.
+    pretransfer_shrink_fn pretransfer_shrink = nullptr;
+    // Optional cancellation probe used only after pretransfer admission. It
+    // is checked between recurrent <=1 MiB writes and attention ring chunks.
+    // False aborts the complete batch without publication.
+    void * continue_context = nullptr;
+    continue_transfer_fn continue_transfer = nullptr;
+};
+
+struct vbr_projected_capture_batch_result {
+    vbr_explicit_capture_status status =
+        vbr_explicit_capture_status::internal_error;
+    vbr_explicit_capture_phase phase =
+        vbr_explicit_capture_phase::validation;
+    vbr_capture_stream_status inner_stream_status =
+        vbr_capture_stream_status::_count;
+    vbr_explicit_generation_failure generation_failure =
+        vbr_explicit_generation_failure::none;
+    vbr_explicit_size_failure size_failure =
+        vbr_explicit_size_failure::none;
+    vbr_capture_manifest_assembly assembly;
+    std::vector<vbr_projected_manifest_publication> publications;
+    uint64_t source_namespace = 0;
+    // First request-order manifest that survived dependency preparation.
+    // This is retry-selection evidence only; it authorizes no publication.
+    uint64_t first_available_manifest_id = 0;
+    uint64_t union_cells = 0;
+    uint64_t planned_packed_bytes = 0;
+    vbr_projected_capture_frontier_status frontier_status =
+        vbr_projected_capture_frontier_status::_count;
+    uint64_t requested_frontier_tokens = 0;
+    uint64_t selected_frontier_tokens = 0;
+    llama_pos selected_frontier_next_position = -1;
+    uint64_t frontier_survey_cells = 0;
+    uint32_t frontier_survey_calls = 0;
+    uint32_t frontier_recapture_calls = 0;
+    uint32_t size_pass_calls = 0;
+    uint32_t projection_calls = 0;
+    uint32_t unit_transfer_calls = 0;
+    uint32_t transferred_units = 0;
+    uint64_t companion_d2h_bytes = 0;
+    uint64_t companion_d2h_reads = 0;
+    uint32_t ring_operation_attempts = 0;
+    uint32_t ring_operation_acquires = 0;
+    uint32_t ring_operation_refusals = 0;
+    vbr_capture_stream_stats transfer;
+};
+
+// Produces immutable catalog capabilities and the narrow publication envelopes
+// consumed by the server-owned catalog adapter. Required recurrent state is
+// sealed per manifest; clean stash payloads, payload-complete dependencies,
+// and non-unified controllers fail closed in this first slice.
+vbr_projected_capture_batch_result vbr_capture_projected_batch(
+    llama_memory_i & memory,
+    const vbr_projected_capture_batch_request & request) noexcept;
