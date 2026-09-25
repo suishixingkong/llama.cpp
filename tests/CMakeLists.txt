@@ -438,6 +438,13 @@ endif()
 llama_build_and_test(test-vbr-hard-seal.cpp)
 target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Identity digests for VBR, the next leaf slice. Same shape as hard-seal: self-reporting (a status
+# from main plus explicit PASS markers), so no /UNDEBUG is needed. It includes its header by bare
+# name, and that header reaches llama.h through llama-vbr-checkpoint-types.h, hence the src include
+# directory on top of what linking llama already propagates.
+llama_build_and_test(test-vbr-identity-digest.cpp)
+target_include_directories(test-vbr-identity-digest PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
