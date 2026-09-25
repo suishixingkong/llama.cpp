@@ -169,3 +169,18 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
 }
+
+    fflush(stderr);
+}
+
+
+uint32_t llama_crc32(const uint8_t * data, size_t n) {
+    static uint32_t table[256];
+    static std::once_flag once;
+    std::call_once(once, []() {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            }
+

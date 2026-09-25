@@ -157,7 +157,7 @@ public:
                          size_t kv_stream_maximum_pool_bytes = 0,
         const llama_memory_vbr_params & vbr = {});
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache(); // frees the VBR VMM pools (if any); trivial otherwise
 
     //
     // llama_memory_i

@@ -60,6 +60,10 @@ struct llama_hparams {
     // note: use the `_impl` suffix to avoid name conflict between members and getters
     //       for example: n_embd_out() vs n_embd_out_impl
 
+    // Calibration id of the loaded TURBO_MEANSUB table (bumped per capture/table load), used to
+    // version cache tensor names that bake meansub-dependent layout in.
+    int32_t turbo_meansub_id = 0;
+
     bool vocab_only;
     bool no_alloc;
     bool rope_finetuned;

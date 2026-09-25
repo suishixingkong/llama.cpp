@@ -403,8 +403,32 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+    // meta device / buffer type / buffer / tensor introspection, for consumers that manage per-device
+    // memory behind a meta buffer (e.g. the VBR KV cache's per-device VMM pools):
+    GGML_API bool                       ggml_backend_dev_is_meta           (ggml_backend_dev_t dev);
+    GGML_API size_t                     ggml_backend_meta_dev_n_devs       (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t         ggml_backend_meta_dev_simple_dev   (ggml_backend_dev_t meta_dev, size_t index);
+    GGML_API bool                       ggml_backend_buft_is_meta          (ggml_backend_buffer_type_t buft);
+    GGML_API bool                       ggml_backend_buffer_is_meta        (ggml_backend_buffer_t buf);
+    GGML_API size_t                     ggml_backend_meta_buft_n_bufts     (ggml_backend_buffer_type_t meta_buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft (ggml_backend_buffer_type_t meta_buft, size_t index);
+    GGML_API size_t                     ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf);
+    GGML_API ggml_backend_buffer_t      ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index);
+    // per-device shard of a tensor placed in a meta buffer (NULL if the tensor is unknown to the buffer)
+    GGML_API struct ggml_tensor *       ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+    // per-device backend instances owned by a meta backend (they share its streams/ordering,
+    // for consumers that schedule auxiliary per-device graphs, e.g. DFlash tape replay)
+    GGML_API bool                       ggml_backend_is_meta               (ggml_backend_t backend);
+    GGML_API size_t                     ggml_backend_meta_n_backends       (ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t             ggml_backend_meta_simple_backend   (ggml_backend_t meta_backend, size_t index);
+
 
     //
+    typedef ggml_backend_buffer_t (*ggml_backend_meta_alloc_simple_t)(
+        size_t index, ggml_backend_buffer_type_t simple_buft, struct ggml_context * ctx, void * userdata);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
+        struct ggml_context * ctx, ggml_backend_buffer_type_t buft, ggml_backend_meta_alloc_simple_t alloc, void * userdata);
+
     // Utils
     //
 

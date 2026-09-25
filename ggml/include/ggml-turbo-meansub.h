@@ -64,6 +64,21 @@ GGML_API bool ggml_turbo_meansub_write(
 #define GGML_TURBO_MEANSUB_FLAG_K 1u
 #define GGML_TURBO_MEANSUB_FLAG_V 2u
 
+// --- baked per-architecture calibration registry (buun) ---
+#define GGML_TURBO_MEANSUB_MAX_MODELS 16
+#define GGML_TURBO_MEANSUB_MAX_L      128
+#define GGML_TURBO_MEANSUB_MAX_C      2048
+
+// Resolve a stable registry ID for one model identity. arch = general.architecture string.
+// The match requires arch + n_layer + n_embd to agree. Returns 0 when no table matches.
+GGML_API int ggml_turbo_meansub_model_id(const char * arch, int n_layer, int n_embd);
+
+// Dense baked mean slab [max_l * max_c] for model_id; kvsel: 0 = K, 1 = V.
+// Returns NULL when model_id is 0 or invalid. Returned storage is immutable and process-lifetime;
+// out_* may be NULL.
+GGML_API const float * ggml_turbo_meansub_table(
+        int model_id, int kvsel, int * out_max_l, int * out_max_c, int * out_live);
+
 #ifdef __cplusplus
 }
 #endif

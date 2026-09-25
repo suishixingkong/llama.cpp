@@ -2509,3 +2509,78 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
 }
+
+ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
+        struct ggml_context * ctx, ggml_backend_buffer_type_t buft, ggml_backend_meta_alloc_simple_t alloc, void * userdata) {
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    const ggml_init_params params_static = {
+        /*.mem_size   =*/ ggml_get_mem_size(ctx),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    const ggml_init_params params_compute = {
+        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+
+    std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+
+    ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->buffer = meta_buf;
+        ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
+        t->data = (void *) 0x2000000000000000; // FIXME
+    }
+    for (size_t i = 0; i < n_simple_bufts; i++) {
+        ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
+        ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+
+        if (alloc != nullptr) {
+            // caller-managed allocation: the callback places every non-view shard tensor
+            // (data + buffer); views are finalized below
+            meta_buf_ctx->bufs[i].reset(alloc(i, simple_buft, ctx, userdata));
+        } else {
+            // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
+            // For those edge cases, allocate a dummy buffer instead.
+            bool any_nonzero_slice = false;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (ggml_nelements(t) != 0) {
+                    any_nonzero_slice = true;
+                    break;
+                }
+            }
+            if (any_nonzero_slice) {
+                meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
+            } else {
+                meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = meta_buf_ctx->bufs[i].get();
+                }
+            }
+        }
+        if (!meta_buf_ctx->bufs[i]) {
+            // allocation failed (callback refusal or device OOM) — fail like the non-meta
+            // allocator does so the caller can surface a load error instead of crashing
+            ggml_backend_buffer_free(meta_buf); // frees the already-installed simple buffers
+            return nullptr;
+        }
+        if (alloc != nullptr) {
+            // finalize any views the callback left untouched (it only owes the non-view tensors);
+            // a callback that finalized its own views is fine — those are skipped by the null check
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
+                }
+            }
+        }
+        meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
+    }
+    return meta_buf;
+}
