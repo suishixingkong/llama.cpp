@@ -189,6 +189,7 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    llama_live_memory_breakdown live_memory_breakdown() const;
     void vbr_import_accounting_observed() noexcept;
 
     //

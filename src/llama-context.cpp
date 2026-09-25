@@ -10,11 +10,16 @@
 #include "llama-kv-stream-config.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-memory-tree.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-vbr-operation.h"
+#include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
 #include "llama.h"
 
@@ -3953,6 +3958,17 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
         }
+        for (const auto & [buft, size] : memory->memory_breakdown_fixed()) {
+            ret[buft].context_fixed += size;
+        }
+        for (const auto & [buft, size] : memory->memory_breakdown_vbr_managed()) {
+            ret[buft].context_vbr_managed += size;
+        }
+        for (const auto & [buft, mb] : ret) {
+            GGML_UNUSED(buft);
+            GGML_ASSERT(mb.context_fixed <= mb.context);
+            GGML_ASSERT(mb.context_vbr_managed <= mb.context);
+        }
     }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -3967,6 +3983,64 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
     }
+    return ret;
+}
+
+llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
+    llama_live_memory_breakdown ret;
+
+    if (memory) {
+        const uint64_t n_planes = uint64_t(cparams.n_rs_seq) + 1;
+
+        const auto add_attention = [&ret](
+                const std::map<ggml_backend_buffer_type_t, size_t> & breakdown) {
+            for (const auto & [buft, size] : breakdown) {
+                ret[buft].attention += size;
+            }
+        };
+
+        const auto add_recurrent = [&ret, n_planes](
+                const std::map<ggml_backend_buffer_type_t, size_t> & breakdown) {
+            for (const auto & [buft, recurrent_total] : breakdown) {
+                auto & row = ret[buft];
+                // The recurrent tensors allocate one equal-width row plane for live state
+                // plus n_rs_seq rollback planes. Assign any backend alignment remainder to
+                // rollback so the two leaves sum to the measured resident allocation.
+                const size_t live = recurrent_total / n_planes;
+                row.recurrent          += live;
+                row.recurrent_rollback += recurrent_total - live;
+            }
+        };
+
+        // Walk each physical allocation once. Hybrid memory's aggregate breakdown is the sum
+        // of these same two children, while its fixed breakdown walks the recurrent child a
+        // second time. Reading the children directly preserves that exact partition without
+        // the duplicate walk or subtraction-based classification.
+        if (auto * hybrid_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+            add_attention(hybrid_idx->get_mem_attn()->memory_breakdown());
+            if (hybrid_idx->get_mem_idx() != nullptr) {
+                add_attention(hybrid_idx->get_mem_idx()->memory_breakdown());
+            }
+            add_recurrent(hybrid_idx->get_mem_recr()->memory_breakdown());
+        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            add_attention(hybrid->get_mem_attn()->memory_breakdown());
+            add_recurrent(hybrid->get_mem_recr()->memory_breakdown());
+        } else if (auto * hybrid_iswa =
+                       dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+            add_attention(hybrid_iswa->get_mem_attn()->memory_breakdown());
+            add_recurrent(hybrid_iswa->get_mem_recr()->memory_breakdown());
+        } else if (auto * recurrent =
+                       dynamic_cast<llama_memory_recurrent *>(memory.get())) {
+            add_recurrent(recurrent->memory_breakdown());
+        } else {
+            add_attention(memory->memory_breakdown());
+            if (!memory->memory_breakdown_fixed().empty()) {
+                throw std::runtime_error(
+                    "unclassified fixed context allocation in live memory breakdown");
+            }
+        }
+    }
+
     return ret;
 }
 
@@ -4691,6 +4765,22 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem == nullptr || mem->seq_rm_transient(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem == nullptr || mem->seq_rm_attn_transient(seq_id, p0, p1);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
@@ -4702,6 +4792,15 @@ void llama_memory_seq_cp(
     }
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    return mem != nullptr && mem->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_seq_keep(
@@ -4766,6 +4865,107 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+double llama_memory_kv_bpv(llama_memory_t mem) {
+    if (!mem) {
+        return -1.0;
+    }
+
+    return mem->kv_bpv();
+}
+
+struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra) {
+    if (!mem) {
+        return {};
+    }
+
+    return mem->memory_vbr_state_v2(seq_id, n_tokens_extra).state;
+}
+
+struct llama_memory_vbr_state_data_v2 llama_memory_vbr_state_v2(
+        llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra) {
+    if (!mem) {
+        return {};
+    }
+
+    return mem->memory_vbr_state_v2(seq_id, n_tokens_extra);
+}
+
+uint64_t llama_memory_vbr_retier_freeze_begin(
+        llama_memory_t mem, const char * owner) {
+    if (!mem || !mem->vbr_operation_armed()) {
+        return 0;
+    }
+
+    vbr_operation_binding binding = {};
+    binding.kind        = vbr_operation_kind::retier_freeze;
+    binding.child_phase = vbr_operation_phase::root;
+    const vbr_operation_id operation_id =
+        vbr_operation_registry_begin(binding);
+    if (!operation_id) {
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=allocator_or_registry_exhausted owner=%s\n",
+                owner != nullptr ? owner : "-");
+        return 0;
+    }
+    if (!mem->vbr_retier_freeze_begin(owner, operation_id)) {
+        const bool ended = vbr_operation_registry_end(operation_id);
+        GGML_ASSERT(ended);
+        LLAMA_LOG_ERROR("VBR_OPERATION event=reject reason=child_bind_failed owner=%s "
+                "operation_id=%llu\n",
+                owner != nullptr ? owner : "-",
+                (unsigned long long) operation_id.value);
+        return 0;
+    }
+    return operation_id.value;
+}
+
+void llama_memory_vbr_retier_freeze_end(
+        llama_memory_t mem, const char * owner, uint64_t operation_id_value) {
+    if (!mem || operation_id_value == 0) {
+        return;
+    }
+    const vbr_operation_id operation_id = { operation_id_value };
+    GGML_ASSERT(vbr_operation_registry_is_live(operation_id));
+    mem->vbr_retier_freeze_end(owner, operation_id);
+    GGML_ASSERT(vbr_operation_registry_end(operation_id));
+}
+
+struct llama_memory_vbr_preflight_data llama_memory_vbr_retier_preflight(
+        llama_memory_t mem, uint32_t n_tokens_extra) {
+    if (!mem) {
+        llama_memory_vbr_preflight_data r = {};
+        r.fits = true;
+        return r;
+    }
+    return mem->vbr_retier_preflight(n_tokens_extra);
+}
+
+double llama_vbr_floor_bits_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+}
+
+double llama_vbr_entry_bits_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_entry_bits_per_token(entry_k, entry_v);
+}
+
+double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_scratch_bytes_per_token(entry_k, entry_v, floor_bpv);
 }
 
 // llama state API
@@ -4980,6 +5180,47 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx) {
+    return ctx ? ctx->live_memory_breakdown() : llama_live_memory_breakdown{};
+}
+
+void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
+    llama_vram_plan_hint_set(device_id, bytes);
+}
+
+void llama_vram_load_begin(bool application_owned_completion) {
+    llama_vram_load_begin_internal(application_owned_completion);
+}
+
+void llama_vram_load_end(bool success) {
+    llama_vram_load_end_internal(success);
+}
+
+void llama_vram_plan_aux(const char * device_id, uint64_t bytes) {
+    llama_vram_plan_aux_add_internal(device_id, bytes);
+}
+
+void llama_vram_load_complete(void) {
+    llama_vram_demand_complete();
+}
+
+void llama_vram_mark_serviced(void) {
+    llama_vram_marker_set_serviced(true);
+}
+
+llama_vram_cotenancy_state llama_vram_cotenancy(const llama_context * ctx) {
+    llama_vram_cotenancy_state st = {};
+    if (ctx != nullptr) {
+        llama_memory_t mem = ctx->get_memory();
+        if (mem != nullptr) {
+            mem->vbr_cotenancy_accum(st.grant_decrement, st.grants_active,
+                                     st.shed_offer, st.grant_pending);
+        }
+    }
+    return st;
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
