@@ -469,6 +469,13 @@ target_include_directories(test-vbr-operation PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-extent.cpp)
 target_include_directories(test-vbr-extent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Pinned transport ring. Self-reporting, so no /UNDEBUG. Its backend-dependent pump cannot run
+# without ggml, so this test covers the creation contract only: geometry, accounting binding, lane
+# binding, the process-wide capacity ceiling and move-only token ownership. The failure codes that
+# need a real device are listed in BUUN_MERGE_PLAN §10.33.
+llama_build_and_test(test-vbr-pinned-ring.cpp)
+target_include_directories(test-vbr-pinned-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

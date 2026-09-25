@@ -51,6 +51,8 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-operation.h
     llama-vbr-extent.cpp
     llama-vbr-extent.h
+    llama-vbr-pinned-ring.cpp
+    llama-vbr-pinned-ring.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
