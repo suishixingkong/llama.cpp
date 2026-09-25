@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-vbr-codec.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -9,14 +10,18 @@
 #include "llama-kv-stream-config.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-tree.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-vram-ledger.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -32,6 +37,23 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool turbo_vbr_layer_schedule_enabled() {
+    const char * e = getenv("VBR_LAYER_SCHEDULE");
+    return e && e[0];
+}
+
+// The on-disk marker identity is one (busid,pid) row, so independent controller
+// trees in one process cannot publish or service demands correctly. iSWA is one
+// tree (its composite memory reports only the base owner); shared-KV drafters are
+// disarmed before memory construction and do not acquire this slot.
+static std::atomic<bool> g_vbr_ledger_tree_owned { false };
+
+llama_context::vbr_shared_scratch_detach_guard::~vbr_shared_scratch_detach_guard() {
+    if (memory != nullptr) {
+        memory->vbr_shared_scratch_detach();
+    }
 }
 
 struct llm_fused_op_probe {
@@ -280,6 +302,50 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.vbr_dynamic = params.vbr_dynamic;
+    cparams.vbr_codec = params.vbr_codec;
+    cparams.vbr_min_bits = params.vbr_min_bits;
+    cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
+    cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
+    cparams.vbr_budget_explicit = params.vbr_budget_explicit;
+    cparams.vbr_min_bits_explicit = params.vbr_min_bits_explicit;
+    cparams.vbr_pin_k = params.vbr_pin_k;
+    cparams.vbr_pin_v = params.vbr_pin_v;
+
+    // A shared-KV drafter (gemma4 assistant / weightless DFlash/Eagle3) views the target's
+    // KV tensors — the target's VBR controller owns those, and the drafter's graphs follow
+    // the owner's tier flips via the delegated tier epoch (llama_kv_cache::vbr_tier_epoch).
+    // Running a second controller in the drafter would double-manage the same pool (and the
+    // kv-cache ctor rejects an armed VBR on a share-linked cache), so disarm it here.
+    // An MTP self-draft carries its own extra (nextn) KV layer but shares the target's
+    // backbone KV; running a second VBR controller on that 1-layer cache is pointless and
+    // warns "no measured order". Disarm it (its layer stays static) WITHOUT wiring ctx_other
+    // memory sharing here — that rewires the draft's KV view and hurts acceptance.
+    if ((cparams.ctx_other != nullptr || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
+            (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0)) {
+        LLAMA_LOG_INFO("%s: shared-KV drafter: VBR is managed by the target context — "
+                "disarming the drafter's own VBR controller (shared layers follow the "
+                "target's tier flips; the drafter's own layers stay at their static types)\n", __func__);
+        cparams.vbr_dynamic              = false;
+        cparams.vbr_codec                = LLAMA_VBR_CODEC_TURBO;
+        cparams.vbr_min_bits             = 0.0;
+        cparams.vbr_vram_budget_bytes    = 0;
+        cparams.vbr_growth_headroom_bytes = 0;
+        cparams.vbr_budget_explicit      = false;
+        cparams.vbr_min_bits_explicit    = false;
+        cparams.vbr_pin_k                = false;
+        cparams.vbr_pin_v                = false;
+    }
+
+    // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
+    // n_stream == 1). Force unified KV here — at context init, AFTER tools have applied their
+    // post-parse n_parallel/n_seq_max mutations (perplexity, imatrix, batched-bench) — so the
+    // controller cannot silently disarm while the logs advertise dynamic VBR.
+    if (cparams.vbr_dynamic && cparams.n_seq_max > 1 && !cparams.kv_unified) {
+        LLAMA_LOG_WARN("%s: dynamic VBR with n_seq_max = %u would split the KV per sequence and "
+                "disarm the degrade controller — forcing unified KV\n", __func__, cparams.n_seq_max);
+        cparams.kv_unified = true;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -320,6 +386,14 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0) {
+        LLAMA_LOG_INFO("%s: vbr                    = %s/%s, min_bits=%g, vram_budget=%" PRIu64 "\n",
+                __func__,
+                cparams.vbr_dynamic ? "dynamic" : "static",
+                llama_vbr_ladder(cparams.vbr_codec).name,
+                cparams.vbr_min_bits,
+                cparams.vbr_vram_budget_bytes);
+    }
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -565,6 +639,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        // Arm immediately after create_memory returns: if any later constructor step throws,
+        // this member is destroyed before `backends` and unregisters their raw handles safely.
+        vbr_shared_scratch_detach_guard_.memory = memory.get();
     }
 
     // init backends

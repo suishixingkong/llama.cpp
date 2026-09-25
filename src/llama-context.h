@@ -189,6 +189,7 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    void vbr_import_accounting_observed() noexcept;
 
     //
     // training
@@ -273,6 +274,21 @@ private:
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    // Internal bounded serializer used by exact companion capture. Unlike the
+    // contiguous C API this preserves writer-owned cancellation quanta and
+    // does not materialize a second complete sequence-state buffer.
+    size_t state_seq_write_data_stream(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags);
+    // Internal streaming counterpart used by immutable VBR companion chains.
+    // The reader supplies the canonical sequence header and bounded tensor
+    // chunks, avoiding a second full host image during restore.
+    size_t state_seq_read_data_stream(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags);
 
     //
     // members
@@ -396,6 +412,13 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // `memory` is declared before `backends`, so ordinary member destruction would tear the
+    // compute backends down first. Shared-KV reverse registrations must detach earlier.
+    struct vbr_shared_scratch_detach_guard {
+        llama_memory_i * memory = nullptr;
+        ~vbr_shared_scratch_detach_guard();
+    } vbr_shared_scratch_detach_guard_;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

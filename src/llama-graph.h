@@ -962,6 +962,10 @@ private:
     // note: these are updated after constructing the new graph
     llm_graph_params params;
 
+    // memory context's VBR tier-flip epoch at build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under this graph's baked views)
+    uint64_t vbr_epoch = 0;
+
     // env: LLAMA_GRAPH_RESULT_DEBUG
     int debug = 0;
 };

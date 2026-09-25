@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-vram-demand.h"
 
 #include "llama.h"
 #include "models/models.h"
@@ -1778,7 +1779,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                // co-tenancy hold-aware alloc: a resident VBR donor may free room within
+                // the ledger's bounded patience (no ledger/donors = one short clean wait)
+                buf = llama_vram_hold_alloc_ctx_tensors(ctx, buft);
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -2261,8 +2264,73 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+bool llama_model::supports_classic_vbr() const {
+    return arch == LLM_ARCH_BAILINGMOE3;
+}
+
+bool llama_model::supports_turbo_vbr() const {
+    // DSV4 owns a specialized, safe Q8-capped interpretation of Turbo VBR.
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return true;
+    }
+
+    // These target contexts use specialized cache owners that do not consume the
+    // ordinary VBR parameters. Do not advertise a dynamic ladder merely because
+    // their metadata happens to contain a compatible attention head dimension.
+    switch (arch) {
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_LLADA:
+        case LLM_ARCH_LLADA_MOE:
+        case LLM_ARCH_RND1:
+            return false;
+        default:
+            break;
+    }
+
+    bool has_kv = false;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (!hparams.has_kv(il) || hparams.n_head_kv(il) == 0) {
+            continue;
+        }
+        has_kv = true;
+
+        // Dynamic Turbo stores the cache in independently 128-padded K/V rows.
+        // Its native FA path supports the resulting matched 128/256/512 geometries.
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        const uint32_t padded_k = ((head_k + 127u) / 128u) * 128u;
+        const uint32_t padded_v = ((head_v + 127u) / 128u) * 128u;
+        if (padded_k != padded_v ||
+                (padded_k != 128u && padded_k != 256u && padded_k != 512u)) {
+            return false;
+        }
+    }
+    return has_kv;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
+    // recurrent/DSA caches do not take them
+    const llama_memory_vbr_params vbr = {
+        /*.dynamic               =*/ cparams.vbr_dynamic,
+        /*.codec                 =*/ cparams.vbr_codec,
+        /*.budget_bytes          =*/ cparams.vbr_vram_budget_bytes,
+        /*.min_bits              =*/ cparams.vbr_min_bits,
+        /*.min_bits_explicit     =*/ cparams.vbr_min_bits_explicit,
+        /*.budget_explicit       =*/ cparams.vbr_budget_explicit,
+        /*.growth_headroom_bytes =*/ cparams.vbr_growth_headroom_bytes,
+        /*.device_share          =*/ 1.0,
+        /*.pin_k                 =*/ cparams.vbr_pin_k,
+        /*.pin_v                 =*/ cparams.vbr_pin_v,
+        /*.trace_label           =*/ nullptr,
+        /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
+    };
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2332,7 +2400,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr, "", 0, nullptr, 0, vbr);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2379,7 +2447,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr, "", 0, nullptr, 0, vbr);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -2426,7 +2494,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr, "", 0, nullptr, 0, vbr);
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
@@ -2476,7 +2544,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr);
+                            nullptr, vbr);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2516,7 +2584,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr, vbr);
                     break;
                 }
             }
@@ -2598,7 +2666,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr), vbr);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2650,7 +2718,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* kv stream stage   */ kv_stream_ok ? params.kv_stream_stage_bytes : 0,
                             /* kv stream arena   */ kv_stream_ok ? params.kv_stream_phase_arena : nullptr,
-                            /* kv stream maximum */ kv_stream_ok ? params.kv_stream_maximum_pool_bytes : 0);
+                            /* kv stream maximum */ kv_stream_ok ? params.kv_stream_maximum_pool_bytes : 0, vbr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2714,7 +2782,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share, vbr);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2731,7 +2799,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share, vbr);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2752,7 +2820,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr, "", 0, nullptr, 0, vbr);
                     }
                 }
             }
@@ -2856,6 +2924,18 @@ int32_t llama_model_n_head(const llama_model * model) {
 
 int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
+}
+
+bool llama_model_kv_cache_types_coupled(const llama_model * model) {
+    return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4;
+}
+
+bool llama_model_supports_vbr_codec(const llama_model * model, llama_vbr_codec codec) {
+    switch (codec) {
+        case LLAMA_VBR_CODEC_TURBO:   return model->supports_turbo_vbr();
+        case LLAMA_VBR_CODEC_CLASSIC: return model->supports_classic_vbr();
+    }
+    return false;
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {

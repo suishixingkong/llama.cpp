@@ -1412,6 +1412,17 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
+    // in-place VBR tier flips rewrite the cache tensors' type/strides under this graph's baked
+    // K/V views and set_rows dst with no shape change any input can see (e.g. a mid-decode
+    // promote or a free-VRAM-clamp degrade wave). One fence here covers every input class.
+    if (params.mctx != nullptr && vbr_epoch != params.mctx->get_vbr_epoch()) {
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to a VBR tier flip\n", __func__);
+        }
+
+        return false;
+    }
+
     if (debug > 1) {
         LLAMA_LOG_DEBUG("%s: checking compatibility of %d inputs:\n", __func__, (int) inputs.size());
     }
@@ -1446,6 +1457,8 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
+
+    vbr_epoch = params.mctx != nullptr ? params.mctx->get_vbr_epoch() : 0;
 }
 
 //
