@@ -458,6 +458,11 @@ else()
     target_compile_options(test-vbr-downward PRIVATE -UNDEBUG)
 endif()
 
+# Operation registry. Self-reporting, so no /UNDEBUG. It needs the src include directory because it
+# includes llama-vbr-operation.h and llama-cparams.h by bare name.
+llama_build_and_test(test-vbr-operation.cpp)
+target_include_directories(test-vbr-operation PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
