@@ -463,6 +463,12 @@ endif()
 llama_build_and_test(test-vbr-operation.cpp)
 target_include_directories(test-vbr-operation PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Committed-extent store and dual-view ownership index. Self-reporting, so no /UNDEBUG. The
+# ownership-index half drives rank_below()/enumerate_owned() against a plain map oracle rather than
+# recomputing the Fenwick tree, so an off-by-one in the index arithmetic cannot hide.
+llama_build_and_test(test-vbr-extent.cpp)
+target_include_directories(test-vbr-extent PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

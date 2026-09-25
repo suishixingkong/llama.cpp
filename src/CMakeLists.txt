@@ -49,6 +49,8 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-upward.h
     llama-vbr-operation.cpp
     llama-vbr-operation.h
+    llama-vbr-extent.cpp
+    llama-vbr-extent.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
