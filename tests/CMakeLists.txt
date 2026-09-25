@@ -445,6 +445,19 @@ target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-identity-digest.cpp)
 target_include_directories(test-vbr-identity-digest PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Downward/upward representation algebra: the consumer-free subset of upstream's test-vbr-downward.
+# The five upstream cases that need llama-memory.h's preflight types or llama-kv-cache.h's stash
+# helpers are stage 2.9 work; the test file's own header comment names them. Unlike the identity and
+# hard-seal tests this one *is* assert-based, so it gets /UNDEBUG for the reason the 2.6a group does.
+# It includes its header by bare name, hence the src include directory.
+llama_build_and_test(test-vbr-downward.cpp)
+target_include_directories(test-vbr-downward PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (MSVC)
+    target_compile_options(test-vbr-downward PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-vbr-downward PRIVATE -UNDEBUG)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

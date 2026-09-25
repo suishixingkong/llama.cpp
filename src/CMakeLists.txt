@@ -42,6 +42,11 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-transaction.h
     llama-vbr-hard-seal.cpp
     llama-vbr-hard-seal.h
+    llama-vbr-identity-digest.h
+    llama-vbr-downward.cpp
+    llama-vbr-downward.h
+    llama-vbr-upward.cpp
+    llama-vbr-upward.h
     llama-cache-accounting.cpp
     llama-cache-accounting.h
     llama-cache-budget.cpp
