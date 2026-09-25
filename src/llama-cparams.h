@@ -59,6 +59,18 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    bool vbr_dynamic;
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO;
+
+    double vbr_min_bits = 0.0;
+    uint64_t vbr_vram_budget_bytes = 0;
+    uint64_t vbr_growth_headroom_bytes = 0;
+    bool vbr_budget_explicit = false;
+    bool vbr_min_bits_explicit = false;
+    // mixed-config side pins, see llama.h vbr_pin_k
+    bool vbr_pin_k = false;
+    bool vbr_pin_v = false;
+
     uint32_t kv_stream_arena_mib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

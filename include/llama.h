@@ -403,6 +403,12 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         uint32_t kv_stream_arena_mib; // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
+        enum llama_vbr_codec vbr_codec; // representation ladder used by dynamic VBR [EXPERIMENTAL]
+        double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
+        uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
+        uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
+                                          // a VBR pool at decode boundaries (0 = 1 GiB default)
+
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -421,6 +427,20 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
+                          // tier-by-tier as the context fills; requires flash attention and a
+                          // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
+        bool vbr_min_bits_explicit; // --vbr-floor was typed: doubles as peer-yield consent —
+                          // co-tenancy demand sheds may walk to the floor instead of
+                          // stopping at the restorable f16->t8 band
+        bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
+                          // must never re-derive it from live free VRAM [EXPERIMENTAL]
+        bool vbr_pin_k;   // K side is PINNED at type_k: the degrade/promote ladder never touches
+                          // it; it still counts in the vbr_min_bits aggregate at its fixed
+                          // bits/value (set for an explicitly-typed side in a mixed config where
+                          // the other side selected dynamic VBR) [EXPERIMENTAL]
+        bool vbr_pin_v;   // same for the V side [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -606,6 +626,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_kv_cache_types_coupled(const struct llama_model * model);
+    // Whether model metadata/topology can safely execute this dynamic VBR codec (including any
+    // topology-specific capped implementation). Backend/device support is validated at context creation.
+    LLAMA_API bool llama_model_supports_vbr_codec(
+            const struct llama_model * model, enum llama_vbr_codec codec);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -818,6 +844,92 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // effective bits/value of the attention KV cache at its CURRENT tensor types, aggregated
+    // over all KV layers (f16 = 16, q8_0 = 8.5, turbo tiers struct-true). Under dynamic VBR
+    // this moves at runtime as tiers degrade/reset. Returns -1 when the context's memory
+    // holds no attention KV. [EXPERIMENTAL]
+    LLAMA_API double llama_memory_kv_bpv(llama_memory_t mem);
+
+    // TurboQuant dynamic VBR: point-in-time pressure/quality state of the attention KV memory.
+    // All-zero when the memory has no active dynamic-VBR controller. [EXPERIMENTAL]
+    struct llama_memory_vbr_state_data {
+        int64_t  deficit_raw;      // projected bytes over the CONFIGURED budget at the current
+                                   // watermark extended by n_tokens_extra (<= 0: fits). Page-exact
+                                   // and free-VRAM independent -- safe to drive policy (e.g. cache
+                                   // eviction) deterministically.
+        int64_t  deficit_clamped;  // same, against the live free-VRAM-clamped budget. Moves with
+                                   // co-tenant VRAM use -- telemetry/emergency signal, NOT policy.
+        double   bpv_if_degraded;  // aggregate KV bits/value the degrade ladder would land at if
+                                   // deficit_raw were paid by tier degradation alone
+        int32_t  cursor;           // applied degrade steps (0 = pristine entry tiers)
+        uint32_t used_cells_other; // used cells NOT owned exclusively by seq_id (seq_id < 0
+                                   // counts every used cell) -- 0 means removing seq_id's cells
+                                   // would empty the cache (full-reset feasibility)
+        uint64_t representation_epoch;     // monotone representation-change counter for the
+                                           // single/primary (non-SWA) VBR controller
+        uint64_t representation_epoch_swa; // monotone counter for the SWA controller when this
+                                           // state aggregates iSWA; 0 for a single controller
+        uint64_t checkpoint_epoch;         // monotone attention-content lineage counter for the
+                                           // primary controller; retiering alone does not move it
+        uint64_t checkpoint_epoch_swa;     // corresponding SWA lineage counter; 0 for a single
+                                           // controller
+        uint32_t retier_freeze_depth;       // active scoped retier-freeze nesting depth
+        uint32_t retier_env_freeze;         // WS-0 deterministic env freeze is active
+        uint64_t retier_freeze_enters;      // successful scoped-freeze entries this boot
+        uint64_t retier_freeze_exits;       // matching scoped-freeze exits this boot
+        uint64_t retier_deferred_decisions; // representation-mutation decisions deferred by scopes
+        uint64_t retier_reconciles;         // mandatory fresh controller passes after outer exits
+    };
+
+    // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
+    // decoded on top of the current occupancy (a launch passes the incoming prompt's suffix).
+    LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
+            llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
+    // Versioned extension of llama_memory_vbr_state_data. The original by-value result must not
+    // grow: doing so would overwrite the return buffer of already-built callers. [EXPERIMENTAL]
+    struct llama_memory_vbr_state_data_v2 {
+        struct llama_memory_vbr_state_data state;
+        uint32_t used_cells_exclusive; // physical cells owned only by seq_id (0 for seq_id < 0)
+                                       // and therefore freed by removing that sequence. Shared
+                                       // aliases are deliberately excluded.
+    };
+
+    LLAMA_API struct llama_memory_vbr_state_data_v2 llama_memory_vbr_state_v2(
+            llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
+    // Dynamic-VBR scoped retier freeze. This suspends representation mutations only; ordinary
+    // memory bookkeeping and decode remain live. The outermost exit arms a fresh controller
+    // evaluation at the next safe decode/idle boundary. begin returns an opaque process-local
+    // operation ID for end, or 0 when this memory has no active dynamic-VBR controller. The ID is
+    // nonzero/non-reusing and is never serialized. owner must remain valid until end.
+    // [EXPERIMENTAL]
+    LLAMA_API uint64_t llama_memory_vbr_retier_freeze_begin(
+            llama_memory_t mem, const char * owner);
+
+    LLAMA_API void llama_memory_vbr_retier_freeze_end(
+            llama_memory_t mem, const char * owner, uint64_t operation_id);
+
+    // Non-mutating footprint check at the CURRENT tiers. Every VMM pool must fit independently;
+    // bytes_needed/available are sums for observability, while max_deficit and fits preserve the
+    // tightest per-pool result (important for tensor split and iSWA). n_tokens_extra is the bounded
+    // replay/fill still to come while retiering is frozen. [EXPERIMENTAL]
+    struct llama_memory_vbr_preflight_data {
+        bool     active;
+        bool     fits;
+        uint32_t pools;
+        uint32_t watermark_cells;
+        uint64_t bytes_needed;
+        uint64_t bytes_available;
+        uint64_t physical_growth_needed;    // additional KV maps + dequant scratch growth
+        uint64_t physical_growth_available; // live free bytes on the corresponding devices
+        int64_t  max_deficit;
+    };
+
+    LLAMA_API struct llama_memory_vbr_preflight_data llama_memory_vbr_retier_preflight(
+            llama_memory_t mem, uint32_t n_tokens_extra);
+
 
     //
     // State / sessions

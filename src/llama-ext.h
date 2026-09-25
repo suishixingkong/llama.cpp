@@ -68,6 +68,13 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    // portion of `context` that does NOT scale with n_ctx (recurrent-state cache, sized by
+    // n_seq_max). Included in `context`, never added separately. Budget formulas that exploit
+    // the context term cancelling out of context-linear projections must still charge this part.
+    size_t context_fixed = 0;
+    // Portion of `context` whose representation/footprint is selected by Turbo/VBR. Auxiliary
+    // fixed-layout caches can be context-linear without belonging to this subset.
+    size_t context_vbr_managed = 0;
 
     size_t total() const {
         return model + context + compute;
@@ -89,6 +96,81 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Internal speculative memory operations: real mutations with ordinary accounting, but no global
+// checkpoint-lineage publication for a caller-proven disposable backup or rejected suffix.
+LLAMA_API bool llama_memory_seq_rm_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_seq_rm_attn_transient(
+        llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+LLAMA_API bool llama_memory_try_seq_cp_transient(
+        llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+        llama_pos p0, llama_pos p1);
+
+// Resident cache-state allocation for one context, split into mutually-exclusive physical
+// leaves: attention KV, live recurrent state, recurrent rollback planes, and speculative
+// rolling-window tape. Keys are backend buffer types (one row per allocation). Recurrent
+// buffers physically contain (1 + n_rs_seq) equal state planes; their allocation bytes are
+// partitioned between the live plane and rollback planes without changing the measured total.
+// The rolling-window field excludes the fixed speculative tape.
+struct llama_live_memory_breakdown_data {
+    size_t attention             = 0;
+    size_t recurrent             = 0;
+    size_t recurrent_rollback    = 0;
+    size_t rolling_window_tape   = 0;
+};
+
+using llama_live_memory_breakdown =
+    std::map<ggml_backend_buffer_type_t, llama_live_memory_breakdown_data>;
+
+LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
+        const struct llama_context * ctx);
+
+// Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
+// from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
+// bits/value would cross floor_bpv (<= 0 = bottom-tier default). Returns -1 when the requested
+// aggregate floor is above the entry layout and 0 when the context has no VBR-capable cache.
+// Works on no_alloc (fit dry-load) contexts — the fit uses it for floor-true capacity math.
+LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
+// Per-token KV bits at the requested entry layout before walking the degrade order.
+LLAMA_API double llama_vbr_entry_bits_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v);
+
+// Per-token bytes of the flash-attention f16 dequant scratch at the settled deep-fill tier state
+// (see llama-memory.h memory_vbr_scratch_bytes_per_token). The fit charges this in its
+// total-VRAM wall constraint only — it must NOT enter the KV budget solves (the scratch draws
+// from the fit margin, not the budget). Works on no_alloc (fit dry-load) contexts.
+LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
+// co-tenancy plan hint: total bytes this process still intends to allocate on the device
+// (PCI bus id per ggml_backend_dev_props.device_id). Set by the fit pass before load so a
+// held demand can publish an honest joint cross-device estimate instead of drip-feeding
+// per-failure asks (est_partial).
+LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
+
+// Composite application-load transaction. Nested component loaders cannot
+// publish SATISFIED or abandon an outer load. The outermost end owns that result.
+LLAMA_API void llama_vram_load_begin(bool application_owned_completion);
+LLAMA_API void llama_vram_load_end(bool success);
+LLAMA_API void llama_vram_plan_aux(const char * device_id, uint64_t bytes);
+LLAMA_API void llama_vram_load_complete(void);
+
+// co-tenancy: declare this process serviced (runs an idle tick — llama-server). Presence
+// markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
+LLAMA_API void llama_vram_mark_serviced(void);
+
+// co-tenancy telemetry for /props//slots: all zeros = inert (single tenant, no ledger)
+struct llama_vram_cotenancy_state {
+    uint64_t grant_decrement; // unamortized bytes currently decremented from KV budgets
+    uint32_t grants_active;   // live grant rows
+    uint64_t shed_offer;      // published donation offer, summed over devices
+    uint64_t grant_pending;   // granted-but-not-yet-flushed bytes
+};
+LLAMA_API struct llama_vram_cotenancy_state llama_vram_cotenancy(const struct llama_context * ctx);
+
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
