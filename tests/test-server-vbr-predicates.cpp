@@ -312,6 +312,168 @@ static void test_lora_config_identity() {
     CHECK(lora_config_identity({ a.info }) != lora_config_identity({ other_digest_same_scale.info }));
 }
 
+// --- server_tokens retention identity --------------------------------------
+// The scheduler/cache compares token sequences by this digest instead of by the
+// token list, and caches the result, so two things have to hold: the digest is a
+// pure function of the sequence, and every mutation that changes the sequence
+// invalidates the cache. The second one is the interesting half -- a missed
+// invalidation makes two different sequences compare equal, which is how a cache
+// entry built for one request gets reused for another.
+static std::string digest_to_hex(const std::array<uint8_t, 32> & digest) {
+    static const char * digits = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (uint8_t byte : digest) {
+        out.push_back(digits[byte >> 4]);
+        out.push_back(digits[byte & 0x0f]);
+    }
+    return out;
+}
+
+static void test_retention_token_identity() {
+    server_tokens base(llama_tokens { 1, 2, 3 }, false);
+
+    // text-only tokens have no media, and the retention view is the token list
+    CHECK(!base.has_media());
+    CHECK_EQ(base.retention_token_ids().size(), size_t(3));
+    CHECK_EQ(base.retention_token_ids()[0], llama_token(1));
+    CHECK_EQ(base.retention_token_ids()[2], llama_token(3));
+
+    std::array<uint8_t, 32> whole = {};
+    CHECK(base.retention_token_digest(whole));
+
+    // Frozen golden: SHA-256 over the length-delimited domain string, the u64 token
+    // count and then one little-endian u32 per token id. Computed independently in
+    // Python, so this pins the domain, the count prefix and the per-token encoding
+    // against a silent reorder.
+    CHECK_EQ(digest_to_hex(whole),
+             std::string("d4b770e94ff2b3e358f2c99526ab1d9066c05d92e1b9ce34653aced3194d852c"));
+
+    // ... and it is a function of the sequence, not of the object
+    {
+        server_tokens same(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> other = {};
+        CHECK(same.retention_token_digest(other));
+        CHECK(other == whole);
+    }
+    {
+        server_tokens longer(llama_tokens { 1, 2, 3, 4 }, false);
+        std::array<uint8_t, 32> other = {};
+        CHECK(longer.retention_token_digest(other));
+        CHECK(other != whole);
+        CHECK_EQ(digest_to_hex(other),
+                 std::string("67507e78ba140b10ee3b6f46f8164ca5bbc75cc2937074c4cbf3d53c79b12c0f"));
+    }
+    {
+        server_tokens empty(llama_tokens {}, false);
+        std::array<uint8_t, 32> other = {};
+        CHECK(empty.retention_token_digest(other));
+        CHECK(other != whole);
+    }
+
+    // every mutator has to invalidate the cache. Each case reads the digest first,
+    // mutates, then reads again -- a stale hit shows up as "unchanged".
+    {
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        std::array<uint8_t, 32> after = {};
+        CHECK(t.retention_token_digest(before));
+        t.push_back(llama_token(4));
+        CHECK(t.retention_token_digest(after));
+        CHECK(after != before);
+        // growing then shrinking back to the original sequence restores the digest
+        t.keep_first(3);
+        CHECK(t.retention_token_digest(after));
+        CHECK(after == before);
+    }
+    {
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        std::array<uint8_t, 32> after = {};
+        CHECK(t.retention_token_digest(before));
+        t.insert(llama_tokens { 7, 8 });
+        CHECK(t.retention_token_digest(after));
+        CHECK(after != before);
+    }
+    {
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        std::array<uint8_t, 32> after = {};
+        CHECK(t.retention_token_digest(before));
+        t.set_token(1, llama_token(99));
+        CHECK(t.retention_token_digest(after));
+        CHECK(after != before);
+    }
+    {
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        std::array<uint8_t, 32> after = {};
+        CHECK(t.retention_token_digest(before));
+        t.keep_first(2);
+        CHECK(t.retention_token_digest(after));
+        CHECK(after != before);
+    }
+    {
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        std::array<uint8_t, 32> after = {};
+        CHECK(t.retention_token_digest(before));
+        t.clear();
+        CHECK(t.retention_token_digest(after));
+        CHECK(after != before);
+        CHECK(t.empty());
+    }
+    {
+        // the cache is carried by clone(), so a clone must not re-derive a
+        // different value; the sequence is unchanged, so the digest is unchanged
+        server_tokens t(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> before = {};
+        CHECK(t.retention_token_digest(before));
+        server_tokens copy = t.clone();
+        std::array<uint8_t, 32> after = {};
+        CHECK(copy.retention_token_digest(after));
+        CHECK(after == before);
+    }
+
+    // --- prefix digest ---
+    // A prefix identity is what a bounded source witness is published under, so it
+    // must depend only on the covered prefix, and must refuse a boundary it cannot
+    // describe exactly.
+    {
+        server_tokens p(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> prefix = {};
+        CHECK((p.retention_token_prefix_digest(3, prefix)));
+        CHECK_EQ(digest_to_hex(prefix),
+                 std::string("e65ed2be72e483d74022de4c419d9b9311802ba65ef5dc7ba53c1f9bfb786f0a"));
+        // a different domain from the whole-token digest, even at equal coverage
+        CHECK(prefix != whole);
+    }
+    {
+        server_tokens p(llama_tokens { 1, 2, 3, 4 }, false);
+        server_tokens q(llama_tokens { 1, 2, 3, 5 }, false);
+        std::array<uint8_t, 32> dp = {};
+        std::array<uint8_t, 32> dq = {};
+        CHECK((p.retention_token_prefix_digest(3, dp)));
+        CHECK((q.retention_token_prefix_digest(3, dq)));
+        // same covered prefix, different suffix: the prefix identity must agree
+        CHECK(dp == dq);
+        std::array<uint8_t, 32> dp4 = {};
+        CHECK((p.retention_token_prefix_digest(4, dp4)));
+        CHECK(dp4 != dp);
+    }
+    {
+        server_tokens p(llama_tokens { 1, 2, 3 }, false);
+        std::array<uint8_t, 32> out = {};
+        out.fill(0xAB);
+        // coverage 0 and coverage beyond the sequence are both refused...
+        CHECK((!p.retention_token_prefix_digest(0, out)));
+        CHECK((out == std::array<uint8_t, 32>{}));
+        out.fill(0xAB);
+        CHECK((!p.retention_token_prefix_digest(4, out)));
+        CHECK((out == std::array<uint8_t, 32>{}));
+    }
+}
+
 int main() {
     test_decode_terminal();
     test_empty_handoff();
@@ -320,6 +482,7 @@ int main() {
     test_media_content_identity();
     test_lease_build_identity();
     test_lora_config_identity();
+    test_retention_token_identity();
 
     // print the executed-check count so a silently-skipped body is visible
     std::printf("test-server-vbr-predicates: %d checks, %d failures\n",

@@ -11,6 +11,7 @@
 #include "json.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <utility>
 #include <vector>
 
 using json = common_json;
@@ -173,6 +175,15 @@ private: // disallow accessing these members directly, risking out-of-sync
     // note(2): for M-RoPE, an image can occupy different number of pos; do not assume 1-to-1 mapping tokens <-> pos
     llama_tokens tokens;
 
+    // Mutation-invalidated identity for scheduler/cache comparisons. The
+    // first read after a token edit is linear; unchanged reads are O(1).
+    mutable std::array<uint8_t, 32> retention_token_digest_cache = {};
+    mutable bool retention_token_digest_valid = false;
+
+    void invalidate_retention_token_digest() noexcept {
+        retention_token_digest_valid = false;
+    }
+
     // for ex. with input of 5 text tokens and 2 images (each image occupies 3 tokens and 2 pos):
     //      [0] [1] [2] [3] [4] [img0] [img0] [img0] [img1] [img1] [img1]
     // idx  0   1   2   3   4   5      6      7      8      9      10
@@ -188,9 +199,27 @@ public:
     server_tokens(const server_tokens&) = delete;
     server_tokens& operator=(const server_tokens&) = delete;
 
-    // Allow moving (usually implicitly generated if members are movable)
-    server_tokens(server_tokens&&) = default;
-    server_tokens& operator=(server_tokens&&) = default;
+    // Keep moves allocation-free. In particular, Microsoft's STL does not
+    // declare std::map's move constructor noexcept, while swapping two maps
+    // with the default allocator is noexcept. The explicit move constructor
+    // preserves the no-fail prompt publication contract on Windows.
+    server_tokens(server_tokens&& other) noexcept {
+        swap(other);
+    }
+    server_tokens& operator=(server_tokens&&) noexcept = default;
+
+    void swap(server_tokens & other) noexcept {
+        using std::swap;
+        swap(has_mtmd, other.has_mtmd);
+        map_idx_to_media.swap(other.map_idx_to_media);
+        tokens.swap(other.tokens);
+        retention_token_digest_cache.swap(other.retention_token_digest_cache);
+        swap(retention_token_digest_valid, other.retention_token_digest_valid);
+    }
+
+    friend void swap(server_tokens & lhs, server_tokens & rhs) noexcept {
+        lhs.swap(rhs);
+    }
 
     // Allow accessing elements using [] operator
     llama_token operator[](size_t index) { return tokens[index]; }
@@ -238,6 +267,24 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // Exact logical token ids for process-local retention identity. Unlike
+    // get_tokens(), this deliberately preserves LLAMA_TOKEN_NULL media cells;
+    // callers must pair it with media_content_identity() so placeholders from
+    // distinct media can never compare as reusable content.
+    const llama_tokens & retention_token_ids() const;
+
+    bool retention_token_digest(
+        std::array<uint8_t, 32> & out) const noexcept;
+
+    // Stable identity for one exact logical prefix. Unlike the whole-token
+    // cache above, this deliberately includes the media-prefix identity and
+    // refuses a boundary that cuts through a media chunk. Stem publication
+    // uses it as a bounded source witness while the live suffix may continue
+    // to change independently.
+    bool retention_token_prefix_digest(
+        size_t coverage_tokens,
+        std::array<uint8_t, 32> & out) const noexcept;
+
     llama_tokens get_text_tokens() const;
 
     std::vector<char> serialize() const;
@@ -250,9 +297,14 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // True only when the sequence contains image/audio chunks. This is
+    // deliberately narrower than has_mtmd, which records slot capability.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
+        invalidate_retention_token_digest();
     }
 
     void keep_first(size_t n);
