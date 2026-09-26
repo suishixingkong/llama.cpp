@@ -321,6 +321,18 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+
+# Pure unit test of tools/llama-bench/llama-bench-vbr.h (the header this tree landed
+# in slice 8b). It includes that header by relative path and does `#undef NDEBUG`
+# before <cassert>, so its asserts are live without needing /UNDEBUG -- which is
+# also why the fork passes /UNDEBUG to its siblings but not to this one.
+llama_build_and_test(test-llama-bench-vbr.cpp)
+
+llama_build_and_test(test-kv-cells.cpp)
+target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-kv-cell-position-index.cpp)
+
 # The kv-stream planner/config/softmax helpers are internal to libllama, so their
 # implementation files are compiled directly into the tests. That keeps the tests
 # working on Windows shared builds, where only LLAMA_API symbols are exported.
