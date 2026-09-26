@@ -336,13 +336,28 @@ struct completion_token_output {
 
 };
 
+// Response-local extension of upstream's slot statistics. Keeping the VBR
+// value here avoids widening every live slot while retaining one timings
+// serializer for cached/prompt/generation/draft and KV representation data.
+struct server_result_stats : server_slot_stats {
+    double kv_bpv = -1.0;
+
+    server_result_stats & operator=(const server_slot_stats & other) {
+        static_cast<server_slot_stats &>(*this) = other;
+        kv_bpv = -1.0;
+        return *this;
+    }
+
+    json to_json() const;
+};
+
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
 
     bool stream;
     bool include_usage;
-    server_slot_stats stats;
+    server_result_stats stats;
     std::string prompt;
 
     bool truncated;
@@ -424,7 +439,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
-    server_slot_stats stats;
+    server_result_stats stats;
     result_prompt_progress progress;
 
     // response formatting

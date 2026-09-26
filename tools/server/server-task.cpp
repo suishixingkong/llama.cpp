@@ -255,6 +255,18 @@ common_chat_msg task_result_state::update_chat_msg(
 }
 
 //
+// server_result_stats
+//
+json server_result_stats::to_json() const {
+    json base = server_slot_stats::to_json();
+    if (kv_bpv >= 0.0) {
+        base["kv_bpv"] = kv_bpv;
+    }
+
+    return base;
+}
+
+//
 // result_prompt_progress
 //
 json result_prompt_progress::to_json() const {

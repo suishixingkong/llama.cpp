@@ -806,6 +806,14 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
+        if (ctx_tgt != nullptr) {
+            const double kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
+            if (kv_bpv >= 0.0) {
+                res["kv_bpv"] = kv_bpv;
+            }
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
@@ -2465,6 +2473,8 @@ private:
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
             res->stats = slot.stats;
+            res->stats.kv_bpv =
+                llama_memory_kv_bpv(llama_get_memory(slot.ctx_tgt));
         }
 
         queue_results.send(std::move(res));
@@ -2492,6 +2502,8 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
+        res->stats.kv_bpv    =
+            llama_memory_kv_bpv(llama_get_memory(slot.ctx_tgt));
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
