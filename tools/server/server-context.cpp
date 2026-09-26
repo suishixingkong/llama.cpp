@@ -43,6 +43,9 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// defined near get_model_info(); shared by the /props and /models responses
+static json server_vbr_meta_json(const server_context_meta * meta);
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -5233,6 +5236,21 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_video          */ impl->chat_params.allow_video,
         /* json_ui_settings       */ impl->json_ui_settings,
         /* slot_n_ctx             */ impl->n_ctx_slot(),
+        /* vbr_enabled            */ impl->params_base.vbr_enabled(),
+        /* vbr_dynamic            */ impl->params_base.vbr_dynamic(),
+        /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
+        /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
+        /* vbr_codec              */ impl->params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo",
+        /* vbr_entry_type_k       */ ggml_type_name(impl->params_base.cache_type_k),
+        /* vbr_entry_type_v       */ ggml_type_name(impl->params_base.cache_type_v),
+        /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
+        /* vbr_capacity_bits      */ impl->params_base.vbr_capacity_bits,
+        /* vbr_selected_bpv       */ impl->params_base.vbr_selected_bpv,
+        /* vbr_selected_kld       */ impl->params_base.vbr_selected_kld,
+        /* vbr_vram_budget_bytes  */ impl->params_base.vbr_vram_budget_bytes,
+        /* vbr_selected_family    */ impl->params_base.vbr_selected_family,
+        /* vbr_selected_policy    */ impl->params_base.vbr_selected_policy,
+        /* vbr_selected_schedule  */ impl->params_base.vbr_selected_schedule,
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -5590,6 +5608,7 @@ static json get_res_model_info(const server_context_meta & meta) {
             {"n_vocab",     meta.model_vocab_n_tokens},
             {"n_ctx",       meta.slot_n_ctx},
             {"n_ctx_train", meta.model_n_ctx_train},
+            {"vbr",         server_vbr_meta_json(&meta)},
             {"n_embd",      meta.model_n_embd_inp},
             {"n_params",    meta.model_n_params},
             {"size",        meta.model_size},
@@ -5650,6 +5669,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
+        { "vbr",                         server_vbr_meta_json(&meta) },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},
@@ -5676,6 +5696,29 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     }
 
     return props;
+}
+
+static json server_vbr_meta_json(const server_context_meta * meta) {
+    return json {
+        {"enabled",           meta->vbr_enabled},
+        {"dynamic",           meta->vbr_dynamic},
+        {"type_k",            meta->vbr_type_k},
+        {"type_v",            meta->vbr_type_v},
+        {"codec",             meta->vbr_codec},
+        {"entry_type_k",      meta->vbr_entry_type_k},
+        {"entry_type_v",      meta->vbr_entry_type_v},
+        {"floor_bpv",         meta->vbr_min_bits},
+        {"capacity_floor_bpv", meta->vbr_capacity_bits},
+        // realized bits/value is a fixed number only for static schedules; under the
+        // dynamic runtime controller it varies with occupancy — null, not a fiction
+        {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
+        {"selected_family",   meta->vbr_selected_family},
+        {"selected_policy",   meta->vbr_selected_policy},
+        {"selected_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_bpv)},
+        {"selected_kld",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_kld)},
+        {"selected_schedule", meta->vbr_dynamic ? json() : json(meta->vbr_selected_schedule)},
+        {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
+    };
 }
 
 json server_routes::get_model_info() const {

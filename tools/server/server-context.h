@@ -72,6 +72,21 @@ struct server_context_meta {
     bool has_inp_video;
     json json_ui_settings;
     int slot_n_ctx;
+    bool vbr_enabled;
+    bool vbr_dynamic;
+    bool vbr_type_k;
+    bool vbr_type_v;
+    std::string vbr_codec;
+    std::string vbr_entry_type_k;
+    std::string vbr_entry_type_v;
+    double vbr_min_bits;
+    double vbr_capacity_bits;
+    double vbr_selected_bpv;
+    double vbr_selected_kld;
+    uint64_t vbr_vram_budget_bytes;
+    std::string vbr_selected_family;
+    std::string vbr_selected_policy;
+    std::string vbr_selected_schedule;
     enum llama_pooling_type pooling_type;
 
     // chat params
