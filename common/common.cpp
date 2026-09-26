@@ -2482,9 +2482,152 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+common_shared_byte_buffer::common_shared_byte_buffer(
+        const common_shared_byte_buffer & other) {
+    bytes_ = other.bytes_;
+    // A copied handle has not acquired its own ledger reference. The shared
+    // storage retains the immutable allocation identity for later admission.
+    accounting_owned_ = false;
+}
+
+common_shared_byte_buffer & common_shared_byte_buffer::operator=(
+        const common_shared_byte_buffer & other) {
+    if (this == &other) {
+        return *this;
+    }
+    if (accounting_owned_) {
+        throw std::logic_error(
+            "cannot replace an accounted checkpoint allocation");
+    }
+    common_shared_byte_buffer replacement(other);
+    bytes_ = std::move(replacement.bytes_);
+    accounting_owned_ = false;
+    return *this;
+}
+
+common_shared_byte_buffer::common_shared_byte_buffer(
+        common_shared_byte_buffer && other) noexcept
+    : bytes_(std::move(other.bytes_)),
+      accounting_owned_(other.accounting_owned_) {
+    other.accounting_owned_ = false;
+}
+
+common_shared_byte_buffer & common_shared_byte_buffer::operator=(
+        common_shared_byte_buffer && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    GGML_ASSERT(!accounting_owned_);
+    bytes_ = std::move(other.bytes_);
+    accounting_owned_ = other.accounting_owned_;
+    other.accounting_owned_ = false;
+    return *this;
+}
+
+size_t common_shared_byte_buffer::size() const noexcept {
+    return bytes_ ? bytes_->bytes.size() : 0;
+}
+
+bool common_shared_byte_buffer::empty() const noexcept {
+    return !bytes_ || bytes_->bytes.empty();
+}
+
+const uint8_t * common_shared_byte_buffer::data() const noexcept {
+    return bytes_ ? bytes_->bytes.data() : nullptr;
+}
+
+void common_shared_byte_buffer::clear() noexcept {
+    bytes_.reset();
+    accounting_owned_ = false;
+}
+
+const uint8_t & common_shared_byte_buffer::operator[](
+        size_t index) const noexcept {
+    return bytes_->bytes[index];
+}
+
+const std::vector<uint8_t> & common_shared_byte_buffer::view()
+        const noexcept {
+    static const std::vector<uint8_t> empty;
+    return bytes_ ? bytes_->bytes : empty;
+}
+
+bool common_shared_byte_buffer::shares_storage_with(
+        const common_shared_byte_buffer & other) const noexcept {
+    return bytes_ && bytes_ == other.bytes_;
+}
+
+const void * common_shared_byte_buffer::storage_identity() const noexcept {
+    return bytes_.get();
+}
+
+long common_shared_byte_buffer::storage_use_count() const noexcept {
+    return bytes_ ? bytes_.use_count() : 0;
+}
+
+bool common_shared_byte_buffer::accounting_binding(
+        const void *& owner, uint64_t & allocation) const noexcept {
+    owner = nullptr;
+    allocation = 0;
+    if (!bytes_ || bytes_->accounting_owner == nullptr ||
+        bytes_->accounting_allocation == 0) {
+        return false;
+    }
+    owner = bytes_->accounting_owner;
+    allocation = bytes_->accounting_allocation;
+    return true;
+}
+
+bool common_shared_byte_buffer::owns_accounting_binding(
+        const void * owner, uint64_t allocation) const noexcept {
+    return accounting_owned_ && bytes_ &&
+           bytes_->accounting_owner == owner &&
+           bytes_->accounting_allocation == allocation;
+}
+
+bool common_shared_byte_buffer::bind_accounting(
+        const void * owner, uint64_t allocation) const noexcept {
+    if (!bytes_ || bytes_->bytes.empty() || owner == nullptr ||
+        allocation == 0) {
+        return false;
+    }
+    if (bytes_->accounting_owner != nullptr ||
+        bytes_->accounting_allocation != 0) {
+        const bool same = bytes_->accounting_owner == owner &&
+                          bytes_->accounting_allocation == allocation;
+        accounting_owned_ |= same;
+        return same;
+    }
+    bytes_->accounting_owner = owner;
+    bytes_->accounting_allocation = allocation;
+    accounting_owned_ = true;
+    return true;
+}
+
+bool common_shared_byte_buffer::unbind_accounting(
+        const void * owner, uint64_t allocation,
+        bool clear_storage_binding) const noexcept {
+    if (!bytes_ || bytes_->accounting_owner != owner ||
+        bytes_->accounting_allocation != allocation) {
+        return false;
+    }
+    accounting_owned_ = false;
+    if (clear_storage_binding) {
+        bytes_->accounting_owner = nullptr;
+        bytes_->accounting_allocation = 0;
+    }
+    return true;
+}
+
+bool operator==(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept {
+    return a.view() == b.view();
+}
+
 size_t common_prompt_checkpoint::size() const {
     const size_t tgt_size = data_tgt_logical_size > 0 ? data_tgt_logical_size : data_tgt.size();
-    return tgt_size + data_dft.size() + data_spec.size();
+    return tgt_size + data_dft.size() + data_qsa.size() + accel.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2493,17 +2636,26 @@ bool common_prompt_checkpoint::empty() const {
 
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
+    id_task  = -1;
 
     is_replay_boundary = false;
 
     pos_min = 0;
     pos_max = 0;
 
+    checkpoint_epoch     = 0;
+    checkpoint_epoch_swa = 0;
+
+    computation_frontier.clear();
+    cache_family = {};
+
     data_tgt.clear();
     data_tgt_on_device = false;
     data_tgt_logical_size = 0;
     data_dft.clear();
-    data_spec.clear();
+    data_qsa.clear();
+    data_dft_full_sequence = false;
+    accel.clear();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2528,9 +2680,10 @@ void common_prompt_checkpoint::update_tgt(
             ctx, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    size_t n = 0;
+    data_tgt.overwrite(ckpt_size, [&](uint8_t * data, size_t size) {
+        n = llama_state_seq_get_data_ext(ctx, data, size, seq_id, flags);
+    });
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2544,11 +2697,14 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    data_dft_full_sequence = flags == LLAMA_STATE_SEQ_FLAGS_NONE;
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    size_t n = 0;
+    data_dft.overwrite(ckpt_size, [&](uint8_t * data, size_t size) {
+        n = llama_state_seq_get_data_ext(ctx, data, size, seq_id, flags);
+    });
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2578,27 +2734,38 @@ void common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+    if (!try_load_dft(ctx, seq_id, flags)) {
+        GGML_ABORT("checkpoint restore rejected: expected %zu bytes\n", data_dft.size());
     }
+}
 
+bool common_prompt_checkpoint::try_load_dft(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
     if (data_dft.empty()) {
-        return;
+        return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+    if (ctx == nullptr) {
+        return false;
     }
+
+    const auto restore_flags = data_dft_full_sequence
+        ? LLAMA_STATE_SEQ_FLAGS_NONE : flags;
+    return llama_state_seq_set_data_ext(
+        ctx, data_dft.data(), data_dft.size(), seq_id, restore_flags) == data_dft.size();
 }
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
     data_tgt_on_device = false;
     data_tgt_logical_size = 0;
+    data_qsa.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
-    data_spec.clear();
+    data_dft_full_sequence = false;
+    accel.spec.clear();
 }

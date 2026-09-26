@@ -1788,11 +1788,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ std::move(portable_checkpoints),
         },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
+        /*.payload =*/ {},
     });
+
+    // a default-constructed payload owns an empty fixed-state image; fill it in place
+    auto * fixed = states.back().payload.fixed_state();
+    GGML_ASSERT(fixed != nullptr);
+    fixed->main = std::move(state_data_tgt);
+    fixed->drft = std::move(state_data_dft);
 
     return &states.back();
 }
@@ -1832,8 +1835,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        auto * best_fixed = it_best->payload.fixed_state();
+        if (best_fixed == nullptr) {
+            SRV_ERR("%s", "cached prompt has no fixed state to restore\n");
+
+            return false;
+        }
+
         {
-            auto & data = it_best->data.main;
+            auto & data = best_fixed->main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1848,7 +1858,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         {
-            auto & data = it_best->data.drft;
+            auto & data = best_fixed->drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);

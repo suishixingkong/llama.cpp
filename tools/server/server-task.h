@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "server-prompt-cache-payload.h"
 
 #include <string>
 #include <unordered_set>
@@ -585,21 +586,23 @@ struct server_prompt {
     }
 };
 
-struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
-
-    size_t size() const {
-        return main.size() + drft.size();
-    }
-};
-
 struct server_prompt_cache_state {
     server_prompt prompt;
-    server_prompt_data data;
+    server_prompt_cache_payload payload;
+
+    // Exact accounting references held by this logical host node. Authority
+    // mode stores one snapshot reference plus one reference per unique shared
+    // checkpoint/accelerator allocation; lifecycle-off shadow mode retains
+    // its historical three aggregate category references.
+    std::vector<llama_cache_acct_op_id> acct_ops;
+    bool accounting_complete = false;
+
+    const std::vector<llama_cache_acct_op_id> & release_ops() const noexcept {
+        return acct_ops;
+    }
 
     size_t size() const {
-        size_t res = data.size();
+        size_t res = payload.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
             res += ckpt.size();

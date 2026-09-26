@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 #include <chrono>
 #include <thread>
@@ -200,6 +201,30 @@ bool are_lora_equal(
         }
     }
     return true;
+}
+
+bool server_fault(const char * tag) {
+    // parse LLAMA_SERVER_FAULT once; empty/unset disables all injection
+    static const std::string faults = []() {
+        const char * env = std::getenv("LLAMA_SERVER_FAULT");
+        return env ? std::string(env) : std::string();
+    }();
+
+    if (faults.empty() || tag == nullptr || tag[0] == '\0') {
+        return false;
+    }
+
+    // match `tag` as a whole comma-delimited token so "load_fail" does not match "load_fail_xyz"
+    const std::string t = tag;
+    for (size_t pos = faults.find(t); pos != std::string::npos; pos = faults.find(t, pos + t.size())) {
+        const bool left  = (pos == 0)                  || faults[pos - 1]        == ',';
+        const bool right = (pos + t.size() == faults.size()) || faults[pos + t.size()] == ',';
+        if (left && right) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras) {

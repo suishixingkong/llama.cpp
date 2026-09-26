@@ -127,6 +127,21 @@ bool are_lora_equal(
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 
+// Test-only fault injection. LLAMA_SERVER_FAULT is a comma-separated list of tags;
+// server_fault(tag) is true when the tag is present. Lets tests drive the prompt-cache / checkpoint
+// transactional failure paths (save failure retains live state, short writes are rejected,
+// non-consuming load) deterministically without provoking real OOM / short-write conditions. Tags:
+//   save_short  - force the state-save writer to report a short write (aborts the save)
+//   load_fail   - force the host-cache target restore to report a short read (non-consuming reject)
+//   load_clone_fail - force lifecycle restore clone staging to fail before target mutation
+//   vbr_prompt_cache_prefix_fail - refuse VBR prefix publication after its
+//                                  provisional lineage clone (rollback gate)
+//   vbr_anchor_prepare_fail - refuse the prepared quality-anchor retirement
+//                             batch before any logical payload mutation
+//   frontier_disagree_after_flip - make the frontier selector disagree only after
+//                                  it owns reads (exercises fail-closed legacy fallback)
+bool server_fault(const char * tag);
+
 //
 // server_tokens
 //

@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-cache-authority.cpp
+    server-cache-authority.h
     server-cache-destruction-quote.cpp
     server-cache-destruction-quote.h
     server-cache-plan-authority.cpp

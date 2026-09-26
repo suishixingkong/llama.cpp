@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "common-cache-family.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -17,6 +18,9 @@
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -1351,6 +1355,145 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Server/common-layer logical computation frontier. This is the state after
+// processing the half-open logical prefix [0, token_count); next_position is the next
+// effective model position for that prefix. The three identity keys are opaque,
+// comparison-only server keys:
+//   - execution_identity: this loaded model/runtime instance
+//   - adapter_config_identity: active adapter weights + exact scales
+//   - media_content_identity: media content/shape in the logical prefix
+//
+// This deliberately lives beside common_prompt_checkpoint rather than in libllama:
+// sequence lineage, per-request adapters and mtmd media are server-layer concepts.
+// version == 0 means a legacy checkpoint with no dual-written frontier.
+struct common_computation_frontier {
+    static constexpr uint32_t VERSION = 1;
+
+    uint32_t version = 0;
+
+    uint64_t sequence_epoch = 0;
+    int64_t  token_count    = 0;
+    llama_pos next_position = 0;
+
+    std::string execution_identity;
+    std::string adapter_config_identity;
+    std::string media_content_identity;
+
+    bool valid() const {
+        return version == VERSION &&
+               sequence_epoch != 0 &&
+               token_count >= 0 &&
+               next_position >= 0 &&
+               !execution_identity.empty() &&
+               !adapter_config_identity.empty() &&
+               !media_content_identity.empty();
+    }
+
+    void clear() {
+        version = 0;
+        sequence_epoch = 0;
+        token_count = 0;
+        next_position = 0;
+        execution_identity.clear();
+        adapter_config_identity.clear();
+        media_content_identity.clear();
+    }
+};
+
+// Copy-on-write byte owner for immutable checkpoint planes. Copying a
+// checkpoint into the host cache or a non-consuming restore delivery shares
+// the exact allocation; the first live mutation detaches only that plane.
+// Empty buffers allocate nothing. Read access is immutable; replacement uses
+// one scoped writer so fixed-cache fan-out stays zero-copy without letting a
+// pointer or reference escape the copy-on-write boundary.
+class common_shared_byte_buffer {
+    struct storage {
+        storage() = default;
+        explicit storage(size_t size) : bytes(size) {}
+        explicit storage(const std::vector<uint8_t> & source)
+            : bytes(source) {}
+
+        std::vector<uint8_t> bytes;
+        const void * accounting_owner = nullptr;
+        uint64_t accounting_allocation = 0;
+    };
+
+public:
+    common_shared_byte_buffer() = default;
+    common_shared_byte_buffer(const common_shared_byte_buffer & other);
+    common_shared_byte_buffer & operator=(
+        const common_shared_byte_buffer & other);
+    common_shared_byte_buffer(common_shared_byte_buffer && other) noexcept;
+    common_shared_byte_buffer & operator=(
+        common_shared_byte_buffer && other) noexcept;
+
+    size_t size() const noexcept;
+    bool empty() const noexcept;
+    const uint8_t * data() const noexcept;
+    void clear() noexcept;
+
+    // Publishes newly filled storage only after the synchronous writer
+    // returns. The writer must not retain the supplied pointer.
+    template<class Writer>
+    void overwrite(size_t size, Writer && writer) {
+        if (accounting_owned_) {
+            throw std::logic_error(
+                "cannot overwrite an accounted checkpoint allocation");
+        }
+        if (size == 0) {
+            std::forward<Writer>(writer)(nullptr, 0);
+            clear();
+            return;
+        }
+        auto replacement =
+            std::make_shared<storage>(size);
+        std::forward<Writer>(writer)(replacement->bytes.data(), size);
+        bytes_ = std::move(replacement);
+    }
+
+    const uint8_t & operator[](size_t index) const noexcept;
+
+    const std::vector<uint8_t> & view() const noexcept;
+    bool shares_storage_with(
+        const common_shared_byte_buffer & other) const noexcept;
+    const void * storage_identity() const noexcept;
+    long storage_use_count() const noexcept;
+    bool accounting_binding(
+        const void *& owner, uint64_t & allocation) const noexcept;
+    bool owns_accounting_binding(
+        const void * owner, uint64_t allocation) const noexcept;
+    bool bind_accounting(
+        const void * owner, uint64_t allocation) const noexcept;
+    bool unbind_accounting(
+        const void * owner, uint64_t allocation,
+        bool clear_storage_binding = true) const noexcept;
+
+    friend bool operator==(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept;
+    friend bool operator!=(
+        const common_shared_byte_buffer & a,
+        const common_shared_byte_buffer & b) noexcept {
+        return !(a == b);
+    }
+
+private:
+    std::shared_ptr<storage> bytes_;
+    mutable bool accounting_owned_ = false;
+};
+
+inline bool operator==(
+        const common_computation_frontier & a,
+        const common_computation_frontier & b) noexcept {
+    return a.version == b.version &&
+           a.sequence_epoch == b.sequence_epoch &&
+           a.token_count == b.token_count &&
+           a.next_position == b.next_position &&
+           a.execution_identity == b.execution_identity &&
+           a.adapter_config_identity == b.adapter_config_identity &&
+           a.media_content_identity == b.media_content_identity;
+}
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1373,16 +1516,50 @@ struct common_prompt_checkpoint {
     uint64_t checkpoint_epoch     = 0;
     uint64_t checkpoint_epoch_swa = 0;
 
-    std::vector<uint8_t> data_tgt;
+    // Logical validity record, dual-written beside the legacy physical fields
+    // during the typed-companion migration. Legacy checkpoints have version == 0.
+    common_computation_frontier computation_frontier;
+
+    // Declared-family provenance. This is policy metadata only: it follows
+    // checkpoint copies/restores but never enters checkpoint payload bytes.
+    common_cache_family_binding cache_family;
+
+    common_shared_byte_buffer data_tgt;
     // ON_DEVICE checkpoints keep tensor payloads in llama_context-owned storage; data_tgt then
     // carries only the serialization envelope. logical_size preserves accounting/eviction weight.
     bool   data_tgt_on_device   = false;
     size_t data_tgt_logical_size = 0;
-    std::vector<uint8_t> data_dft;
+    common_shared_byte_buffer data_dft;
+    // Fixed-F16 Qwen4 QSA index image at the same logical frontier. It is
+    // excluded from PARTIAL_ONLY target state and therefore travels as its
+    // own authenticated VBR companion.
+    common_shared_byte_buffer data_qsa;
+    // Draft checkpoints used as VBR companions contain the complete sequence
+    // image so they can populate an empty draft context. Legacy speculative
+    // checkpoints may contain only PARTIAL_ONLY state. Retain the wire mode
+    // with the bytes rather than making restore infer it from current flags.
+    bool data_dft_full_sequence = false;
 
-    // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
-    std::vector<uint8_t> data_spec;
+    // Typed accelerator state stashed with the checkpoint (typed
+    // accelerators). Exact restore readiness is conjunctive (PROPOSAL §6
+    // invariant 3): a component that is mandatory-on-presence and fails to
+    // apply fails the WHOLE checkpoint restore fail-closed; purely optional
+    // components may degrade drafting quality only, never correctness.
+    struct accel_state {
+        // DFlash drafter ring buffer bytes. Mandatory-on-presence: a non-empty
+        // ring that fails to load fails the restore (shipped behavior at the
+        // ring-restore site).
+        common_shared_byte_buffer ring;
+
+        // Speculative-impl state (e.g. eagle3's deferred-boundary g_embd row).
+        // Applied unconditionally; absence resets the impl state. Optional.
+        common_shared_byte_buffer spec;
+
+        size_t size()  const { return ring.size() + spec.size(); }
+        bool   empty() const { return ring.empty() && spec.empty(); }
+        void   clear()       { ring.clear(); spec.clear(); }
+    };
+    accel_state accel;
 
     size_t size() const;
 
@@ -1410,6 +1587,14 @@ struct common_prompt_checkpoint {
             llama_state_seq_flags flags) const;
 
     void load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    // Server restore paths must be able to reject an incompatible draft image
+    // without terminating the process. The aborting load_dft() wrapper remains
+    // for callers whose checkpoint mismatch is an invariant violation.
+    bool try_load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
