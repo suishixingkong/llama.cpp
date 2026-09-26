@@ -255,6 +255,30 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-fusion.cpp)
 endif()
 
+# LoRA execution-content digest contract (slice 7d precondition).
+#
+# Lives outside the block above even though it loads a model and reads internal
+# headers (llama_model::get_tensor, llm_arch_name): those are reachable from a shared
+# build because the llama target exports all symbols on Windows. The adapters are
+# synthesized at run time, so the test needs a base model with an untied output
+# projection; point LLAMA_TEST_LORA_MODEL at one to register it with ctest, otherwise
+# the executable is only built and stays available for a manual run.
+llama_build(test-lora-adapter-digest.cpp)
+set(LORA_ADAPTER_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-lora-adapters/")
+file(MAKE_DIRECTORY "${LORA_ADAPTER_DIR}")
+
+set(LLAMA_TEST_LORA_MODEL "" CACHE FILEPATH
+    "Base GGUF used by test-lora-adapter-digest; the test is not registered when empty")
+
+if (LLAMA_TEST_LORA_MODEL)
+    llama_test(
+        test-lora-adapter-digest
+        NAME test-lora-adapter-digest
+        LABEL main
+        ARGS "${LLAMA_TEST_LORA_MODEL}" "${LORA_ADAPTER_DIR}"
+    )
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

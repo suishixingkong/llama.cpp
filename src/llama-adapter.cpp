@@ -3,11 +3,119 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-sha256.h"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <map>
 #include <cassert>
 #include <sstream>
 #include <stdexcept>
+
+namespace {
+
+// SHA-256 and the length-delimited serialization live in llama-sha256.h (shared with the VBR
+// checkpoint identity digest). The digest content below is versioned independently so it can be
+// extended without silently aliasing the current domain.
+class adapter_digest_writer : public llama_sha256_writer {
+public:
+    void string(const std::string & value) {
+        llama_sha256_writer::string(value.data(), value.size());
+    }
+
+    void tensor(const ggml_tensor * tensor) {
+        u32(uint32_t(tensor->type));
+        for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+            u64(uint64_t(tensor->ne[i]));
+        }
+
+        const size_t size = ggml_nbytes(tensor);
+        u64(size);
+
+        // CPU/host buffers can be hashed in place. Device buffers use the same backend read path
+        // as state serialization; this happens once at adapter load, outside graph construction.
+        if (tensor->data != nullptr && ggml_backend_buffer_is_host(tensor->buffer)) {
+            bytes(tensor->data, size);
+        } else {
+            std::vector<uint8_t> data(size);
+            ggml_backend_tensor_get(tensor, data.data(), 0, size);
+            bytes(data.data(), data.size());
+        }
+    }
+};
+
+static void llama_adapter_lora_set_digest(llama_adapter_lora & adapter) {
+    adapter_digest_writer digest;
+    static const char domain[] = "llama.cpp lora execution digest";
+    digest.bytes(domain, sizeof(domain) - 1);
+    digest.u32(1); // serialization version
+
+    std::vector<std::pair<std::string, const llama_adapter_lora_weight *>> weights;
+    weights.reserve(adapter.ab_map.size());
+    for (const auto & entry : adapter.ab_map) {
+        weights.emplace_back(entry.first, &entry.second);
+    }
+    std::sort(weights.begin(), weights.end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.first < rhs.first;
+    });
+
+    digest.u64(weights.size());
+    for (const auto & entry : weights) {
+        digest.string(entry.first);
+        digest.tensor(entry.second->a);
+        digest.tensor(entry.second->b);
+    }
+
+    float alpha = adapter.alpha;
+    if (alpha == 0.0f) {
+        alpha = 0.0f; // normalize -0.0: both signs select the no-alpha execution path
+    }
+    uint32_t alpha_bits;
+    static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha), "unexpected float size");
+    memcpy(&alpha_bits, &alpha, sizeof(alpha_bits));
+    digest.u32(alpha_bits);
+
+    digest.u64(adapter.alora_invocation_tokens.size());
+    for (llama_token token : adapter.alora_invocation_tokens) {
+        digest.u32(uint32_t(token));
+    }
+
+    // Only metadata interpreted by the current execution loader belongs in the semantic domain.
+    // alpha and aLoRA tokens are encoded above in their native representation. Rank semantics are
+    // encoded by every A/B shape; also preserve either customary scalar rank spelling if present.
+    static const std::array<const char *, 3> semantic_keys = {
+        "general.type",
+        "general.architecture",
+        "adapter.type",
+    };
+    static const std::array<const char *, 2> optional_rank_keys = {
+        "adapter.lora.rank",
+        "adapter.lora.r",
+    };
+
+    size_t n_semantic_keys = semantic_keys.size();
+    for (const char * key : optional_rank_keys) {
+        n_semantic_keys += adapter.gguf_kv.count(key);
+    }
+    digest.u64(n_semantic_keys);
+    for (const char * key : semantic_keys) {
+        digest.string(key);
+        const auto it = adapter.gguf_kv.find(key);
+        digest.string(it == adapter.gguf_kv.end() ? std::string() : it->second);
+    }
+    for (const char * key : optional_rank_keys) {
+        const auto it = adapter.gguf_kv.find(key);
+        if (it != adapter.gguf_kv.end()) {
+            digest.string(key);
+            digest.string(it->second);
+        }
+    }
+
+    adapter.digest = digest.finish();
+}
+
+} // namespace
 
 // vec
 
@@ -414,6 +522,8 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
+    llama_adapter_lora_set_digest(adapter);
+
     // register adapter with model
     model.loras.insert(&adapter);
 
@@ -472,6 +582,12 @@ int32_t llama_adapter_meta_val_str_by_index(const llama_adapter_lora * adapter, 
     auto it = adapter->gguf_kv.begin();
     std::advance(it, i);
     return snprintf(buf, buf_size, "%s", it->second.c_str());
+}
+
+void llama_adapter_meta_digest(const llama_adapter_lora * adapter, uint8_t * out) {
+    GGML_ASSERT(adapter != nullptr);
+    GGML_ASSERT(out != nullptr);
+    memcpy(out, adapter->digest.data(), adapter->digest.size());
 }
 
 void llama_adapter_lora_free(llama_adapter_lora * adapter) {

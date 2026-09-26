@@ -740,6 +740,9 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_adapter_meta_val_str_by_index(const struct llama_adapter_lora * adapter, int32_t i, char * buf, size_t buf_size);
 
+    // Get the adapter's execution-content SHA-256 digest. Writes exactly 32 bytes to out.
+    LLAMA_API void llama_adapter_meta_digest(const struct llama_adapter_lora * adapter, uint8_t * out);
+
     // Manually free a LoRA adapter
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);

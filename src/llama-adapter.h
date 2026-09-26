@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -76,6 +77,9 @@ struct llama_adapter_lora {
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
+
+    // SHA-256 over the execution-relevant adapter contents (see llama-adapter.cpp).
+    std::array<uint8_t, 32> digest = {};
 
     explicit llama_adapter_lora(llama_model * model) : model(model) {}
     ~llama_adapter_lora() = default;

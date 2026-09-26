@@ -8,11 +8,14 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "../../src/llama-sha256.h"
 
 #include <random>
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <type_traits>
@@ -201,6 +204,44 @@ bool are_lora_equal(
         }
     }
     return true;
+}
+
+std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras) {
+    // Collect the ACTIVE adapters as (content digest, scale bits) and sort into the same canonical
+    // order libllama applies them in (by digest, then scale bits) so the identity is independent of
+    // request order. Inactive (scale 0, incl. -0) adapters do not affect execution and are excluded.
+    std::vector<std::pair<std::array<uint8_t, 32>, uint32_t>> entries;
+    entries.reserve(loras.size());
+
+    for (const auto & la : loras) {
+        if (la.ptr == nullptr || la.scale == 0.0f) {
+            continue;
+        }
+
+        std::array<uint8_t, 32> digest{};
+        llama_adapter_meta_digest(la.ptr, digest.data());
+
+        uint32_t scale_bits;
+        static_assert(sizeof(scale_bits) == sizeof(la.scale), "unexpected float size");
+        std::memcpy(&scale_bits, &la.scale, sizeof(scale_bits)); // -0 excluded above, no normalize needed
+
+        entries.emplace_back(digest, scale_bits);
+    }
+
+    std::sort(entries.begin(), entries.end());
+
+    // The identity is a pure comparison key (never logged or parsed), and the entries are
+    // fixed-width and sorted, so their raw concatenation is unambiguous. Prefix the active count so
+    // an empty set (base adapters only) is still a distinct, well-defined identity.
+    std::string key = std::to_string(entries.size());
+    key.reserve(key.size() + entries.size() * (32 + sizeof(uint32_t)));
+
+    for (const auto & e : entries) {
+        key.append(reinterpret_cast<const char *>(e.first.data()), e.first.size());
+        key.append(reinterpret_cast<const char *>(&e.second), sizeof(e.second));
+    }
+
+    return key;
 }
 
 bool server_fault(const char * tag) {

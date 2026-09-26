@@ -127,6 +127,13 @@ bool are_lora_equal(
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 
+// Canonical, order-independent identity of the active adapter configuration: the same set of
+// (adapter content digest, scale) applied in any request order maps to the same string, matching the
+// deterministic graph apply order (sorted by per-adapter content digest, then scale bits). Inactive
+// (scale 0) adapters are excluded. Used to key persisted prompt-cache state so a cache entry built
+// under one adapter set is never restored for a request with a different one.
+std::string lora_config_identity(const std::vector<common_adapter_lora_info> & loras);
+
 // Test-only fault injection. LLAMA_SERVER_FAULT is a comma-separated list of tags;
 // server_fault(tag) is true when the tag is present. Lets tests drive the prompt-cache / checkpoint
 // transactional failure paths (save failure retains live state, short writes are rejected,

@@ -13,8 +13,13 @@
 
 #include "server-context.h"
 #include "server-task.h"
+#include "server-common.h"
 
+#include "../src/llama-adapter.h"
+
+#include <array>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 static int g_checks   = 0;
@@ -220,6 +225,93 @@ static void test_lease_build_identity() {
     CHECK(id.valid());
 }
 
+// --- lora_config_identity ---------------------------------------------------
+// The key that persisted prompt-cache entries are stored under. If this is not a
+// pure function of the *active* adapter set, a cache entry built with one adapter
+// set can be restored for a request with a different one, which is a correctness
+// bug rather than a performance regression. The adapters are hand-built here (their
+// digest field is written directly) so the test stays model-free; the digest itself
+// is covered by test-lora-adapter-digest.
+namespace {
+
+struct fake_lora {
+    std::unique_ptr<llama_adapter_lora> adapter;
+    common_adapter_lora_info             info;
+};
+
+fake_lora make_fake_lora(uint8_t digest_fill, float scale) {
+    fake_lora fake;
+    fake.adapter = std::make_unique<llama_adapter_lora>(nullptr);
+    fake.adapter->digest.fill(digest_fill);
+    fake.info.scale = scale;
+    fake.info.ptr   = fake.adapter.get();
+    return fake;
+}
+
+} // namespace
+
+static void test_lora_config_identity() {
+    // empty set (base adapters only) is itself a well-defined identity
+    CHECK_EQ(lora_config_identity({}), std::string("0"));
+
+    // frozen golden: one active adapter, digest 0..31, scale 1.0f.
+    // The entry is "digest bytes || scale bits (LE)" -- pinning the order here is
+    // what catches a silent swap of the two fields.
+    {
+        fake_lora one = make_fake_lora(0x00, 1.0f);
+        one.adapter->digest.fill(0x00);
+        for (size_t i = 0; i < one.adapter->digest.size(); ++i) {
+            one.adapter->digest[i] = uint8_t(i);
+        }
+        const std::string key = lora_config_identity({ one.info });
+        std::string expected = "1";
+        expected.append(reinterpret_cast<const char *>(one.adapter->digest.data()), 32);
+        expected.push_back('\x00'); // 1.0f == 0x3f800000, little-endian
+        expected.push_back('\x00');
+        expected.push_back('\x80');
+        expected.push_back('\x3f');
+        CHECK_EQ(key, expected);
+        CHECK_EQ(key.size(), size_t(1 + 32 + 4));
+    }
+
+    fake_lora a = make_fake_lora(0x11, 1.0f);
+    fake_lora b = make_fake_lora(0x22, 0.5f);
+
+    // order independence: the same set in either request order is one identity
+    const std::string ab = lora_config_identity({ a.info, b.info });
+    const std::string ba = lora_config_identity({ b.info, a.info });
+    CHECK_EQ(ab, ba);
+    CHECK(ab != lora_config_identity({ a.info }));
+    CHECK(ab != lora_config_identity({ b.info }));
+
+    // the count prefix keeps a duplicated adapter distinct from a single one
+    CHECK(lora_config_identity({ a.info, a.info }) != lora_config_identity({ a.info }));
+    // ... and the two entries are byte-identical, which is why the prefix is needed
+    CHECK_EQ(lora_config_identity({ a.info, a.info }).size(), size_t(1 + 2*(32 + 4)));
+
+    // inactive adapters do not affect execution, so they must not affect the key.
+    // -0.0f compares equal to 0.0f, so both spellings of "off" are excluded.
+    fake_lora off      = make_fake_lora(0x33, 0.0f);
+    fake_lora off_neg  = make_fake_lora(0x44, -0.0f);
+    CHECK_EQ(lora_config_identity({ off.info }), std::string("0"));
+    CHECK_EQ(lora_config_identity({ off_neg.info }), std::string("0"));
+    CHECK_EQ(lora_config_identity({ off.info, a.info }), lora_config_identity({ a.info }));
+    CHECK_EQ(lora_config_identity({ a.info, off_neg.info }), lora_config_identity({ a.info }));
+
+    // a null pointer is excluded too, even with a live scale (defensive: the
+    // loader can leave ptr unset for an adapter that failed to load)
+    fake_lora null_ptr = make_fake_lora(0x55, 1.0f);
+    null_ptr.info.ptr = nullptr;
+    CHECK_EQ(lora_config_identity({ null_ptr.info }), std::string("0"));
+    CHECK_EQ(lora_config_identity({ null_ptr.info, a.info }), lora_config_identity({ a.info }));
+
+    // both components of an active entry are load-bearing
+    fake_lora a_same_digest_other_scale = make_fake_lora(0x11, 2.0f);
+    CHECK(lora_config_identity({ a.info }) != lora_config_identity({ a_same_digest_other_scale.info }));
+    fake_lora other_digest_same_scale = make_fake_lora(0x12, 1.0f);
+    CHECK(lora_config_identity({ a.info }) != lora_config_identity({ other_digest_same_scale.info }));
+}
+
 int main() {
     test_decode_terminal();
     test_empty_handoff();
@@ -227,6 +319,7 @@ int main() {
     test_stem_matches();
     test_media_content_identity();
     test_lease_build_identity();
+    test_lora_config_identity();
 
     // print the executed-check count so a silently-skipped body is visible
     std::printf("test-server-vbr-predicates: %d checks, %d failures\n",

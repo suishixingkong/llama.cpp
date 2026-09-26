@@ -107,7 +107,7 @@ if (LLAMA_BUILD_TESTS)
     target_link_libraries(test-server-vbr-predicates PRIVATE
         server-context mtmd llama llama-common)
     target_include_directories(test-server-vbr-predicates PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd)
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
     target_compile_features(test-server-vbr-predicates PRIVATE cxx_std_17)
     add_test(NAME test-server-vbr-predicates COMMAND test-server-vbr-predicates)
     set_property(TEST test-server-vbr-predicates PROPERTY LABELS main)
