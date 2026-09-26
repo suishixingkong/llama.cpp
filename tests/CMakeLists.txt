@@ -522,6 +522,62 @@ target_include_directories(test-vbr-artifact-capture PRIVATE ${PROJECT_SOURCE_DI
 llama_build_and_test(test-vbr-artifact-codec.cpp)
 target_include_directories(test-vbr-artifact-codec PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Cache-plan / cache-lease / cache-yield / retention unit tests.
+#
+# Deliberate deviation from the fork: it registers these inside the
+# `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)` block, which would silently create
+# no target at all on this Windows + BUILD_SHARED_LIBS=ON machine. They are pure
+# logic tests over headers that need no llama internals, and each one compiles
+# its own tools/server module .cpp straight into the executable -- so they do
+# not depend on the server-context target either, which is what forces the
+# placement outside the model-gated block.
+llama_build_and_test(
+    test-cache-plan-authority.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+target_include_directories(test-cache-plan-authority PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(
+    test-cache-lease.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+target_include_directories(test-cache-lease PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(test-cache-plan-record.cpp)
+target_include_directories(test-cache-plan-record PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(
+    test-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+target_include_directories(test-cache-yield PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(
+    test-cache-destruction-quote.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+target_include_directories(test-cache-destruction-quote PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(
+    test-retention-policy-corpus.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+target_include_directories(test-retention-policy-corpus PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
