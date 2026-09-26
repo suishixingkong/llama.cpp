@@ -5005,6 +5005,21 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+// fork llama-context.cpp:8375 -- the public wrapper that head/include/llama.h:865
+// declares. `llama_memory_i::seq_rm_attn` already exists in this tree, so the
+// wrapper forwards to a real virtual rather than a stub.
+bool llama_memory_seq_rm_attn(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_attn(seq_id, p0, p1);
+}
+
 bool llama_memory_seq_rm_transient(
         llama_memory_t mem,
           llama_seq_id seq_id,

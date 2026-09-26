@@ -795,6 +795,15 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Remove only the attention component over [p0, p1). Hybrid memories leave recurrent
+    // state untouched; non-hybrid attention memories are identical to llama_memory_seq_rm;
+    // recurrent-only memories reject. [EXPERIMENTAL]
+    LLAMA_API bool llama_memory_seq_rm_attn(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

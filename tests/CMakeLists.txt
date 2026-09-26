@@ -598,6 +598,29 @@ target_include_directories(test-retention-sidecar PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/tools/server)
 
+# Representation-epoch / identity. The epoch binary is llama_build() only because
+# its fixture arm needs a real iSWA Gemma-4 model this repo cannot synthesise; the
+# three CPU entry points below are self-contained. The fork leaves them unlabelled,
+# which would make them invisible to a label-filtered run, so they are given the
+# `main` label this tree uses for every other test.
+llama_build(test-vbr-representation-epoch.cpp)
+target_include_directories(test-vbr-representation-epoch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(
+    NAME test-vbr-controller-identity-cpu
+    COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --identity-cpu)
+set_property(TEST test-vbr-controller-identity-cpu PROPERTY LABELS main)
+add_test(
+    NAME test-vbr-generation-tracker-cpu
+    COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --generation-cpu)
+set_property(TEST test-vbr-generation-tracker-cpu PROPERTY LABELS main)
+add_test(
+    NAME test-vbr-operation-recovery-cpu
+    COMMAND $<TARGET_FILE:test-vbr-representation-epoch> --operation-cpu)
+set_property(TEST test-vbr-operation-recovery-cpu PROPERTY LABELS main)
+
+llama_build_and_test(test-vbr-representation-identity.cpp)
+target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
