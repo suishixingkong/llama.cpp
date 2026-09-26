@@ -10,7 +10,25 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <nlohmann/json.hpp>
+
 #include <sstream>
+
+namespace {
+
+json server_json_from_ordered(nlohmann::ordered_json value) {
+    return json::parse(value.dump());
+}
+
+} // namespace
+
+//
+// server_task_result_cache_control
+//
+
+json server_task_result_cache_control::to_json() {
+    return server_json_from_ordered(server_cache_control_json(operation, result));
+}
 
 //
 // task_params
@@ -1651,6 +1669,100 @@ json server_task_result_slot_erase::to_json() {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
     };
+}
+
+//
+// server_task_result_cache_capture
+//
+
+json server_task_result_cache_capture::to_json() {
+    const char * consistency_name = "_count";
+    switch (consistency) {
+        case server_cache_capture_consistency::unavailable:
+            consistency_name = "unavailable";
+            break;
+        case server_cache_capture_consistency::capture_exact:
+            consistency_name = "capture_exact";
+            break;
+        case server_cache_capture_consistency::_count:
+            break;
+    }
+    return json {
+        { "status", server_vbr_artifact_capture_status_name(status) },
+        { "consistency", consistency_name },
+        { "reference", reference },
+        { "controllers", controllers },
+        { "units", units },
+        { "companions", companions },
+        { "payload_bytes", payload_bytes },
+        { "stash_bytes", stash_bytes },
+        { "companion_bytes", companion_bytes },
+        { "chunks", chunks },
+        { "backpressure_waits", backpressure_waits },
+        { "event_completions", event_completions },
+        { "synchronous_fallbacks", synchronous_fallbacks },
+        { "dedup", dedup },
+    };
+}
+
+const char * server_cache_import_consistency_name(
+        server_cache_import_consistency consistency) noexcept {
+    switch (consistency) {
+        case server_cache_import_consistency::unavailable: return "unavailable";
+        case server_cache_import_consistency::capture_exact: return "capture_exact";
+        case server_cache_import_consistency::live_rebased: return "live_rebased";
+        case server_cache_import_consistency::_count: break;
+    }
+    return "_count";
+}
+
+//
+// server_task_result_cache_import
+//
+
+json server_task_result_cache_import::to_json() {
+    const char * consistency_name =
+        server_cache_import_consistency_name(consistency);
+    return json {
+        { "status", server_vbr_artifact_import_status_name(status) },
+        { "validation_status",
+          vbr_manifest_validation_status_name(validation_status) },
+        { "stage_status", vbr_adopt_stage_status_name(stage_status) },
+        { "downward_reserve_status",
+          vbr_downward_reserve_status_name(downward_reserve_status) },
+        { "adopt_status", vbr_adopt_status_name(adopt_status) },
+        { "recovery", vbr_adopt_recovery_outcome_name(recovery) },
+        { "phase", adopt_attempted
+              ? json(vbr_adopt_phase_name(phase)) : json(nullptr) },
+        { "downward_subphase",
+          adopt_attempted
+              ? json(vbr_downward_adopt_subphase_name(downward_subphase))
+              : json(nullptr) },
+        { "downward_edge",
+          downward_edge == UINT32_MAX ? json(nullptr) : json(downward_edge) },
+        { "schedule", vbr_import_schedule_status_name(schedule_status) },
+        { "destination_schedule",
+          vbr_import_destination_status_name(destination_status) },
+        { "destination_policy_steps", destination_policy_steps },
+        { "destination_logical_bytes", destination_logical_bytes },
+        { "destination_physical_growth_bytes",
+          destination_physical_growth_bytes },
+        { "destination_max_deficit", destination_max_deficit },
+        { "decision", vbr_import_decision_name(decision) },
+        { "consistency", consistency_name },
+        { "units", units },
+        { "companions", companions },
+        { "payload_bytes", payload_bytes },
+        { "companion_bytes", companion_bytes },
+    };
+}
+
+//
+// server_task_result_cache_plan_preflight
+//
+
+json server_task_result_cache_plan_preflight::to_json() {
+    return server_json_from_ordered(server_cache_plan_preflight_json(view));
 }
 
 //

@@ -3,6 +3,13 @@
 #include "common.h"
 #include "llama.h"
 #include "server-prompt-cache-payload.h"
+#include "server-cache-control.h"
+#include "server-cache-plan-preflight.h"
+// The cache result types name the artifact-store statuses directly. The fork's
+// server-task.h relies on its includers having pulled this in first; spelling the
+// dependency out keeps the header self-contained.
+#include "server-vbr-artifact-store.h"
+#include "../../src/llama-vbr-artifact.h"
 
 #include <string>
 #include <unordered_set>
@@ -543,6 +550,86 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+enum class server_cache_capture_consistency : uint8_t {
+    unavailable = 0,
+    capture_exact,
+    _count,
+};
+
+struct server_task_result_cache_capture : server_task_result {
+    server_vbr_artifact_capture_status status {};
+    server_cache_capture_consistency consistency =
+        server_cache_capture_consistency::unavailable;
+    std::string reference;
+    uint32_t controllers = 0;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t stash_bytes = 0;
+    uint64_t companion_bytes = 0;
+    uint64_t chunks = 0;
+    uint64_t backpressure_waits = 0;
+    uint64_t event_completions = 0;
+    uint64_t synchronous_fallbacks = 0;
+    bool dedup = false;
+
+    virtual json to_json() override;
+};
+
+enum class server_cache_import_consistency : uint8_t {
+    unavailable = 0,
+    capture_exact,
+    live_rebased,
+    _count,
+};
+
+const char * server_cache_import_consistency_name(
+    server_cache_import_consistency consistency) noexcept;
+
+struct server_task_result_cache_import : server_task_result {
+    server_vbr_artifact_import_status status {};
+    vbr_manifest_validation_status validation_status {};
+    vbr_adopt_stage_status stage_status {};
+    vbr_downward_reserve_status downward_reserve_status {};
+    vbr_adopt_status adopt_status {};
+    vbr_adopt_recovery_outcome recovery {};
+    bool adopt_attempted = false;
+    vbr_adopt_phase phase {};
+    vbr_downward_adopt_subphase downward_subphase {};
+    uint32_t downward_edge = UINT32_MAX;
+    vbr_import_schedule_status schedule_status {};
+    vbr_import_destination_status destination_status {};
+    uint32_t destination_policy_steps = 0;
+    uint64_t destination_logical_bytes = 0;
+    uint64_t destination_physical_growth_bytes = 0;
+    int64_t destination_max_deficit = 0;
+    vbr_import_decision decision {};
+    server_cache_import_consistency consistency =
+        server_cache_import_consistency::unavailable;
+    uint32_t units = 0;
+    uint32_t companions = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t companion_bytes = 0;
+
+    virtual json to_json() override;
+};
+
+// Internal scheduler result. The public adapter adds the deliberately redacted wire
+// serializer; until then no route can serialize this task result.
+struct server_task_result_cache_plan_preflight : server_task_result {
+    server_cache_plan_preflight_view view;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_cache_control : server_task_result {
+    server_cache_control_operation operation =
+        server_cache_control_operation::_count;
+    server_cache_control_result result;
 
     virtual json to_json() override;
 };
