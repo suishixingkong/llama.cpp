@@ -516,6 +516,15 @@ else()
     target_compile_options(test-dflash-adaptive PRIVATE -UNDEBUG)
 endif()
 
+# The repack cache is a Linux-flock design: the whole test body sits under
+# `#if defined(__linux__)`, so anywhere else it returns 77. That is what SKIP_RETURN_CODE is
+# for, and the fork registers it unconditionally for exactly that reason. It still earns its
+# place here as the link-level consumer that keeps src/llama-repack-cache.cpp from being dead
+# code we cannot observe.
+llama_build_and_test(test-repack-cache.cpp)
+target_include_directories(test-repack-cache PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
+set_tests_properties(test-repack-cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+
 # VBR leaf kernels.
 
 # Self-reporting rather than assert-based: it returns a status from main and prints explicit PASS

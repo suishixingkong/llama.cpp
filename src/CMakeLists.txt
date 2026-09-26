@@ -101,6 +101,7 @@ set(LLAMA_CORE_SOURCES
     llama-model-saver.cpp
     llama-model.cpp
     llama-quant.cpp
+    llama-repack-cache.cpp
     llama-sampler.cpp
     llama-vocab.cpp
     unicode-data.cpp
@@ -128,7 +129,10 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+# ../vendor is the fork's own addition -- neither the common ancestor bfdc32183 nor upstream
+# master has it. src/llama-repack-cache.cpp reaches <nlohmann/json.hpp> through it, so it
+# comes in together with that file; nothing else in this tree's src/ needs it.
+target_include_directories(llama PRIVATE . ../vendor ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
