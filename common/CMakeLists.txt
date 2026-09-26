@@ -70,6 +70,8 @@ add_library(${TARGET}
     chat.h
     common-cache-plan.cpp
     common-cache-plan.h
+    common-retention-sidecar.cpp
+    common-retention-sidecar.h
     common.cpp
     common.h
     console.cpp
@@ -136,6 +138,9 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC .)
+# The retention sidecar codec uses the internal SHA-256 primitive from src/.
+set_source_files_properties(common-retention-sidecar.cpp
+    PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 

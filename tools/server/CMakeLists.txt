@@ -9,6 +9,31 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-cache-destruction-quote.cpp
+    server-cache-destruction-quote.h
+    server-cache-plan-authority.cpp
+    server-cache-plan-authority.h
+    server-cache-plan-preflight.cpp
+    server-cache-plan-preflight.h
+    server-cache-plan-preflight-internal.h
+    server-cache-lease.cpp
+    server-cache-lease.h
+    server-cache-lifecycle.h
+    server-cache-retention-proof.cpp
+    server-cache-retention-proof.h
+    server-cache-vbr-proof.cpp
+    server-cache-vbr-proof.h
+    server-cache-yield.cpp
+    server-cache-yield.h
+    server-prompt-cache-payload.cpp
+    server-prompt-cache-payload.h
+    server-recurrent-expansion.h
+    server-retention-sidecar.cpp
+    server-retention-sidecar.h
+    server-vbr-capture-readiness.cpp
+    server-vbr-capture-readiness.h
+    server-vbr-prompt-cache-support.cpp
+    server-vbr-prompt-cache-support.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
