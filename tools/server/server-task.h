@@ -667,9 +667,22 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Server-local lineage for computation-frontier migration.
+    // It moves with host-cache/child-slot prompt clones and resets whenever
+    // the prompt ledger is structurally cleared.
+    uint64_t sequence_epoch = 0;
+
+    friend void swap(server_prompt & lhs, server_prompt & rhs) noexcept {
+        using std::swap;
+        swap(lhs.tokens, rhs.tokens);
+        lhs.checkpoints.swap(rhs.checkpoints);
+        swap(lhs.sequence_epoch, rhs.sequence_epoch);
+    }
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        sequence_epoch = 0;
     }
 
     int n_tokens() const {
@@ -680,6 +693,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            sequence_epoch,
         };
     }
 };

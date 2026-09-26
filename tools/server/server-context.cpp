@@ -314,6 +314,12 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // Canonical identity of the adapter set this slot is executing under. Computed
+    // on first use and cached, because a capture identity is built per request while
+    // the adapter set changes only when a request installs different adapters.
+    std::string vbr_adapter_config_identity;
+    bool vbr_adapter_config_identity_valid = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -1018,6 +1024,12 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // In-process execution/lineage namespace for computation-frontier records.
+    // Checkpoints are never portable across this random model-instance key;
+    // slot-file restore explicitly invalidates them below.
+    std::string frontier_execution_identity;
+    uint64_t frontier_next_sequence_epoch = 1;
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1522,6 +1534,9 @@ private:
         }
 
         slots.clear();
+        frontier_execution_identity =
+            "server-execution-v1:" + random_string();
+        frontier_next_sequence_epoch = 1;
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -4539,6 +4554,85 @@ private:
         for (size_t i = 0; i < src.size(); i++) {
             dst[i] += src[i];
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Computation-frontier identity (slice 7d part 3).
+    //
+    // Landed inert: the consumers are the capture/restore paths of 7d part 4/5.
+    // Bodies are verbatim from the fork (server-context.cpp:4585 for the epoch,
+    // :11322 and :11357 for the identity block), with the port's adapter digest
+    // and lora_config_identity() as the only external dependency.
+    //
+    // The identity block is what an artifact reference is authenticated against:
+    // which execution namespace, which adapter set, which media prefix, how many
+    // tokens and at which position. Every field is derived, never passed in.
+    // -------------------------------------------------------------------------
+
+    uint64_t ensure_frontier_sequence_epoch(server_prompt & prompt) {
+        if (prompt.sequence_epoch == 0) {
+            GGML_ASSERT(frontier_next_sequence_epoch != 0);
+            prompt.sequence_epoch = frontier_next_sequence_epoch++;
+            GGML_ASSERT(frontier_next_sequence_epoch != 0);
+        }
+        return prompt.sequence_epoch;
+    }
+
+    bool build_capture_identity_fields(
+            server_slot & slot,
+            vbr_artifact_identity_block & identity,
+            server_vbr_artifact_capture_status & status,
+            int64_t coverage_tokens = -1) {
+        const int64_t token_count = coverage_tokens < 0
+            ? slot.prompt.n_tokens() : coverage_tokens;
+        const llama_pos next_position = coverage_tokens < 0
+            ? slot.prompt.tokens.pos_next()
+            : slot.prompt.tokens.pos_next(size_t(coverage_tokens));
+        identity.media_content_identity.clear();
+        if (token_count <= 0 || token_count > slot.prompt.n_tokens() ||
+            next_position <= 0 ||
+            !slot.prompt.tokens.media_content_identity(
+                token_count, identity.media_content_identity)) {
+            status =
+                server_vbr_artifact_capture_status::identity_unavailable;
+            return false;
+        }
+        const uint64_t sequence_epoch =
+            ensure_frontier_sequence_epoch(slot.prompt);
+        if (!slot.vbr_adapter_config_identity_valid) {
+            slot.vbr_adapter_config_identity =
+                lora_config_identity(slot.lora);
+            slot.vbr_adapter_config_identity_valid = true;
+        }
+        identity.execution_identity = frontier_execution_identity;
+        identity.adapter_config_identity = slot.vbr_adapter_config_identity;
+        identity.sequence_epoch = sequence_epoch;
+        identity.token_count = token_count;
+        identity.next_position = next_position;
+        status = server_vbr_artifact_capture_status::ok;
+        return true;
+    }
+
+    bool build_capture_identity(
+            server_slot & slot,
+            vbr_artifact_identity_block & identity,
+            std::vector<llama_token> & token_block,
+            server_vbr_artifact_capture_status & status) {
+        token_block.clear();
+        if (!build_capture_identity_fields(slot, identity, status)) {
+            return false;
+        }
+        try {
+            token_block.reserve(size_t(identity.token_count));
+            for (int64_t i = 0; i < identity.token_count; ++i) {
+                token_block.push_back(slot.prompt.tokens[size_t(i)]);
+            }
+        } catch (...) {
+            token_block.clear();
+            status = server_vbr_artifact_capture_status::internal_error;
+            return false;
+        }
+        return true;
     }
 };
 
