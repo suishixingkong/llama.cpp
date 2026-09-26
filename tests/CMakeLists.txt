@@ -578,6 +578,26 @@ target_include_directories(test-retention-policy-corpus PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/tools/server)
 
+llama_build_and_test(test-cache-accounting.cpp)
+target_include_directories(test-cache-accounting PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-cache-budget.cpp)
+target_include_directories(test-cache-budget PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-cache-authority.cpp)
+target_include_directories(test-cache-authority PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(
+    test-retention-sidecar.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp)
+target_include_directories(test-retention-sidecar PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
