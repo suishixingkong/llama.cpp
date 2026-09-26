@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "llama-vbr-codec.h"
 
 #include "json.h"
 #include "log.h"
@@ -27,6 +28,32 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// floor-true KV pricing inputs/outputs for dynamic VBR (see common_params_fit_impl): the dry
+// context is created with PRICE-tier types (the movable swap in common_fit_params), while the
+// runtime floor clamp lands on a discrete tier MIX along the degrade order — capacity math must
+// use the mix cost, queried from the dry context via llama_vbr_floor_bits_per_token.
+struct common_vbr_fit_costs {
+    ggml_type entry_k = GGML_TYPE_COUNT; // in: true entry types (cparams' are price-swapped)
+    ggml_type entry_v = GGML_TYPE_COUNT;
+    double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
+    double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
+    // out: model requires matching K/V cache types and does not implement classic retiering.
+    // These Turbo paths run a static cap under dynamic VBR, so the dry-load KV bytes are already
+    // the truth and floor/price capacity scaling must not be applied.
+    bool      types_coupled = false;
+    // Per-token bytes of the flash-attention f16 dequant scratch at settled deep fill: a
+    // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
+    // the total-VRAM wall constraint only, never in the budget-capacity solves.
+    double    scratch_bytes_pt = 0.0;    // out
+};
+
+double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_per_token, bool types_coupled) {
+    if (types_coupled || floor_bits_per_token <= 0.0 || price_bits_per_token <= 0.0) {
+        return 1.0;
+    }
+    return std::max(1.0, floor_bits_per_token / price_bits_per_token);
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -35,7 +62,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        common_vbr_fit_costs * vbr_costs = nullptr,
+        bool plan_hint = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -77,9 +106,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
-            ret.back().mb.model   += mb.model;
-            ret.back().mb.context += mb.context;
-            ret.back().mb.compute += mb.compute;
+            ret.back().mb.model         += mb.model;
+            ret.back().mb.context       += mb.context;
+            ret.back().mb.compute       += mb.compute;
+            ret.back().mb.context_fixed += mb.context_fixed;
+            ret.back().mb.context_vbr_managed += mb.context_vbr_managed;
             continue;
         }
 
@@ -89,9 +120,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
         for (size_t i = 0; i < nd; i++) {
             if (dev == llama_model_get_device(model, i)) {
-                ret[i].mb.model   += mb.model;
-                ret[i].mb.context += mb.context;
-                ret[i].mb.compute += mb.compute;
+                ret[i].mb.model         += mb.model;
+                ret[i].mb.context       += mb.context;
+                ret[i].mb.compute       += mb.compute;
+                ret[i].mb.context_fixed += mb.context_fixed;
+                ret[i].mb.context_vbr_managed += mb.context_vbr_managed;
                 break;
             }
         }
@@ -137,6 +170,35 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
+    // co-tenancy plan hint: this process intends to allocate model+context+compute on each
+    // device, published as a held demand's joint cross-device estimate. plan_hint defaults
+    // FALSE so a forgotten tag fails toward the designed no-hint/est_partial fallback —
+    // only the requested-full-configuration measurement is tagged (a hint that lies is
+    // worse than none: it carries a one-revision fuse). When the fit later shrinks the
+    // config the standing hint overstates; the satisfied phase caps the harm. Meta devices
+    // (SPLIT_MODE_TENSOR) split evenly, matching the shard rotation's balanced layout.
+    if (plan_hint) {
+        auto hint = [](ggml_backend_dev_t d, uint64_t bytes) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(d, &props);
+            if (props.device_id != nullptr) {
+                llama_vram_plan_hint(props.device_id, bytes);
+            }
+        };
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            const uint64_t planned = ret[i].mb.model + ret[i].mb.context + ret[i].mb.compute;
+            if (ggml_backend_dev_is_meta(dev)) {
+                const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
+                for (size_t j = 0; j < n_simple; j++) {
+                    hint(ggml_backend_meta_dev_simple_dev(dev, j), planned / n_simple);
+                }
+            } else {
+                hint(dev, planned);
+            }
+        }
+    }
+
     hp_ngl         = llama_model_n_layer(model);
     if (mparams->load_mtp) {
         hp_ngl    += llama_model_n_layer_nextn(model);
@@ -145,6 +207,20 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_expert    = llama_model_n_expert(model);
 
     common_memory_breakdown_print(ctx);
+
+    if (vbr_costs != nullptr) {
+        vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
+        if (vbr_costs->bits_pt_floor < 0.0) {
+            throw std::runtime_error("VBR aggregate floor exceeds the selected mixed K/V entry layout");
+        }
+        vbr_costs->bits_pt_price = llama_vbr_entry_bits_per_token(ctx, cparams->type_k, cparams->type_v);
+        vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
+        // Turbo cannot retier coupled MLA layouts. The classic ladder was
+        // introduced specifically for their single physical K allocation and
+        // therefore uses the ordinary floor/price mixture accounting.
+        vbr_costs->types_coupled = llama_model_kv_cache_types_coupled(model) &&
+            cparams->vbr_codec == LLAMA_VBR_CODEC_TURBO;
+    }
 
     llama_free(ctx);
     llama_model_free(model);
@@ -179,7 +255,8 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level,
+        ggml_type type_k_entry, ggml_type type_v_entry) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -261,7 +338,11 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    common_vbr_fit_costs vbr_costs;
+    vbr_costs.entry_k = type_k_entry;
+    vbr_costs.entry_v = type_v_entry;
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -273,15 +354,41 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                    cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true);
         }
     }
+    const dmds_t dmds_target_full = dmds_full;
     add_extra_memory(dmds_full);
+    const dmds_t dmds_extra_full = dmds_extra;
 
     const size_t nd = devs.size(); // number of devices
 
+    // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
+    // but the runtime clamp holds the aggregate at a discrete tier MIX >= the literal floor —
+    // capacity estimates must scale measured KV cost up by mix/price or they over-advertise
+    // (e.g. floor 6: price t4 = 4.125 bpv vs an achievable mix of ~6.04)
+    const double vbr_kv_scale = common_vbr_fit_kv_scale(
+        vbr_costs.bits_pt_floor, vbr_costs.bits_pt_price, vbr_costs.types_coupled);
+    if (vbr_costs.types_coupled) {
+        // coupled-KV model (MLA family): dynamic VBR runs a static cap there, the dry-load
+        // bytes are already the achievable cost — floor/price scaling would over-advertise
+        LOG_INF("%s: VBR dynamic: coupled-KV model runs a static cap — pricing KV at dry-load bytes\n",
+                __func__);
+    } else {
+        if (vbr_kv_scale > 1.0 + 1e-6) {
+            LOG_INF("%s: VBR dynamic: floor mix costs %.4g bits/token vs %.4g at the pricing tier "
+                    "— scaling KV capacity math by %.3f\n",
+                    __func__, vbr_costs.bits_pt_floor, vbr_costs.bits_pt_price, vbr_kv_scale);
+        }
+    }
+
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
+    // Headroom handed to the VBR runtime: always a single-device figure, because the controller
+    // applies it to each device's own free memory. The fork additionally recomputes it for its
+    // SPLIT_MODE_TENSOR meta-device branch, which this tree does not support.
+    const int64_t margin_per_dev = margins_s[0];
     if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
@@ -307,6 +414,303 @@ static void common_params_fit_impl(
         }
     }
 
+    // Context bytes whose representation is selected by Turbo/VBR. This is intentionally not
+    // `context - context_fixed`: an auxiliary index cache can scale with n_ctx while remaining
+    // fixed-layout and outside the controller budget.
+    auto sum_context_vbr_managed_bytes = [&](const dmds_t & dmds) {
+        int64_t result = 0;
+        if (nd == 0) {
+            result += dmds.back().mb.context_vbr_managed;
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                result += dmds[id].mb.context_vbr_managed;
+            }
+        }
+        return result;
+    };
+
+    auto round_ctx_down = [](uint64_t n_ctx) {
+        n_ctx -= n_ctx % 256;
+        n_ctx = std::max<uint64_t>(n_ctx, 256);
+        n_ctx = std::min<uint64_t>(n_ctx, std::numeric_limits<uint32_t>::max());
+        return (uint32_t) n_ctx;
+    };
+
+    // The dynamic-VBR runtime controller's fit pass owns the "auto" KV VRAM budget. In
+    // dynamic mode the KV is priced at the FLOOR tier throughout this function (swap in
+    // common_fit_params) — the runtime cache starts at its configured entry and degrades toward the floor as
+    // it fills, with mapped-physical bytes capped at the budget. The BUDGET handed to the
+    // controller (env VBR_BUDGET_MIB) = explicit --vbr-vram, or the bytes the KV can take on
+    // this box: its (floor-priced) projected footprint plus whatever would remain free above the
+    // margin. That formula preserves the margin exactly: mapped - floor_cost <= free - margin.
+    auto vbr_scale_est = [&](uint64_t est) {
+        // beyond the trained context rope is invalid and compute growth unaccounted — cap
+        // every VBR-derived advert (explicit -c bypasses the estimators for power users)
+        est = std::min<uint64_t>(est, hp_nct);
+        return round_ctx_down(est);
+    };
+    // Advert-honesty cap for dynamic auto mode: the floor capacity of the GROWTH-REACHABLE
+    // budget (device total - model - compute - fixed context - margin). Deliberately NOT the
+    // armed snapshot: kv_size bakes at construction, so a co-tenant present at startup must not
+    // permanently shrink the context ceiling the runtime budget can later grow back into.
+    // Returns 0 when no cap is needed (the full trained context is servable at the floor).
+    //
+    // The flash-attention f16 dequant scratch grows linearly with attended width at depth
+    // (turbo/degraded tiers materialize K/V to f16). It lives OUTSIDE the KV budget — it is
+    // paid from the fit MARGIN — so it is charged against the margin, not on top of it:
+    // vbr_scratch_excess is the scratch demand beyond the summed margins, and only that excess
+    // tightens the wall. Charging margin + scratch would double-count (on a typical 24GB
+    // single-model box S(n_ctx_train) ~= the 1 GiB margin and the advert is unchanged —
+    // matching measured full-context fills); the budget solves must not carry it at all.
+    // Single home for the scratch-vs-margin comparison — the cap subtracts it, the warn in
+    // vbr_dynamic_arm_budget fires when it is > 0 for the requested context.
+    auto vbr_scratch_excess = [&](uint64_t n_tokens) -> int64_t {
+        double margin_total = 0.0;
+        for (size_t id = 0; id < nd; id++) {
+            margin_total += (double) margins[id];
+        }
+        return (int64_t) std::max(0.0, vbr_costs.scratch_bytes_pt * (double) n_tokens - margin_total);
+    };
+    auto vbr_growth_reachable_ctx_cap = [&]() -> uint32_t {
+        if (nd == 0 || hp_nct == 0) {
+            return 0;
+        }
+        int64_t budget_gr = 0;
+        int64_t ctx_kv    = 0; // price-tier KV cost of the full context (RS excluded)
+        for (size_t id = 0; id < nd; id++) {
+            const llama_device_memory_data & target = dmds_target_full[id];
+            const llama_memory_breakdown_data extra_mb = dmds_extra_full.empty()
+                ? llama_memory_breakdown_data{} : dmds_extra_full[id].mb;
+
+            // The runtime VBR budget controls only the target KV. Reserve the complete extra
+            // model/context/compute allocation first; its fixed-F16 KV cannot be spent by the
+            // target controller or scaled by the target's floor-mix ratio.
+            const int64_t context_fixed_layout =
+                (int64_t) target.mb.context - (int64_t) target.mb.context_vbr_managed;
+            budget_gr += std::max<int64_t>(0,
+                target.total - (int64_t) target.mb.model - (int64_t) target.mb.compute
+                    - context_fixed_layout - (int64_t) extra_mb.total() - margins[id]);
+            ctx_kv += (int64_t) target.mb.context_vbr_managed;
+        }
+        ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
+        budget_gr -= vbr_scratch_excess(hp_nct);
+        if (ctx_kv <= 0 || budget_gr <= 0) {
+            return 0;
+        }
+        const uint64_t cap_tokens = (uint64_t) budget_gr * hp_nct / (uint64_t) ctx_kv;
+        if (cap_tokens >= hp_nct) {
+            return 0;
+        }
+        return vbr_scale_est(cap_tokens);
+    };
+    // min-cap an auto-derived advert (never an explicit -c) + the honesty log
+    auto vbr_cap_advert = [&]() {
+        if (!cparams->vbr_dynamic || cparams->n_ctx == 0) {
+            return;
+        }
+        const uint32_t cap = vbr_growth_reachable_ctx_cap();
+        if (cap != 0 && cap < cparams->n_ctx) {
+            LOG_INF("%s: VBR dynamic: advertised n_ctx capped %u -> %u = growth-reachable budget capacity at the quality floor\n",
+                    __func__, cparams->n_ctx, cap);
+            cparams->n_ctx = cap;
+        }
+    };
+    // captured BEFORE any mutation: vbr_dynamic_arm_budget writes the resolved auto budget back
+    // into cparams->vbr_vram_budget_bytes, so explicit-vs-auto checks must use this snapshot
+    const uint64_t vbr_budget_explicit = cparams->vbr_vram_budget_bytes;
+    // "the VBR/turbo cache family is in play": turbo-typed KV or any dynamic-VBR input. A plain
+    // -ctk turbo3_tcq gets the same capacity estimation as --vbr-bits t3 — same cache, same math.
+    const bool vbr_selected = ggml_is_turbo_kv_type(cparams->type_k) || ggml_is_turbo_kv_type(cparams->type_v) ||
+                              cparams->vbr_dynamic || vbr_budget_explicit != 0 || cparams->vbr_min_bits > 0.0;
+    auto vbr_dynamic_arm_budget = [&](const std::vector<int64_t> & projected_free_per_device,
+                                      int64_t projected_free_host) {
+        if (!cparams->vbr_dynamic) {
+            return;
+        }
+        uint64_t budget = vbr_budget_explicit; // explicit --vbr-vram
+        if (budget == 0) {
+            // b algebraically reduces to free_measured - model - compute - margin: the context
+            // term cancels against its copy inside projected_used. The n_ctx-INVARIANT part of
+            // the context (recurrent state, sized by n_seq_max) must NOT ride that cancellation —
+            // it is a real allocation the KV budget can never reuse, so charge it explicitly.
+            // (It used to be charged by accident: the probe physically allocated RS, depressing
+            // measured free. Once the probe honors no_alloc, only this subtraction charges it.)
+            int64_t b = 0;
+            if (nd == 0) {
+                b = (int64_t) dmds_target_full.back().mb.context_vbr_managed
+                    + projected_free_host - margins[0];
+            } else {
+                for (size_t id = 0; id < nd; id++) {
+                    b += std::max<int64_t>(0,
+                            (int64_t) dmds_target_full[id].mb.context_vbr_managed
+                            + projected_free_per_device[id] - margins[id]);
+                }
+            }
+            if (b <= 0) {
+                LOG_WRN("%s: VBR dynamic: no VRAM headroom for an auto KV budget — the runtime falls "
+                        "back to the floor-layout cost of the full context\n", __func__);
+                return;
+            }
+            budget = (uint64_t) b;
+        }
+        // hand the resolved budget to the runtime through cparams (context not created yet),
+        // plus the fit target as the runtime's growth headroom: startup arming and runtime
+        // re-derivation then encode the SAME worst case, and raising -fitt hardens both
+        cparams->vbr_vram_budget_bytes = budget;
+        cparams->vbr_growth_headroom_bytes = (uint64_t) margin_per_dev;
+        LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
+                __func__, std::max<uint64_t>(1, budget / MiB),
+                vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");
+        // the fit prices KV at the largest tier <= the floor; the runtime clamp lands on the
+        // achievable tier MIX (vbr_kv_scale x the priced cost). Warn up front when the budget
+        // cannot deliver the full context there (the runtime will also warn, at fill).
+        const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
+            : llama_vbr_type_bits_per_value(llama_vbr_ladder(cparams->vbr_codec).default_floor);
+        const int64_t ctx_priced = sum_context_vbr_managed_bytes(dmds_target_full);
+        // fire for the tier-exact default floor too (scale 1): a budget below the floor-cost
+        // full context is the only startup signal for the runtime's warn-once-exceed state
+        if (ctx_priced > 0 && (double) budget < (double) ctx_priced * vbr_kv_scale) {
+            LOG_WRN("%s: VBR dynamic: the KV budget (%" PRIu64 " MiB) is below the full-context cost "
+                    "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
+                    "clamp early\n", __func__, budget / MiB,
+                    floor_bpv, (double) ctx_priced * vbr_kv_scale / (double) MiB);
+        }
+        // An explicit -c bypasses every advert estimator, so the only startup honesty signal
+        // for an overcommitted context is this warn: the f16 dequant scratch is paid from the
+        // fit margin, and when the full-context scratch outgrows it (shared vbr_scratch_excess,
+        // same margin basis as the growth-reachable cap) the deepest fills can stop short of -c
+        // — recoverably (per-request context-exceeded), not with an abort.
+        if (cparams->n_ctx != 0) {
+            const int64_t excess = vbr_scratch_excess(cparams->n_ctx);
+            if (excess > 0) {
+                LOG_WRN("%s: VBR dynamic: the f16 dequant scratch outgrows the fit margin by "
+                        "~%" PRId64 " MiB at -c %u — the deepest fills may stop short of the full "
+                        "context (recoverably)\n", __func__, excess / MiB, cparams->n_ctx);
+            }
+        }
+    };
+
+    auto vbr_estimate_ctx_from_total_budget = [&](uint64_t budget_bytes, const dmds_t & dmds_full) {
+        if (!vbr_selected || cparams->n_ctx != 0 || hp_nct == 0 || budget_bytes == 0) {
+            return uint32_t(0);
+        }
+        // in dynamic mode the KV is priced at the PRICE tier for the whole fit (see
+        // common_fit_params); scale to the achievable floor-mix cost so these byte->token
+        // estimates are true floor capacities, capped at the trained context (beyond it rope
+        // is invalid and compute growth unaccounted)
+        const int64_t ctx_full = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_full) * vbr_kv_scale);
+        if (ctx_full <= 0) {
+            return uint32_t(0);
+        }
+
+        const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
+        if (n_ctx_probe >= hp_nct) {
+            return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
+        }
+
+        cparams->n_ctx = n_ctx_probe;
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        cparams->n_ctx = 0;
+
+        const int64_t ctx_probe = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_probe) * vbr_kv_scale);
+        if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
+            return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
+        }
+
+        uint64_t n_ctx_est = n_ctx_probe;
+        if (budget_bytes > (uint64_t) ctx_probe) {
+            n_ctx_est += (budget_bytes - (uint64_t) ctx_probe) * (hp_nct - n_ctx_probe) / (uint64_t) (ctx_full - ctx_probe);
+        } else {
+            n_ctx_est = (uint64_t) budget_bytes * n_ctx_probe / (uint64_t) ctx_probe;
+        }
+
+        return vbr_scale_est(n_ctx_est);
+    };
+
+    auto vbr_estimate_ctx_from_remaining = [&](const dmds_t & dmds_target, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+        if (!vbr_selected || cparams->n_ctx != 0 || vbr_budget_explicit != 0 || hp_nct == 0) {
+            return uint32_t(0);
+        }
+        // dynamic mode with an auto budget: keep the model default UNLESS even the
+        // growth-reachable budget cannot serve it at the quality floor — advertising cells the
+        // box can never hold at the floor tier ends in the warn-once-then-exceed state at depth
+        if (cparams->vbr_dynamic) {
+            return vbr_growth_reachable_ctx_cap();
+        }
+
+        const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
+        if (n_ctx_probe >= hp_nct) {
+            return uint32_t(0);
+        }
+
+        cparams->n_ctx = n_ctx_probe;
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        cparams->n_ctx = 0;
+
+        uint64_t n_ctx_est = std::numeric_limits<uint64_t>::max();
+        auto update_estimate = [&](int64_t ctx_full, int64_t ctx_probe, int64_t projected_free, int64_t margin) {
+            if (ctx_full <= 0) {
+                return;
+            }
+            const int64_t ctx_budget = ctx_full + projected_free - margin;
+            if (ctx_budget <= ctx_full || ctx_budget <= 0) {
+                return;
+            }
+
+            uint64_t local_est = hp_nct;
+            if (ctx_probe > 0 && ctx_full > ctx_probe) {
+                local_est = n_ctx_probe + (uint64_t) (ctx_budget - ctx_probe) * (hp_nct - n_ctx_probe) / (uint64_t) (ctx_full - ctx_probe);
+            } else {
+                local_est = (uint64_t) ctx_budget * hp_nct / (uint64_t) ctx_full;
+            }
+            n_ctx_est = std::min(n_ctx_est, local_est);
+        };
+
+        if (nd == 0) {
+            update_estimate(dmds_target.back().mb.context, dmds_probe.back().mb.context, projected_free_host, margins[0]);
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                update_estimate(dmds_target[id].mb.context, dmds_probe[id].mb.context, projected_free_per_device[id], margins[id]);
+            }
+        }
+
+        if (n_ctx_est == std::numeric_limits<uint64_t>::max() || n_ctx_est <= hp_nct) {
+            return uint32_t(0);
+        }
+
+        // vbr_scale_est caps at n_ctx_train: an uncapped estimate here advertised megatoken
+        // contexts on small models (RoPE-invalid + compute-buffer OOM at warmup)
+        return vbr_scale_est(n_ctx_est);
+    };
+
+    auto vbr_select_ctx = [&](const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+        // the controller budget is independent of context selection — arm it even when -c is
+        // explicit (the estimators below no-op on n_ctx != 0) or the estimate comes up empty
+        vbr_dynamic_arm_budget(projected_free_per_device, projected_free_host);
+
+        uint32_t vbr_n_ctx = 0;
+        if (vbr_budget_explicit != 0) {
+            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(vbr_budget_explicit, dmds_target_full);
+        } else {
+            vbr_n_ctx = vbr_estimate_ctx_from_remaining(dmds_target_full, projected_free_per_device, projected_free_host);
+        }
+        if (vbr_n_ctx == 0) {
+            return false;
+        }
+
+        cparams->n_ctx = vbr_n_ctx;
+        if (cparams->vbr_dynamic) {
+            LOG_INF("%s: VBR dynamic: advertised n_ctx = %" PRIu32 " = KV budget capacity at the %.4g bits/value floor (%s budget)\n",
+                __func__, cparams->n_ctx,
+                cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
+                    : llama_vbr_type_bits_per_value(llama_vbr_ladder(cparams->vbr_codec).default_floor),
+                vbr_budget_explicit != 0 ? "explicit" : "auto");
+        } else {
+            LOG_TRC("%s: VBR selected n_ctx = %" PRIu32 " from %s\n",
+                __func__, cparams->n_ctx, vbr_budget_explicit != 0 ? "explicit KV VRAM budget" : "remaining memory budget");
+        }
+        return true;
+    };
     int64_t sum_free            = 0;
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
@@ -321,6 +725,9 @@ static void common_params_fit_impl(
         LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
+            if (vbr_select_ctx(projected_free_per_device, sum_projected_free)) {
+                return;
+            }
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
             return;
@@ -351,6 +758,9 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
+                if (vbr_select_ctx(projected_free_per_device, 0)) {
+                    return;
+                }
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 return;
@@ -364,10 +774,22 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
+                if (vbr_select_ctx(projected_free_per_device, 0)) {
+                    return;
+                }
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 return;
             }
         }
+    }
+
+    // the controller budget is context-independent (b reduces to free - model - compute -
+    // margin), but it was only armed on the margins-met paths above — every step-2/3/4 exit
+    // (context shrink, explicit -c margin miss, layer redistribution) left the runtime on the
+    // conservative floor-cost fallback. Arm it here, once, for all of them. Host-only (nd == 0)
+    // is skipped: dynamic VBR needs a VMM-capable device and the controller is inert without one.
+    if (nd >= 1) {
+        vbr_dynamic_arm_budget(projected_free_per_device, 0);
     }
 
     // step 2: try reducing memory use by reducing the context size
@@ -433,6 +855,7 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert(); // shrunk advert must still be floor-servable
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
@@ -442,6 +865,7 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert();
                     }
                 } else {
                     if (n_ctx_min == UINT32_MAX) {
@@ -876,6 +1300,17 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+ggml_type common_vbr_fit_price_type(
+        ggml_type entry, double floor_bpv, bool pinned, llama_vbr_codec codec) {
+    if (pinned || !llama_vbr_codec_contains(codec, entry)) {
+        return entry;
+    }
+    const ggml_type price_t = llama_vbr_floor_price_type(codec, floor_bpv);
+    const double price_bits = llama_vbr_type_bits_per_value(price_t);
+    const double entry_bits = llama_vbr_type_bits_per_value(entry);
+    return price_bits < entry_bits ? price_t : entry;
+}
+
 enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
@@ -888,8 +1323,49 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    // SPLIT_MODE_TENSOR with everything explicit (-c AND --vbr-vram): when there is no extra
+    // model/context and no MoE fit authority, nothing remains to size or arm (the estimators
+    // no-op on explicit values and there is no layer redistribution). Required extras must
+    // still pass through the aggregate-device measurement.
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic &&
+            cparams->n_ctx != 0 && cparams->vbr_vram_budget_bytes != 0 &&
+            extra == nullptr) {
+        LOG_INF("%s: SPLIT_MODE_TENSOR: -c and --vbr-vram both explicit — nothing to fit, skipping\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the configured entry
+    // tier. The runtime controller caps mapped-physical KV at the budget and the layout sits at
+    // the floor when the context is full — so floor cost is what capacity/fitting must assume.
+    // With this swap every fit branch does the right thing: a memory-constrained box shrinks
+    // n_ctx to the FLOOR capacity of its VRAM (not the ~6.5x smaller entry-tier capacity), and
+    // the auto KV budget prices its headroom correctly. Entry types are restored for the real
+    // load — the cache still starts at its configured entry and degrades toward the floor as it fills.
+    const ggml_type type_k_entry = cparams->type_k;
+    const ggml_type type_v_entry = cparams->type_v;
+    if (cparams->vbr_dynamic) {
+        const ggml_type price_t = llama_vbr_floor_price_type(cparams->vbr_codec, cparams->vbr_min_bits);
+        // only degradable sides price at the floor: a codec rung on a side that is not
+        // pin-flagged. A PINNED side (vbr_pin_k/v, or an
+        // an entry outside the selected codec ladder) keeps its real cost — pricing it at the
+        // floor tier would over-advertise capacity for that half. Mirrors the runtime's
+        // vbr_unit_movable contract: type swappable AND side not pinned.
+        cparams->type_k = common_vbr_fit_price_type(
+            type_k_entry, cparams->vbr_min_bits, cparams->vbr_pin_k, cparams->vbr_codec);
+        cparams->type_v = common_vbr_fit_price_type(
+            type_v_entry, cparams->vbr_min_bits, cparams->vbr_pin_v, cparams->vbr_codec);
+        const bool both_movable =
+            !cparams->vbr_pin_k && llama_vbr_codec_contains(cparams->vbr_codec, type_k_entry) &&
+            !cparams->vbr_pin_v && llama_vbr_codec_contains(cparams->vbr_codec, type_v_entry);
+        LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier%s\n",
+                __func__, ggml_type_name(price_t),
+                both_movable ? "" : " (pinned side at its own cost)");
+    }
+
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level,
+                type_k_entry, type_v_entry);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

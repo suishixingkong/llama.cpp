@@ -141,6 +141,10 @@ target_include_directories(${TARGET} PUBLIC .)
 # The retention sidecar codec uses the internal SHA-256 primitive from src/.
 set_source_files_properties(common-retention-sidecar.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
+# fit.cpp reads the VBR price ladder / type-bit tables from src/llama-vbr-codec.h
+# (arg.cpp reaches the same header with a relative path instead).
+set_source_files_properties(fit.cpp
+    PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
