@@ -1,0 +1,51 @@
+{
+  "acquire": {
+    "object": "cache_control",
+    "schema_version": 1,
+    "status": "ok",
+    "result": {
+      "lease": "e1l_0123456789abcdeffedcba9876543210",
+      "granted_class": "hard",
+      "effective_floor": "t4",
+      "expires_at_ms": 123456789,
+      "fallback": {
+        "state": "resolved",
+        "kind": "retained_host",
+        "payload_kind": "fixed_state"
+      },
+      "protected_bytes": 64,
+      "fallback_pinned_bytes": 96,
+      "shared_fallback": true,
+      "payload_kind": "fixed_state"
+    }
+  },
+  "inspect": {
+    "object": "cache_control",
+    "schema_version": 1,
+    "status": "ok",
+    "result": {
+      "granted_class": "hard",
+      "expires_at_ms": 123456789,
+      "protection_state": "current",
+      "lease_frontier": {
+        "token_count": 12,
+        "next_position": 12
+      },
+      "proven_frontier": {
+        "token_count": 12,
+        "next_position": 12
+      },
+      "family_role": "main",
+      "family_label": "main-agent",
+      "fallback": {
+        "state": "resolved",
+        "kind": "retained_host",
+        "payload_kind": "fixed_state"
+      },
+      "protected_bytes": 64,
+      "fallback_pinned_bytes": 96,
+      "shared_fallback": true,
+      "payload_kind": "fixed_state"
+    }
+  }
+}

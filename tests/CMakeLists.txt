@@ -333,6 +333,30 @@ target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 llama_build_and_test(test-kv-cell-position-index.cpp)
 
+# Cache-control wire/golden-path test. Eleven cache module .cpp files are compiled
+# in (all byte-identical to the fork), and the golden JSON it compares against is
+# read from the source tree through CACHE_CONTROL_GOLDEN_PATH.
+# The fork registers this inside `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)`; here it
+# must sit outside that block or the target is never created on Windows + shared.
+llama_build_and_test(
+    test-cache-control.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-control-wire.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-retention-proof.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-retention-sidecar.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-destruction-quote.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-plan-authority.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-yield.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp)
+target_include_directories(test-cache-control PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_definitions(test-cache-control PRIVATE
+    CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
+
 # The kv-stream planner/config/softmax helpers are internal to libllama, so their
 # implementation files are compiled directly into the tests. That keeps the tests
 # working on Windows shared builds, where only LLAMA_API symbols are exported.
