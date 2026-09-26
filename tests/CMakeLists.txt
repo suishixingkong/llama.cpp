@@ -506,6 +506,16 @@ else()
     target_compile_options(test-vbr-transaction PRIVATE -UNDEBUG)
 endif()
 
+# The DFlash depth policy is a header-only controller (common/speculative-dflash-adaptive.h)
+# whose whole body is asserts, so it needs the same /UNDEBUG treatment. It has no model
+# dependency: the test drives it with synthetic cycle costs.
+llama_build_and_test(test-dflash-adaptive.cpp)
+if (MSVC)
+    target_compile_options(test-dflash-adaptive PRIVATE /UNDEBUG)
+else()
+    target_compile_options(test-dflash-adaptive PRIVATE -UNDEBUG)
+endif()
+
 # VBR leaf kernels.
 
 # Self-reporting rather than assert-based: it returns a status from main and prints explicit PASS
