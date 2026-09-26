@@ -11,6 +11,9 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-context.h"
+#include "../../src/llama-io.h"
+#include "../../src/llama-vbr-qsa-index.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -292,6 +295,44 @@ struct server_batch {
     }
 };
 
+struct server_frontier_logits_state {
+    std::vector<float> values;
+    std::array<uint8_t, 32> token_digest = {};
+    uint64_t sequence_epoch = 0;
+    bool pending = false;
+
+    server_frontier_logits_state() noexcept : values() {}
+
+    void clear() noexcept {
+        std::vector<float>().swap(values);
+        token_digest = {};
+        sequence_epoch = 0;
+        pending = false;
+    }
+
+    void install(
+            std::vector<float> && source,
+            const std::array<uint8_t, 32> & digest,
+            uint64_t epoch) noexcept {
+        values = std::move(source);
+        token_digest = digest;
+        sequence_epoch = epoch;
+        pending = false;
+    }
+
+    bool matches(
+            const server_tokens & tokens,
+            uint64_t epoch,
+            size_t vocabulary_size) const noexcept {
+        if (tokens.empty() || tokens.has_media() || values.size() != vocabulary_size ||
+            sequence_epoch != epoch) {
+            return false;
+        }
+        std::array<uint8_t, 32> digest = {};
+        return tokens.retention_token_digest(digest) && digest == token_digest;
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -317,6 +358,10 @@ struct server_slot {
     // Canonical identity of the adapter set this slot is executing under. Computed
     // on first use and cached, because a capture identity is built per request while
     // the adapter set changes only when a request installs different adapters.
+    // Full raw vocabulary logits produced at the exact retained prompt
+    // frontier. They are captured only at a successful generation stop and
+    // travel as an authenticated VBR companion with the same token/KV image.
+    server_frontier_logits_state frontier_logits;
     std::string vbr_adapter_config_identity;
     bool vbr_adapter_config_identity_valid = false;
 
@@ -806,6 +851,44 @@ struct server_slot {
         });
         other.init_sampler();
     }
+    // --- computation-frontier and speculative accessors (slice 7d part 3b) ---
+
+    bool frontier_logits_matches() const noexcept {
+        try {
+            return ctx_tgt && frontier_logits.matches(
+                prompt.tokens, prompt.sequence_epoch,
+                size_t(llama_vocab_n_tokens(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)))));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void bind_frontier_logits_to_prompt() noexcept {
+        if (frontier_logits.values.empty()) {
+            return;
+        }
+        try {
+            std::array<uint8_t, 32> digest = {};
+            if (prompt.tokens.retention_token_digest(digest)) {
+                frontier_logits.token_digest = digest;
+                frontier_logits.sequence_epoch = prompt.sequence_epoch;
+                return;
+            }
+        } catch (...) {
+        }
+        frontier_logits.clear();
+    }
+
+    // FORK-DIFF: the fork keeps an owned speculative handle plus a raw
+    // spec_shared and picks whichever is live; the port's slot holds one raw
+    // pointer to the shared owner (see bind_slots_to_draft_context), so the
+    // accessor is the identity.
+    // fork: server-context.cpp:2571 `return spec ? spec.get() : spec_shared;`
+    common_speculative * get_spec() const {
+        return spec;
+    }
+
 };
 
 // returns 0 on success
@@ -4632,6 +4715,460 @@ private:
             status = server_vbr_artifact_capture_status::internal_error;
             return false;
         }
+        return true;
+    }
+
+    bool build_capture_request(
+            server_slot & slot,
+            vbr_explicit_capture_request & request,
+            server_vbr_artifact_capture_status & status,
+            const common_prompt_checkpoint * checkpoint = nullptr) {
+        request = {};
+        if (checkpoint) {
+            if (!checkpoint->computation_frontier.valid() ||
+                checkpoint->n_tokens <= 0 ||
+                checkpoint->n_tokens >= slot.prompt.n_tokens() ||
+                checkpoint->computation_frontier.token_count !=
+                    checkpoint->n_tokens ||
+                checkpoint->computation_frontier.next_position <= 0 ||
+                checkpoint->computation_frontier.sequence_epoch !=
+                    slot.prompt.sequence_epoch ||
+                checkpoint->computation_frontier.execution_identity !=
+                    frontier_execution_identity ||
+                checkpoint->computation_frontier.adapter_config_identity !=
+                    lora_config_identity(slot.lora) ||
+                !build_capture_identity_fields(
+                    slot, request.identity, status,
+                    checkpoint->n_tokens) ||
+                request.identity.next_position !=
+                    checkpoint->computation_frontier.next_position ||
+                request.identity.media_content_identity !=
+                    checkpoint->computation_frontier.media_content_identity) {
+                status = server_vbr_artifact_capture_status::
+                    identity_unavailable;
+                return false;
+            }
+            try {
+                request.token_block.reserve(size_t(checkpoint->n_tokens));
+                for (int64_t i = 0; i < checkpoint->n_tokens; ++i) {
+                    request.token_block.push_back(
+                        slot.prompt.tokens[size_t(i)]);
+                }
+            } catch (...) {
+                request.token_block.clear();
+                status = server_vbr_artifact_capture_status::internal_error;
+                return false;
+            }
+        } else if (!build_capture_identity(
+                       slot, request.identity, request.token_block, status)) {
+            return false;
+        }
+        // The first durable capture mints a nonzero sequence epoch. A raw
+        // frontier row retained at generation stop may therefore still be
+        // bound to epoch zero even though its token digest is exact.
+        slot.bind_frontier_logits_to_prompt();
+        request.sequence = slot.id;
+        request.frontier.execution_identity =
+            request.identity.execution_identity.data();
+        request.frontier.execution_identity_len =
+            request.identity.execution_identity.size();
+        request.frontier.adapter_config_identity =
+            request.identity.adapter_config_identity.data();
+        request.frontier.adapter_config_identity_len =
+            request.identity.adapter_config_identity.size();
+        request.frontier.media_content_identity =
+            request.identity.media_content_identity.data();
+        request.frontier.media_content_identity_len =
+            request.identity.media_content_identity.size();
+        request.frontier.sequence_epoch = request.identity.sequence_epoch;
+        request.frontier.token_count = request.identity.token_count;
+        request.frontier.next_position = request.identity.next_position;
+        request.idle_decode_thread = true;
+
+        const auto pageable_domain =
+            vbr_artifact_portable_domain {
+                llama_cache_acct_residency::pageable_host,
+                llama_cache_acct_domain_kind::not_applicable,
+                UINT32_MAX, UINT16_MAX,
+            };
+        const auto add_checkpoint_buffer = [&request, pageable_domain](
+                const server_vbr_companion_codec & codec,
+                const common_shared_byte_buffer & bytes) {
+            if (bytes.empty()) {
+                return false;
+            }
+            vbr_explicit_companion_provider provider;
+            provider.kind = codec.kind;
+            provider.format_version = codec.format_version;
+            provider.build_identity_digest =
+                codec.build_identity_digest;
+            provider.domain = pageable_domain;
+            provider.context = &bytes;
+            provider.size = [](
+                    const void * context,
+                    llama_seq_id,
+                    uint64_t & output) noexcept {
+                const auto * source =
+                    static_cast<const common_shared_byte_buffer *>(context);
+                output = source ? uint64_t(source->size()) : 0;
+                return output != 0;
+            };
+            provider.capture_stream = [](
+                    const void * context,
+                    llama_seq_id,
+                    llama_io_write_i & output) {
+                const auto * source =
+                    static_cast<const common_shared_byte_buffer *>(context);
+                if (!source || source->empty()) {
+                    return false;
+                }
+                const auto view = source->view();
+                output.write(view.data(), view.size());
+                return true;
+            };
+            if (codec.kind == vbr_artifact_companion_kind::recurrent) {
+                provider.terminal_position = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_pos & output) noexcept {
+                    const auto * source = static_cast<
+                        const common_shared_byte_buffer *>(context);
+                    if (!source || source->empty()) {
+                        return false;
+                    }
+                    const auto view = source->view();
+                    return vbr_explicit_recurrent_companion_terminal(
+                        view.data(), view.size(), output);
+                };
+            } else if (codec.kind == vbr_artifact_companion_kind::qsa_index) {
+                provider.terminal_position = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_pos & output) noexcept {
+                    const auto * source = static_cast<
+                        const common_shared_byte_buffer *>(context);
+                    if (!source || source->empty()) {
+                        return false;
+                    }
+                    const auto view = source->view();
+                    return vbr_qsa_index_companion_terminal(
+                        view.data(), view.size(), output);
+                };
+            } else if (codec.kind ==
+                    vbr_artifact_companion_kind::typed_accelerator) {
+                provider.terminal_position = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_pos & output) noexcept {
+                    const auto * source = static_cast<
+                        const common_shared_byte_buffer *>(context);
+                    if (!source || source->empty()) {
+                        return false;
+                    }
+                    const auto view = source->view();
+                    return common_speculative_ring_state_serialized_terminal(
+                        view.data(), view.size(), output);
+                };
+            }
+            request.companions.push_back(provider);
+            return true;
+        };
+
+        if (checkpoint) {
+            const server_vbr_companion_codec recurrent_codec {
+                vbr_artifact_companion_kind::recurrent, 1,
+                vbr_explicit_recurrent_companion_build_identity(),
+            };
+            server_vbr_companion_codec draft_codec;
+            server_vbr_companion_codec accelerator_codec;
+            server_vbr_companion_codec qsa_codec;
+            const bool draft_codec_ready = !ctx_dft ||
+                server_vbr_companion_codec_for(
+                    vbr_artifact_companion_kind::required_spec_payload,
+                    draft_codec);
+            const bool accelerator_codec_ready = !slot.can_speculate() ||
+                server_vbr_companion_codec_for(
+                    vbr_artifact_companion_kind::typed_accelerator,
+                    accelerator_codec);
+            std::vector<llama_memory_tree_child> tree;
+            size_t recurrent_children = 0;
+            bool payload_complete_attention = false;
+            if (!llama_memory_tree_collect(
+                    llama_get_memory(ctx_tgt), tree)) {
+                status = server_vbr_artifact_capture_status::unsupported;
+                return false;
+            }
+            const bool needs_qsa = std::any_of(
+                tree.begin(), tree.end(), [](const auto & child) {
+                    return child.qsa_index_owner != nullptr;
+                });
+            const bool qsa_codec_ready = !needs_qsa ||
+                server_vbr_companion_codec_for(
+                    vbr_artifact_companion_kind::qsa_index, qsa_codec);
+            for (const auto & child : tree) {
+                recurrent_children += child.recurrent != nullptr;
+                payload_complete_attention |= child.attention != nullptr &&
+                    child.dependency_mode ==
+                        checkpoint_child_dependency_mode::payload_complete;
+            }
+            // SWA/iSWA checkpoint bytes contain tier-sensitive attention
+            // state.  They remain unavailable until that state has its own
+            // artifact owner; treating it as a recurrent blob would duplicate
+            // or mismatch the VBR attention tree.
+            if (!draft_codec_ready || !accelerator_codec_ready ||
+                !qsa_codec_ready ||
+                payload_complete_attention || recurrent_children > 1 ||
+                (recurrent_children != 0 &&
+                 !add_checkpoint_buffer(
+                     recurrent_codec,
+                     checkpoint->data_tgt)) ||
+                (needs_qsa && !add_checkpoint_buffer(
+                     qsa_codec, checkpoint->data_qsa)) ||
+                (ctx_dft && !add_checkpoint_buffer(
+                     draft_codec,
+                     checkpoint->data_dft)) ||
+                (slot.can_speculate() && !checkpoint->accel.ring.empty() &&
+                 !add_checkpoint_buffer(
+                     accelerator_codec,
+                     checkpoint->accel.ring))) {
+                status = server_vbr_artifact_capture_status::
+                    required_companion_unavailable;
+                return false;
+            }
+            status = server_vbr_artifact_capture_status::ok;
+            return true;
+        }
+
+        std::vector<llama_memory_tree_child> live_tree;
+        if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), live_tree)) {
+            status = server_vbr_artifact_capture_status::unsupported;
+            return false;
+        }
+        for (const auto & child : live_tree) {
+            if (child.qsa_index_owner) {
+                request.companions.push_back(
+                    vbr_qsa_index_capture_provider(*child.qsa_index_owner));
+            }
+        }
+
+        if (ctx_dft) {
+            server_vbr_companion_codec codec;
+            if (!server_vbr_companion_codec_for(
+                    vbr_artifact_companion_kind::required_spec_payload,
+                    codec)) {
+                status = server_vbr_artifact_capture_status::
+                    required_companion_unavailable;
+                return false;
+            }
+            vbr_explicit_companion_provider draft;
+            draft.kind = codec.kind;
+            draft.format_version = codec.format_version;
+            draft.build_identity_digest = codec.build_identity_digest;
+            draft.domain = pageable_domain;
+            // FORK-DIFF: the fork keeps the draft context in a llama_context_ptr and
+            // passes ctx_dft.get() (fork server-context.cpp:3489); the port keeps a raw
+            // llama_context * (see bind_slots_to_draft_context), so the pointer is the
+            // value.
+            draft.context = ctx_dft;
+            draft.size = [](
+                    const void * context,
+                    llama_seq_id sequence,
+                    uint64_t & output) noexcept {
+                const auto size =
+                    llama_state_seq_get_size_ext(
+                        static_cast<llama_context *>(
+                            const_cast<void *>(context)),
+                        sequence,
+                        LLAMA_STATE_SEQ_FLAGS_NONE);
+                output = uint64_t(size);
+                return size != 0;
+            };
+            draft.capture = [](
+                    const void * context,
+                    llama_seq_id sequence,
+                    std::vector<uint8_t> & output) noexcept {
+                try {
+                    auto * ctx =
+                        static_cast<llama_context *>(
+                            const_cast<void *>(context));
+                    const size_t size =
+                        llama_state_seq_get_size_ext(
+                            ctx, sequence,
+                            LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (size == 0) {
+                        return false;
+                    }
+                    output.resize(size);
+                    return llama_state_seq_get_data_ext(
+                               ctx, output.data(), size, sequence,
+                               LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+                } catch (...) {
+                    output.clear();
+                    return false;
+                }
+            };
+            draft.capture_stream = [](
+                    const void * context,
+                    llama_seq_id sequence,
+                    llama_io_write_i & output) {
+                auto * ctx = static_cast<llama_context *>(
+                    const_cast<void *>(context));
+                if (!ctx) {
+                    return false;
+                }
+                const size_t expected = llama_state_seq_get_size_ext(
+                    ctx, sequence, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t written = ctx->state_seq_write_data_stream(
+                    output, sequence, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (written != expected || output.n_bytes() != expected) {
+                    SRV_DBG(
+                        "VBR draft companion stream size mismatch "
+                        "expected=%zu written=%zu writer=%zu\n",
+                        expected, written, output.n_bytes());
+                    return false;
+                }
+                return written != 0;
+            };
+            request.companions.push_back(draft);
+        }
+        if (slot.can_speculate()) {
+            const size_t ring_size =
+                common_speculative_ring_state_size(slot.get_spec());
+            if (ring_size != 0) {
+                server_vbr_companion_codec codec;
+                if (!server_vbr_companion_codec_for(
+                        vbr_artifact_companion_kind::typed_accelerator,
+                        codec)) {
+                    status = server_vbr_artifact_capture_status::
+                        required_companion_unavailable;
+                    return false;
+                }
+                vbr_explicit_companion_provider accelerator;
+                accelerator.kind = codec.kind;
+                accelerator.format_version = codec.format_version;
+                accelerator.build_identity_digest =
+                    codec.build_identity_digest;
+                accelerator.domain = pageable_domain;
+                accelerator.context = &slot;
+                accelerator.size = [](
+                        const void * context,
+                        llama_seq_id,
+                        uint64_t & output) noexcept {
+                    const auto * owner =
+                        static_cast<const server_slot *>(context);
+                    const size_t size =
+                        common_speculative_ring_state_size(
+                            owner->get_spec());
+                    output = uint64_t(size);
+                    return size != 0;
+                };
+                accelerator.capture = [](
+                        const void * context,
+                        llama_seq_id,
+                        std::vector<uint8_t> & output) noexcept {
+                    try {
+                        const auto * owner =
+                            static_cast<const server_slot *>(context);
+                        const size_t size =
+                            common_speculative_ring_state_size(
+                                owner->get_spec());
+                        if (size == 0) {
+                            return false;
+                        }
+                        output.resize(size);
+                        common_speculative_ring_state_save(
+                            owner->get_spec(),
+                            output.data(), output.size());
+                        return true;
+                    } catch (...) {
+                        output.clear();
+                        return false;
+                    }
+                };
+                accelerator.capture_stream = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_io_write_i & output) {
+                    const auto * owner =
+                        static_cast<const server_slot *>(context);
+                    return owner && common_speculative_ring_state_write(
+                        owner->get_spec(), output);
+                };
+                accelerator.terminal_position = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_pos & output) noexcept {
+                    const auto * owner =
+                        static_cast<const server_slot *>(context);
+                    return owner && common_speculative_ring_state_terminal(
+                        owner->get_spec(), output);
+                };
+                request.companions.push_back(accelerator);
+            }
+        }
+        server_vbr_companion_codec logits_codec;
+        if (!server_vbr_companion_codec_for(
+                vbr_artifact_companion_kind::frontier_logits,
+                logits_codec)) {
+            status = server_vbr_artifact_capture_status::
+                required_companion_unavailable;
+            return false;
+        }
+        vbr_explicit_companion_provider frontier_logits;
+        frontier_logits.kind = logits_codec.kind;
+        frontier_logits.format_version = logits_codec.format_version;
+        frontier_logits.build_identity_digest =
+            logits_codec.build_identity_digest;
+        frontier_logits.domain = pageable_domain;
+        frontier_logits.required = false;
+        frontier_logits.context = &slot;
+        frontier_logits.size = [](
+                const void * context,
+                llama_seq_id,
+                uint64_t & output) noexcept {
+            const auto * owner = static_cast<const server_slot *>(context);
+            if (!owner || !owner->frontier_logits_matches() ||
+                owner->frontier_logits.values.size() >
+                    UINT64_MAX/sizeof(float)) {
+                output = 0;
+                return false;
+            }
+            output = uint64_t(owner->frontier_logits.values.size())*sizeof(float);
+            return output != 0;
+        };
+        frontier_logits.capture = [](
+                const void * context,
+                llama_seq_id,
+                std::vector<uint8_t> & output) noexcept {
+            try {
+                const auto * owner = static_cast<const server_slot *>(context);
+                if (!owner || !owner->frontier_logits_matches()) {
+                    return false;
+                }
+                output.resize(owner->frontier_logits.values.size()*sizeof(float));
+                std::memcpy(output.data(), owner->frontier_logits.values.data(),
+                            output.size());
+                return !output.empty();
+            } catch (...) {
+                output.clear();
+                return false;
+            }
+        };
+        frontier_logits.capture_stream = [](
+                const void * context,
+                llama_seq_id,
+                llama_io_write_i & output) {
+            const auto * owner = static_cast<const server_slot *>(context);
+            if (!owner || !owner->frontier_logits_matches()) {
+                return false;
+            }
+            output.write(
+                owner->frontier_logits.values.data(),
+                owner->frontier_logits.values.size()*sizeof(float));
+            return true;
+        };
+        request.companions.push_back(frontier_logits);
+        status = server_vbr_artifact_capture_status::ok;
         return true;
     }
 };
