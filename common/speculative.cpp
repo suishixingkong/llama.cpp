@@ -174,6 +174,21 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // fork common/speculative.cpp:347
+    // Called after an external sequence lifecycle mutation. Most implementations
+    // have no branch-local state beyond their serialized state and need no action.
+    //
+    // FORK-DIFF: the fork overrides this in common_speculative_impl_draft_dflash
+    // (discard_branch_state()), common_speculative_impl_draft_mtp
+    // (pending_h_lifecycle / proposals / adaptive*) and common_speculative_impl_dflash
+    // (ring_state_reset()). This tree's draft_dflash / draft_mtp have none of that
+    // state and it has no common_speculative_impl_dflash at all, so no port
+    // implementation overrides this yet and every event takes the no-op default
+    // below. Overrides belong with the speculative.cpp port - BUUN_MERGE_PLAN.md.
+    virtual void sequence_transition(
+            llama_seq_id /*seq_id*/,
+            common_speculative_sequence_event /*event*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -3126,5 +3141,19 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+}
+
+// fork common/speculative.cpp:6103
+void common_speculative_sequence_transition(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        common_speculative_sequence_event event) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->sequence_transition(seq_id, event);
     }
 }

@@ -147,6 +147,24 @@ bool   common_speculative_ring_state_serialized_terminal(
 bool   common_speculative_ring_state_empty(const common_speculative * spec);
 void   common_speculative_ring_state_reset(common_speculative * spec);
 
+// fork common/speculative.h:160
+enum class common_speculative_sequence_event : uint8_t {
+    prompt_rewind = 0,          // retained draft prefix remains installed
+    target_restored_without_draft, // target restored; draft must reconstruct
+    draft_image_restored,       // complete target+draft sequence images restored
+    composite_image_restored,   // draft plus typed accelerator state restored
+    live_range_shift,           // live target/draft positions were renumbered
+    target_replaced,            // target replaced; draft sequence was cleared
+    full_clear,                 // target and draft sequences were cleared
+};
+
+// One owner for external sequence lifecycle mutations. Implementations discard
+// branch-local state and apply the event-specific memory/ring policy.
+void common_speculative_sequence_transition(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        common_speculative_sequence_event event);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };
