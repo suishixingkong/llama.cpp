@@ -674,6 +674,14 @@ set_property(TEST test-vbr-operation-recovery-cpu PROPERTY LABELS main)
 llama_build_and_test(test-vbr-representation-identity.cpp)
 target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# The SWA-window capture/install gates need a real attention-only iSWA model
+# (Gemma4-class), which no CI machine has -- the fork registers this one as
+# build-only for exactly that reason. Keep it that way: it is still the only
+# link-time consumer of src/llama-vbr-swa-window.cpp, so building it proves the
+# new translation unit really lands in libllama.
+llama_build(test-vbr-swa-window.cpp)
+target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

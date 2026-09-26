@@ -67,6 +67,8 @@ set(LLAMA_CORE_SOURCES
     llama-vbr-artifact-validate.h
     llama-vbr-explicit-capture.cpp
     llama-vbr-explicit-capture.h
+    llama-vbr-swa-window.cpp
+    llama-vbr-swa-window.h
     llama-vbr-qsa-index.cpp
     llama-vbr-qsa-index.h
     llama-vbr-artifact-stage.cpp
