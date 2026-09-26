@@ -22,6 +22,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "llama-bench-vbr.h"
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
@@ -332,6 +333,12 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+using cmd_cache_type = common_vbr_cache_choice;
+
+static const char * cmd_cache_type_name(const cmd_cache_type & choice) {
+    return choice.vbr ? "vbr" : ggml_type_name(choice.type);
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -344,8 +351,8 @@ struct cmd_params {
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
-    std::vector<ggml_type>           type_k;
-    std::vector<ggml_type>           type_v;
+    std::vector<cmd_cache_type>      type_k;
+    std::vector<cmd_cache_type>      type_v;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -368,6 +375,15 @@ struct cmd_params {
     std::vector<uint32_t>            fit_params_min_ctx;
     std::vector<int>                 kv_stream_arena_mib;
     std::vector<int>                 n_parallel;
+    bool                             vbr = false; // arm dynamic VBR and its decode-time degrade controller
+    llama_vbr_codec                  vbr_codec = LLAMA_VBR_CODEC_TURBO;
+    bool                             vbr_codec_explicit = false;
+    std::string                      vbr_entry;  // discrete entry tier (quality-first default: f16)
+    std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
+    std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
+    bool                             vbr_entry_explicit = false;
+    bool                             vbr_floor_explicit = false;
+    bool                             vbr_vram_explicit = false;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -391,8 +407,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
-    /* type_k               */ { GGML_TYPE_F16 },
-    /* type_v               */ { GGML_TYPE_F16 },
+    /* type_k               */ { { GGML_TYPE_F16, false, false } },
+    /* type_v               */ { { GGML_TYPE_F16, false, false } },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -415,6 +431,15 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_min_ctx   */ { 0 },
     /* kv_stream_arena_mib  */ { 0 },
     /* n_parallel           */ { 1 },
+    /* vbr                  */ false,
+    /* vbr_codec            */ LLAMA_VBR_CODEC_TURBO,
+    /* vbr_codec_explicit   */ false,
+    /* vbr_entry            */ "f16",
+    /* vbr_floor            */ "auto",
+    /* vbr_vram             */ "auto",
+    /* vbr_entry_explicit   */ false,
+    /* vbr_floor_explicit   */ false,
+    /* vbr_vram_explicit    */ false,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -465,8 +490,13 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
-    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
-    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
+    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
+    printf("  --vbr-codec <turbo|classic>                        dynamic VBR codec ladder (default: turbo)\n");
+    printf("  --vbr-entry <tier>                                  dynamic VBR entry tier (default: f16)\n");
+    printf("  --vbr-floor <tier|bits|auto>                        arm dynamic VBR (both sides), aggregate floor\n");
+    printf("                                                    (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
+    printf("  --vbr-vram <auto|SIZE[K|M|G]>                     VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                          (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -551,6 +581,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.vbr                  = cmd_params_defaults.vbr;
+    params.vbr_codec            = cmd_params_defaults.vbr_codec;
+    params.vbr_codec_explicit   = cmd_params_defaults.vbr_codec_explicit;
+    params.vbr_entry            = cmd_params_defaults.vbr_entry;
+    params.vbr_floor            = cmd_params_defaults.vbr_floor;
+    params.vbr_vram             = cmd_params_defaults.vbr_vram;
+    params.vbr_entry_explicit   = cmd_params_defaults.vbr_entry_explicit;
+    params.vbr_floor_explicit   = cmd_params_defaults.vbr_floor_explicit;
+    params.vbr_vram_explicit    = cmd_params_defaults.vbr_vram_explicit;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -648,14 +687,19 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
+                    if (t == "vbr") {
+                        params.vbr = true;
+                        types.push_back({ GGML_TYPE_F16, true, true });
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
@@ -668,19 +712,64 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
+                    if (t == "vbr") {
+                        params.vbr = true;
+                        types.push_back({ GGML_TYPE_F16, true, true });
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "--vbr-floor" || arg == "--vbr-min-bits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr       = true;
+                params.vbr_floor = argv[i];
+                params.vbr_floor_explicit = true;
+            } else if (arg == "--vbr-entry") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr       = true;
+                params.vbr_entry = argv[i];
+                params.vbr_entry_explicit = true;
+            } else if (arg == "--vbr-codec") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string codec = argv[i];
+                if (codec == "turbo") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_TURBO;
+                } else if (codec == "classic") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_CLASSIC;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr = true;
+                params.vbr_codec_explicit = true;
+            } else if (arg == "--vbr-vram" || arg == "--vbr-budget") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr      = true;
+                params.vbr_vram = argv[i];
+                params.vbr_vram_explicit = true;
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1276,6 +1365,15 @@ struct cmd_params_instance {
     uint32_t           fit_min_ctx;
     int                kv_stream_arena_mib;
     int                n_parallel;
+    bool               vbr;
+    bool               vbr_k;
+    bool               vbr_v;
+    llama_vbr_codec    vbr_codec;
+    std::string        vbr_entry;
+    double             vbr_min_bits;
+    bool               vbr_min_bits_explicit;
+    uint64_t           vbr_budget_bytes;
+    bool               vbr_budget_explicit;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1358,12 +1456,30 @@ struct cmd_params_instance {
         // llama-server's "-np 1" requirement (see llama_kv_stream_config_validate)
         cparams.n_seq_max = (uint32_t) std::max(1, n_parallel);
 
+        llama_bench_vbr_row row;
+        row.active = vbr;
+        row.k = vbr_k;
+        row.v = vbr_v;
+        row.type_k = type_k;
+        row.type_v = type_v;
+        row.codec = vbr_codec;
+        row.entry = vbr_entry;
+        row.floor_bits = vbr_min_bits;
+        row.floor_explicit = vbr_min_bits_explicit;
+        row.budget_bytes = vbr_budget_bytes;
+        row.budget_explicit = vbr_budget_explicit;
+        llama_bench_vbr_apply_row(row, cparams);
+
         return cparams;
     }
 };
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
+    const llama_bench_vbr_plan vbr_plan = llama_bench_vbr_make_plan(
+        params.type_k, params.type_v, params.vbr_entry, params.vbr_floor, params.vbr_vram,
+        params.vbr_entry_explicit, params.vbr_floor_explicit, params.vbr_vram_explicit,
+        params.vbr_codec, params.vbr_codec_explicit);
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1395,6 +1511,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & pl : params.poll)
     for (const auto & ks : params.kv_stream_arena_mib)
     for (const auto & np : params.n_parallel) {
+        const llama_bench_vbr_row vbr = llama_bench_vbr_resolve_row(vbr_plan, tk, tv);
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1406,8 +1523,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1430,6 +1547,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
                 /* .n_parallel            = */ np,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1445,8 +1571,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1469,6 +1595,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
                 /* .n_parallel            = */ np,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1484,8 +1619,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1508,6 +1643,15 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .kv_stream_arena_mib   = */ ks,
                 /* .n_parallel            = */ np,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1534,6 +1678,15 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    bool                     vbr;
+    bool                     vbr_k;
+    bool                     vbr_v;
+    std::string              vbr_codec;
+    std::string              vbr_entry;
+    double                   vbr_floor;
+    bool                     vbr_floor_explicit;
+    uint64_t                 vbr_vram_bytes;
+    bool                     vbr_vram_explicit;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1574,6 +1727,17 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        vbr            = inst.vbr;
+        vbr_k          = inst.vbr_k;
+        vbr_v          = inst.vbr_v;
+        vbr_codec      = inst.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo";
+        vbr_entry      = inst.vbr_entry;
+        vbr_floor      = inst.vbr_min_bits;
+        vbr_floor_explicit = inst.vbr_min_bits_explicit;
+        vbr_vram_bytes = inst.vbr_budget_bytes;
+        vbr_vram_explicit = inst.vbr_budget_explicit;
+        // deviation: the fork also flips this to mparams.n_gpu_layers;
+        // unrelated to VBR, so upstream's inst. form is kept.
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1644,7 +1808,9 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "vbr_codec",     "vbr_entry",      "vbr_floor",
+            "vbr_floor_explicit",
+            "vbr_vram_bytes", "vbr_vram_explicit", "n_gpu_layers", "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
@@ -1662,14 +1828,16 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "vbr_vram_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" ||
+            field == "vbr_floor_explicit" || field == "vbr_vram_explicit") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "vbr_floor") {
             return FLOAT;
         }
         if (field == "load_mode" || field == "lazy_mode") {
@@ -1730,8 +1898,14 @@ struct test {
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
-                                            ggml_type_name(type_k),
-                                            ggml_type_name(type_v),
+                                            vbr_k ? "vbr" : ggml_type_name(type_k),
+                                            vbr_v ? "vbr" : ggml_type_name(type_v),
+                                            vbr_codec,
+                                            vbr_entry,
+                                            std::to_string(vbr_floor),
+                                            std::to_string(vbr_floor_explicit),
+                                            std::to_string(vbr_vram_bytes),
+                                            std::to_string(vbr_vram_explicit),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -2032,6 +2206,14 @@ struct markdown_printer : public printer {
         }
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
+        }
+        if (params.vbr) {
+            fields.emplace_back("vbr_codec");
+            fields.emplace_back("vbr_entry");
+            fields.emplace_back("vbr_floor");
+            fields.emplace_back("vbr_floor_explicit");
+            fields.emplace_back("vbr_vram_bytes");
+            fields.emplace_back("vbr_vram_explicit");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
