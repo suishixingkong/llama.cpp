@@ -357,6 +357,23 @@ target_include_directories(test-cache-control PRIVATE
 target_compile_definitions(test-cache-control PRIVATE
     CACHE_CONTROL_GOLDEN_PATH="${PROJECT_SOURCE_DIR}/tests/fixtures/cache-control-v1.json")
 
+# Backend ABI gates. These need ggml internals only and no model, so they are
+# registered outside the model-gated block (the fork keeps its siblings inside,
+# but this tree must build them on Windows + BUILD_SHARED_LIBS=ON).
+# Three sibling candidates from the same fork family were rejected because their
+# target code is not in this tree: test-mul-mat-params (GGML_MMID_WINDOW_N_LOCAL,
+# ggml_mmid_expert_index, GGML_HINT_FORCE_MMQ, ggml_flash_attn_ext_*_sparse_mask),
+# test-expert-window-params (ggml_mul_mat_id_set_expert_window) and
+# test-moe-metadata (llama_model_loader's ctor has no 13-argument overload here).
+llama_build_and_test(test-backend-expert-transfer.cpp)
+target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
+
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Needs non-public ggml{,-backend}-impl.h
+    llama_build_and_test(test-backend-meta-replay.cpp)
+    set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # The kv-stream planner/config/softmax helpers are internal to libllama, so their
 # implementation files are compiled directly into the tests. That keeps the tests
 # working on Windows shared builds, where only LLAMA_API symbols are exported.
