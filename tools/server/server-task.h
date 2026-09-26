@@ -717,6 +717,15 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_cache_payload payload;
 
+    // Canonical identity of the adapter configuration this state was computed under; a load is
+    // only served from an entry whose key matches the requesting slot's current adapter config
+    std::string adapter_config_key;
+
+    // Exact model/execution identity for a sealed VBR payload. Fixed entries
+    // leave this empty because their historical compatibility check remains
+    // the server-local adapter/state codec contract.
+    std::string vbr_execution_identity;
+
     // Exact accounting references held by this logical host node. Authority
     // mode stores one snapshot reference plus one reference per unique shared
     // checkpoint/accelerator allocation; lifecycle-off shadow mode retains
@@ -724,9 +733,25 @@ struct server_prompt_cache_state {
     std::vector<llama_cache_acct_op_id> acct_ops;
     bool accounting_complete = false;
 
+    // recovery proof's non-policy recovery guard. List nodes are stable; authoritative
+    // redundant eviction increments this before prepare and the raw eraser
+    // refuses to destroy the cited survivor until capability close.
+    uint32_t recovery_pins = 0;
+
+    // Automatic pre- family signal. A save sourced from a parent/main slot
+    // receives the provisional lease boundary retention weight; child-task saves do not.
+    // Declared identity replaces this heuristic rather than stacking with it.
+    bool main_family = false;
+    common_cache_family_binding cache_family;
+
     const std::vector<llama_cache_acct_op_id> & release_ops() const noexcept {
         return acct_ops;
     }
+
+    // Request-local observer identity. It lives on the list node so save-time
+    // dedup/splice preserves surviving identities and an allocator-reused
+    // address can never inherit a consumed entry's source id.
+    int32_t cache_plan_source_id = -1;
 
     size_t size() const {
         size_t res = payload.size();
@@ -762,6 +787,21 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // ---------------------------------------------------------------------
+    // group C tip: the only part of the server_prompt_cache rewrite that the
+    // cache-plan observation face actually calls. Everything else in that
+    // class (118 members, 69 out-of-line bodies, 26 types) stays out until a
+    // consumer lands. Verbatim from the fork; coordinates on each line.
+    // ---------------------------------------------------------------------
+    // fork server-task.h:1379
+    int32_t cache_plan_next_source_id = 0;
+
+    // fork server-task.h:1567 / server-task.cpp:2418
+    void cache_plan_begin_inventory() noexcept;
+    bool cache_plan_get_source_id(
+        server_prompt_cache_state & state,
+        int32_t & source_id) noexcept;
 };
 
 // used exclusively by router mode

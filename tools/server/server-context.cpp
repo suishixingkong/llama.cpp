@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-cache-authority.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -1129,6 +1130,23 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // ---------------------------------------------------------------------
+    // group C tip: the server_context_impl handles the cache-plan observation
+    // face dereferences. The authority/retention machinery behind them is NOT
+    // part of this landing -- only the handles, so the class compiles. They
+    // stay null until the constructor wiring lands; every reader already
+    // null-checks (the fork guarantees it, because an ordinary fixed-cache run
+    // has no authority at all).
+    // Deliberately absent: cache_retention_metadata (no reader in the spliced
+    // set) and vbr_idle_frontier_queries (needs the frontier-query type, which
+    // is only reachable through the retention wave, not through observation).
+    // Verbatim declarations from the fork, coordinates on each line.
+    // ---------------------------------------------------------------------
+    // fork server-context.cpp:3534
+    std::unique_ptr<server_cache_authority> cache_authority;
+    // fork server-context.cpp:3481
+    llama_context_ptr ctx_dft_shared;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 

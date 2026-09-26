@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-cache-plan-authority.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1812,6 +1813,22 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// group C tip: the only two server_prompt_cache members the cache-plan
+// observation face calls. Verbatim from the fork (server-task.cpp:2418).
+void server_prompt_cache::cache_plan_begin_inventory() noexcept {
+    cache_plan_next_source_id = 0;
+    for (auto & state : states) {
+        state.cache_plan_source_id = -1;
+    }
+}
+
+bool server_prompt_cache::cache_plan_get_source_id(
+        server_prompt_cache_state & state,
+        int32_t & source_id) noexcept {
+    return server_cache_plan_assign_source_id(
+        state.cache_plan_source_id, cache_plan_next_source_id, source_id);
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
