@@ -794,6 +794,13 @@ struct server_prompt_cache_vbr_frontier_query {
     bool stem_durable = false;
 };
 
+struct server_prompt_cache_vbr_frontier_batch_diagnostics {
+    uint64_t states_visited = 0;
+    uint64_t vbr_states_visited = 0;
+    uint64_t stem_artifact_lookups = 0;
+    uint64_t stem_matches = 0;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -832,6 +839,28 @@ struct server_prompt_cache {
     bool cache_plan_get_source_id(
         server_prompt_cache_state & state,
         int32_t & source_id) noexcept;
+    // fork server-task.h:1696
+    server_retention_sidecar_store * retention_obs = nullptr;
+    // fork server-task.h:1651 (the fork marks this private; this struct has no access specifiers)
+    // Reused by the scheduler-owned durability classifier. Durable stems
+    // accumulate across capture waves, so this arena follows the full host
+    // candidate bound rather than the <=8 manifests admitted by one wave.
+    mutable std::vector<server_prompt_cache_vbr_frontier_query *>
+        vbr_stem_witness_arena;
+
+    // Read-only suppression check for an already-durable shorter frontier.
+    // The host package must be exact for coverage and the current live prompt
+    // must still carry that exact prefix under the same source epoch.
+    // Sorts the populated prefix of the caller-owned query arena and marks
+    // immutable identity matches in one bounded pass over host states. This
+    // is selection evidence, not permission to clear a live source.
+    bool mark_vbr_frontiers(
+        server_prompt_cache_vbr_frontier_query * queries,
+        size_t query_count,
+        server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics =
+            nullptr)
+        const noexcept;
+
 };
 
 // used exclusively by router mode

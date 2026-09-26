@@ -2075,3 +2075,167 @@ void server_prompt_cache::update() {
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
+
+
+// fork server-task.cpp:2607 (161 lines, verbatim)
+bool server_prompt_cache::mark_vbr_frontiers(
+        server_prompt_cache_vbr_frontier_query * queries,
+        size_t query_count,
+        server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics)
+        const noexcept {
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+    const auto identity_less = [](const auto & lhs, const auto & rhs) {
+        return std::tie(
+                   lhs.sequence_epoch, lhs.token_count, lhs.next_position,
+                   lhs.execution_identity, lhs.adapter_config_identity,
+                   lhs.media_content_identity) <
+               std::tie(
+                   rhs.sequence_epoch, rhs.token_count, rhs.next_position,
+                   rhs.execution_identity, rhs.adapter_config_identity,
+                   rhs.media_content_identity);
+    };
+    try {
+        if ((query_count != 0 && !queries) ||
+            query_count > SERVER_RETENTION_MAX_CANDIDATES) {
+            return false;
+        }
+        if (query_count == 0) {
+            return true;
+        }
+        vbr_stem_witness_arena.clear();
+        bool has_stem_witness = false;
+        for (size_t i = 0; i < query_count; ++i) {
+            auto & query = queries[i];
+            query.durable = false;
+            query.token_identity_digest = {};
+            query.token_identity_ready = false;
+            query.stem_durable = false;
+            const auto & identity = query.identity;
+            if (query.slot_id < 0 ||
+                !query.prompt ||
+                identity.execution_identity.empty() ||
+                identity.adapter_config_identity.empty() ||
+                identity.media_content_identity.empty() ||
+                identity.sequence_epoch == 0 ||
+                identity.token_count <= 0 ||
+                identity.next_position <= 0) {
+                return false;
+            }
+            if (query.expected_stem_artifact.v != 0) {
+                if (!retention_obs) {
+                    return false;
+                }
+                has_stem_witness = true;
+            }
+        }
+        std::sort(queries, queries + query_count, [&](const auto & lhs,
+                                                      const auto & rhs) {
+            if (identity_less(lhs.identity, rhs.identity)) {
+                return true;
+            }
+            if (identity_less(rhs.identity, lhs.identity)) {
+                return false;
+            }
+            return lhs.slot_id < rhs.slot_id;
+        });
+        // Sorting moves query objects in place. Capture their final addresses
+        // only after identity ordering so each pointer retains its witness.
+        if (has_stem_witness &&
+            vbr_stem_witness_arena.capacity() < query_count) {
+            vbr_stem_witness_arena.reserve(query_count);
+        }
+        for (size_t i = 0; i < query_count; ++i) {
+            if (queries[i].expected_stem_artifact.v != 0) {
+                vbr_stem_witness_arena.push_back(&queries[i]);
+            }
+        }
+        std::sort(
+            vbr_stem_witness_arena.begin(),
+            vbr_stem_witness_arena.end(),
+            [](const auto * lhs, const auto * rhs) {
+                return std::tie(
+                           lhs->expected_stem_artifact.v, lhs->slot_id) <
+                       std::tie(
+                           rhs->expected_stem_artifact.v, rhs->slot_id);
+            });
+        for (const auto & state : states) {
+            if (diagnostics) {
+                ++diagnostics->states_visited;
+            }
+            if (state.payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                continue;
+            }
+            if (diagnostics) {
+                ++diagnostics->vbr_states_visited;
+            }
+            const auto * artifact = state.payload.vbr_artifact();
+            if (!artifact || !artifact->package()) {
+                return false;
+            }
+            const auto & identity = artifact->package().manifest().identity;
+            std::array<uint8_t, 32> host_token_identity = {};
+            auto current = std::lower_bound(
+                queries, queries + query_count, identity,
+                [&](const auto & query, const auto & key) {
+                    return identity_less(query.identity, key);
+                });
+            for (; current != queries + query_count &&
+                    !identity_less(identity, current->identity) &&
+                    !identity_less(current->identity, identity);
+                 ++current) {
+                if (!current->token_identity_ready) {
+                    if (!current->prompt->tokens.retention_token_digest(
+                            current->token_identity_digest)) {
+                        return false;
+                    }
+                    current->token_identity_ready = true;
+                }
+                if (!state.prompt.tokens.retention_token_digest(
+                        host_token_identity)) {
+                    return false;
+                }
+                if (state.adapter_config_key ==
+                        current->identity.adapter_config_identity &&
+                    state.vbr_execution_identity ==
+                        current->identity.execution_identity &&
+                    host_token_identity ==
+                        current->token_identity_digest) {
+                    current->durable = true;
+                }
+            }
+            if (!vbr_stem_witness_arena.empty()) {
+                if (diagnostics) {
+                    ++diagnostics->stem_artifact_lookups;
+                }
+                const auto host_artifact = retention_obs->artifact_id(
+                    server_retention_instance_key::for_host_entry(&state));
+                const auto found = std::lower_bound(
+                    vbr_stem_witness_arena.begin(),
+                    vbr_stem_witness_arena.end(),
+                    host_artifact.v,
+                    [](const auto * witness, uint64_t value) {
+                        return witness->expected_stem_artifact.v < value;
+                    });
+                for (auto current_stem = found;
+                     current_stem != vbr_stem_witness_arena.end() &&
+                     (*current_stem)->expected_stem_artifact == host_artifact;
+                     ++current_stem) {
+                    (*current_stem)->stem_durable = true;
+                    if (diagnostics) {
+                        ++diagnostics->stem_matches;
+                    }
+                }
+            }
+        }
+        return true;
+    } catch (...) {
+        for (size_t i = 0; i < query_count; ++i) {
+            queries[i].durable = false;
+            queries[i].stem_durable = false;
+        }
+        return false;
+    }
+}
