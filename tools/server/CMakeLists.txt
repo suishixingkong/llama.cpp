@@ -11,6 +11,9 @@ add_library(${TARGET} STATIC
     server-task.h
     server-cache-authority.cpp
     server-cache-authority.h
+    server-cache-control.cpp
+    server-cache-control.h
+    server-cache-control-wire.cpp
     server-cache-destruction-quote.cpp
     server-cache-destruction-quote.h
     server-cache-plan-authority.cpp
@@ -32,6 +35,8 @@ add_library(${TARGET} STATIC
     server-recurrent-expansion.h
     server-retention-sidecar.cpp
     server-retention-sidecar.h
+    server-vbr-artifact-store.cpp
+    server-vbr-artifact-store.h
     server-vbr-capture-readiness.cpp
     server-vbr-capture-readiness.h
     server-vbr-prompt-cache-support.cpp

@@ -4081,6 +4081,37 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     return io.n_bytes();
 }
 
+size_t llama_context::state_seq_write_data_stream(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    io.write(&io_magic, sizeof(io_magic));
+    io.write(&seq_id, sizeof(seq_id));
+    return state_seq_write_data(io, seq_id, flags);
+}
+
+size_t llama_context::state_seq_read_data_stream(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    try {
+        uint32_t magic_read = 0;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        llama_seq_id source_sequence = -1;
+        io.read(&source_sequence, sizeof(source_sequence));
+        if (source_sequence < 0) {
+            throw std::runtime_error("invalid source sequence id");
+        }
+        return state_seq_read_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 //
 // perf
 //

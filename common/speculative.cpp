@@ -2959,6 +2959,130 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 }
 
+// FORK-DIFF: the DFlash ring-buffer state family.
+//
+// The fork dispatches each of these over the entries of `spec->impls` whose type is
+// COMMON_SPECULATIVE_TYPE_DFLASH, calling the matching method on
+// `common_speculative_impl_dflash` - a fork-only speculative backend that owns a
+// GPU-mirrored KV ring and depends on the fork's draft-model support
+// (src/models/dflash_draft.cpp and friends). None of that exists in this tree and
+// no such implementation can be constructed, so `impls` never contains a DFLASH
+// entry here.
+//
+// Every definition below therefore returns exactly what the fork's own loop returns
+// for a spec with no DFLASH entry - the values are the fork's semantics for the
+// "this process has no DFlash ring" case, not invented placeholders. The artifact
+// store consumes them fail-closed: a capture or restore of a typed-accelerator
+// companion cannot succeed, and it never registers such a companion in the first
+// place because the `request.accelerator` that would select the provider is only
+// ever set by the fork's server-context.cpp, which is not ported.
+//
+// When the DFlash backend is ported, replace these bodies with the fork's dispatchers
+// (buun-llama-cpp/common/speculative.cpp:6685..6880) and delete this comment.
+
+size_t common_speculative_ring_state_size(const common_speculative * spec) {
+    // fork loop: sums the DFLASH impls' ring_state_size() -> 0 with no impl
+    (void) spec;
+    return 0;
+}
+
+void common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size) {
+    // fork loop: copies each DFLASH impl's ring image out -> nothing to copy
+    (void) spec;
+    (void) buf;
+    (void) size;
+}
+
+bool common_speculative_ring_state_write(
+        const common_speculative * spec,
+        llama_io_write_i & output) {
+    // fork: `return written != 0;` -> false with no impl
+    (void) spec;
+    (void) output;
+    return false;
+}
+
+bool common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size) {
+    // fork: true only if some DFLASH impl accepted the image -> false
+    (void) spec;
+    (void) buf;
+    (void) size;
+    return false;
+}
+
+bool common_speculative_ring_state_read(
+        common_speculative * spec,
+        llama_io_read_i & input,
+        size_t size) {
+    // fork: `selected && selected->ring_state_read(...)` -> false with no impl
+    (void) spec;
+    (void) input;
+    (void) size;
+    return false;
+}
+
+bool common_speculative_ring_state_get_currency(
+        const common_speculative * spec,
+        common_speculative_ring_state_currency & output) {
+    output = {};
+    output.terminal = -1;
+    // fork: `if (!selected) return false;` -> false, with the cleared output above
+    (void) spec;
+    return false;
+}
+
+bool common_speculative_ring_state_matches_frontier(
+        const common_speculative * spec,
+        const uint8_t * buf,
+        size_t size,
+        llama_pos expected_terminal) {
+    // fork: `return matched != 0 && matched == size;` -> false with no impl
+    (void) spec;
+    (void) buf;
+    (void) size;
+    (void) expected_terminal;
+    return false;
+}
+
+bool common_speculative_ring_state_terminal(
+        const common_speculative * spec,
+        llama_pos & terminal) {
+    terminal = -1;
+    // fork: `return found;` -> false with no impl
+    (void) spec;
+    return false;
+}
+
+// The one member of this family with real logic: a pure function of the serialized
+// ring header. Ported verbatim from the fork.
+bool common_speculative_ring_state_serialized_terminal(
+        const uint8_t * buf,
+        size_t size,
+        llama_pos & terminal) {
+    terminal = -1;
+    if (!buf || size < 6*sizeof(int32_t)) {
+        return false;
+    }
+    int32_t committed = 0;
+    std::memcpy(&committed, buf+2*sizeof(int32_t), sizeof(committed));
+    if (committed <= 0) {
+        return false;
+    }
+    terminal = llama_pos(committed-1);
+    return true;
+}
+
+bool common_speculative_ring_state_empty(const common_speculative * spec) {
+    // fork: returns false only if some DFLASH impl is non-empty -> true with no impl
+    (void) spec;
+    return true;
+}
+
+void common_speculative_ring_state_reset(common_speculative * spec) {
+    // fork loop: resets each DFLASH impl -> nothing to reset
+    (void) spec;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
