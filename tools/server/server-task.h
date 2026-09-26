@@ -20,6 +20,18 @@
 #include "server-common.h"
 #include "server-cache-lease.h"
 
+
+// group A phase 2: verbatim from the fork server-task.h
+
+// fork server-task.h:29  (6 lines)
+constexpr common_cache_plan_payload_kind server_cache_plan_payload_kind(
+        server_prompt_cache_payload_kind kind) noexcept {
+    return kind == server_prompt_cache_payload_kind::vbr_artifact
+        ? common_cache_plan_payload_kind::vbr_artifact
+        : common_cache_plan_payload_kind::fixed_state;
+}
+
+
 // Derived lease identity for one exact logical prefix. Fails (and leaves `out`
 // unusable) when any component is missing, so a caller can never key a lease on
 // a partially known identity.
@@ -762,6 +774,24 @@ struct server_prompt_cache_state {
 
         return res;
     }
+};
+
+// Caller-owned batch inventory for automatic durability classification. The
+// canonical artifact identity narrows the state-list search; `prompt` supplies
+// the exact token witness. The cache marks rows in one state-list pass.
+struct server_prompt_cache_vbr_frontier_query {
+    int32_t slot_id = -1;
+    vbr_artifact_identity_block identity;
+    const server_prompt * prompt = nullptr;
+    std::array<uint8_t, 32> token_identity_digest = {};
+    bool token_identity_ready = false;
+    bool durable = false;
+    // Optional immutable host-node witness for a previously published stem.
+    // The scheduler separately binds this artifact to the unchanged full
+    // source attempt and selected coverage; this batch only proves that exact
+    // destination association remains live.
+    llama_cache_acct_artifact_id expected_stem_artifact;
+    bool stem_durable = false;
 };
 
 struct server_prompt_cache {

@@ -40,6 +40,28 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include "server-cache-destruction-quote.h"
+#include "server-cache-plan-authority.h"
+#include "server-cache-plan-preflight-internal.h"
+#include "server-cache-yield.h"
+#include "server-vbr-artifact-store.h"
+#include "server-vbr-capture-readiness.h"
+#include "server-vbr-prompt-cache-support.h"
+#include "server-recurrent-expansion.h"
+#include "common-cache-plan.h"
+#include "gguf.h"
+#include "../../src/llama-ext.h"
+#include "../../src/llama-memory-hybrid-idx.h"
+#include "../../src/llama-sha256.h"
+#include <nlohmann/json.hpp>
+
+// group A phase 2: file-scope helper, verbatim from the fork
+
+// fork server-context.cpp:77
+static json server_json_from_ordered(nlohmann::ordered_json value) {
+    return json::parse(value.dump());
+}
+
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -899,6 +921,48 @@ struct server_slot {
     // fork: server-context.cpp:2571 `return spec ? spec.get() : spec_shared;`
     common_speculative * get_spec() const {
         return spec;
+    }
+
+    // ---------------------------------------------------------------------
+    // group A phase 2: slot state, verbatim from the fork
+    // ---------------------------------------------------------------------
+
+    // fork server-context.cpp:2303
+    bool frontier_ratchet_flipped = false;
+    // fork server-context.cpp:1511
+    server_retention_sidecar_store * retention_obs = nullptr;
+    // fork server-context.cpp:1512
+    server_cache_lease_table * lease_obs = nullptr;
+    // fork server-context.cpp:1517
+    const std::string * lease_execution_identity = nullptr;
+    // fork server-context.cpp:1518
+    server_cache_authority * lifecycle_authority = nullptr;
+
+    // fork server-context.cpp:1675  (4 lines)
+    bool hard_lease_blocks_live_prefix() const {
+        return hard_lease_blocks_live_range(
+            0, static_cast<uint64_t>(std::max(0, prompt.n_tokens())));
+    }
+
+    // fork server-context.cpp:1655  (19 lines)
+    bool hard_lease_blocks_live_range(
+            uint64_t first_token, uint64_t token_count) const {
+        if (!lifecycle_authority || !lease_obs || !retention_obs ||
+            !lease_execution_identity ||
+            prompt.n_tokens() <= 0 || token_count == 0) {
+            return false;
+        }
+        const auto artifact = retention_obs->artifact_id(
+            server_retention_instance_key::for_slot(id));
+        server_cache_lease_identity identity;
+        if (artifact.v == 0 || !server_cache_lease_build_identity(
+                *lease_execution_identity, lora_config_identity(lora),
+                prompt.tokens, prompt.n_tokens(), identity)) {
+            return false;
+        }
+        return server_cache_hard_lease_blocks_range(
+            lease_obs, artifact, identity, prompt.sequence_epoch,
+            first_token, token_count);
     }
 
 };
@@ -5204,6 +5268,70 @@ private:
         status = server_vbr_artifact_capture_status::ok;
         return true;
     }
+    // ---------------------------------------------------------------------
+    // group A phase 2: prereq members, verbatim from the fork
+    // ---------------------------------------------------------------------
+
+    // fork server-context.cpp:3548
+    std::vector<server_prompt_cache_vbr_frontier_query>
+        vbr_idle_frontier_queries;
+    // fork server-context.cpp:3540
+    std::unique_ptr<server_retention_sidecar_store> cache_retention_metadata;
+
+    // fork server-context.cpp:5464  (6 lines)
+    server_retention_sidecar_store * live_retention_owner() noexcept {
+        if (cache_authority) {
+            return &cache_authority->retention;
+        }
+        return cache_retention_metadata.get();
+    }
+
+    // fork server-context.cpp:5556  (8 lines)
+    server_slot * find_slot_by_id(int32_t slot_id) noexcept {
+        const auto found = std::find_if(
+            slots.begin(), slots.end(),
+            [slot_id](const server_slot & slot) {
+                return slot.id == slot_id;
+            });
+        return found == slots.end() ? nullptr : &*found;
+    }
+
+    // fork server-context.cpp:4704  (21 lines)
+    bool checkpoint_frontier_is_current(
+            const server_slot & slot,
+            const common_prompt_checkpoint & checkpoint,
+            const std::string & adapter_identity) const {
+        const auto & frontier = checkpoint.computation_frontier;
+        if (!frontier.valid() ||
+            frontier.sequence_epoch != slot.prompt.sequence_epoch ||
+            frontier.execution_identity != frontier_execution_identity ||
+            frontier.adapter_config_identity != adapter_identity ||
+            frontier.token_count != checkpoint.n_tokens ||
+            checkpoint.pos_max < 0 ||
+            frontier.next_position <= 0 ||
+            frontier.next_position - 1 != checkpoint.pos_max) {
+            return false;
+        }
+
+        std::string media_identity;
+        return slot.prompt.tokens.media_content_identity(
+                   frontier.token_count, media_identity) &&
+               media_identity == frontier.media_content_identity;
+    }
+
+    // fork server-context.cpp:11170  (11 lines)
+    void assert_scheduler_thread(
+            std::thread::id & pinned,
+            const char * what) {
+        const auto current = std::this_thread::get_id();
+        if (pinned == std::thread::id{}) {
+            pinned = current;
+        }
+        if (pinned != current) {
+            GGML_ABORT("%s\n", what);
+        }
+    }
+
 };
 
 //

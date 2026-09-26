@@ -47,6 +47,20 @@ private:
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
+
+    // group A phase 2: verbatim from the fork server-queue.h
+
+    // fork server-queue.h:124  (9 lines)
+    bool has_deferred_for_slot(int id_slot) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & task : queue_tasks_deferred) {
+            if (task.id_slot == id_slot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     ~server_queue() { worker_stop(); }
 
     // Add a new task to the end of the queue
