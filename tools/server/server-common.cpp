@@ -484,6 +484,46 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
     return idx;
 }
 
+bool server_tokens::media_content_identity(int64_t n_tokens, std::string & out) const {
+    if (n_tokens < 0 || n_tokens > (int64_t) tokens.size()) {
+        return false;
+    }
+
+    // Length-prefix every variable-width value so the comparison key is
+    // unambiguous even if a future mtmd content id contains punctuation. The
+    // key is process-local checkpoint metadata, not a portable file format.
+    out = "server-media-prefix-v1";
+
+    size_t n_chunks = 0;
+    for (const auto & entry : map_idx_to_media) {
+        const size_t start = entry.first;
+        if (start >= (size_t) n_tokens) {
+            break;
+        }
+
+        const auto & chunk = entry.second;
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+        const char * id = mtmd_input_chunk_get_id(chunk.get());
+
+        // A frontier in the middle of a media chunk has no coherent media
+        // prefix. Empty ids are likewise unverifiable; get_common_prefix
+        // already treats them as divergence.
+        if (start + n_tok > (size_t) n_tokens || id == nullptr || id[0] == '\0') {
+            out.clear();
+            return false;
+        }
+
+        const size_t id_len = std::strlen(id);
+        out += string_format("|%zu:%zu:%d:%zu:", start, n_tok, n_pos, id_len);
+        out.append(id, id_len);
+        n_chunks++;
+    }
+
+    out += string_format("|chunks:%zu", n_chunks);
+    return true;
+}
+
 std::string server_tokens::str() const {
     std::ostringstream oss;
     oss << "tokens: ";

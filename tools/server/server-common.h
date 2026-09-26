@@ -201,6 +201,12 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    // Canonical comparison key for every media chunk wholly contained in the
+    // first n_tokens logical tokens. Returns false when the prefix cuts through
+    // a media chunk or a chunk has no content identity; callers must then fail
+    // closed rather than publish a reusable frontier.
+    bool media_content_identity(int64_t n_tokens, std::string & out) const;
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx

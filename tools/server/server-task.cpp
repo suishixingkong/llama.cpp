@@ -1708,6 +1708,24 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+bool server_cache_lease_build_identity(
+        const std::string & execution_identity,
+        const std::string & adapter_identity,
+        const server_tokens & tokens,
+        int64_t coverage_tokens,
+        server_cache_lease_identity & out) {
+    if (execution_identity.empty() ||
+        adapter_identity.empty() ||
+        coverage_tokens < 0) {
+        return false;
+    }
+    out.execution_identity = execution_identity;
+    out.adapter_config_identity = adapter_identity;
+    return tokens.media_content_identity(
+               coverage_tokens, out.media_content_identity) &&
+           out.valid();
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {

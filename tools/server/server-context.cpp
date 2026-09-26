@@ -108,6 +108,60 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+server_speculative_decode_terminal
+server_speculative_decode_terminal_resolve(
+        int decode_result,
+        bool hard_seal_terminal,
+        bool single_token_batch,
+        bool selected_exception,
+        bool speculative_ok) noexcept {
+    if (decode_result != 0) {
+        if (decode_result == 1 && hard_seal_terminal) {
+            return server_speculative_decode_terminal::preserve_hard_seal;
+        }
+        if (decode_result == -1 || decode_result < -1 ||
+                (decode_result == 1 && single_token_batch)) {
+            return server_speculative_decode_terminal::ordinary_ret_error;
+        }
+        return server_speculative_decode_terminal::retry;
+    }
+    if (selected_exception || !speculative_ok) {
+        return server_speculative_decode_terminal::reset_committed_then_throw;
+    }
+    return server_speculative_decode_terminal::success;
+}
+
+bool server_vbr_empty_handoff_lookup_allowed(
+        const server_vbr_empty_handoff_gate & gate) noexcept {
+    return gate.slot_count == 1 && !gate.hard_lease &&
+        !gate.deferred_task &&
+        gate.incumbent_supported;
+}
+
+bool server_vbr_empty_handoff_allowed(
+        const server_vbr_empty_handoff_gate & gate) noexcept {
+    return server_vbr_empty_handoff_lookup_allowed(gate) &&
+        gate.incoming_prefix > gate.incumbent_lcp &&
+        gate.durable_incumbent_prefix > gate.incumbent_lcp &&
+        !gate.exact_incumbent_durable && gate.family_matches;
+}
+
+bool server_vbr_live_source_displacement_allowed(
+        bool kv_unified,
+        size_t slot_count) noexcept {
+    // Empty import is a whole-child contract. Clearing one sequence out of a
+    // multi-slot unified tree leaves foreign rows behind, so retain the live
+    // source and let the atomic occupied-replacement route preserve them.
+    return !kv_unified || slot_count <= 1;
+}
+
+bool server_vbr_stem_matches_capture_source(
+        bool valid,
+        const std::array<uint8_t, 32> & stem_source,
+        const std::array<uint8_t, 32> & capture_source) noexcept {
+    return valid && stem_source == capture_source;
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {

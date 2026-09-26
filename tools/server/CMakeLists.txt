@@ -97,3 +97,18 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# C++ unit test for the pure cache/VBR decision helpers (slice 7d part 1). Lives here
+# rather than tests/ because that subdir is configured before tools/, so the
+# server-context target is not yet defined there. Model-free — runs on CPU.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-server-vbr-predicates
+        ${PROJECT_SOURCE_DIR}/tests/test-server-vbr-predicates.cpp)
+    target_link_libraries(test-server-vbr-predicates PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-server-vbr-predicates PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-vbr-predicates PRIVATE cxx_std_17)
+    add_test(NAME test-server-vbr-predicates COMMAND test-server-vbr-predicates)
+    set_property(TEST test-server-vbr-predicates PROPERTY LABELS main)
+endif()

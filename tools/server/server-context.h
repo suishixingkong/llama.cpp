@@ -6,12 +6,59 @@
 
 #include "json.h"
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <set>
 
 struct server_context_impl; // private implementation
+
+enum class server_speculative_decode_terminal {
+    success,
+    preserve_hard_seal,
+    ordinary_ret_error,
+    retry,
+    reset_committed_then_throw,
+};
+
+server_speculative_decode_terminal
+server_speculative_decode_terminal_resolve(
+    int decode_result,
+    bool hard_seal_terminal,
+    bool single_token_batch,
+    bool selected_exception,
+    bool speculative_ok) noexcept;
+
+// Inputs to the empty-slot handoff decision. The scheduler fills these from the
+// live slot table; the predicates below are pure so the policy can be reasoned
+// about (and tested) without a server.
+struct server_vbr_empty_handoff_gate {
+    size_t slot_count = 0;
+    uint64_t incoming_prefix = 0;
+    uint64_t incumbent_lcp = 0;
+    uint64_t durable_incumbent_prefix = 0;
+    bool exact_incumbent_durable = false;
+    bool hard_lease = false;
+    bool deferred_task = false;
+    bool incumbent_supported = false;
+    bool family_matches = false;
+};
+
+bool server_vbr_empty_handoff_lookup_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_empty_handoff_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_live_source_displacement_allowed(
+    bool kv_unified,
+    size_t slot_count) noexcept;
+
+bool server_vbr_stem_matches_capture_source(
+    bool valid,
+    const std::array<uint8_t, 32> & stem_source,
+    const std::array<uint8_t, 32> & capture_source) noexcept;
 
 struct server_context_meta {
     std::string build_info;

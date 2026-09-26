@@ -11,6 +11,17 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-cache-lease.h"
+
+// Derived lease identity for one exact logical prefix. Fails (and leaves `out`
+// unusable) when any component is missing, so a caller can never key a lease on
+// a partially known identity.
+bool server_cache_lease_build_identity(
+    const std::string & execution_identity,
+    const std::string & adapter_identity,
+    const server_tokens & tokens,
+    int64_t coverage_tokens,
+    server_cache_lease_identity & out);
 
 
 enum server_task_type {
