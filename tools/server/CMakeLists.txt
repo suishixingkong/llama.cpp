@@ -112,3 +112,18 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-server-vbr-predicates COMMAND test-server-vbr-predicates)
     set_property(TEST test-server-vbr-predicates PROPERTY LABELS main)
 endif()
+
+# C++ unit test for the cache-receipt chain (slice 9i). Same reasoning as above:
+# it needs server-common.cpp, which is only reachable through server-context.
+# Model-free — runs on CPU.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-cache-receipt-chain
+        ${PROJECT_SOURCE_DIR}/tests/test-cache-receipt-chain.cpp)
+    target_link_libraries(test-cache-receipt-chain PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-cache-receipt-chain PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-cache-receipt-chain PRIVATE cxx_std_17)
+    add_test(NAME test-cache-receipt-chain COMMAND test-cache-receipt-chain)
+    set_property(TEST test-cache-receipt-chain PROPERTY LABELS main)
+endif()

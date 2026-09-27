@@ -641,6 +641,28 @@ server_tokens format_prompt_rerank(
         const std::string & doc,
         const mtmd_helper_init_opt & init_opt);
 
+// ---- cache receipt ----
+// Untrusted divergence-location hint attached to responses when enabled: a
+// keyed, chained block-hash vector over the slot's cached token prefix,
+// versioned against tokenizer/template identity. Never authorization.
+struct server_cache_receipt {
+    uint32_t                 version = 1;
+    uint32_t                 block_tokens = 1024;
+    std::string              hash_spec;      // "sha256-chain-trunc64/v1" or unkeyed-debug variant
+    std::string              model_identity; // model name/id the chain is scoped to
+    uint64_t                 sequence_epoch = 0;
+    int64_t                  token_count = 0;
+    std::string              adapter_identity;
+    std::vector<std::string> chain;          // one truncated hex digest per block
+};
+
+// Chained keyed hash over token ids: h_i = trunc64(SHA256(key || h_{i-1} || block_i)).
+// Empty key is permitted only when unkeyed_debug is set (caller enforces policy).
+std::vector<std::string> cache_receipt_chain(
+        const std::vector<llama_token> & tokens,
+        uint32_t                          block_tokens,
+        const std::string &               key);
+
 // simple implementation of a pipe
 // used for streaming data between threads
 template<typename T>

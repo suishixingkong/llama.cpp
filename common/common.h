@@ -799,6 +799,12 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
+    // Cache receipt: untrusted divergence-location hint
+    // on responses. Keyed chain by default; unkeyed only behind the debug flag.
+    bool        cache_receipt = false;
+    std::string cache_receipt_key;          // per-session/tenant comparison key
+    bool        cache_receipt_unkeyed_debug = false;
+
     float slot_prompt_similarity = 0.1f;
 
     // batched-bench params

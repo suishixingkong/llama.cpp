@@ -402,6 +402,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
+    // cache receipt (§7.7): serialized JSON attached verbatim when enabled;
+    // empty = no receipt. Built in send_final_response from slot state.
+    json cache_receipt;
+
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
     }

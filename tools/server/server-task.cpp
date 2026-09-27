@@ -390,6 +390,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (!cache_receipt.is_null()) {
+        res["cache_receipt"] = cache_receipt;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 

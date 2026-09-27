@@ -273,6 +273,22 @@ bool server_http_context::init(const common_params & params) {
         return true;
     };
 
+    // Cache receipts protect every dynamic response. Install this hook only
+    // when the feature needs it so everything stays zero-work while disabled.
+    // FORK-DIFF: the fork condition and body also cover --cache-plan-preflight
+    // and --cache-control-api (fork server-http.cpp:316-335), whose params do
+    // not exist in this tree yet. Only the receipt limb is reachable here;
+    // widen this when those two land so no response loses its no-store.
+    if (params.cache_receipt) {
+        srv->set_post_routing_handler([
+                cache_receipt = params.cache_receipt](
+                const httplib::Request & req, httplib::Response & res) {
+            if (cache_receipt && !frontend_paths.count(req.path)) {
+                res.set_header("Cache-Control", "no-store");
+            }
+        });
+    }
+
     // register server middlewares
     srv->set_pre_routing_handler([&params, middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
         if (params.cors_credentials && params.cors_origins == "*") {

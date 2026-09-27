@@ -1892,6 +1892,17 @@ private:
             }
         }
 
+        // cache receipt (§7.7 security contract): keyed by default; an unkeyed
+        // chain leaks prompt-content comparability and requires the explicit
+        // debug flag. Fail closed at startup, never silently downgrade.
+        if (params_base.cache_receipt &&
+            params_base.cache_receipt_key.empty() &&
+            !params_base.cache_receipt_unkeyed_debug) {
+            SRV_ERR("%s\n", "--cache-receipt requires --cache-receipt-key "
+                    "(or --cache-receipt-unkeyed-debug for trusted local use)");
+            return false;
+        }
+
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -2862,6 +2873,34 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+
+        // cache receipt (§7.7): keyed chained block-hash over the slot's cached
+        // token prefix + frontier identity. Untrusted hint, never authorization.
+        // Portable tokenizer/template digests are §7.2 scope; the chain is
+        // versioned by hash_spec + model identity here.
+        if (params_base.cache_receipt) {
+            const llama_tokens receipt_tokens = slot.prompt.tokens.get_text_tokens();
+            std::string identity = lora_config_identity(slot.lora);
+            if (identity == "0") {
+                identity = "base:no-lora";
+            }
+            const bool keyed = !params_base.cache_receipt_key.empty();
+            res->cache_receipt = json {
+                {"version",          1},
+                {"hash_spec",        keyed ? "sha256-chain-trunc64/v1"
+                                           : "sha256-chain-trunc64-unkeyed-debug/v1"},
+                {"block_tokens",     1024},
+                {"model",            slot.task->params.oaicompat_model.empty()
+                                         ? params_base.model.path
+                                         : slot.task->params.oaicompat_model},
+                {"sequence_epoch",   slot.prompt.sequence_epoch},
+                {"token_count",      (int64_t) receipt_tokens.size()},
+                {"adapter_identity", identity},
+                {"chain",            cache_receipt_chain(
+                                         receipt_tokens, 1024,
+                                         params_base.cache_receipt_key)},
+            };
+        }
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;

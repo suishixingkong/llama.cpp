@@ -4544,6 +4544,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-receipt"},
+        "attach a cache receipt (keyed chained block-hash divergence hint) to responses (default: disabled)",
+        [](common_params & params) {
+            params.cache_receipt = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_RECEIPT"));
+    add_opt(common_arg(
+        {"--cache-receipt-key"}, "KEY",
+        "per-session/tenant comparison key for the cache-receipt chain (required unless --cache-receipt-unkeyed-debug)",
+        [](common_params & params, const std::string & value) {
+            params.cache_receipt_key = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_RECEIPT_KEY"));
+    add_opt(common_arg(
+        {"--cache-receipt-unkeyed-debug"},
+        "allow an UNKEYED cache-receipt chain (trusted local/debug only; leaks prompt-content comparability)",
+        [](common_params & params) {
+            params.cache_receipt_unkeyed_debug = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
