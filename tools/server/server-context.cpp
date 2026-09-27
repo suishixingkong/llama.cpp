@@ -4378,8 +4378,11 @@ private:
                             }
                         }*/
 
+                        // fork 9k-b2-i: n_past_common/n_past_keep declarations (fork 16315-16318)
                         // keep track how many tokens we can reuse from the previous state
-                        int n_past = 0;
+                        int    n_past        = 0;
+                        size_t n_past_common = 0;
+                        size_t n_past_keep   = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4432,15 +4435,35 @@ private:
                                 return;
                             }
 
+                        // fork 9k-b2-i: n_cached_before/n_content_lcp (fork 16339-16351)
+                            // Gate-5 edit-regime observation. Capture the logical
+                            // branch point before checkpoint restore or VBR policy
+                            // can rewind the physical frontier. The raw token LCP
+                            // and actually reusable LCP are intentionally separate:
+                            // adapter/alora constraints can add replay work without
+                            // changing where the user's content diverged.
+                            const size_t n_cached_before = slot.prompt.tokens.size();
+                            const size_t n_content_lcp =
+                                slot.prompt.tokens.get_common_prefix(input_tokens);
+
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                n_past = (int) n_content_lcp;
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
+                        // fork 9k-b2-i: n_past_common/n_past_keep assignment (fork 16359-16365)
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
+
+                                // Preserve the true token LCP before checkpoint restore
+                                // rewinds n_past to a smaller physical frontier. n_past_keep is the
+                                // separately bounded amount that prompt.tokens may continue to
+                                // claim after restore; see the restore-site recurrent guard below.
+                                // Keeping token bookkeeping never mutates KV/state by itself.
+                                n_past_common = n_past;
+                                n_past_keep   = n_past_common;
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
@@ -4482,10 +4505,35 @@ private:
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
                                             //}
 
+                        // fork 9k-b2-i: cache-reuse splice invalidation (fork 16407-16434)
+                                            // The splice rewrites live cell positions (and later
+                                            // re-RoPEs their K bytes) beneath any retained context
+                                            // checkpoint. On non-hybrid (e.g. pure-SWA) models the
+                                            // checkpoint selector has no epoch guard, so a stale
+                                            // checkpoint over spliced cells would restore silently
+                                            // wrong state. Invalidate before the first mutation.
+                                            slot.observe_live_range_drop(
+                                                server_cache_destruction_reason::live_prefix_replace,
+                                                true);
+                                            if (!slot.prompt.checkpoints.empty()) {
+                                                SLT_WRN(slot, "cache-reuse splice invalidates %zu context checkpoint(s)\n",
+                                                        slot.prompt.checkpoints.size());
+                                                (void) slot.checkpoint_drop_joined_impl(
+                                                    slot.prompt.checkpoints.begin(),
+                                                    slot.prompt.checkpoints.end());
+                                            }
+
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            ::server_cache_live_range_drop_impl(
+                                                ctx_tgt, slot.id, head_p, head_c);
+                                            common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
+
+                                            if (ctx_dft) {
+                                                ::server_cache_live_range_drop_impl(
+                                                    ctx_dft, slot.id, head_p, head_c);
+                                                common_context_seq_add(ctx_dft, slot.id, head_c, head_c + n_match, kv_shift);
+                                            }
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -4501,9 +4549,41 @@ private:
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
+                        // fork 9k-b2-i: edit/divergence sample + speculative rewind (fork 16455-16484)
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            const size_t n_reusable_lcp =
+                                slot.task->params.cache_prompt ? n_past_common : 0;
+                            const size_t n_rewind =
+                                n_cached_before > n_content_lcp
+                                    ? n_cached_before - n_content_lcp
+                                    : 0;
+                            const size_t n_append =
+                                input_tokens.size() > n_content_lcp
+                                    ? input_tokens.size() - n_content_lcp
+                                    : 0;
+                            SLT_INF(
+                                slot,
+                                "edit/divergence sample "
+                                "(cached/incoming/lcp/reusable/rewind/append/cache_prompt) = "
+                                "(%zu/%zu/%zu/%zu/%zu/%zu/%d)\n",
+                                n_cached_before, input_tokens.size(),
+                                n_content_lcp, n_reusable_lcp,
+                                n_rewind, n_append,
+                                slot.task->params.cache_prompt ? 1 : 0);
+
+                            if (n_rewind > 0) {
+                                // A deferred speculative carry belongs to the discarded
+                                // suffix, even when its numeric positions happen to fall
+                                // below the retained LCP. Preserve the reusable drafter
+                                // prefix, but invalidate branch-local proposal state at
+                                // the scheduler's semantic rewind boundary.
+                                common_speculative_sequence_transition(
+                                    slot.get_spec(), slot.id,
+                                    common_speculative_sequence_event::prompt_rewind);
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -4514,11 +4594,34 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
+                        // fork 9k-b2-i: complete_vbr_import + fail-closed desync (fork 16494-16521)
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                const bool complete_vbr_import =
+                                    slot.vbr_imported_complete_frontier >=
+                                        uint64_t(n_past);
+                                slot.vbr_imported_complete_frontier = 0;
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
-                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
+                                    // Fail-closed coordinated restore. The token ledger claims a
+                                    // prefix (n_past > 0) but this sequence's KV is empty (pos_min == -1) --
+                                    // a token-ledger/KV desync. Upstream GGML_ABORTs here, taking down the
+                                    // whole server (every client) on a "should not happen" invariant. The
+                                    // Transactional save and exact-size validation close the known host-cache route (empty-main select + non-
+                                    // consuming both-or-nothing load); this converts any remaining/latent
+                                    // desync into a per-slot recovery, matching the fork's recoverable-failure
+                                    // rule (llama-kv-cache.cpp VBR try_map: "fail this batch recoverably
+                                    // instead of a process abort killing every client"). Coordinate the two
+                                    // structures -- clear KV (tgt+dft) + the stale ledger via prompt_clear --
+                                    // and full-reprocess. Loud ERR so a real desync is never silently masked.
+                                    SLT_ERR(slot, "token-ledger/KV desync (n_past = %d, pos_min = -1, tokens = %d, seq_id = %d) -- failing closed: clearing slot and reprocessing from scratch\n",
+                                            n_past, (int) slot.prompt.tokens.size(), slot.id);
+                                    slot.mandatory_recovery_reset(
+                                        server_cache_destruction_reason::restore_failure);
+                                    n_past            = 0;
+                                    n_past_common     = 0;
+                                    n_past_keep       = 0;
+                                    pos_next          = 0;
+                                    slot.cache_status = "full reprocess: token-ledger/KV desync recovered";
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
@@ -4564,7 +4667,8 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                        // fork 9k-b2-i: !complete_vbr_import guard (fork 16566)
+                                if (!complete_vbr_import && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4617,19 +4721,75 @@ private:
                             }
                         }
 
+                        // fork 9k-b2-i: low-LCP reset + exact prompt action (fork 17188-17233)
+                        // dynamic VBR: trade a token-trivial reusable prefix for the lossless
+                        // full reset (n_past -> 0 makes the seq_rm below a full clear; the
+                        // cache empties and the next prepare restores every entry tier)
+                        server_cache_destruction_admission
+                            vbr_low_lcp_admission;
+                        {
+                            const int n_past_before_vbr_reset = n_past;
+                            n_past = vbr_reset_on_low_lcp(
+                                slot, n_past, vbr_low_lcp_admission);
+                            if (n_past < n_past_before_vbr_reset) {
+                                // A VBR reset physically cleared state; do not let true-LCP token
+                                // retention claim the cleared prefix.
+                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                if (n_past == 0) {
+                                    // The full reset physically discarded whatever any
+                                    // provider installed — a policy reset, not a failed
+                                    // attempt, but delivery is revoked either way
+                                    if (slot.cache_plan) {
+                                        slot.cache_plan->revoke_deliveries();
+                                    }
+                                }
+                            }
+                        }
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            const auto exact_prompt_action =
+                                server_slot_exact_prompt_action_resolve(
+                                    size_t(slot.task->n_tokens()),
+                                    slot.task->need_sampling(),
+                                    slot.diff_self_spec,
+                                    slot.frontier_logits_matches());
+                            if (exact_prompt_action.use_frontier_logits) {
+                                slot.frontier_logits.pending = true;
+                                SLT_INF(slot,
+                                    "using authenticated frontier logits for exact prompt hit (n_past = %d)\n",
+                                    n_past);
+                            } else {
+                                SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                                n_past = int(exact_prompt_action.reusable_tokens);
+                                // The last token must really be re-evaluated for logits; preserving it
+                                // only in token bookkeeping would skip that decode.
+                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            }
                         }
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
+                        // fork 9k-b2-i: admission-aware ledger truncate (fork 17238-17254)
                         metrics.add_prompt_cached(n_past);
 
-                        slot.prompt.tokens.keep_first(n_past);
+                        const size_t n_tokens_keep =
+                            std::max(n_past_keep, (size_t) n_past);
+                        if (vbr_low_lcp_admission.covers(
+                                server_cache_destruction_class::live_range_drop,
+                                server_cache_destruction_reason::low_lcp_reset) &&
+                            vbr_low_lcp_admission.execution ==
+                                server_cache_destruction_execution::pass_through) {
+                            // The joined low-LCP manifest was admitted before its checkpoint
+                            // invalidation; carry that same authority to this later phase.
+                            slot.server_cache_token_ledger_truncate_impl(n_tokens_keep);
+                        } else {
+                            slot.observe_live_range_drop(
+                                server_cache_destruction_reason::live_prefix_replace);
+                            slot.server_cache_token_ledger_truncate_impl(n_tokens_keep);
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
