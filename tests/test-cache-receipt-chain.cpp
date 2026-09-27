@@ -29,15 +29,26 @@
 #include <string>
 #include <vector>
 
-static int g_checks   = 0;
-static int g_failures = 0;
+static int  g_checks   = 0;
+static int  g_failures = 0;
+// The negative control injects one deliberately-false check; it silences the report
+// for that single evaluation so a *passing* run never prints "FAIL".  Judging by
+// output text (rather than an exit code) is this tree's convention, and a stray FAIL
+// line in a green run would read as a red one.  `g_muted` counts the reports that were
+// produced but not printed, so the control can still prove the failure/report path ran.
+static bool g_report   = true;
+static int  g_muted    = 0;
 
 #define CHECK(cond)                                                          \
     do {                                                                     \
         ++g_checks;                                                          \
         if (!(cond)) {                                                       \
             ++g_failures;                                                    \
-            std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);       \
+            if (g_report) {                                                  \
+                std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);   \
+            } else {                                                         \
+                ++g_muted;                                                   \
+            }                                                                \
         }                                                                    \
     } while (0)
 
@@ -46,8 +57,12 @@ static int g_failures = 0;
         ++g_checks;                                                          \
         if (!((a) == (b))) {                                                 \
             ++g_failures;                                                    \
-            std::printf("FAIL %s:%d  %s != %s\n",                            \
-                        __FILE__, __LINE__, #a, #b);                         \
+            if (g_report) {                                                  \
+                std::printf("FAIL %s:%d  %s != %s\n",                        \
+                            __FILE__, __LINE__, #a, #b);                     \
+            } else {                                                         \
+                ++g_muted;                                                   \
+            }                                                                \
         }                                                                    \
     } while (0)
 
@@ -239,13 +254,23 @@ int main() {
     test_payload_model_defaults();
 
     // ------------------------------------------------------ negative control
+    // Prove the counter and the report path are really wired: inject one
+    // deliberately-false check, confirm the failure count moved by exactly one and
+    // that the failure branch reported (g_muted), then roll both counters back so the
+    // injection never reaches the exit code or the reported total.  This is the only
+    // way to tell a `0 failures` line from a harness whose counter is not connected.
+    // The injection is silenced (see g_report) so a green run prints no "FAIL" text.
     std::printf("== negative control: the counter really can fail\n");
     {
-        const int before = g_failures;
-        CHECK(false);                                  // deliberately false
-        CHECK(g_failures == before + 1);               // the counter moved by 1
+        const int before       = g_failures;
+        const int muted_before = g_muted;
+        g_report = false;
+        CHECK(false);                                  // deliberately false, not reported
+        g_report = true;
+        CHECK(g_failures == before + 1);               // the counter moved by exactly 1
+        CHECK(g_muted == muted_before + 1);            // ... and the failure branch ran
         g_failures = before;                           // do not let it reach the exit code
-        g_checks  -= 2;                                // ... nor the reported total
+        g_checks  -= 3;                                // ... nor the reported total
     }
 
     std::printf("test-cache-receipt-chain: %d checks, %d failures\n",
