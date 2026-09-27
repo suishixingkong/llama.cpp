@@ -1090,6 +1090,14 @@ struct server_slot {
     bool vbr_idle_stem_retry = false;
     // fork server-context.cpp:1567
     uint64_t vbr_imported_complete_frontier = 0;
+    // FORK-DIFF: the fork declares this inside the diffusion self-speculation
+    // group (diff_draft_length, the mask/think token ids, diff_prev_logits, ...).
+    // Only the flag itself is read by the SWA-window eligibility predicate, and
+    // nothing in this tree ever sets it, so the group's other members stay out.
+    // fork server-context.cpp:1587-1588
+    // diffusion self-speculation
+    bool                 diff_self_spec     = false;
+
     // fork server-context.cpp:1649
     std::list<server_swa_window_checkpoint> swa_windows;
     // fork server-context.cpp:1830
@@ -1412,6 +1420,9 @@ private:
     // Checkpoints are never portable across this random model-instance key;
     // slot-file restore explicitly invalidates them below.
     std::string frontier_execution_identity;
+    // fork server-context.cpp:3521-3522
+    std::array<uint8_t, 32> swa_window_execution_identity {};
+    int32_t swa_window_checkpoint_limit = 0;
     uint64_t frontier_next_sequence_epoch = 1;
 
     int trace = 0;        // env: LLAMA_TRACE
@@ -5594,9 +5605,57 @@ private:
         return selected;
     }
 
+    // fork server-context.cpp:4744  (9 lines)
+    bool swa_window_eligible(const server_slot & slot) const {
+        return swa_window_checkpoint_limit > 0 && active_prefix_enabled() &&
+            !ctx_dft && !slot.can_speculate() && !slot.diff_self_spec && slot.lora.empty() &&
+            slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
+            !slot.task->is_parent() && !slot.task->is_child() &&
+            !slot.task->tokens.has_media() && !slot.prompt.tokens.has_media() &&
+            std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](auto type) { return type == COMMON_SPECULATIVE_TYPE_NONE; });
+    }
+
+    // fork server-context.cpp:4754  (3 lines)
+    static std::shared_ptr<void> reserve_swa_staging(void * opaque, size_t bytes) {
+        return static_cast<server_prompt_cache *>(opaque)->reserve_active_storage(bytes);
+    }
+
     // fork server-context.cpp:4758  (3 lines)
     vbr_explicit_representation_policy swa_window_representation() const {
         return {frontier_execution_identity.data(), frontier_execution_identity.size()};
+    }
+
+    // fork server-context.cpp:4762  (30 lines)
+    void capture_swa_window(server_slot & slot, int64_t frontier) {
+        if (frontier <= 0 || frontier > INT32_MAX || slot.prompt.tokens.pos_next(frontier) != frontier ||
+            (!slot.swa_windows.empty() && slot.swa_windows.back().image->frontier() == frontier)) { return; }
+        const int64_t start = ggml_time_us();
+        try {
+            struct reservation { server_prompt_cache * cache; size_t tokens; } budget {prompt_cache.get(), size_t(frontier)};
+            vbr_swa_window_capture_request capture;
+            capture.sequence = slot.id; capture.frontier = frontier;
+            capture.sequence_epoch = ensure_frontier_sequence_epoch(slot.prompt);
+            capture.execution_identity = swa_window_execution_identity;
+            capture.representation = swa_window_representation();
+            capture.capacity_context = &budget;
+            capture.reserve = [](void * opaque, size_t bytes) -> std::shared_ptr<void> {
+                auto & b = *static_cast<reservation *>(opaque);
+                if (bytes > SIZE_MAX-sizeof(server_swa_window_checkpoint)) { return {}; }
+                return b.cache->reserve_active_storage(bytes+sizeof(server_swa_window_checkpoint), b.tokens);
+            };
+            auto result = vbr_capture_swa_window(*ctx_tgt, capture);
+            if (result.status != vbr_swa_window_status::ok) {
+                SLT_DBG(slot, "SWA window capture skipped: status=%d frontier=%" PRId64 "\n", int(result.status), frontier);
+                return;
+            }
+            slot.swa_windows.push_back({capture.sequence_epoch, std::move(result.image)});
+            while (slot.swa_windows.size() > size_t(swa_window_checkpoint_limit)) { slot.swa_windows.pop_front(); }
+            SLT_INF(slot, "SWA window captured: frontier=%" PRId64 " windows=%zu host_bytes=%zu capture_ms=%.3f\n",
+                    frontier, slot.swa_windows.size(), prompt_cache->active_storage_bytes(), (ggml_time_us()-start)/1000.0);
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(slot, "%s", "SWA window capture skipped: host allocation unavailable\n");
+        }
     }
 
     // fork server-context.cpp:11170  (11 lines)
