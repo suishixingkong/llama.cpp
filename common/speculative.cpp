@@ -3144,6 +3144,103 @@ void common_speculative_print_stats(const common_speculative * spec) {
     }
 }
 
+// fork common/speculative.cpp:61-155
+bool common_speculative_mtp_carry_lifecycle::draft_ready() const noexcept {
+    return ready;
+}
+
+const float * common_speculative_mtp_carry_lifecycle::draft_carry(
+        const float * pending_h) const noexcept {
+    return ready ? pending_h : nullptr;
+}
+
+common_speculative_mtp_carry_lifecycle::process_mode
+common_speculative_mtp_carry_lifecycle::target_process_mode(
+        llama_pos first_position) const noexcept {
+    if (ready) {
+        return process_mode::retained_carry;
+    }
+    return first_position == 0 ? process_mode::cold_zero : process_mode::target_only;
+}
+
+void common_speculative_mtp_carry_lifecycle::target_process_refreshed() noexcept {
+    ready = true;
+}
+
+void common_speculative_mtp_carry_lifecycle::target_process_skipped() noexcept {
+    ready = false;
+}
+
+void common_speculative_mtp_carry_lifecycle::sequence_transition(
+        common_speculative_sequence_event event) noexcept {
+    switch (event) {
+        case common_speculative_sequence_event::prompt_rewind:
+        case common_speculative_sequence_event::target_restored_without_draft:
+        case common_speculative_sequence_event::draft_image_restored:
+        case common_speculative_sequence_event::composite_image_restored:
+        case common_speculative_sequence_event::live_range_shift:
+        case common_speculative_sequence_event::target_replaced:
+        case common_speculative_sequence_event::full_clear:
+            ready = false;
+            break;
+    }
+}
+
+bool common_speculative_mtp_carry_state_save(
+        const common_speculative_mtp_carry_lifecycle & lifecycle,
+        const std::vector<float> & pending_h,
+        std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    if (!lifecycle.draft_ready() || pending_h.empty() ||
+            pending_h.size() > UINT32_MAX) {
+        data.clear();
+        return false;
+    }
+
+    const uint32_t width = (uint32_t) pending_h.size();
+    data.resize(header_size + (size_t) width*sizeof(float));
+    std::memcpy(data.data() + 0*sizeof(uint32_t), &magic,   sizeof(uint32_t));
+    std::memcpy(data.data() + 1*sizeof(uint32_t), &version, sizeof(uint32_t));
+    std::memcpy(data.data() + 2*sizeof(uint32_t), &width,   sizeof(uint32_t));
+    std::memcpy(data.data() + header_size, pending_h.data(),
+                (size_t) width*sizeof(float));
+    return true;
+}
+
+bool common_speculative_mtp_carry_state_load(
+        common_speculative_mtp_carry_lifecycle & lifecycle,
+        std::vector<float> & pending_h,
+        const std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    lifecycle.target_process_skipped();
+
+    uint32_t stored_magic = 0;
+    uint32_t stored_version = 0;
+    uint32_t width = 0;
+    if (data.size() < header_size) {
+        return false;
+    }
+    std::memcpy(&stored_magic,   data.data() + 0*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&stored_version, data.data() + 1*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&width,          data.data() + 2*sizeof(uint32_t), sizeof(uint32_t));
+    if (stored_magic != magic || stored_version != version ||
+            width != pending_h.size() ||
+            data.size() != header_size + (size_t) width*sizeof(float)) {
+        return false;
+    }
+
+    std::memcpy(pending_h.data(), data.data() + header_size,
+                (size_t) width*sizeof(float));
+    lifecycle.target_process_refreshed();
+    return true;
+}
+
 // fork common/speculative.cpp:6103
 void common_speculative_sequence_transition(
         common_speculative * spec,

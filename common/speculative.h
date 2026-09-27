@@ -158,6 +158,41 @@ enum class common_speculative_sequence_event : uint8_t {
     full_clear,                 // target and draft sequences were cleared
 };
 
+// fork common/speculative.h:170-202
+// MTP's pending target-hidden row is process-local state: sequence images do
+// not serialize it. Keep the validity decision separate from the row storage
+// so a restored/cloned sequence cannot consume a row from the previous branch.
+class common_speculative_mtp_carry_lifecycle {
+public:
+    enum class process_mode {
+        retained_carry,
+        cold_zero,
+        target_only,
+    };
+
+    bool draft_ready() const noexcept;
+    const float * draft_carry(const float * pending_h) const noexcept;
+    process_mode target_process_mode(llama_pos first_position) const noexcept;
+
+    void target_process_refreshed() noexcept;
+    void target_process_skipped() noexcept;
+    void sequence_transition(common_speculative_sequence_event event) noexcept;
+
+private:
+    bool ready = false;
+};
+
+// Host-checkpoint codec for the deferred MTP hidden row. A complete draft
+// sequence image is not usable without this carry at a nonzero frontier.
+bool common_speculative_mtp_carry_state_save(
+        const common_speculative_mtp_carry_lifecycle & lifecycle,
+        const std::vector<float> & pending_h,
+        std::vector<uint8_t> & data);
+bool common_speculative_mtp_carry_state_load(
+        common_speculative_mtp_carry_lifecycle & lifecycle,
+        std::vector<float> & pending_h,
+        const std::vector<uint8_t> & data);
+
 // One owner for external sequence lifecycle mutations. Implementations discard
 // branch-local state and apply the event-specific memory/ring policy.
 void common_speculative_sequence_transition(

@@ -701,6 +701,14 @@ target_include_directories(test-vbr-representation-identity PRIVATE ${PROJECT_SO
 llama_build(test-vbr-swa-window.cpp)
 target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# MTP carry lifecycle + host-checkpoint codec (slice 9h). Pure logic over a bool
+# and a float vector: no model, no context, so unlike the SWA-window binary above
+# this one is a genuine runtime consumer -- it pins target_process_mode()'s truth
+# table and the codec's wire format. Lives outside the
+# `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)` block on purpose; inside it the
+# target would silently not exist on this Windows + shared build.
+llama_build_and_test(test-speculative-mtp-carry.cpp)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
