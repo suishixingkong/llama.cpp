@@ -5571,6 +5571,34 @@ private:
                media_identity == frontier.media_content_identity;
     }
 
+    // fork server-context.cpp:4726  (4 lines)
+    bool active_prefix_enabled() const {
+        return slots.size() > 1 && prompt_cache && params_base.kv_unified &&
+            !params_base.ctx_shift && params_base.n_cache_reuse == 0;
+    }
+
+    // fork server-context.cpp:4731  (11 lines)
+    // FORK-DIFF: the fork also accepts COMMON_SPECULATIVE_TYPE_DFLASH here. That enumerator
+    // does not exist in this tree (common/common.h jumps from DRAFT_DFLASH to DRAFT_DSPARK),
+    // so no value can reach this loop equal to it and the branch is dropped. Re-add it in the
+    // same position if the enumerator is ever ported.
+    std::optional<common_speculative_type> active_prefix_draft_type() const {
+        auto selected = COMMON_SPECULATIVE_TYPE_NONE;
+        for (auto type : params_base.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_NONE) { continue; }
+            if (selected != COMMON_SPECULATIVE_TYPE_NONE ||
+                (type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                 type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) { return {}; }
+            selected = type;
+        }
+        return selected;
+    }
+
+    // fork server-context.cpp:4758  (3 lines)
+    vbr_explicit_representation_policy swa_window_representation() const {
+        return {frontier_execution_identity.data(), frontier_execution_identity.size()};
+    }
+
     // fork server-context.cpp:11170  (11 lines)
     void assert_scheduler_thread(
             std::thread::id & pinned,
