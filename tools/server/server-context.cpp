@@ -350,6 +350,26 @@ struct server_batch {
     }
 };
 
+// fork server-context.cpp:640-643 (anonymous namespace there; file scope here)
+struct server_slot_exact_prompt_action {
+    bool use_frontier_logits = false;
+    size_t reusable_tokens = 0;
+};
+
+// fork server-context.cpp:755-766 (anonymous namespace there; `static` here)
+static server_slot_exact_prompt_action server_slot_exact_prompt_action_resolve(
+        size_t prompt_tokens,
+        bool need_sampling,
+        bool diffusion_self_speculation,
+        bool frontier_logits_match) noexcept {
+    server_slot_exact_prompt_action result;
+    result.use_frontier_logits = prompt_tokens > 0 && need_sampling &&
+        !diffusion_self_speculation && frontier_logits_match;
+    result.reusable_tokens = prompt_tokens -
+        ((prompt_tokens > 0 && !result.use_frontier_logits) ? 1u : 0u);
+    return result;
+}
+
 struct server_frontier_logits_state {
     std::vector<float> values;
     std::array<uint8_t, 32> token_digest = {};
@@ -1020,8 +1040,90 @@ struct server_slot {
     // group A phase 2: slot state, verbatim from the fork
     // ---------------------------------------------------------------------
 
-    // fork server-context.cpp:2303
+    // fork server-context.cpp:2294-2303 + 2305-2374
+    // (the port already had 2303 alone; the fork defines all seven counters
+    //  and both ratchet methods together)
+    // Computation-frontier shadow-to-authority ratchet. Only checkpoint-selection
+    // decisions qualify the agreement streak; other consistency checks may
+    // reset/fallback it but cannot make a vacuous workload flip authority.
+    uint64_t frontier_ratchet_min_agreements = 1024;
+    uint64_t frontier_ratchet_agreement_streak = 0;
+    uint64_t frontier_ratchet_agreements_total = 0;
+    uint64_t frontier_ratchet_disagreements_total = 0;
+    uint64_t frontier_ratchet_flips_total = 0;
+    uint64_t frontier_ratchet_fallbacks_total = 0;
     bool frontier_ratchet_flipped = false;
+
+    void frontier_ratchet_disagreement(
+            const char * site,
+            int64_t legacy_choice,
+            int64_t frontier_choice) {
+        frontier_ratchet_disagreements_total++;
+        frontier_ratchet_agreement_streak = 0;
+
+        if (frontier_ratchet_flipped) {
+            frontier_ratchet_flipped = false;
+            frontier_ratchet_fallbacks_total++;
+            SLT_ERR(*this,
+                    "FRONTIER_RATCHET event=post_flip_disagreement action=fallback_legacy "
+                    "site=%s legacy=%" PRId64 " frontier=%" PRId64
+                    " disagreements=%" PRIu64 " fallbacks=%" PRIu64 "\n",
+                    site, legacy_choice, frontier_choice,
+                    frontier_ratchet_disagreements_total,
+                    frontier_ratchet_fallbacks_total);
+        } else {
+            SLT_WRN(*this,
+                    "FRONTIER_RATCHET event=shadow_disagreement action=keep_legacy "
+                    "site=%s legacy=%" PRId64 " frontier=%" PRId64
+                    " disagreements=%" PRIu64 "\n",
+                    site, legacy_choice, frontier_choice,
+                    frontier_ratchet_disagreements_total);
+        }
+    }
+
+    // Returns whether the frontier path owns this selection. `eligible` means
+    // at least one dual-written record was actually evaluated; empty/legacy-only
+    // scans do not count toward "sustained".
+    bool frontier_ratchet_selection(
+            bool eligible,
+            bool agreement,
+            int64_t legacy_choice,
+            int64_t frontier_choice) {
+        if (!eligible) {
+            if (frontier_ratchet_flipped) {
+                frontier_ratchet_disagreement(
+                    "checkpoint_selection_no_frontier_record",
+                    legacy_choice, frontier_choice);
+            }
+            return false;
+        }
+
+        if (!agreement) {
+            frontier_ratchet_disagreement(
+                "checkpoint_selection", legacy_choice, frontier_choice);
+            return false;
+        }
+
+        frontier_ratchet_agreements_total++;
+        if (!frontier_ratchet_flipped &&
+            frontier_ratchet_min_agreements > 0) {
+            frontier_ratchet_agreement_streak++;
+            if (frontier_ratchet_agreement_streak >=
+                    frontier_ratchet_min_agreements) {
+                frontier_ratchet_flipped = true;
+                frontier_ratchet_flips_total++;
+                SLT_INF(*this,
+                        "FRONTIER_RATCHET event=flip action=frontier_reads "
+                        "streak=%" PRIu64 " threshold=%" PRIu64
+                        " flips=%" PRIu64 "\n",
+                        frontier_ratchet_agreement_streak,
+                        frontier_ratchet_min_agreements,
+                        frontier_ratchet_flips_total);
+            }
+        }
+
+        return frontier_ratchet_flipped;
+    }
     // fork server-context.cpp:1511
     // fork server-context.cpp:1510
     server_cache_destruction_observer * destruction_obs = nullptr;
@@ -1185,6 +1287,8 @@ struct server_slot {
 
     // fork server-context.cpp:1649
     std::list<server_swa_window_checkpoint> swa_windows;
+    // fork server-context.cpp:1828
+    using checkpoint_iterator = std::list<common_prompt_checkpoint>::iterator;
     // fork server-context.cpp:1830
     server_cache_checkpoint_authority_context checkpoint_authority_context() noexcept {
         return {
@@ -1254,6 +1358,31 @@ struct server_slot {
         frontier_logits.clear();
     }
 
+    // fork server-context.cpp:2054-2076
+    bool prompt_clear_after_vbr_publication(
+            server_cache_destruction_reason reason =
+                server_cache_destruction_reason::idle_reclaim) {
+        const auto admission = observe_full_slot(
+            server_cache_destruction_class::slot_drop,
+            reason);
+        if (admission.verdict ==
+                server_cache_destruction_verdict::would_refuse_hard_leased ||
+            admission.verdict ==
+                server_cache_destruction_verdict::unavailable) {
+            return false;
+        }
+        // The VBR artifact owns every required companion at this frontier,
+        // including the draft-context sequence when speculation is active.
+        // Leaving that sequence live would make the otherwise-empty import
+        // target fail its required-companion admission on the next request.
+        if (ctx_dft && !llama_memory_seq_rm(
+                llama_get_memory(ctx_dft), id, -1, -1)) {
+            return false;
+        }
+        server_cache_slot_drop_impl();
+        return true;
+    }
+
     // fork server-context.cpp:2115
     server_cache_destruction_admission observe_mandatory_recovery_reset(
             server_cache_destruction_reason reason) const {
@@ -1266,6 +1395,29 @@ struct server_slot {
     void mandatory_recovery_reset(server_cache_destruction_reason reason) {
         observe_mandatory_recovery_reset(reason);
         server_cache_slot_drop_impl();
+    }
+
+    // fork server-context.cpp:2161-2181
+    checkpoint_iterator server_cache_checkpoint_drop_impl(
+            checkpoint_iterator first,
+            checkpoint_iterator last) {
+        if (lifecycle_authority && first != last) {
+            checkpoint_ring_changed();
+        }
+        return prompt.checkpoints.erase(first, last);
+    }
+
+    checkpoint_iterator checkpoint_drop_joined_impl(
+            checkpoint_iterator first,
+            checkpoint_iterator last) {
+        if (retention_obs) {
+            for (auto it = first; it != last; ++it) {
+                retention_obs->retire(
+                    server_retention_instance_key::for_checkpoint(
+                        id, &*it));
+            }
+        }
+        return server_cache_checkpoint_drop_impl(first, last);
     }
 
     // fork server-context.cpp:2224-2226  — the token_ledger_truncate row's physical
@@ -1351,6 +1503,29 @@ struct server_slot {
 // (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
 static bool server_vbr_dynamic_active(const common_params & params) {
     return params.vbr_dynamic();
+}
+
+// A flip is deliberately per-boot: persisting migration confidence across a
+// binary/model/config change would turn yesterday's evidence into authority for
+// different code. Zero keeps the frontier path in permanent shadow mode.
+static uint64_t server_frontier_ratchet_min_agreements() {
+    static constexpr uint64_t DEFAULT_MIN_AGREEMENTS = 1024;
+
+    const char * env = std::getenv("LLAMA_FRONTIER_RATCHET_MIN_AGREEMENTS");
+    if (env == nullptr || env[0] == '\0') {
+        return DEFAULT_MIN_AGREEMENTS;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0') {
+        SRV_WRN("invalid LLAMA_FRONTIER_RATCHET_MIN_AGREEMENTS='%s'; using %" PRIu64 "\n",
+                env, DEFAULT_MIN_AGREEMENTS);
+        return DEFAULT_MIN_AGREEMENTS;
+    }
+
+    return (uint64_t) parsed;
 }
 
 // returns 0 on success
@@ -1577,6 +1752,8 @@ private:
     std::array<uint8_t, 32> swa_window_execution_identity {};
     int32_t swa_window_checkpoint_limit = 0;
     uint64_t frontier_next_sequence_epoch = 1;
+    // fork server-context.cpp:3528
+    uint64_t frontier_ratchet_threshold = 1024;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -2115,7 +2292,13 @@ private:
         frontier_execution_identity =
             "server-execution-v1:" + random_string();
         frontier_next_sequence_epoch = 1;
-
+        frontier_ratchet_threshold =
+            server_frontier_ratchet_min_agreements();
+        SRV_INF(
+            "computation-frontier ratchet: legacy reads authoritative, "
+            "flip after %" PRIu64 " qualifying agreements%s\n",
+            frontier_ratchet_threshold,
+            frontier_ratchet_threshold == 0 ? " (shadow-only)" : "");
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
