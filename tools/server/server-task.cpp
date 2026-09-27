@@ -1829,6 +1829,235 @@ bool server_prompt_cache::cache_plan_get_source_id(
         state.cache_plan_source_id, cache_plan_next_source_id, source_id);
 }
 
+// ---------------------------------------------------------------------
+// slice 9e: the host-reservation (active-storage) face of
+// server_prompt_cache. Verbatim from the fork; coordinates on each line.
+// ---------------------------------------------------------------------
+// fork server-task.cpp:1864-1986
+namespace {
+
+struct server_prompt_cache_budget_bytes {
+    size_t compact = 0;
+    size_t anchor = 0;
+    bool exact = false;
+};
+
+bool server_prompt_cache_measure_fixed_states(
+        const std::vector<const server_prompt_cache_state *> & fixed,
+        llama_cache_acct_ledger * ledger,
+        size_t & bytes) noexcept {
+    bytes = 0;
+    try {
+        bool shared_plane = false;
+        for (const auto * state : fixed) {
+            if (!state || state->payload.kind() ==
+                    server_prompt_cache_payload_kind::vbr_artifact ||
+                state->size() > SIZE_MAX - bytes) {
+                return false;
+            }
+            bytes += state->size();
+            for (const auto & checkpoint : state->prompt.checkpoints) {
+                shared_plane |=
+                    checkpoint.data_tgt.storage_use_count() > 1 ||
+                    checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
+                    checkpoint.accel.ring.storage_use_count() > 1 ||
+                    checkpoint.accel.spec.storage_use_count() > 1;
+            }
+        }
+        if (!shared_plane) {
+            return true;
+        }
+        if (!ledger) {
+            return false;
+        }
+        std::vector<llama_cache_acct_op_id> ops;
+        for (const auto * state : fixed) {
+            if (!state->accounting_complete ||
+                state->release_ops().empty()) {
+                return false;
+            }
+            ops.insert(ops.end(), state->release_ops().begin(),
+                       state->release_ops().end());
+        }
+        std::sort(ops.begin(), ops.end());
+        if (ops.empty() ||
+            std::adjacent_find(ops.begin(), ops.end()) != ops.end()) {
+            return false;
+        }
+        llama_cache_acct_release_set_preview preview;
+        if (!ledger->preview_release_set(ops, ledger->serial(), preview)) {
+            return false;
+        }
+        uint64_t exact = 0;
+        for (const auto & row : preview.rows) {
+            if (row.resident_allocated > UINT64_MAX - exact) {
+                return false;
+            }
+            exact += row.resident_allocated;
+        }
+        if (exact > SIZE_MAX) {
+            return false;
+        }
+        bytes = size_t(exact);
+        return true;
+    } catch (...) {
+        bytes = 0;
+        return false;
+    }
+}
+
+server_prompt_cache_budget_bytes server_prompt_cache_measure_budgets(
+        const std::list<server_prompt_cache_state> & states,
+        llama_cache_acct_ledger * ledger) noexcept {
+    server_prompt_cache_budget_bytes out;
+    try {
+        std::vector<const server_prompt_cache_payload *> payloads;
+        std::vector<const server_prompt_cache_state *> fixed;
+        bool payloads_reserved = false;
+        for (const auto & state : states) {
+            if (state.payload.kind() ==
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                if (!payloads_reserved) {
+                    payloads.reserve(states.size());
+                    payloads_reserved = true;
+                }
+                payloads.push_back(&state.payload);
+            } else {
+                fixed.push_back(&state);
+            }
+        }
+        size_t fixed_bytes = 0;
+        if (!server_prompt_cache_measure_fixed_states(
+                fixed, ledger, fixed_bytes)) {
+            return out;
+        }
+        server_prompt_cache_vbr_budget_summary summary;
+        if (!server_prompt_cache_payload::summarize_vbr_budgets(
+                payloads, summary) ||
+            summary.compact_resident_bytes > SIZE_MAX - fixed_bytes ||
+            summary.anchor_resident_bytes > SIZE_MAX -
+                fixed_bytes - size_t(summary.compact_resident_bytes)) {
+            return out;
+        }
+        out.compact = fixed_bytes +
+            size_t(summary.compact_resident_bytes);
+        out.anchor = size_t(summary.anchor_resident_bytes);
+        out.exact = true;
+        return out;
+    } catch (...) {
+        return {};
+    }
+}
+
+} // namespace
+
+static size_t server_prompt_cache_effective_token_limit(
+    size_t limit_size,
+    size_t limit_tokens,
+    size_t cache_bytes,
+    size_t cache_tokens) noexcept;
+
+// fork server-task.cpp:1988-2069
+struct server_prompt_cache::active_storage_state {
+    size_t bytes = 0, tokens = 0;
+    llama_cache_acct_ledger * ledger = nullptr;
+    std::list<llama_cache_acct_op_id> ops;
+};
+
+void server_prompt_cache::detach_active_storage_accounting() noexcept {
+    if (!active_storage_ || !active_storage_->ledger) { return; }
+    for (auto & op : active_storage_->ops) {
+        if (op) { (void) active_storage_->ledger->abort(op); }
+        op = {};
+    }
+    // A reader may outlive the cache AND the accounting owner. Its local
+    // capacity lease remains independent, with no callback into either owner.
+    active_storage_->ledger = nullptr;
+}
+
+size_t server_prompt_cache::active_storage_bytes() const noexcept {
+    return active_storage_ ? active_storage_->bytes : 0;
+}
+
+size_t server_prompt_cache::active_storage_tokens() const noexcept {
+    return active_storage_ ? active_storage_->tokens : 0;
+}
+
+bool server_prompt_cache::fits_bytes(size_t host_bytes) const noexcept {
+    const size_t reserved = active_storage_bytes();
+    return host_bytes <= SIZE_MAX-reserved &&
+        (limit_size == 0 || (reserved <= limit_size && host_bytes <= limit_size-reserved));
+}
+
+size_t server_prompt_cache::effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept {
+    const size_t bytes = active_storage_bytes(), tokens = active_storage_tokens();
+    if (host_bytes > SIZE_MAX-bytes || host_tokens > SIZE_MAX-tokens) { return 0; }
+    const size_t effective = server_prompt_cache_effective_token_limit(
+        limit_size, limit_tokens, host_bytes+bytes, host_tokens+tokens);
+    return effective > tokens ? effective-tokens : 0;
+}
+
+std::shared_ptr<void> server_prompt_cache::reserve_active_storage(size_t bytes, size_t tokens) {
+    size_t current_bytes = size();
+    const size_t current_tokens = n_tokens();
+    if (quality_anchor_budget_enabled) {
+        const auto measured = server_prompt_cache_measure_budgets(states, acct);
+        if (!measured.exact) { return {}; }
+        current_bytes = measured.compact; // quality anchors have their own envelope
+    }
+    if (!bytes || bytes > SIZE_MAX-current_bytes || tokens > SIZE_MAX-current_tokens ||
+        current_tokens+tokens > SIZE_MAX-active_storage_tokens() ||
+        !fits_bytes(current_bytes+bytes) ||
+        (limit_tokens && current_tokens+tokens > effective_host_token_limit(current_bytes+bytes, current_tokens+tokens))) {
+        return {};
+    }
+    if (!active_storage_) { active_storage_ = std::make_shared<active_storage_state>(); }
+    struct charge {
+        std::shared_ptr<active_storage_state> state;
+        size_t bytes, tokens;
+        std::list<llama_cache_acct_op_id>::iterator op;
+        charge(std::shared_ptr<active_storage_state> s, size_t b, size_t t) : state(std::move(s)), bytes(b), tokens(t) {
+            op = state->ops.insert(state->ops.end(), llama_cache_acct_op_id{});
+            state->bytes += bytes; state->tokens += tokens;
+        }
+        ~charge() {
+            if (state->ledger && *op) { (void) state->ledger->abort(*op); }
+            state->ops.erase(op);
+            state->bytes -= bytes; state->tokens -= tokens;
+        }
+    };
+    auto result = std::make_shared<charge>(active_storage_, bytes, tokens);
+    active_storage_->ledger = acct;
+    if (acct) {
+        // Keep the capacity quote RESERVED for the lease lifetime. There is no
+        // fictitious physical allocation, staged peak or committed publication;
+        // the physical-headroom coordinator accounts for this reservation once.
+        *result->op = acct->reserve(
+            tokens ? llama_cache_acct_category::checkpoint_state_payload : llama_cache_acct_category::transfer_staging,
+            llama_cache_acct_resource_domain::non_device(llama_cache_acct_residency::pageable_host),
+            {}, 0, bytes);
+        if (!*result->op) { return {}; }
+    }
+    return result;
+}
+
+// The definition the forward declaration above announces; the fork keeps
+// the two far apart.
+// fork server-task.cpp:2528-2539
+static size_t server_prompt_cache_effective_token_limit(
+        size_t limit_size,
+        size_t limit_tokens,
+        size_t cache_bytes,
+        size_t cache_tokens) noexcept {
+    if (limit_size == 0) {
+        return limit_tokens;
+    }
+    const float size_per_token = std::max<float>(
+        1.0f, float(cache_bytes) / std::max<size_t>(1, cache_tokens));
+    return std::max<size_t>(limit_tokens, limit_size / size_per_token);
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 

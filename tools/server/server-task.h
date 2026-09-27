@@ -807,6 +807,26 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
+    // The fork marks the state member and the detach hook below private;
+    // this struct carries no access specifiers, so they stay public here.
+    // active_storage_ is touched only from member bodies, so the
+    // visibility cannot matter.
+    // fork server-task.h:1345-1353
+    // Scheduler-owned, non-evicting reservation for process-local active
+    // companions and restore staging. Readers share one charge; the last
+    // reader releases it, even after this cache has been destroyed. Ordinary
+    // host publications include these reservations in their capacity checks.
+    std::shared_ptr<void> reserve_active_storage(size_t bytes, size_t tokens = 0);
+    size_t active_storage_bytes() const noexcept;
+    size_t active_storage_tokens() const noexcept;
+    bool fits_bytes(size_t host_bytes) const noexcept;
+    size_t effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept;
+
+    // fork server-task.h:1356-1358
+    struct active_storage_state;
+    std::shared_ptr<active_storage_state> active_storage_;
+    void detach_active_storage_accounting() noexcept;
+
     std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit
@@ -831,6 +851,10 @@ struct server_prompt_cache {
     // class (118 members, 69 out-of-line bodies, 26 types) stays out until a
     // consumer lands. Verbatim from the fork; coordinates on each line.
     // ---------------------------------------------------------------------
+    // fork server-task.h:1375-1377
+    // Explicit VBR restore product gate. Keeping this false preserves literal zero
+    // anchor work unless a nonzero --vbr-anchor-cache-mib pool is requested.
+    bool quality_anchor_budget_enabled = false;
     // fork server-task.h:1379
     int32_t cache_plan_next_source_id = 0;
 
@@ -860,6 +884,19 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics =
             nullptr)
         const noexcept;
+
+    // fork server-task.h:1691
+    llama_cache_acct_ledger * acct = nullptr;
+
+    // FORK-DIFF: the fork's destructor body also calls clear_accounting(),
+    // a different (not yet landed) member of the same rewrite. Only the
+    // detach hook is reachable from what exists here; the omitted call
+    // cleans accounting this tree never creates, so the observable result
+    // is unchanged.
+    // fork server-task.h:1712-1715
+    ~server_prompt_cache() {
+        detach_active_storage_accounting();
+    }
 
 };
 
