@@ -580,12 +580,16 @@ struct server_slot {
         return res;
     }
 
-    void prompt_clear() {
-        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
-
-        mem.seq_rm(id, -1, -1);
-
-        prompt.clear();
+    // fork server-context.cpp:2046-2052 (replaces this port's pre-door prompt_clear)
+    // The fork routes slot clearing through the censused door; this port still had
+    // the raw eraser, which the file's own comment at 434-436 forbids.  Default
+    // argument keeps every existing 0-arg call site unchanged.
+    void prompt_clear(
+            server_cache_destruction_reason reason =
+                server_cache_destruction_reason::slot_rebind) {
+        (void) observe_full_slot(
+            server_cache_destruction_class::slot_drop, reason);
+        server_cache_slot_drop_impl();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1381,6 +1385,44 @@ struct server_slot {
         }
         server_cache_slot_drop_impl();
         return true;
+    }
+
+    // fork server-context.cpp:2078-2113  (36 lines)
+    server_cache_destruction_admission observe_live_range_drop(
+            server_cache_destruction_reason reason,
+            bool include_checkpoints = false) const {
+        server_cache_destruction_admission admission;
+        admission.cls    = server_cache_destruction_class::live_range_drop;
+        admission.reason = reason;
+        admission.issued = true;
+        if (!destruction_obs) {
+            return admission;
+        }
+        server_cache_destruction_request request;
+        request.cls    = server_cache_destruction_class::live_range_drop;
+        request.reason = reason;
+        request.add_target(
+            server_cache_destruction_target_kind::live_target,
+            id,
+            retention_obs ? retention_obs->artifact_id(
+                server_retention_instance_key::for_slot(id))
+                : llama_cache_acct_artifact_id{});
+        if (ctx_dft) {
+            request.add_target(
+                server_cache_destruction_target_kind::live_draft, id);
+        }
+        request.add_target(
+            server_cache_destruction_target_kind::token_ledger, id);
+        if (include_checkpoints) {
+            request.add_target(
+                server_cache_destruction_target_kind::checkpoint_ring, id);
+        }
+        for (const auto category : {
+                llama_cache_acct_category::live_attention_state,
+                llama_cache_acct_category::live_recurrent_state }) {
+            request.add_yield(category);
+        }
+        return server_cache_retention_admit(destruction_obs, request);
     }
 
     // fork server-context.cpp:2115
@@ -7020,6 +7062,40 @@ private:
             ? cells[size_t(slot_id)] : 0;
     }
 
+    // Durability classifier and the clear door it authorises.  The port already
+    // lands the 5471/5483 accessors and the 5579 eligibility filter in fork order;
+    // these two sat in the gap between them.
+    // fork server-context.cpp:5490-5509  (20 lines)
+    bool vbr_idle_source_durable(
+            const server_slot & slot) const noexcept {
+        if (!params_base.vbr_prompt_cache) {
+            return true;
+        }
+        if (!prompt_cache || slot.prompt.n_tokens() <= 0) {
+            return false;
+        }
+        try {
+            return automatic_vbr_cache_support(
+                       slot.prompt.tokens, slot.lora,
+                       slot.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported &&
+                prompt_cache->contains_vbr_frontier(
+                    slot.prompt, frontier_execution_identity,
+                    lora_config_identity(slot.lora));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // fork server-context.cpp:5537-5543  (7 lines)
+    bool vbr_clear_idle_source(server_slot & slot) {
+        if (params_base.vbr_prompt_cache) {
+            return slot.prompt_clear_after_vbr_publication();
+        }
+        slot.prompt_clear(server_cache_destruction_reason::idle_reclaim);
+        return true;
+    }
+
     // fork server-context.cpp:5579  (25 lines)
     bool vbr_idle_reclaim_eligible(
             const server_slot & slot,
@@ -7427,6 +7503,97 @@ private:
             }
         }
         return vbr_oldest_idle_slot(filter);
+    }
+
+    // The reclaim wave and the recovery reset that calls it.  Both sit between the
+    // port's 5949 and 8607 blocks, so they are placed there to keep fork order.
+    // fork server-context.cpp:5986-6018  (33 lines, includes the fork's doc comment)
+    // Dynamic VBR clear-only reclaim of idle slots. With automatic host
+    // caching enabled, an exact immutable frontier is required before clear;
+    // otherwise the older clear-only behavior remains unchanged. Never touch
+    // a processing slot or one pinned by an explicitly deferred task.
+    int vbr_clear_idle_slots(int except_id, const char * reason) {
+        int cleared = 0;
+        for (auto & s : slots) {
+            if (s.id == except_id || s.is_processing() || s.prompt.n_tokens() == 0) {
+                continue;
+            }
+            // Approved guard, not destruction-authority certification: the legacy eraser
+            // simply does not consider a hard-leased live prefix.
+            if (s.hard_lease_blocks_live_prefix()) {
+                SLT_INF(s, "vbr reclaim (%s): kept — hard lease seals the live prefix\n", reason);
+                continue;
+            }
+            if (!vbr_idle_source_durable(s)) {
+                SLT_INF(s, "vbr reclaim (%s): kept — no durable VBR frontier\n",
+                        reason);
+                continue;
+            }
+            if (queue_tasks.has_deferred_for_slot(s.id)) {
+                SLT_INF(s, "vbr reclaim (%s): kept — a deferred id_slot task pins this slot\n", reason);
+                continue;
+            }
+            SLT_WRN(s, "vbr reclaim (%s): clearing %d cached tokens\n", reason, (int) s.prompt.n_tokens());
+            const bool removed = vbr_clear_idle_source(s);
+            if (removed) {
+                cleared++;
+            }
+        }
+        return cleared;
+    }
+
+    // fork server-context.cpp:6083-6134  (52 lines, includes the fork's doc comment)
+    // reset-on-low-LCP (dynamic VBR): tiers are per-tensor and promotion cannot cross the tap
+    // boundary, so the ONLY full-quality recovery is the lossless empty-cache reset. When a
+    // DEGRADED conversation keeps a token-trivial prefix anyway (rolling-window agent
+    // harnesses rewrite mid-context every turn), trade the prefix for the reset: clear the
+    // idle slots (recovery reclaim — deliberately NOT deficit-gated: budget slack is exactly
+    // the state that starves the pressure path, and worthless idle caches are the only
+    // obstacle to recovery that benefits every stream), and if the pool then holds nothing
+    // but this slot's cells, drop n_past to 0 — the full re-prefill re-enters at the entry
+    // tier, so turn-N cache quality equals turn-1. Returns the (possibly zeroed) n_past.
+    int vbr_reset_on_low_lcp(
+            server_slot & slot,
+            int n_past,
+            server_cache_destruction_admission & admission) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reset_keep_frac <= 0.0f) {
+            return n_past;
+        }
+        const int n_prompt = slot.task->n_tokens();
+        if (n_prompt <= 0 || (float) n_past >= params_base.vbr_reset_keep_frac * (float) n_prompt) {
+            return n_past;
+        }
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        auto st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.cursor < 2) {
+            return n_past; // pristine or one transient step — a full re-prefill buys ~nothing
+        }
+        // Approved guard, not a destructive capability. The range is
+        // exactly the prefix this recovery path would discard.
+        if (slot.hard_lease_blocks_live_range(
+                0, static_cast<uint64_t>(std::max(0, n_past)))) {
+            SLT_INF(slot, "%s", "vbr reset blocked: hard lease seals the reusable prefix\n");
+            return n_past;
+        }
+        vbr_clear_idle_slots(slot.id, "reset-recovery");
+        st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.used_cells_other > 0) {
+            SLT_INF(slot, "vbr reset blocked: %u used cells belong to other sequences (pinned or processing slots)\n",
+                    st.used_cells_other);
+            return n_past;
+        }
+        SLT_WRN(slot, "vbr reset: cursor %d and only %d/%d prompt tokens reusable (< %.2f) — dropping the prefix; "
+                "the full re-prefill re-enters at the entry tier\n",
+                st.cursor, n_past, n_prompt, (double) params_base.vbr_reset_keep_frac);
+        admission = slot.observe_live_range_drop(
+            server_cache_destruction_reason::low_lcp_reset, true);
+        if (admission.execution !=
+                server_cache_destruction_execution::pass_through) {
+            return n_past;
+        }
+        (void) slot.checkpoint_drop_joined_impl(
+            slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end());
+        return 0;
     }
 
     // fork server-context.cpp:8607  (20 lines)
@@ -8063,6 +8230,20 @@ private:
             view.status = server_cache_plan_preflight_status::internal_fault;
         }
         return view;
+    }
+
+    // fork server-context.cpp:11637-11648  (12 lines)
+    static server_vbr_prompt_cache_support_status
+    automatic_vbr_cache_support(
+            const server_tokens & tokens,
+            const std::vector<common_adapter_lora_info> & lora,
+            bool speculative_slot) noexcept {
+        // Media and aLoRA still need their own frontier authority. Draft-model
+        // and DFlash state are exact companion payloads in the same adoption
+        // transaction as target KV, so speculative slots are supported.
+        return server_vbr_prompt_cache_support_for(
+            false, speculative_slot, tokens.has_media(),
+            lora_all_alora(lora));
     }
 
     // fork server-context.cpp:3890  (140 lines)

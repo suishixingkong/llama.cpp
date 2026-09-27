@@ -912,6 +912,14 @@ struct server_prompt_cache {
     mutable std::vector<server_prompt_cache_vbr_frontier_query *>
         vbr_stem_witness_arena;
 
+    // fork server-task.h:1391-1397  (7 lines)
+    // Exact immutable VBR-frontier presence query. This alone is not a clear
+    // authority: automatic displacement also revalidates the live semantic
+    // frontier, scheduler state, pending work, and lease/recovery protection.
+    bool contains_vbr_frontier(
+        const server_prompt & prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.

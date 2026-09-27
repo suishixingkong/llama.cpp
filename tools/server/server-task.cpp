@@ -2310,6 +2310,70 @@ void server_prompt_cache::update() {
 }
 
 
+// The exact-identity comparison this query is built on, then the query itself.
+// Both were absent: the port landed mark_vbr_frontiers (fork 2607) without them.
+// fork server-task.cpp:2541-2582  (42 lines)
+static bool server_prompt_cache_vbr_frontier_matches(
+        const server_prompt & prompt,
+        const server_prompt_cache_payload & payload,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        bool * raw_token_comparison = nullptr) noexcept {
+    if (raw_token_comparison) {
+        *raw_token_comparison = false;
+    }
+    try {
+        const auto * artifact = payload.vbr_artifact();
+        if (!artifact || execution_identity.empty()) {
+            return false;
+        }
+        const auto & package = artifact->package();
+        if (!package) {
+            return false;
+        }
+        const auto & manifest = package.manifest();
+        const auto & identity = manifest.identity;
+        if (identity.execution_identity != execution_identity ||
+            identity.adapter_config_identity != adapter_config_key ||
+            identity.sequence_epoch != prompt.sequence_epoch ||
+            identity.token_count != prompt.n_tokens() ||
+            identity.next_position != prompt.tokens.pos_next()) {
+            return false;
+        }
+        if (raw_token_comparison) {
+            *raw_token_comparison = true;
+        }
+        if (manifest.token_block.tokens !=
+                prompt.tokens.retention_token_ids()) {
+            return false;
+        }
+        std::string media_identity;
+        return prompt.tokens.media_content_identity(
+                   prompt.n_tokens(), media_identity) &&
+               media_identity == identity.media_content_identity;
+    } catch (...) {
+        return false;
+    }
+}
+
+// fork server-task.cpp:2590-2605  (16 lines)
+bool server_prompt_cache::contains_vbr_frontier(
+        const server_prompt & prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept {
+    for (const auto & state : states) {
+        if (state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact &&
+            state.adapter_config_key == adapter_config_key &&
+            server_prompt_cache_vbr_frontier_matches(
+                prompt, state.payload, execution_identity,
+                adapter_config_key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // fork server-task.cpp:2607 (161 lines, verbatim)
 bool server_prompt_cache::mark_vbr_frontiers(
         server_prompt_cache_vbr_frontier_query * queries,
