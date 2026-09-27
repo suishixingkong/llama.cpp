@@ -968,6 +968,62 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
+server_tokens server_tokens::clone_text_prefix(size_t n) const {
+    if (has_media() || n > tokens.size()) {
+        throw std::invalid_argument("server_tokens text prefix is unavailable");
+    }
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    res.tokens.assign(tokens.begin(), tokens.begin() + n);
+    return res;
+}
+
+server_tokens server_tokens::clone_cached_prefix(size_t n) const {
+    if (!has_media()) { return clone_text_prefix(n); }
+    std::string identity;
+    if (n > tokens.size() || !media_content_identity(n, identity)) {
+        throw std::invalid_argument("server_tokens cached prefix is unavailable");
+    }
+    server_tokens res;
+    res.has_mtmd = has_mtmd;
+    res.tokens.assign(tokens.begin(), tokens.begin() + n);
+    for (const auto & entry : map_idx_to_media) {
+        if (entry.first >= n) { break; }
+        mtmd::input_chunk_ptr chunk(mtmd_input_chunk_get_placeholder(entry.second.get()));
+        if (!chunk) { throw std::runtime_error("media prefix placeholder failed"); }
+        res.map_idx_to_media.emplace(entry.first, std::move(chunk));
+    }
+    return res;
+}
+
+std::vector<llama_pos> server_tokens::prefix_row_positions(size_t n) const {
+    std::string identity;
+    if (n > tokens.size() || !media_content_identity(n, identity)) {
+        throw std::invalid_argument("server_tokens prefix positions are unavailable");
+    }
+    std::vector<llama_pos> rows;
+    rows.reserve(n);
+    llama_pos pos = 0;
+    for (size_t i = 0; i < n;) {
+        if (tokens[i] != LLAMA_TOKEN_NULL) {
+            rows.push_back(pos++);
+            ++i;
+            continue;
+        }
+        const auto & chunk = find_chunk(i);
+        const size_t count = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const auto * image = mtmd_input_chunk_get_tokens_image(chunk.get());
+        for (size_t j = 0; j < count; ++j) {
+            // Same primary positions as mtmd_helper_decode_image_chunk. Audio
+            // uses the sequential 1D mapping even with M-RoPE enabled.
+            rows.push_back(image ? mtmd_image_tokens_get_decoder_pos(image, pos, j).t : pos + j);
+        }
+        i += count;
+        pos += mtmd_input_chunk_get_n_pos(chunk.get());
+    }
+    return rows;
+}
+
 //
 // tokenizer and input processing utils
 //

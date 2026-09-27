@@ -320,6 +320,17 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+
+    // Copy only a text prefix. This is intentionally narrower than clone():
+    // projected VBR restore must not allocate/copy a potentially million-token
+    // parent merely to discard its suffix immediately afterward.
+    server_tokens clone_text_prefix(size_t n) const;
+
+    // Ledger for already-installed KV: copy only the prefix, replacing media
+    // payloads with placeholders. Refuse partial/unidentified media chunks.
+    server_tokens clone_cached_prefix(size_t n) const;
+    // Primary KV positions, including M-RoPE image multiplicities and gaps.
+    std::vector<llama_pos> prefix_row_positions(size_t n) const;
 };
 
 
