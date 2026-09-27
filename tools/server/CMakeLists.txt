@@ -141,3 +141,18 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-retention-reuse-useful COMMAND test-retention-reuse-useful)
     set_property(TEST test-retention-reuse-useful PROPERTY LABELS main)
 endif()
+
+# C++ unit test for server_cache_checkpoint_ring_changed (slice 9k-a). Same
+# reasoning as above: the definition lives in server-task.cpp, which is only
+# reachable through the server-context target. Model-free.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-cache-checkpoint-ring-changed
+        ${PROJECT_SOURCE_DIR}/tests/test-cache-checkpoint-ring-changed.cpp)
+    target_link_libraries(test-cache-checkpoint-ring-changed PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-cache-checkpoint-ring-changed PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-cache-checkpoint-ring-changed PRIVATE cxx_std_17)
+    add_test(NAME test-cache-checkpoint-ring-changed COMMAND test-cache-checkpoint-ring-changed)
+    set_property(TEST test-cache-checkpoint-ring-changed PROPERTY LABELS main)
+endif()

@@ -1830,19 +1830,22 @@ done:
     return res;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+// fork: external linkage — the server's censused destruction doors call these
+// directly (upstream made them static when its slot.mem wrapper became the
+// only caller; the fork kept its own door architecture in the 2026-08-09 sync)
+void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
 
-static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
-static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 }

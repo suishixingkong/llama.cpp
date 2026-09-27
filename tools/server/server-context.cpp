@@ -67,6 +67,34 @@ static json server_json_from_ordered(nlohmann::ordered_json value) {
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Keep the C-style memory API balanced across every server early return. A scope only
+// becomes active for a dynamic-VBR memory; non-VBR checkpoints preserve their old path exactly.
+class server_vbr_retier_freeze_scope {
+public:
+    server_vbr_retier_freeze_scope(llama_memory_t mem, const char * owner) :
+        mem(mem), owner(owner),
+        operation_id(llama_memory_vbr_retier_freeze_begin(mem, owner)) {
+    }
+
+    ~server_vbr_retier_freeze_scope() {
+        if (operation_id != 0) {
+            llama_memory_vbr_retier_freeze_end(mem, owner, operation_id);
+        }
+    }
+
+    server_vbr_retier_freeze_scope(const server_vbr_retier_freeze_scope &) = delete;
+    server_vbr_retier_freeze_scope & operator=(const server_vbr_retier_freeze_scope &) = delete;
+
+    bool active() const {
+        return operation_id != 0;
+    }
+
+private:
+    llama_memory_t mem;
+    const char * owner;
+    uint64_t operation_id;
+};
+
 // defined near get_model_info(); shared by the /props and /models responses
 static json server_vbr_meta_json(const server_context_meta * meta);
 
@@ -382,6 +410,44 @@ struct server_cache_plan_observer {
     uint64_t records_finalized  = 0;
     uint64_t shadow_unavailable = 0;
 };
+
+// Retention policy stays at the server's logical-operation boundary. These functions
+// are the closed physical seams allowed to invoke the low-level destructive primitives.
+// Callers must first admit their logical manifest, or be an explicitly transient operation.
+static bool server_cache_live_range_drop_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        bool attention_only = false) {
+    return attention_only
+        ? llama_memory_seq_rm_attn(mem, seq_id, p0, p1)
+        : llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
+static void server_cache_live_range_drop_impl(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    common_context_seq_rm(ctx, seq_id, p0, p1);
+}
+
+static bool server_cache_mandatory_recovery_reset_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
+static void server_cache_mandatory_recovery_reset_impl(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    common_context_seq_rm(ctx, seq_id, p0, p1);
+}
 
 struct server_slot {
     int id;
@@ -1200,6 +1266,13 @@ struct server_slot {
     void mandatory_recovery_reset(server_cache_destruction_reason reason) {
         observe_mandatory_recovery_reset(reason);
         server_cache_slot_drop_impl();
+    }
+
+    // fork server-context.cpp:2224-2226  — the token_ledger_truncate row's physical
+    // choke point. The fallback arm of the restore/trim transaction truncates the
+    // ledger to 0 when a rejected suffix trim has already cleared everything.
+    void server_cache_token_ledger_truncate_impl(size_t n_tokens) {
+        prompt.tokens.keep_first(n_tokens);
     }
 
     // fork server-context.cpp:2431-2483  (9 + 13 + 29 lines)
@@ -4041,6 +4114,19 @@ private:
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
+                    // fork server-context.cpp:16283-16288.  Only the declarations that the
+                    // restore/trim transaction below reads are landable now: the region that
+                    // INSTALLS a recurrent-checkpoint row (fork 16294-17266, the can_split
+                    // rework) is not ported yet, so the three checkpoint_* flags keep their
+                    // fork initial values and every attention-only arm below is
+                    // constant-false -- which is exactly the fork's state on a restore that
+                    // installed no recurrent row.  vbr_restore_freeze is likewise never begun.
+                    std::unique_ptr<server_vbr_retier_freeze_scope> vbr_restore_freeze;
+                    bool return_after_vbr_restore_trim = false;
+                    bool checkpoint_tgt_recurrent_installed = false;
+                    bool checkpoint_dft_recurrent_installed = false;
+                    llama_pos checkpoint_installed_pos = -1;
+                    const bool starting_prompt = slot.state == SLOT_STATE_STARTED;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4348,7 +4434,113 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // Checkpoint restores reset recurrent rollback depth. In particular,
+                    // [TAG_PROMPT_LOGITS] can move p0 one token behind the restored
+                    // frontier, making this bounded trim legitimately fallible.
+                    // A successful PARTIAL_ONLY hybrid restore has already installed the
+                    // recurrent row at checkpoint_installed_pos. When the suffix begins at
+                    // exactly the next position, trimming that row only to reinstall the same
+                    // checkpoint bytes is redundant. Keep the old whole-memory path for every
+                    // other case, especially [TAG_PROMPT_LOGITS]'s one-behind trim: recurrent
+                    // rollback depth is then a real validity check and must still fail closed.
+                    const bool trim_tgt_attn_only =
+                        checkpoint_tgt_recurrent_installed &&
+                        (int64_t) p0 == (int64_t) checkpoint_installed_pos + 1;
+                    const bool trim_dft_attn_only =
+                        checkpoint_dft_recurrent_installed &&
+                        (int64_t) p0 == (int64_t) checkpoint_installed_pos + 1;
+                    if (trim_tgt_attn_only || trim_dft_attn_only) {
+                        SLT_INF(slot,
+                                "CHECKPOINT_ATTN_ONLY_TRIM p0=%d target=%u draft=%u\n",
+                                p0,
+                                trim_tgt_attn_only ? 1u : 0u,
+                                trim_dft_attn_only ? 1u : 0u);
+                    }
+                    const auto checkpoint_lineage_before_trim =
+                        trim_tgt_attn_only
+                            ? llama_memory_vbr_state(
+                                llama_get_memory(ctx_tgt), slot.id, 0)
+                            : llama_memory_vbr_state_data{};
+                    bool trim_ok = ::server_cache_live_range_drop_impl(
+                        llama_get_memory(ctx_tgt), slot.id, p0, -1,
+                        trim_tgt_attn_only);
+                    if (trim_ok && ctx_dft) {
+                        // FORK-DIFF (fork server-context.cpp:17324-17326): the fork holds
+                        // ctx_dft in a llama_context_ptr; this tree keeps the raw pointer
+                        // (port server-context.cpp:5131 already notes the same divergence).
+                        // Restoring `ctx_dft.get()` on the call line reproduces fork:17325
+                        // byte-for-byte.
+                        trim_ok = ::server_cache_live_range_drop_impl(
+                            llama_get_memory(ctx_dft), slot.id, p0, -1,
+                            trim_dft_attn_only);
+                    }
+
+                    if (trim_ok && trim_tgt_attn_only) {
+                        const auto checkpoint_lineage_after_trim =
+                            llama_memory_vbr_state(
+                                llama_get_memory(ctx_tgt), slot.id, 0);
+                        if (server_cache_checkpoint_rebase_preserved_suffix(
+                                slot.prompt.checkpoints,
+                                checkpoint_lineage_before_trim,
+                                checkpoint_lineage_after_trim,
+                                p0) > 0) {
+                            slot.checkpoint_ring_changed();
+                        }
+                    }
+
+                    if (!trim_ok) {
+                        SLT_WRN(slot, "memory_seq_rm [%d, end) rejected; falling back to full prompt re-processing\n", p0);
+
+                        // Full removal is infallible for memory implementations and retains
+                        // common_context_seq_rm's asserting contract. Clear both target and
+                        // draft so a failure on either side cannot leave them out of sync.
+                        slot.observe_mandatory_recovery_reset(
+                            server_cache_destruction_reason::trim_rejection);
+                        ::server_cache_mandatory_recovery_reset_impl(
+                            ctx_tgt, slot.id, -1, -1);
+                        if (ctx_dft) {
+                            // FORK-DIFF (fork server-context.cpp:17352-17355): same raw-pointer
+                            // divergence as above. Restoring `ctx_dft.get()` on the call line
+                            // reproduces fork:17354 byte-for-byte.
+                            ::server_cache_mandatory_recovery_reset_impl(
+                                ctx_dft, slot.id, -1, -1);
+                        }
+                        common_speculative_sequence_transition(
+                            slot.get_spec(), slot.id,
+                            common_speculative_sequence_event::full_clear);
+
+                        slot.server_cache_token_ledger_truncate_impl(0);
+                        slot.stats.n_prompt_cached = 0;
+                        slot.stats.n_prompt_processed = 0;
+
+                        // The suffix trim of the restore transaction was rejected and
+                        // everything installed was cleared — the delivered rows failed to
+                        // realize their frontier. Record the precise reason on each, revoke
+                        // delivery, and mark the attempt failed: cold fallback dominates.
+                        if (slot.cache_plan) {
+                            for (const auto prov : { common_cache_plan_provider::host_cache_entry,
+                                                     common_cache_plan_provider::live_context_checkpoint }) {
+                                if (auto * c = slot.cache_plan->selected_row(prov)) {
+                                    if (c->delivered) {
+                                        c->note_reject(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID);
+                                    }
+                                }
+                            }
+                            slot.cache_plan->revoke_deliveries();
+                            slot.cache_plan->restore_attempt_failed = true;
+                        }
+                    }
+
+                    // Retiering resumes only after the coordinated restore+trim transaction.
+                    // The outer exit arms a fresh controller pass at the next safe boundary.
+                    vbr_restore_freeze.reset();
+                    if (return_after_vbr_restore_trim) {
+                        return;
+                    }
+
+                    if (starting_prompt && trim_ok && slot.prompt.tokens.empty()) {
+                        restore_active_prefix(slot);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -6101,12 +6293,6 @@ private:
 
 
     // ---- group A file-local types (verbatim from the fork) ----
-
-    // fork server-context.cpp:1423
-struct server_cache_plan_observer {
-    uint64_t records_finalized  = 0;
-    uint64_t shadow_unavailable = 0;
-};
 
     // fork server-context.cpp:4219
     struct cache_plan_host_source_registry {

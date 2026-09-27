@@ -1,5 +1,6 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
+#include "server-cache-authority.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -2470,4 +2471,12 @@ bool server_prompt_cache::mark_vbr_frontiers(
         }
         return false;
     }
+}
+
+void server_cache_checkpoint_ring_changed(
+        server_cache_checkpoint_authority_context & context) noexcept {
+    context.attempts.ring_changed();
+    context.seam_heuristic = nullptr;
+    context.floor_refusal =
+        common_cache_plan_destruction_reason::mandatory_anchor;
 }
