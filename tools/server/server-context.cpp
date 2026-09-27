@@ -50,6 +50,7 @@
 #include "server-recurrent-expansion.h"
 #include "common-cache-plan.h"
 #include "gguf.h"
+#include "../../src/llama-vbr-swa-window.h"
 #include "../../src/llama-ext.h"
 #include "../../src/llama-memory-hybrid-idx.h"
 #include "../../src/llama-sha256.h"
@@ -357,6 +358,23 @@ struct server_frontier_logits_state {
         std::array<uint8_t, 32> digest = {};
         return tokens.retention_token_digest(digest) && digest == token_digest;
     }
+};
+
+// fork server-context.cpp:1487
+struct server_vbr_idle_refusal_witness {
+    std::array<uint8_t, 32> attempt_identity = {};
+    uint64_t accounting_serial = 0;
+    uint64_t retention_epoch = 0;
+    uint64_t lease_event_ordinal = 0;
+    uint64_t lease_next_expiry_ns = 0;
+    bool lease_tracked = false;
+    bool valid = false;
+};
+
+// fork server-context.cpp:1497
+struct server_swa_window_checkpoint {
+    uint64_t sequence_epoch = 0;
+    std::shared_ptr<const vbr_swa_window_image> image;
 };
 
 struct server_slot {
@@ -1016,6 +1034,141 @@ struct server_slot {
         }
         return server_cache_retention_admit(destruction_obs, request);
     }
+
+    // ---------------------------------------------------------------------
+    // group A drop face: the state and the erasers the destruction-admission
+    // path needs (slice 8q).  Bodies verbatim from the fork; fork coordinates
+    // are on each header line.
+    // ---------------------------------------------------------------------
+
+    // fork server-context.cpp:1506
+    common_cache_family_binding cache_family;
+    // fork server-context.cpp:1519
+    bool cache_debug_observability = false;
+    // fork server-context.cpp:1527
+    uint64_t vbr_reuse_capture_frontier = 0;
+    // fork server-context.cpp:1537
+    server_cache_checkpoint_attempt_latch checkpoint_attempts;
+    // fork server-context.cpp:1538
+    const common_prompt_checkpoint * checkpoint_seam_heuristic = nullptr;
+    // fork server-context.cpp:1539
+    common_cache_plan_destruction_reason checkpoint_floor_refusal =
+        common_cache_plan_destruction_reason::mandatory_anchor;
+    // fork server-context.cpp:1541
+    std::array<uint8_t, 32> vbr_idle_capture_attempt_identity = {};
+    // fork server-context.cpp:1542
+    int64_t vbr_idle_capture_retry_after_ms = 0;
+    // fork server-context.cpp:1543
+    bool vbr_idle_capture_terminal = false;
+    // fork server-context.cpp:1544
+    bool vbr_idle_capture_isolated_retry = false;
+    // fork server-context.cpp:1549
+    std::vector<server_vbr_idle_refusal_witness>
+        vbr_idle_admission_refusals;
+    // fork server-context.cpp:1551
+    server_vbr_prompt_cache_support_status vbr_idle_support_status =
+        server_vbr_prompt_cache_support_status::supported;
+    // fork server-context.cpp:1553
+    std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
+    // fork server-context.cpp:1554
+    bool vbr_idle_capture_representation_valid = false;
+    // fork server-context.cpp:1558
+    std::array<uint8_t, 32> vbr_idle_stem_source_identity = {};
+    // fork server-context.cpp:1559
+    uint64_t vbr_idle_stem_coverage_tokens = 0;
+    // fork server-context.cpp:1560
+    llama_cache_acct_artifact_id vbr_idle_stem_host_artifact;
+    // fork server-context.cpp:1561
+    bool vbr_idle_stem_source_valid = false;
+    // fork server-context.cpp:1562
+    bool vbr_idle_stem_retry = false;
+    // fork server-context.cpp:1567
+    uint64_t vbr_imported_complete_frontier = 0;
+    // fork server-context.cpp:1649
+    std::list<server_swa_window_checkpoint> swa_windows;
+    // fork server-context.cpp:1830
+    server_cache_checkpoint_authority_context checkpoint_authority_context() noexcept {
+        return {
+            id,
+            prompt.checkpoints,
+            lifecycle_authority,
+            retention_obs,
+            destruction_obs,
+            lease_obs,
+            checkpoint_attempts,
+            checkpoint_seam_heuristic,
+            checkpoint_floor_refusal,
+            cache_debug_observability,
+        };
+    }
+
+    // fork server-context.cpp:1845
+    void checkpoint_ring_changed() noexcept {
+        auto context = checkpoint_authority_context();
+        server_cache_checkpoint_ring_changed(context);
+    }
+
+    // fork server-context.cpp:1855
+    void vbr_idle_capture_source_reset() noexcept {
+        vbr_idle_capture_attempt_identity = {};
+        vbr_idle_capture_retry_after_ms = 0;
+        vbr_idle_capture_terminal = false;
+        vbr_idle_capture_isolated_retry = false;
+        vbr_idle_admission_refusals.clear();
+        vbr_idle_support_status =
+            server_vbr_prompt_cache_support_status::supported;
+        vbr_idle_capture_published_identity = {};
+        vbr_idle_capture_representation_valid = false;
+        vbr_idle_stem_source_identity = {};
+        vbr_idle_stem_coverage_tokens = 0;
+        vbr_idle_stem_host_artifact = {};
+        vbr_idle_stem_source_valid = false;
+        vbr_idle_stem_retry = false;
+    }
+
+    // fork server-context.cpp:1872
+    void server_cache_slot_drop_impl(bool retire_retention = true) {
+        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+        if (retire_retention && retention_obs) {
+            retention_obs->retire_slot(id);
+        }
+
+        // A default-constructed slot exists only in model-free ownership
+        // tests. Production slots always carry ctx_tgt and remove their live
+        // sequence here before clearing the scheduler image.
+        if (mem.ctx_tgt) {
+            mem.seq_rm(id, -1, -1);
+        }
+        common_speculative_sequence_transition(
+            get_spec(), id,
+            common_speculative_sequence_event::full_clear);
+
+        if (lifecycle_authority && !prompt.checkpoints.empty()) {
+            checkpoint_ring_changed();
+        }
+        prompt.clear();
+        swa_windows.clear();
+        cache_family = {};
+        vbr_reuse_capture_frontier = 0;
+        vbr_idle_capture_source_reset();
+        vbr_imported_complete_frontier = 0;
+        frontier_logits.clear();
+    }
+
+    // fork server-context.cpp:2115
+    server_cache_destruction_admission observe_mandatory_recovery_reset(
+            server_cache_destruction_reason reason) const {
+        return observe_full_slot(
+            server_cache_destruction_class::mandatory_recovery_reset,
+            reason);
+    }
+
+    // fork server-context.cpp:2142
+    void mandatory_recovery_reset(server_cache_destruction_reason reason) {
+        observe_mandatory_recovery_reset(reason);
+        server_cache_slot_drop_impl();
+    }
+
 };
 
 // returns 0 on success
