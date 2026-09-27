@@ -814,6 +814,32 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Share full-attention rows at positions [0, n_tokens) into an attention-empty destination.
+    // Requires distinct valid sequence IDs, n_tokens > 0, complete unique source positions,
+    // and unified storage (fixed KV, or dynamic VBR without SWA). Unsupported layouts return false.
+    // Recurrent state and SWA rows are NOT copied: callers must separately restore a matching
+    // historical PARTIAL_ONLY checkpoint before decoding hybrid/SWA destinations. On false, neither
+    // sequence's content is changed. VBR callers must also validate the checkpoint's
+    // attention-content lineage against the source; position coverage alone is insufficient.
+    // Call llama_synchronize(ctx) before this operation; do not race decode.
+    // This shares rows, not copy-on-write storage: callers must not shift or replace the
+    // logical content while another sequence still uses it. Sequence removal is safe;
+    // VBR controller retiering applies to the shared rows for all owners together.
+    // [EXPERIMENTAL]
+    LLAMA_API bool llama_memory_try_share_attn_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos n_tokens);
+
+    // Non-mutating preflight for the operation above. Success is not a reservation;
+    // try_share rechecks coverage before changing membership.
+    LLAMA_API bool llama_memory_can_share_attn_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos n_tokens);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

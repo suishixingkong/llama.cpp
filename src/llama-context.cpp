@@ -5058,6 +5058,22 @@ bool llama_memory_try_seq_cp_transient(
     return mem != nullptr && mem->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_try_share_attn_prefix(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos n_tokens) {
+    return mem != nullptr && mem->try_share_attn_prefix(seq_id_src, seq_id_dst, n_tokens);
+}
+
+bool llama_memory_can_share_attn_prefix(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos n_tokens) {
+    return mem != nullptr && mem->can_share_attn_prefix(seq_id_src, seq_id_dst, n_tokens);
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {
