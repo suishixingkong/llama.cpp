@@ -805,6 +805,42 @@ struct server_prompt_cache_vbr_frontier_batch_diagnostics {
     uint64_t stem_matches = 0;
 };
 
+
+// Match the fork's established useful cache-reuse granularity. Tiny shared
+// prefixes remain valid LCP hits, but cannot earn durable frequency credit or
+// authorize copying a much larger displaced live state into host RAM.
+constexpr size_t SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS = 256;
+
+inline bool server_prompt_cache_retention_reuse_is_useful(
+        size_t reused_tokens,
+        const common_chat_msg_spans * message_spans = nullptr) noexcept {
+    if (reused_tokens >= SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS) {
+        return true;
+    }
+    if (reused_tokens == 0 || !message_spans) {
+        return false;
+    }
+    // A complete system/instruction prefix reaching the start of user content
+    // is semantically valuable even when a compact template tokenizes below
+    // the generic anti-noise floor. The raw token LCP may continue into shared
+    // user boilerplate; the later restore seam narrows credit to the frontier
+    // that was actually installed. This admits short shared-system fleets
+    // without promoting ubiquitous BOS/header overlaps.
+    bool complete_system_prefix = false;
+    for (const auto & span : message_spans->spans) {
+        if (span.role == COMMON_CHAT_ROLE_SYSTEM &&
+            span.pos <= reused_tokens &&
+            span.len <= reused_tokens - span.pos) {
+            complete_system_prefix = true;
+        }
+        if (complete_system_prefix &&
+            span.role == COMMON_CHAT_ROLE_USER &&
+            span.pos <= reused_tokens) {
+            return true;
+        }
+    }
+    return false;
+}
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);

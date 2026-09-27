@@ -871,6 +871,9 @@ struct server_slot {
             res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
+            if (!cache_status.empty()) {
+                res["cache_status"] = cache_status; // [obs] why the last prompt (partially) reprocessed
+            }
             res["params"] = ptask->params.to_json(only_metrics);
             res["next_token"] = json::array({
                 {
@@ -1051,8 +1054,24 @@ struct server_slot {
     common_cache_family_binding cache_family;
     // fork server-context.cpp:1519
     bool cache_debug_observability = false;
+    // fork server-context.cpp:1521
+    bool retention_reuse_pending = false;
+    // fork server-context.cpp:1522
+    uint64_t retention_reuse_tokens = 0;
     // fork server-context.cpp:1527
     uint64_t vbr_reuse_capture_frontier = 0;
+    // fork server-context.cpp:1528
+    server_retention_lineage_ticket retention_reuse_source;
+    // fork server-context.cpp:1529
+    server_retention_lineage_ticket retention_destination;
+    // fork server-context.cpp:1530
+    bool retention_branch_pending = false;
+    // fork server-context.cpp:1531
+    bool retention_request_succeeded = false;
+    // fork server-context.cpp:1532
+    bool retention_geometry_failed = false;
+    // fork server-context.cpp:1536
+    bool vbr_prompt_cache_enabled = false;
     // fork server-context.cpp:1537
     server_cache_checkpoint_attempt_latch checkpoint_attempts;
     // fork server-context.cpp:1538
@@ -1183,11 +1202,72 @@ struct server_slot {
         server_cache_slot_drop_impl();
     }
 
+    // fork server-context.cpp:2431-2483  (9 + 13 + 29 lines)
+    void clear_retention_reuse() noexcept {
+        if (retention_obs) {
+            retention_obs->release_lineage_ticket(retention_reuse_source);
+        } else {
+            retention_reuse_source = {};
+        }
+        retention_reuse_pending = false;
+        retention_reuse_tokens = 0;
+    }
+
+    void stage_active_prefix_reuse(
+            const server_retention_instance_key & source, uint64_t n_tokens) noexcept {
+        // Replace the discarded incumbent's receipt, not the destination lineage.
+        // This runs only after the prefix has been installed successfully.
+        clear_retention_reuse();
+        retention_branch_pending = false;
+        if (retention_obs && server_prompt_cache_retention_reuse_is_useful(
+                    n_tokens, &task->params.message_spans) &&
+            retention_obs->acquire_lineage_ticket(source, retention_reuse_source)) {
+            retention_reuse_pending = true;
+            retention_reuse_tokens = n_tokens;
+        }
+    }
+
+    void commit_retention_reuse() noexcept {
+        if (!retention_reuse_pending) {
+            return;
+        }
+        retention_reuse_pending = false;
+        // A later trim or cold replay can supersede a staged reuse receipt.
+        retention_reuse_tokens = std::min(retention_reuse_tokens, stats.n_prompt_cached);
+        const bool reused_branch = retention_branch_pending;
+        common_retention_credit_result credit =
+            common_retention_credit_result::unavailable;
+        if (retention_obs && server_prompt_cache_retention_reuse_is_useful(
+                    retention_reuse_tokens, &task->params.message_spans) &&
+            retention_reuse_source.valid()) {
+            credit = retention_obs->credit_reuse(retention_reuse_source);
+        }
+        if (retention_obs) {
+            retention_obs->release_lineage_ticket(retention_reuse_source);
+        }
+        if (vbr_prompt_cache_enabled && reused_branch &&
+            retention_reuse_tokens != 0 &&
+            credit != common_retention_credit_result::unavailable) {
+            vbr_reuse_capture_frontier = retention_reuse_tokens;
+        }
+        retention_request_succeeded = !retention_branch_pending ||
+            !retention_destination.valid() ||
+            (retention_obs && retention_obs->activate_lineage_ticket(
+                retention_destination));
+        retention_reuse_tokens = 0;
+    }
+
     // ---- group A slot state (verbatim declarations from the fork) ----
 
     common_retention_pool retention_pool = common_retention_pool::attention;
     json cache_plan_json;
     std::unique_ptr<common_cache_plan_record> cache_plan;
+
+    // fork server-context.cpp:2289  (4 lines)
+    // [obs] human-readable reason for how the last prompt's prefix was (or wasn't) reused, surfaced
+    // in GET /slots so a user can see WHY a request cold-processed instead of guessing. Set at the
+    // prompt-reuse decision points; greppable by tests (including typed VBR-lineage rejection).
+    std::string cache_status;
 
 };
 
@@ -1532,6 +1612,8 @@ private:
             slot.spec    = shared_spec;
             slot.ctx_dft = draft_context;
             slot.mem.init(slot.ctx_tgt, draft_context);
+            // fork server-context.cpp:5336
+            slot.vbr_prompt_cache_enabled = params_base.vbr_prompt_cache;
             if (draft_context == nullptr) {
                 // Cached draft state only carries meaning for the context that produced it.
                 // It has to go as a set: draft generation asserts that a reused partial draft
@@ -2015,6 +2097,8 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
+            // fork server-context.cpp:7423
+            slot.vbr_prompt_cache_enabled = params_base.vbr_prompt_cache;
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
@@ -2838,6 +2922,10 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // Inspection and launch do not count as reuse. Publish the pending
+        // live-prefix credit only at the successful final-response boundary.
+        // fork server-context.cpp:10910
+        slot.commit_retention_reuse();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -5696,6 +5784,307 @@ private:
             SLT_WRN(slot, "%s", "SWA window capture skipped: host allocation unavailable\n");
         }
     }
+
+
+    // Late fallback only: normal live/host/checkpoint selection and its approved
+    // clearing have already left an empty destination. Never displace a hit or
+    // change a pre-mutation authoritative plan. The source and any borrowed
+    // checkpoint remain alive for this entire non-yielding scheduler callback.
+    void restore_active_prefix(server_slot & dst) {
+        if (!active_prefix_enabled() ||
+            (!llama_model_is_hybrid(model_tgt) && n_swa <= 0) || dst.diff_self_spec ||
+            !dst.task || dst.task->type != SERVER_TASK_TYPE_COMPLETION ||
+            !dst.task->params.cache_prompt || dst.task->is_parent() || dst.task->is_child() ||
+            !dst.prompt.tokens.empty() || !dst.prompt.checkpoints.empty() ||
+            !dst.lora.empty()) {
+            return;
+        }
+        const auto draft_type = active_prefix_draft_type();
+        if (!draft_type) { return; }
+        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        // FORK-DIFF (fork server-context.cpp:4809): the fork's native DFlash block-diffusion
+        // mode is absent from this tree -- common_speculative_type has no
+        // COMMON_SPECULATIVE_TYPE_DFLASH member -- so this comparison can never hold. This is
+        // the exact result of that member being absent, not an approximation of it.
+        const bool dflash = false;
+        const bool shared_dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        const bool drafting = mtp || dflash || shared_dflash;
+        // FORK-DIFF (fork server-context.cpp:4813): ctx_dft is a raw llama_context * in this
+        // tree (port:390) where the fork holds a llama_context_ptr, and the dflash limb above
+        // is constant-false, so the shared-draft arm is unreachable here.
+        llama_context * draft_ctx = ctx_dft;
+        if (drafting != bool(draft_ctx) || drafting != dst.can_speculate()) { return; }
+        // DFlash media/rebased positions need their own qualification. Existing
+        // MTP/media and target-only SWA admission are unchanged.
+        if ((dflash || shared_dflash) && dst.task->tokens.has_media()) { return; }
+        // Retained attention windows use zero-copy sharing. Recycled windows
+        // may use the separately qualified typed historical companion.
+        const bool live_attention = server_vbr_dynamic_active(params_base) &&
+            n_swa > 0 && !llama_model_is_hybrid(model_tgt) && !drafting;
+
+        auto * rec = dst.cache_plan.get();
+        common_cache_plan_candidate * row = nullptr;
+        bool installed = false;
+        try {
+            const int64_t start = ggml_time_us();
+            struct candidate {
+                const server_slot * source = nullptr;
+                const common_prompt_checkpoint * checkpoint = nullptr;
+                int64_t n_tokens = 0;
+                std::vector<llama_pos> rows;
+                size_t window_bytes = 0;
+            } best;
+            std::vector<std::pair<const server_slot *, const server_swa_window_checkpoint *>> windows;
+            std::optional<server_tokens> installed_prefix;
+            const auto adapter = lora_config_identity(dst.lora);
+            const auto mem = llama_get_memory(ctx_tgt);
+            const auto provider = live_attention
+                ? common_cache_plan_provider::active_attention_prefix
+                : common_cache_plan_provider::active_context_checkpoint;
+            std::vector<float> carry;
+
+            for (const auto & source : slots) {
+                if (source.id == dst.id || source.state != SLOT_STATE_GENERATING ||
+                    !source.task || !source.task->params.cache_prompt ||
+                    source.task->is_parent() || source.task->is_child() ||
+                    !source.lora.empty() ||
+                    source.can_speculate() != drafting ||
+                    ((dflash || shared_dflash) && source.prompt.tokens.has_media()) ||
+                    (!source.prompt.tokens.has_media() &&
+                     source.prompt.tokens.pos_next() != source.prompt.n_tokens())) {
+                    continue;
+                }
+                // Always replay at least one input token to produce A2's own logits.
+                const size_t lcp = std::min(source.prompt.tokens.get_common_prefix(dst.task->tokens),
+                                           dst.task->tokens.size() - 1);
+                if (live_attention) {
+                    if (lcp <= size_t(best.n_tokens) || lcp > size_t(INT32_MAX)) { continue; }
+                    std::vector<llama_pos> rows;
+                    if (source.prompt.tokens.has_media() || dst.task->tokens.has_media()) {
+                        std::string source_media, destination_media;
+                        if (!source.prompt.tokens.media_content_identity(lcp, source_media) ||
+                            !dst.task->tokens.media_content_identity(lcp, destination_media) ||
+                            source_media != destination_media ||
+                            source.prompt.tokens.pos_next(lcp) != dst.task->tokens.pos_next(lcp)) {
+                            continue;
+                        }
+                        rows = dst.task->tokens.prefix_row_positions(lcp);
+                        if (!mem->can_share_live_prefix_rows(source.id, dst.id,
+                                dst.task->tokens.pos_next(lcp), rows)) {
+                            continue;
+                        }
+                    } else if (!mem->can_share_live_prefix(source.id, dst.id, llama_pos(lcp))) {
+                        if (swa_window_eligible(dst) && swa_window_eligible(source)) {
+                            for (auto it = source.swa_windows.rbegin(); it != source.swa_windows.rend(); ++it) {
+                                if (it->image->frontier() > int64_t(lcp) || it->image->frontier() <= best.n_tokens ||
+                                    it->sequence_epoch != source.prompt.sequence_epoch) { continue; }
+                                windows.emplace_back(&source, &*it);
+                            }
+                        }
+                        continue;
+                    }
+                    best = { &source, nullptr, int64_t(lcp), std::move(rows) };
+                    continue;
+                }
+                // The shared rows may have been retiered since capture. That is
+                // allowed, but a content edit/replacement invalidates the old RS
+                // checkpoint even when the same token positions are present.
+                std::optional<llama_memory_vbr_state_data> source_vbr;
+                for (const auto & cp : source.prompt.checkpoints) {
+                    if (cp.n_tokens <= 0 || uint64_t(cp.n_tokens) > lcp ||
+                        cp.n_tokens <= best.n_tokens ||
+                        cp.pos_min < 0 || cp.pos_min > cp.pos_max ||
+                        (llama_model_is_hybrid(model_tgt) && cp.pos_min != cp.pos_max) ||
+                        cp.data_tgt.empty() || !cp.data_qsa.empty() || (!dflash && !cp.accel.ring.empty()) ||
+                        !checkpoint_frontier_is_current(source, cp, adapter) ||
+                        (source.retention_obs && !source.retention_obs->clone_source_available(
+                            server_retention_instance_key::for_checkpoint(source.id, &cp)))) {
+                        continue;
+                    }
+                    std::vector<llama_pos> rows;
+                    if (source.prompt.tokens.has_media() || dst.task->tokens.has_media()) {
+                        std::string media_identity;
+                        if (!dst.task->tokens.media_content_identity(cp.n_tokens, media_identity) ||
+                            media_identity != cp.computation_frontier.media_content_identity ||
+                            dst.task->tokens.pos_next(cp.n_tokens) != cp.computation_frontier.next_position) {
+                            continue;
+                        }
+                        rows = dst.task->tokens.prefix_row_positions(cp.n_tokens);
+                        if (!mem->can_share_attn_prefix_rows(source.id, dst.id,
+                                cp.computation_frontier.next_position, rows)) {
+                            continue;
+                        }
+                    } else if (int64_t(cp.pos_max) + 1 != cp.n_tokens ||
+                               !llama_memory_can_share_attn_prefix(mem, source.id, dst.id, cp.n_tokens)) {
+                        continue;
+                    }
+                    if (server_vbr_dynamic_active(params_base)) {
+                        // The pressure snapshot also scans occupancy. Do not pay
+                        // for it on unrelated-prefix or fixed-KV requests.
+                        if (!source_vbr) {
+                            source_vbr = llama_memory_vbr_state(mem, source.id, 0);
+                        }
+                        if (!common_prompt_checkpoint_lineage_matches(cp, *source_vbr)) {
+                            continue;
+                        }
+                    }
+                    if (mtp) {
+                        if (carry.empty()) {
+                            carry.resize(llama_model_n_embd_out(model_tgt));
+                        }
+                        common_speculative_mtp_carry_lifecycle scratch;
+                        if (cp.data_dft.empty() || !cp.data_dft_full_sequence ||
+                            !common_speculative_mtp_carry_state_load(scratch, carry, cp.accel.spec.view())) {
+                            continue;
+                        }
+                    }
+                    if (shared_dflash && (cp.data_dft.empty() || !cp.data_dft_full_sequence || !cp.accel.spec.empty())) {
+                        continue;
+                    }
+                    if (dflash && (!cp.accel.spec.empty() ||
+                        !common_speculative_ring_state_matches_frontier(dst.get_spec(), cp.accel.ring.view().data(),
+                            cp.accel.ring.size(), cp.pos_max))) { continue; }
+                    best = { &source, &cp, cp.n_tokens, std::move(rows) };
+                }
+            }
+            // Rank metadata first. A failed/larger proposal must not retain a
+            // reservation that prevents a better candidate, or discard an
+            // already feasible live hit. Live sharing wins equal-length ties.
+            std::stable_sort(windows.begin(), windows.end(), [](const auto & a, const auto & b) {
+                return a.second->image->frontier() > b.second->image->frontier();
+            });
+            bool synchronized = false;
+            for (const auto & candidate : windows) {
+                const auto & source = *candidate.first;
+                const auto & image = candidate.second->image;
+                if (image->frontier() <= best.n_tokens) { break; }
+                if (!synchronized) {
+                    llama_synchronize(ctx_tgt);
+                    synchronized = true;
+                }
+                auto prefix = dst.task->tokens.clone_cached_prefix(image->frontier());
+                vbr_swa_window_plan_request request;
+                request.source_epoch = source.prompt.sequence_epoch;
+                request.destination = dst.id;
+                request.destination_epoch = ensure_frontier_sequence_epoch(dst.prompt);
+                request.execution_identity = swa_window_execution_identity;
+                request.representation = swa_window_representation();
+                request.capacity_context = prompt_cache.get(); request.reserve = reserve_swa_staging;
+                auto plan = vbr_prepare_swa_window(*ctx_tgt, image, request);
+                if (plan.status != vbr_swa_window_status::ok) { continue; }
+                vbr_swa_window_install_request install {request.source_epoch, request.destination_epoch, request.execution_identity};
+                install.capacity_context = prompt_cache.get(); install.reserve = reserve_swa_staging;
+                if (vbr_install_swa_window(*ctx_tgt, std::move(plan.plan), install) != vbr_swa_window_status::ok) { continue; }
+                installed = true;
+                installed_prefix.emplace(std::move(prefix));
+                best = {&source, nullptr, image->frontier(), {}, image->retained_bytes()};
+                break;
+            }
+            if (rec) {
+                // Only the selected active prefix is recorded, not a complete
+                // cost-planner inventory of every sibling/source considered here.
+                if (best.source) {
+                    rec->note_inventory_truncated(provider);
+                } else {
+                    rec->note_inventory_complete(provider);
+                }
+            }
+            if (!best.source) {
+                return;
+            }
+
+            const auto * cp = best.checkpoint;
+            const auto n_tokens = best.n_tokens;
+            const auto next_pos = dst.task->tokens.pos_next(n_tokens);
+            row = rec ? rec->find_or_add(provider, best.source->id, uint8_t(0),
+                                         dst.id, rec->selection) : nullptr;
+            if (row) {
+                row->lcp_tokens = llama_cache_acct_value::measured(n_tokens);
+                row->payload_bytes = llama_cache_acct_value::measured(cp ? cp->size() : best.window_bytes);
+                rec->select(provider, row);
+            }
+            auto prefix = installed_prefix ? std::move(*installed_prefix) : dst.task->tokens.clone_cached_prefix(n_tokens);
+            // Media capability belongs to the slot, not this request. A text
+            // completion can be followed by an image after erase/ID reuse.
+            prefix.has_mtmd = dst.prompt.tokens.has_mtmd;
+            std::string status = live_attention ? "shared active attention prefix" : "restored active context checkpoint";
+            if (best.window_bytes) { status = "restored historical SWA window"; }
+            if (!synchronized) { llama_synchronize(ctx_tgt); }
+            if (draft_ctx) {
+                llama_synchronize(draft_ctx);
+            }
+            const bool shared = installed || (live_attention
+                ? (best.rows.empty() ? mem->try_share_live_prefix(best.source->id, dst.id, next_pos)
+                                    : mem->try_share_live_prefix_rows(best.source->id, dst.id, next_pos, best.rows))
+                : !best.rows.empty()
+                    ? mem->try_share_attn_prefix_rows(best.source->id, dst.id,
+                        cp->computation_frontier.next_position, best.rows)
+                    : llama_memory_try_share_attn_prefix(mem, best.source->id, dst.id, n_tokens));
+            if (!shared) {
+                if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT); }
+                return;
+            }
+            installed = true;
+            const bool target_ok = live_attention || llama_state_seq_set_data_ext(ctx_tgt,
+                    cp->data_tgt.data(), cp->data_tgt.size(), dst.id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == cp->data_tgt.size();
+            const bool draft_ok = target_ok && (!(mtp || shared_dflash) || cp->try_load_dft(
+                    draft_ctx, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            if (!draft_ok || llama_memory_seq_pos_max(mem, dst.id) != (cp ? cp->pos_max : next_pos - 1)) {
+                throw std::runtime_error("active prefix checkpoint restore failed");
+            }
+            if (shared_dflash && llama_memory_seq_pos_max(llama_get_memory(draft_ctx), dst.id) != cp->pos_max) {
+                throw std::runtime_error("active prefix draft frontier mismatch");
+            }
+            common_speculative_sequence_transition(dst.get_spec(), dst.id,
+                mtp ? common_speculative_sequence_event::composite_image_restored
+                    : shared_dflash ? common_speculative_sequence_event::draft_image_restored
+                    : common_speculative_sequence_event::target_restored_without_draft);
+            if (mtp && !common_speculative_set_state(dst.get_spec(), dst.id, cp->accel.spec.view())) {
+                throw std::runtime_error("active prefix MTP state restore failed");
+            }
+            if (dflash && !common_speculative_ring_state_load(dst.get_spec(),
+                    cp->accel.ring.view().data(), cp->accel.ring.size())) {
+                throw std::runtime_error("active prefix DFlash ring restore failed");
+            }
+            // Publish only the input prefix, not source task/sampler/output or its
+            // checkpoint ring. The next ordinary decode establishes A2's lineage.
+            dst.prompt.tokens.swap(prefix);
+            ensure_frontier_sequence_epoch(dst.prompt);
+            dst.stats.n_prompt_cached = n_tokens;
+            metrics.add_prompt_cached(n_tokens);
+            dst.cache_status.swap(status);
+            dst.stage_active_prefix_reuse(
+                cp ? server_retention_instance_key::for_checkpoint(best.source->id, cp)
+                   : server_retention_instance_key::for_slot(best.source->id), n_tokens);
+            if (row) {
+                rec->revoke_deliveries();
+                row->accept();
+                row->delivered = true;
+            } else if (rec) {
+                // Reuse succeeded, but a full observer cannot represent its provider.
+                // Drop the record instead of attributing these tokens to the old live slot.
+                if (cache_plan_obs) { cache_plan_obs->shadow_unavailable++; }
+                dst.cache_plan.reset();
+                rec = nullptr;
+            }
+            SLT_INF(dst, "active prefix restored: source_slot=%d source_task=%d tokens=%" PRId64
+                    " replay=%zu restore_ms=%.3f\n", best.source->id, best.source->task->id,
+                    n_tokens, dst.task->tokens.size() - size_t(n_tokens),
+                    (ggml_time_us() - start) / 1000.0);
+            return;
+        } catch (const std::exception & e) {
+            if (installed) {
+                dst.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+                dst.stats.n_prompt_cached = 0;
+            }
+            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT); }
+            if (rec && installed) { rec->restore_attempt_failed = true; }
+            SLT_WRN(dst, "active prefix unavailable, using cold prefill: %s\n", e.what());
+            return;
+        }
+    }
+
 
     // fork server-context.cpp:11170  (11 lines)
     void assert_scheduler_thread(

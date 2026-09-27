@@ -127,3 +127,17 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-cache-receipt-chain COMMAND test-cache-receipt-chain)
     set_property(TEST test-cache-receipt-chain PROPERTY LABELS main)
 endif()
+
+# C++ unit test for the retention-reuse predicate (slice 9j). Same reasoning as
+# above: server-task.h is only reachable through server-context. Model-free.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-retention-reuse-useful
+        ${PROJECT_SOURCE_DIR}/tests/test-retention-reuse-useful.cpp)
+    target_link_libraries(test-retention-reuse-useful PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-retention-reuse-useful PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-retention-reuse-useful PRIVATE cxx_std_17)
+    add_test(NAME test-retention-reuse-useful COMMAND test-retention-reuse-useful)
+    set_property(TEST test-retention-reuse-useful PROPERTY LABELS main)
+endif()
