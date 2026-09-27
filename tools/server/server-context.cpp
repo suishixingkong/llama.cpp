@@ -930,6 +930,8 @@ struct server_slot {
     // fork server-context.cpp:2303
     bool frontier_ratchet_flipped = false;
     // fork server-context.cpp:1511
+    // fork server-context.cpp:1510
+    server_cache_destruction_observer * destruction_obs = nullptr;
     server_retention_sidecar_store * retention_obs = nullptr;
     // fork server-context.cpp:1512
     server_cache_lease_table * lease_obs = nullptr;
@@ -965,6 +967,55 @@ struct server_slot {
             first_token, token_count);
     }
 
+
+    // fork server-context.cpp:1998
+    server_cache_destruction_admission observe_full_slot(
+            server_cache_destruction_class cls,
+            server_cache_destruction_reason reason) const {
+        GGML_ASSERT(
+            cls == server_cache_destruction_class::slot_drop ||
+            cls == server_cache_destruction_class::mandatory_recovery_reset);
+        server_cache_destruction_admission admission;
+        admission.cls    = cls;
+        admission.reason = reason;
+        admission.issued = true;
+        if (!destruction_obs) {
+            return admission;
+        }
+        server_cache_destruction_request request;
+        request.cls    = cls;
+        request.reason = reason;
+        for (const auto kind : {
+                server_cache_destruction_target_kind::live_target,
+                server_cache_destruction_target_kind::token_ledger,
+                server_cache_destruction_target_kind::checkpoint_ring,
+                server_cache_destruction_target_kind::rolling_window,
+                server_cache_destruction_target_kind::typed_accelerator }) {
+            if (kind == server_cache_destruction_target_kind::live_target &&
+                retention_obs) {
+                request.add_target(
+                    kind,
+                    id,
+                    retention_obs->artifact_id(
+                        server_retention_instance_key::for_slot(id)));
+            } else {
+                request.add_target(kind, id);
+            }
+        }
+        if (ctx_dft) {
+            request.add_target(
+                server_cache_destruction_target_kind::live_draft, id);
+        }
+        for (const auto category : {
+                llama_cache_acct_category::live_attention_state,
+                llama_cache_acct_category::live_recurrent_state,
+                llama_cache_acct_category::checkpoint_state_payload,
+                llama_cache_acct_category::typed_accelerator_payload,
+                llama_cache_acct_category::rolling_window_tape }) {
+            request.add_yield(category);
+        }
+        return server_cache_retention_admit(destruction_obs, request);
+    }
 };
 
 // returns 0 on success
