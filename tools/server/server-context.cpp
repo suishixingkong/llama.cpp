@@ -1183,6 +1183,15 @@ struct server_slot {
 
 };
 
+// fork server-context.cpp:815 (definition)
+// The dynamic VBR runtime controller flips KV tensor types in place as the context fills; state
+// save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
+// restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
+// (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
+static bool server_vbr_dynamic_active(const common_params & params) {
+    return params.vbr_dynamic();
+}
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
@@ -2327,7 +2336,7 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && fixed_host_cache_enabled();
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
@@ -5644,6 +5653,11 @@ struct server_cache_plan_observer {
     };
 
     // ---- group A data members (verbatim declarations from the fork) ----
+
+    // fork server-context.cpp:4271
+    bool fixed_host_cache_enabled() const noexcept {
+        return prompt_cache && !server_vbr_dynamic_active(params_base);
+    }
 
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
     std::thread::id cache_plan_preflight_scheduler_thread;
