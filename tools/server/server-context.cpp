@@ -2050,6 +2050,31 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        if (server_vbr_dynamic_active(params_base)) {
+            // Disabled: these mechanisms serialize/shift the ATTENTION KV, whose tensor tiers flip
+            // in place at runtime under the dynamic VBR controller (a FLAGS_NONE state restore
+            // would land bytes under the wrong tier or past the VMM watermark; cache_reuse needs
+            // shifts, and get_can_shift() is false under VMM anyway).
+            if (params_base.cache_ram_mib != 0 &&
+                !params_base.vbr_prompt_cache) {
+                params_base.cache_ram_mib = 0;
+                SRV_WRN("%s\n", "dynamic VBR prompt-cache artifacts were explicitly disabled; fixed KV state images are unsafe and cache-ram will be disabled");
+            } else if (params_base.cache_ram_mib != 0) {
+                SRV_INF("%s\n", "dynamic VBR idle caching will store projected artifacts; fixed KV state images remain disabled");
+            }
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            if (!params_base.slot_save_path.empty()) {
+                // llama_state_seq_save_file carries full tier-typed attention KV: a save taken
+                // after any degrade is refused at the lib level, and even entry-tier saves stop
+                // restoring once the target cache has degraded — predictably off beats flaky
+                params_base.slot_save_path.clear();
+                SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -3175,7 +3200,9 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (!params_base.vbr_prompt_cache &&
+                        params_base.cache_idle_slots &&
+                        !server_vbr_dynamic_active(params_base)) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
