@@ -377,6 +377,12 @@ struct server_swa_window_checkpoint {
     std::shared_ptr<const vbr_swa_window_image> image;
 };
 
+// fork server-context.cpp:1423
+struct server_cache_plan_observer {
+    uint64_t records_finalized  = 0;
+    uint64_t shadow_unavailable = 0;
+};
+
 struct server_slot {
     int id;
 
@@ -1168,6 +1174,12 @@ struct server_slot {
         observe_mandatory_recovery_reset(reason);
         server_cache_slot_drop_impl();
     }
+
+    // ---- group A slot state (verbatim declarations from the fork) ----
+
+    common_retention_pool retention_pool = common_retention_pool::attention;
+    json cache_plan_json;
+    std::unique_ptr<common_cache_plan_record> cache_plan;
 
 };
 
@@ -5534,6 +5546,2127 @@ private:
         if (pinned != current) {
             GGML_ABORT("%s\n", what);
         }
+    }
+
+
+    // ---- group A file-local types (verbatim from the fork) ----
+
+    // fork server-context.cpp:1423
+struct server_cache_plan_observer {
+    uint64_t records_finalized  = 0;
+    uint64_t shadow_unavailable = 0;
+};
+
+    // fork server-context.cpp:4219
+    struct cache_plan_host_source_registry {
+        explicit cache_plan_host_source_registry(bool publish) noexcept
+            : publish_(publish) {}
+
+        void begin(server_prompt_cache * cache) noexcept {
+            if (publish_ && cache) {
+                cache->cache_plan_begin_inventory();
+                published_.clear();
+                published_.reserve(cache->states.size());
+                for (auto & state : cache->states) {
+                    published_.emplace(
+                        server_retention_instance_key::for_host_entry(
+                            &state).instance,
+                        &state);
+                }
+            }
+        }
+
+        bool get(
+                server_prompt_cache & cache,
+                server_prompt_cache_state & state,
+                int32_t & source_id) {
+            if (publish_) {
+                return cache.cache_plan_get_source_id(state, source_id);
+            }
+            return local_.get_or_assign(
+                server_retention_instance_key::for_host_entry(
+                    &state).instance,
+                source_id);
+        }
+
+        bool find(uintptr_t instance, int32_t & source_id) const noexcept {
+            if (!publish_) {
+                return local_.find(instance, source_id);
+            }
+            const auto found = published_.find(instance);
+            if (found == published_.end() ||
+                found->second->cache_plan_source_id < 0) {
+                source_id = -1;
+                return false;
+            }
+            source_id = found->second->cache_plan_source_id;
+            return true;
+        }
+
+    private:
+        bool publish_ = false;
+        server_cache_plan_local_source_registry local_;
+        std::unordered_map<uintptr_t, const server_prompt_cache_state *>
+            published_;
+    };
+
+    // fork server-context.cpp:5565
+    enum class vbr_recovery_requirement : uint8_t {
+        full_frontier = 0,
+        full_or_stem,
+        none_for_admission_progress,
+    };
+
+    // fork server-context.cpp:5571
+    struct vbr_live_retention_filter {
+        int except_id = -1;
+        int spec_tier = -1;
+        const std::vector<uint8_t> * refused_by_seq = nullptr;
+        vbr_recovery_requirement recovery =
+            vbr_recovery_requirement::full_frontier;
+    };
+
+    // fork server-context.cpp:8889
+    struct cache_plan_stage1_selection {
+        server_slot * target = nullptr;
+        bool update_cache = false;
+        bool selection_deferred_busy = false;
+        std::unique_ptr<common_cache_plan_record> record;
+    };
+
+    // fork server-context.cpp:9249
+    struct cache_plan_stage1_inventory {
+        std::vector<common_adapter_lora_info> incoming_loras;
+        std::string incoming_adapter;
+        bool incoming_adapter_ready = false;
+        bool incoming_adapter_matches = false;
+        bool host_lookup_enabled = false;
+    };
+
+    // ---- group A data members (verbatim declarations from the fork) ----
+
+    std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
+    std::thread::id cache_plan_preflight_scheduler_thread;
+    std::vector<server_live_retention_candidate> vbr_retention_candidates;
+    std::vector<int32_t> vbr_retention_candidate_by_seq;
+    std::vector<uint8_t> vbr_retention_seen_by_seq;
+    std::vector<uint8_t> vbr_durable_sources_by_seq;
+    std::vector<uint8_t> vbr_durable_stems_by_seq;
+    std::vector<uint32_t> vbr_exclusive_cells_by_seq;
+    size_t vbr_retention_candidate_count = 0;
+    uint64_t vbr_retention_projection_epoch = 0;
+    const std::vector<uint32_t> * vbr_exclusive_cells_for_test = nullptr;
+    // ---------------------------------------------------------------------
+    // group A: cache-plan observation face + the retention wave it calls.
+    // Bodies verbatim from the fork; the fork coordinates are on each header
+    // line. Placed together rather than in the fork's own order: inside a
+    // class body that is semantically irrelevant and it keeps the addition
+    // additive, so a future rebase can move them mechanically.
+    // ---------------------------------------------------------------------
+
+    // fork server-context.cpp:3670  (128 lines)
+    bool cache_plan_observe_live_memory(bool certify) noexcept {
+        if (!cache_authority || cache_authority->live_device_domains.empty()) {
+            return true;
+        }
+
+        try {
+            using live_row = llama_live_memory_breakdown_data;
+            std::vector<live_row> totals(cache_authority->live_device_domains.size());
+            bool complete = true;
+
+            const auto add_checked = [&complete](size_t & dst, size_t value) {
+                if (value > std::numeric_limits<size_t>::max() - dst) {
+                    complete = false;
+                    return;
+                }
+                dst += value;
+            };
+
+            llama_context * contexts[] = {
+                ctx_tgt,
+                // FORK-DIFF: the fork holds ctx_dft in a llama_context_ptr (fork:3488) and writes ctx_dft.get();
+                // the port keeps a raw llama_context * (see port:1231 and the note at 5131).
+                ctx_dft,
+                ctx_dft_shared.get(),
+            };
+            for (size_t i_ctx = 0; i_ctx < std::size(contexts); ++i_ctx) {
+                const llama_context * ctx = contexts[i_ctx];
+                if (!ctx || std::find(contexts, contexts + i_ctx, ctx) != contexts + i_ctx) {
+                    continue;
+                }
+                const auto breakdown = llama_get_live_memory_breakdown(ctx);
+                for (const auto & [raw_buft, row] : breakdown) {
+                    if (!raw_buft || ggml_backend_buft_is_host(raw_buft)) {
+                        continue;
+                    }
+
+                    ggml_backend_buffer_type_t buft = raw_buft;
+                    if (ggml_backend_buft_is_meta(buft)) {
+                        if (ggml_backend_meta_buft_n_bufts(buft) != 1) {
+                            complete = false;
+                            continue;
+                        }
+                        buft = ggml_backend_meta_buft_simple_buft(buft, 0);
+                    }
+
+                    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+                    const auto it = std::find_if(
+                        cache_authority->live_device_domains.begin(),
+                        cache_authority->live_device_domains.end(),
+                        [device](const auto & binding) {
+                            return binding.device == device;
+                        });
+                    if (it == cache_authority->live_device_domains.end()) {
+                        complete = false;
+                        continue;
+                    }
+
+                    auto & total = totals[size_t(
+                        it - cache_authority->live_device_domains.begin())];
+                    add_checked(total.attention,           row.attention);
+                    add_checked(total.recurrent,           row.recurrent);
+                    add_checked(total.recurrent_rollback,  row.recurrent_rollback);
+                    add_checked(total.rolling_window_tape, row.rolling_window_tape);
+                }
+            }
+
+            // complete is fixed after accumulation; when unavailable, every domain is marked
+            // the same way, so the fail path is hoisted out of the per-domain gauge loop.
+            if (!complete) {
+                for (const auto & binding : cache_authority->live_device_domains) {
+                    for (const auto category : {
+                            llama_cache_acct_category::live_attention_state,
+                            llama_cache_acct_category::live_recurrent_state,
+                            llama_cache_acct_category::recurrent_rollback_planes,
+                            llama_cache_acct_category::rolling_window_tape }) {
+                        cache_authority->ledger.mark_unavailable(
+                            category, binding.domain,
+                            llama_cache_acct_measure::resident_allocated);
+                    }
+                    cache_authority->ledger.mark_producer_unavailable(
+                        binding.domain, llama_cache_acct_producer::live_memory);
+                }
+                return false;
+            }
+
+            for (size_t i = 0; i < totals.size(); ++i) {
+                const auto & domain = cache_authority->live_device_domains[i].domain;
+                const auto & total  = totals[i];
+                cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::live_attention_state, domain,
+                    llama_cache_acct_measure::resident_allocated, total.attention);
+                cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::live_recurrent_state, domain,
+                    llama_cache_acct_measure::resident_allocated, total.recurrent);
+                cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::recurrent_rollback_planes, domain,
+                    llama_cache_acct_measure::resident_allocated,
+                    total.recurrent_rollback);
+                cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::rolling_window_tape, domain,
+                    llama_cache_acct_measure::resident_allocated,
+                    total.rolling_window_tape);
+                if (certify) {
+                    (void) cache_authority->ledger.certify_complete(
+                        domain, llama_cache_acct_producer::live_memory);
+                }
+            }
+
+            // Imported VMM pages are conservatively charged as transfer
+            // staging until this complete observation accounts for them as
+            // live attention state. Retire that bridge only after every gauge
+            // has been published, avoiding both a gap and double-accounting.
+            for (size_t i_ctx = 0; i_ctx < std::size(contexts); ++i_ctx) {
+                llama_context * ctx = contexts[i_ctx];
+                if (!ctx || std::find(contexts, contexts + i_ctx, ctx) !=
+                                contexts + i_ctx) {
+                    continue;
+                }
+                ctx->vbr_import_accounting_observed();
+            }
+
+            return complete;
+        } catch (...) {
+            for (const auto & binding : cache_authority->live_device_domains) {
+                cache_authority->ledger.mark_producer_unavailable(
+                    binding.domain, llama_cache_acct_producer::live_memory);
+            }
+            return false;
+        }
+    }
+
+    // fork server-context.cpp:3802  (85 lines)
+    bool cache_plan_configure_budget() noexcept {
+        if (!cache_authority) {
+            return true;
+        }
+        try {
+            cache_authority->budget_devices.clear();
+            cache_authority->budget_devices.reserve(
+                cache_authority->live_device_domains.size());
+            for (const auto & binding : cache_authority->live_device_domains) {
+                llama_cache_budget_device_input input;
+                input.backend_device = binding.device;
+                input.domain = binding.domain;
+                input.phys_state = llama_cache_budget_capacity_state::unavailable;
+                input.compute_state = llama_cache_budget_capacity_state::known;
+                input.cache_cap_state = llama_cache_budget_capacity_state::unbounded;
+                input.reserve_provenance =
+                    llama_cache_budget_reserve_provenance::configured;
+                cache_authority->budget_devices.push_back(input);
+            }
+
+            bool complete = true;
+            const auto add_checked = [&complete](uint64_t & dst, size_t value) {
+                if (uint64_t(value) >
+                    std::numeric_limits<uint64_t>::max() - dst) {
+                    complete = false;
+                    return;
+                }
+                dst += uint64_t(value);
+            };
+
+            const llama_context * contexts[] = {
+                ctx_tgt,
+                // FORK-DIFF: the fork holds ctx_dft in a llama_context_ptr (fork:3488) and writes ctx_dft.get();
+                // the port keeps a raw llama_context * (see port:1231 and the note at 5131).
+                ctx_dft,
+                ctx_dft_shared.get(),
+            };
+            for (size_t i_ctx = 0; i_ctx < std::size(contexts); ++i_ctx) {
+                const llama_context * ctx = contexts[i_ctx];
+                if (!ctx ||
+                    std::find(contexts, contexts + i_ctx, ctx) !=
+                        contexts + i_ctx) {
+                    continue;
+                }
+                for (const auto & [raw_buft, row] :
+                        llama_get_memory_breakdown(ctx)) {
+                    if (row.compute == 0 || !raw_buft ||
+                        ggml_backend_buft_is_host(raw_buft)) {
+                        continue;
+                    }
+                    // The context owner expands Meta scheduler buffers into
+                    // physical rows. A Meta row here is incomplete accounting,
+                    // not a quantity that can safely be split by topology.
+                    if (ggml_backend_buft_is_meta(raw_buft)) {
+                        complete = false;
+                        continue;
+                    }
+                    const ggml_backend_dev_t device =
+                        ggml_backend_buft_get_device(raw_buft);
+                    auto it = std::find_if(
+                        cache_authority->budget_devices.begin(),
+                        cache_authority->budget_devices.end(),
+                        [device](const auto & input) {
+                            return input.backend_device == device;
+                        });
+                    if (it == cache_authority->budget_devices.end()) {
+                        complete = false;
+                        continue;
+                    }
+                    add_checked(it->current_compute_allocated, row.compute);
+                }
+            }
+
+            for (auto & input : cache_authority->budget_devices) {
+                input.configured_compute_reserve =
+                    input.current_compute_allocated;
+                if (!complete) {
+                    input.compute_state =
+                        llama_cache_budget_capacity_state::unavailable;
+                }
+            }
+            return complete;
+        } catch (...) {
+            cache_authority->budget_devices.clear();
+            return false;
+        }
+    }
+
+    // fork server-context.cpp:4031  (187 lines)
+    bool cache_plan_assemble_yield_candidates(
+            const std::vector<server_retention_candidate> & catalog,
+            std::vector<server_cache_yield_candidate> & candidates) noexcept {
+        try {
+            const auto resolve = [&](const server_retention_candidate & source,
+                                     server_cache_yield_candidate & candidate,
+                                     server_cache_lease_identity & identity,
+                                     bool & identity_known) {
+                switch (source.instance_key.kind) {
+                    case common_retention_artifact_kind::host_entry: {
+                        if (prompt_cache &&
+                            source.instance_key.owner_slot == -1 &&
+                            source.instance_key.instance != 0) {
+                            const auto backing = std::find_if(
+                                prompt_cache->states.begin(),
+                                prompt_cache->states.end(),
+                                [&](const auto & entry) {
+                                    return server_retention_instance_key::
+                                               for_host_entry(&entry).instance ==
+                                           source.instance_key.instance;
+                                });
+                            if (backing == prompt_cache->states.end()) {
+                                candidate.availability =
+                                    server_retention_candidate_availability::
+                                        backing_missing_or_stale;
+                                break;
+                            }
+                            const auto coverage =
+                                source.record.stamp.coverage_tokens;
+                            identity_known =
+                                coverage <= uint64_t(INT64_MAX) &&
+                                server_cache_lease_build_identity(
+                                    frontier_execution_identity,
+                                    backing->adapter_config_key,
+                                    backing->prompt.tokens,
+                                    int64_t(coverage),
+                                    identity);
+                            for (const auto op : backing->release_ops()) {
+                                if (op) {
+                                    candidate.release_ops.push_back(op);
+                                }
+                            }
+                            if (candidate.release_ops.empty()) {
+                                candidate.availability =
+                                    server_retention_candidate_availability::
+                                        backing_missing_or_stale;
+                            }
+                        } else {
+                            candidate.availability =
+                                server_retention_candidate_availability::
+                                    backing_missing_or_stale;
+                        }
+                        break;
+                    }
+                    case common_retention_artifact_kind::live_slot: {
+                        const auto slot_it = std::find_if(
+                            slots.begin(), slots.end(),
+                            [&](const auto & candidate_slot) {
+                                return candidate_slot.id ==
+                                    source.instance_key.owner_slot &&
+                                    server_retention_instance_key::for_slot(
+                                        candidate_slot.id).instance ==
+                                        source.instance_key.instance;
+                            });
+                        if (slot_it != slots.end()) {
+                            const auto coverage =
+                                source.record.stamp.coverage_tokens;
+                            identity_known =
+                                coverage <= uint64_t(INT64_MAX) &&
+                                server_cache_lease_build_identity(
+                                    frontier_execution_identity,
+                                    lora_config_identity(slot_it->lora),
+                                    slot_it->prompt.tokens,
+                                    int64_t(coverage),
+                                    identity);
+                            candidate.availability = slot_it->is_processing()
+                                ? server_retention_candidate_availability::
+                                      in_flight_mutation
+                                : server_retention_candidate_availability::
+                                      available;
+                        } else {
+                            candidate.availability =
+                                server_retention_candidate_availability::
+                                    backing_missing_or_stale;
+                        }
+                        // Sequence removal does not free the fixed pooled KV
+                        // backing. The live descriptor therefore contributes
+                        // a known-zero transactional release; independently
+                        // owned checkpoint children in the same slot manifest
+                        // contribute their real operations.
+                        candidate.has_unsupported_host_spill = false;
+                        break;
+                    }
+                    case common_retention_artifact_kind::checkpoint: {
+                        // retention accounting live members publish exact independently releasable
+                        // payload operations. Host-entry checkpoint clones remain
+                        // aggregate-owned and therefore stay fail-closed here.
+                        candidate.availability =
+                            server_retention_candidate_availability::
+                                backing_missing_or_stale;
+                        candidate.has_unsupported_host_spill = true;
+                        if (source.instance_key.instance == 0) {
+                            break;
+                        }
+
+                        for (const auto & owner : slots) {
+                            if (source.instance_key.owner_slot != owner.id) {
+                                continue;
+                            }
+                            const auto checkpoint = std::find_if(
+                                owner.prompt.checkpoints.begin(),
+                                owner.prompt.checkpoints.end(),
+                                [&](const auto & item) {
+                                    return server_retention_instance_key::
+                                               for_checkpoint(
+                                                   owner.id, &item).instance ==
+                                           source.instance_key.instance;
+                                });
+                            if (checkpoint !=
+                                owner.prompt.checkpoints.end()) {
+                                identity_known =
+                                    server_cache_lease_build_identity(
+                                        frontier_execution_identity,
+                                        lora_config_identity(owner.lora),
+                                        owner.prompt.tokens,
+                                        checkpoint->n_tokens,
+                                        identity);
+                                if (owner.is_processing()) {
+                                    candidate.availability =
+                                        server_retention_candidate_availability::
+                                            in_flight_mutation;
+                                } else if (!source.release_ops.empty()) {
+                                    candidate.availability =
+                                        server_retention_candidate_availability::
+                                            available;
+                                    candidate.has_unsupported_host_spill = false;
+                                }
+                                break;
+                            }
+                        }
+                        if (!identity_known &&
+                            source.instance_key.owner_slot == -1 &&
+                            prompt_cache) {
+                            for (const auto & owner : prompt_cache->states) {
+                                const auto checkpoint = std::find_if(
+                                    owner.prompt.checkpoints.begin(),
+                                    owner.prompt.checkpoints.end(),
+                                    [&](const auto & item) {
+                                        return server_retention_instance_key::
+                                                   for_checkpoint(
+                                                       -1, &item).instance ==
+                                               source.instance_key.instance;
+                                    });
+                                if (checkpoint !=
+                                    owner.prompt.checkpoints.end()) {
+                                    identity_known =
+                                        server_cache_lease_build_identity(
+                                            frontier_execution_identity,
+                                            owner.adapter_config_key,
+                                            owner.prompt.tokens,
+                                            checkpoint->n_tokens,
+                                            identity);
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case common_retention_artifact_kind::_count:
+                        candidate.availability =
+                            server_retention_candidate_availability::
+                                backing_missing_or_stale;
+                        break;
+                }
+            };
+            if (!server_cache_yield_assemble(
+                    catalog, cache_authority->leases, resolve, candidates)) {
+                candidates.clear();
+                return false;
+            }
+
+            return true;
+        } catch (...) {
+            candidates.clear();
+            return false;
+        }
+    }
+
+    // fork server-context.cpp:5471  (11 lines)
+    bool vbr_refresh_exclusive_cells() noexcept {
+        if (vbr_exclusive_cells_for_test) {
+            return vbr_exclusive_cells_for_test->size() >= slots.size();
+        }
+        std::fill(vbr_exclusive_cells_by_seq.begin(),
+                  vbr_exclusive_cells_by_seq.end(), 0);
+        auto * memory = llama_get_memory(ctx_tgt);
+        return memory && memory->vbr_accumulate_exclusive_cells(
+            vbr_exclusive_cells_by_seq.data(),
+            vbr_exclusive_cells_by_seq.size());
+    }
+
+    // fork server-context.cpp:5483  (6 lines)
+    uint32_t vbr_exclusive_cells(int32_t slot_id) const noexcept {
+        const auto & cells = vbr_exclusive_cells_for_test
+            ? *vbr_exclusive_cells_for_test : vbr_exclusive_cells_by_seq;
+        return slot_id >= 0 && size_t(slot_id) < cells.size()
+            ? cells[size_t(slot_id)] : 0;
+    }
+
+    // fork server-context.cpp:5579  (25 lines)
+    bool vbr_idle_reclaim_eligible(
+            const server_slot & slot,
+            const vbr_live_retention_filter & filter) noexcept {
+        const bool full_durable = slot.id >= 0 &&
+            size_t(slot.id) < vbr_durable_sources_by_seq.size() &&
+            vbr_durable_sources_by_seq[size_t(slot.id)] != 0;
+        const bool stem_durable =
+            filter.recovery != vbr_recovery_requirement::full_frontier &&
+            slot.id >= 0 &&
+            size_t(slot.id) < vbr_durable_stems_by_seq.size() &&
+            vbr_durable_stems_by_seq[size_t(slot.id)] != 0;
+        const bool durable = !params_base.vbr_prompt_cache ||
+            full_durable || stem_durable ||
+            filter.recovery ==
+                vbr_recovery_requirement::none_for_admission_progress;
+        const bool refused = filter.refused_by_seq && slot.id >= 0 &&
+            size_t(slot.id) < filter.refused_by_seq->size() &&
+            (*filter.refused_by_seq)[size_t(slot.id)] != 0;
+        return slot.id != filter.except_id && !slot.is_processing() &&
+            slot.prompt.n_tokens() > 0 && durable && !refused &&
+            !slot.hard_lease_blocks_live_prefix() &&
+            !queue_tasks.has_deferred_for_slot(slot.id) &&
+            (filter.spec_tier < 0 ||
+                slot.can_speculate() == (filter.spec_tier != 0));
+    }
+
+    // fork server-context.cpp:5605  (178 lines)
+    bool vbr_prepare_retention_wave(
+            const vbr_live_retention_filter & filter,
+            bool advance_epoch = true,
+            bool sample_durability = true) noexcept {
+        auto * owner = live_retention_owner();
+        vbr_retention_candidate_count = 0;
+        vbr_retention_projection_epoch = 0;
+        if (params_base.vbr_prompt_cache) {
+            if (vbr_durable_sources_by_seq.size() != slots.size() ||
+                vbr_durable_stems_by_seq.size() != slots.size()) {
+                return false;
+            }
+            std::fill(
+                vbr_durable_sources_by_seq.begin(),
+                vbr_durable_sources_by_seq.end(), uint8_t(0));
+            std::fill(
+                vbr_durable_stems_by_seq.begin(),
+                vbr_durable_stems_by_seq.end(), uint8_t(0));
+            if (sample_durability) {
+                size_t query_count = 0;
+                for (auto & slot : slots) {
+                    if (slot.prompt.n_tokens() <= 0) {
+                        continue;
+                    }
+                    if (slot.id < 0 || size_t(slot.id) >= slots.size() ||
+                        query_count >= vbr_idle_frontier_queries.size()) {
+                        return false;
+                    }
+                    auto & query = vbr_idle_frontier_queries[query_count++];
+                    query = {};
+                    query.slot_id = slot.id;
+                    query.prompt = &slot.prompt;
+                    server_vbr_artifact_capture_status identity_status;
+                    if (!build_capture_identity_fields(
+                            slot, query.identity, identity_status)) {
+                        query_count--;
+                        continue;
+                    }
+                    query.expected_stem_artifact =
+                        slot.vbr_idle_stem_source_valid
+                            ? slot.vbr_idle_stem_host_artifact
+                            : llama_cache_acct_artifact_id {};
+                }
+                if (query_count != 0 &&
+                    (!prompt_cache || !prompt_cache->mark_vbr_frontiers(
+                        vbr_idle_frontier_queries.data(), query_count))) {
+                    return false;
+                }
+                for (size_t i = 0; i < query_count; ++i) {
+                    const auto & query = vbr_idle_frontier_queries[i];
+                    if (query.slot_id < 0 ||
+                        size_t(query.slot_id) >= slots.size()) {
+                        return false;
+                    }
+                    vbr_durable_sources_by_seq[size_t(query.slot_id)] =
+                        query.durable ? 1 : 0;
+                    vbr_durable_stems_by_seq[size_t(query.slot_id)] =
+                        query.stem_durable ? 1 : 0;
+                }
+            }
+        }
+        if (!owner || vbr_retention_candidates.size() != slots.size() ||
+            vbr_retention_candidate_by_seq.size() != slots.size() ||
+            vbr_retention_seen_by_seq.size() != slots.size()) {
+            return false;
+        }
+        std::fill(
+            vbr_retention_seen_by_seq.begin(),
+            vbr_retention_seen_by_seq.end(), uint8_t(0));
+        if (advance_epoch) {
+            if (!owner->begin_competition_wave()) {
+                return false;
+            }
+            vbr_retention_projection_epoch = owner->competition_epoch_value();
+        } else {
+            // Slot selection is a read-only forecast. A new lineage is not
+            // admitted until a later checkpoint/final publication, and that
+            // transition owns its competition epoch. Quote at the current
+            // epoch here so retries, overlapping launches, and appends cannot
+            // predict an epoch they do not commit.
+            vbr_retention_projection_epoch =
+                owner->competition_epoch_value();
+        }
+        struct inventory_context {
+            server_context_impl * self;
+            const vbr_live_retention_filter * filter;
+            size_t observed = 0;
+            bool complete = true;
+        } context { this, &filter, 0, true };
+        const auto snapshot = owner->value_snapshots(
+            &context,
+            +[](void * opaque,
+                const server_retention_value_snapshot & row) noexcept {
+                auto & state = *static_cast<inventory_context *>(opaque);
+                state.observed++;
+                // Host aliases are part of the complete retention snapshot
+                // and their coverage is already folded into each live row's
+                // external_shared_coverage_tokens. Validate and count them,
+                // but materialize only scheduler-owned live slots here.
+                if (row.instance_key.kind !=
+                        common_retention_artifact_kind::live_slot) {
+                    return true;
+                }
+                if (row.kind !=
+                        common_retention_artifact_kind::live_slot ||
+                    row.instance_key.owner_slot < 0 ||
+                    state.self->vbr_retention_candidate_count >=
+                        state.self->vbr_retention_candidates.size()) {
+                    state.complete = false;
+                    return false;
+                }
+                const int32_t slot_id = row.instance_key.owner_slot;
+                if (size_t(slot_id) >= state.self->slots.size() ||
+                    state.self->slots[size_t(slot_id)].id != slot_id ||
+                    state.self->vbr_retention_seen_by_seq[
+                        size_t(slot_id)] != 0) {
+                    state.complete = false;
+                    return false;
+                }
+                auto * slot = &state.self->slots[size_t(slot_id)];
+                if (slot->prompt.n_tokens() == 0) {
+                    state.complete = false;
+                    return false;
+                }
+                state.self->vbr_retention_seen_by_seq[
+                    size_t(slot_id)] = 1;
+                auto & candidate = state.self->vbr_retention_candidates[
+                    state.self->vbr_retention_candidate_count++];
+                candidate = {};
+                candidate.slot_id = slot->id;
+                candidate.artifact_id = row.artifact_id;
+                candidate.stamp = row.stamp;
+                candidate.lineage = row.lineage;
+                candidate.external_shared_coverage_tokens =
+                    row.external_shared_coverage_tokens;
+                candidate.present = true;
+                candidate.eligible = state.self->vbr_idle_reclaim_eligible(
+                    *slot, *state.filter);
+                return true;
+            });
+        if (!context.complete ||
+            snapshot.status !=
+                server_retention_value_snapshot_status::complete ||
+            snapshot.size != context.observed) {
+            return false;
+        }
+        for (const auto & slot : slots) {
+            if (slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (slot.id < 0 || size_t(slot.id) >=
+                    vbr_retention_seen_by_seq.size() ||
+                vbr_retention_seen_by_seq[size_t(slot.id)] == 0) {
+                return false;
+            }
+        }
+        if (vbr_retention_candidate_count == 0 ||
+            !server_live_retention_prepare(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch)) {
+            return false;
+        }
+        std::fill(
+            vbr_retention_candidate_by_seq.begin(),
+            vbr_retention_candidate_by_seq.end(), int32_t(-1));
+        for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+            const int32_t slot_id = vbr_retention_candidates[i].slot_id;
+            if (slot_id < 0 || size_t(slot_id) >=
+                    vbr_retention_candidate_by_seq.size() ||
+                vbr_retention_candidate_by_seq[size_t(slot_id)] != -1 ||
+                i > size_t(INT32_MAX)) {
+                return false;
+            }
+            vbr_retention_candidate_by_seq[size_t(slot_id)] = int32_t(i);
+        }
+        return true;
+    }
+
+    // fork server-context.cpp:5784  (120 lines)
+    bool vbr_refresh_retention_wave(
+            const vbr_live_retention_filter & filter) noexcept {
+        auto * owner = live_retention_owner();
+        if (!owner || vbr_retention_candidate_count == 0) {
+            return false;
+        }
+        bool needs_exclusive_cells = false;
+        for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+            auto & candidate = vbr_retention_candidates[i];
+            if (candidate.slot_id < 0 || size_t(candidate.slot_id) >=
+                    slots.size() ||
+                slots[size_t(candidate.slot_id)].id != candidate.slot_id) {
+                return false;
+            }
+            auto * slot = &slots[size_t(candidate.slot_id)];
+            candidate.present = slot->prompt.n_tokens() > 0;
+            candidate.eligible = candidate.present &&
+                vbr_idle_reclaim_eligible(*slot, filter);
+            candidate.marginal_cells = 0;
+            needs_exclusive_cells |= candidate.eligible;
+            candidate.external_shared_coverage_tokens = candidate.present
+                ? UINT64_MAX : 0;
+        }
+        if (needs_exclusive_cells && !vbr_refresh_exclusive_cells()) {
+            return false;
+        }
+        for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+            auto & candidate = vbr_retention_candidates[i];
+            if (candidate.eligible) {
+                candidate.marginal_cells =
+                    vbr_exclusive_cells(candidate.slot_id);
+                // Singleton pricing cannot account for a physical alias group whose
+                // members release cells only together. Keep the historical order until
+                // compound live projection owns that case.
+                if (candidate.marginal_cells == 0) {
+                    return false;
+                }
+            }
+        }
+        struct refresh_context {
+            server_context_impl * self;
+            size_t observed = 0;
+            size_t live_rows = 0;
+            bool complete = true;
+        } context { this, 0, 0, true };
+        std::fill(
+            vbr_retention_seen_by_seq.begin(),
+            vbr_retention_seen_by_seq.end(), uint8_t(0));
+        const auto snapshot = owner->value_snapshots(
+            &context,
+            +[](void * opaque,
+                const server_retention_value_snapshot & row) noexcept {
+                auto & state = *static_cast<refresh_context *>(opaque);
+                state.observed++;
+                if (row.instance_key.kind !=
+                        common_retention_artifact_kind::live_slot) {
+                    return true;
+                }
+                if (row.kind != common_retention_artifact_kind::live_slot) {
+                    state.complete = false;
+                    return false;
+                }
+                const int32_t slot_id = row.instance_key.owner_slot;
+                if (slot_id < 0 || size_t(slot_id) >=
+                        state.self->vbr_retention_candidate_by_seq.size()) {
+                    state.complete = false;
+                    return false;
+                }
+                const int32_t candidate_index =
+                    state.self->vbr_retention_candidate_by_seq[
+                        size_t(slot_id)];
+                if (candidate_index < 0 || size_t(candidate_index) >=
+                        state.self->vbr_retention_candidate_count ||
+                    state.self->vbr_retention_seen_by_seq[
+                        size_t(slot_id)] != 0) {
+                    state.complete = false;
+                    return false;
+                }
+                auto & found = state.self->vbr_retention_candidates[
+                    size_t(candidate_index)];
+                if (!found.present || found.slot_id != slot_id ||
+                    found.artifact_id != row.artifact_id ||
+                    found.stamp.pool != row.stamp.pool ||
+                    found.stamp.stable_id != row.stamp.stable_id ||
+                    found.stamp.lineage_id != row.stamp.lineage_id ||
+                    found.stamp.recency_ordinal !=
+                        row.stamp.recency_ordinal ||
+                    found.stamp.coverage_tokens !=
+                        row.stamp.coverage_tokens ||
+                    found.lineage != row.lineage) {
+                    state.complete = false;
+                    return false;
+                }
+                found.external_shared_coverage_tokens =
+                    row.external_shared_coverage_tokens;
+                state.self->vbr_retention_seen_by_seq[
+                    size_t(slot_id)] = 1;
+                state.live_rows++;
+                return true;
+            });
+        size_t present = 0;
+        for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+            const auto & candidate = vbr_retention_candidates[i];
+            if (candidate.present) {
+                present++;
+                if (candidate.slot_id < 0 || size_t(candidate.slot_id) >=
+                        vbr_retention_seen_by_seq.size() ||
+                    vbr_retention_seen_by_seq[
+                        size_t(candidate.slot_id)] == 0 ||
+                    candidate.external_shared_coverage_tokens == UINT64_MAX) {
+                    return false;
+                }
+            }
+        }
+        return context.complete &&
+            snapshot.status ==
+                server_retention_value_snapshot_status::complete &&
+            snapshot.size == context.observed &&
+            context.live_rows == present;
+    }
+
+    // fork server-context.cpp:5905  (15 lines)
+    server_slot * vbr_oldest_idle_slot(
+            const vbr_live_retention_filter & filter) noexcept {
+        server_slot * oldest = nullptr;
+        for (auto & slot : slots) {
+            if (!vbr_idle_reclaim_eligible(slot, filter)) {
+                continue;
+            }
+            if (!oldest ||
+                std::tie(slot.t_last_used, slot.id) <
+                    std::tie(oldest->t_last_used, oldest->id)) {
+                oldest = &slot;
+            }
+        }
+        return oldest;
+    }
+
+    // fork server-context.cpp:5921  (23 lines)
+    server_slot * vbr_retention_victim(
+            bool & learned_available,
+            const vbr_live_retention_filter & filter) noexcept {
+        if (learned_available &&
+            !vbr_refresh_retention_wave(filter)) {
+            learned_available = false;
+        }
+        if (learned_available) {
+            const auto projection = server_live_retention_project_prepared(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch);
+            if (projection.complete) {
+                auto * selected = find_slot_by_id(projection.slot_id);
+                if (selected &&
+                    vbr_idle_reclaim_eligible(*selected, filter)) {
+                    return selected;
+                }
+            }
+            learned_available = false;
+        }
+        return vbr_oldest_idle_slot(filter);
+    }
+
+    // fork server-context.cpp:5949  (36 lines)
+    server_slot * vbr_retention_victim_prepared(
+            bool & learned_available,
+            const vbr_live_retention_filter & filter) noexcept {
+        if (learned_available) {
+            for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+                auto & candidate = vbr_retention_candidates[i];
+                if (candidate.slot_id < 0 ||
+                    size_t(candidate.slot_id) >= slots.size() ||
+                    slots[size_t(candidate.slot_id)].id !=
+                        candidate.slot_id) {
+                    learned_available = false;
+                    break;
+                }
+                candidate.eligible = candidate.present &&
+                    vbr_idle_reclaim_eligible(
+                        slots[size_t(candidate.slot_id)], filter);
+            }
+        }
+        if (learned_available) {
+            const auto projection = server_live_retention_project_prepared(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch);
+            if (projection.complete) {
+                auto * selected = find_slot_by_id(projection.slot_id);
+                if (selected &&
+                    vbr_idle_reclaim_eligible(*selected, filter)) {
+                    return selected;
+                }
+                learned_available = false;
+            } else if (projection.candidate_count != 0) {
+                learned_available = false;
+            }
+        }
+        return vbr_oldest_idle_slot(filter);
+    }
+
+    // fork server-context.cpp:8607  (20 lines)
+    common_cache_plan_selection cache_plan_origin_for(
+            const server_task & task,
+            uint64_t lcp) const noexcept {
+        if (task.id_slot != -1) {
+            return common_cache_plan_selection::by_id;
+        }
+        const float sim = task.tokens.empty()
+            ? 0.0f : float(lcp) / float(task.tokens.size());
+        // Keep in lockstep with the shipped tier boundaries below. A weak
+        // token prefix is not conversation identity: unrelated requests can
+        // share a system prompt, and routing one onto that slot destroys the
+        // longer live lineage. Only the established strict-similarity tier
+        // selects by prompt overlap; everything else uses the retention-aware
+        // LRU tier.
+        if (common_cache_plan_strict_similarity(
+                sim, slot_prompt_similarity)) {
+            return common_cache_plan_selection::similarity;
+        }
+        return common_cache_plan_selection::lru;
+    }
+
+    // fork server-context.cpp:8628  (6 lines)
+    bool cache_plan_target_in_domain(
+            const server_task & task,
+            const server_slot & slot) const noexcept {
+        return !slot.is_processing() &&
+               (task.id_slot == -1 || slot.id == task.id_slot);
+    }
+
+    // fork server-context.cpp:8635  (30 lines)
+    bool cache_plan_inventory_live_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            common_cache_plan_record & rec) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & slot = slots[i];
+            if (task.id_slot != -1 && slot.id != task.id_slot) {
+                continue;
+            }
+            const auto origin = cache_plan_origin_for(task, slot_lcps[i]);
+            auto * row = rec.find_or_add(
+                common_cache_plan_provider::live_slot, slot.id,
+                COMMON_CACHE_PLAN_PHASE_LRU, slot.id, origin);
+            if (!row) {
+                return false;
+            }
+            server_cache_plan_apply_live(row, server_cache_plan_evaluate_live(
+                slot.is_processing(), !slot.prompt.tokens.empty(), slot_lcps[i],
+                task.tokens.size(), slot.prompt.tokens.size()));
+            // The shipped similarity scan visits below-threshold rows too;
+            // authority membership is the first tier that can select the target.
+            row->origin_tier = origin;
+            row->t_last_used_us = llama_cache_acct_value::measured(
+                uint64_t(std::max<int64_t>(slot.t_last_used, 0)));
+            row->spec_capable = slot.can_speculate();
+            row->spec_capable_known = true;
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::live_slot);
+        return true;
+    }
+
+    // fork server-context.cpp:8666  (97 lines)
+    bool cache_plan_inventory_host_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            const std::string & incoming_adapter,
+            bool recurrent,
+            common_cache_plan_record & rec,
+            cache_plan_host_source_registry & source_registry) {
+        if (!prompt_cache) {
+            rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+            return true;
+        }
+        for (auto & state : prompt_cache->states) {
+            // VBR nodes use the typed VBR restore selector, not the legacy
+            // fixed-state inventory. Skip them before fixed source-ID allocation
+            // and long-prefix work so they cannot exhaust that inventory.
+            if (!state.payload.fixed_state_restorable()) {
+                continue;
+            }
+            int32_t host_source_id = -1;
+            if (!source_registry.get(
+                    *prompt_cache, state, host_source_id)) {
+                rec.inventory_states[size_t(
+                    common_cache_plan_provider::host_cache_entry)] =
+                    common_cache_plan_inventory_state::overflowed;
+                return false;
+            }
+            const uint64_t lcp = state.prompt.tokens.get_common_prefix(task.tokens);
+            const auto host_eval = server_cache_plan_evaluate_host(
+                state.payload.fixed_state_restorable(),
+                state.adapter_config_key == incoming_adapter,
+                lcp, task.tokens.size(), state.prompt.tokens.size(),
+                state.payload.size());
+            std::vector<server_cache_plan_checkpoint_evaluation> checkpoint_evals;
+            checkpoint_evals.reserve(state.prompt.checkpoints.size());
+            for (const auto & checkpoint : state.prompt.checkpoints) {
+                checkpoint_evals.push_back(server_cache_plan_evaluate_checkpoint(
+                    !checkpoint.empty(), true, recurrent, true,
+                    checkpoint.pos_min, checkpoint.pos_max,
+                    int64_t(lcp), 0, checkpoint.size()));
+            }
+
+            for (size_t target_i = 0; target_i < slots.size(); ++target_i) {
+                const auto & candidate_target = slots[target_i];
+                if (!cache_plan_target_in_domain(task, candidate_target)) {
+                    continue;
+                }
+                const auto origin = cache_plan_origin_for(task, slot_lcps[target_i]);
+                auto * host = rec.find_or_add(
+                    common_cache_plan_provider::host_cache_entry, host_source_id,
+                    COMMON_CACHE_PLAN_PHASE_HOST_SCAN, candidate_target.id, origin);
+                if (!host) {
+                    return false;
+                }
+                host->payload_kind =
+                    server_cache_plan_payload_kind(state.payload.kind());
+                server_cache_plan_apply_host(host, host_eval);
+
+                int32_t checkpoint_ordinal = 0;
+                for (const auto & eval : checkpoint_evals) {
+                    const int32_t checkpoint_source =
+                        server_cache_plan_host_checkpoint_source_id(
+                            host_source_id, checkpoint_ordinal++);
+                    if (checkpoint_source < 0) {
+                        rec.inventory_states[size_t(
+                            common_cache_plan_provider::live_context_checkpoint)] =
+                            common_cache_plan_inventory_state::overflowed;
+                        return false;
+                    }
+                    auto * checkpoint = rec.find_or_add(
+                        common_cache_plan_provider::live_context_checkpoint,
+                        checkpoint_source,
+                        COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                        candidate_target.id, origin);
+                    if (!checkpoint) {
+                        return false;
+                    }
+                    server_cache_plan_apply_checkpoint(checkpoint, eval);
+                    if (server_cache_plan_viable(host_eval.reason) &&
+                        server_cache_plan_viable(eval.reason)) {
+                        checkpoint->component_only = true;
+                        checkpoint->dependent_host_source_id = host_source_id;
+                        auto * chain = rec.add_chain(
+                            common_cache_plan_provider::host_cache_entry,
+                            int32_t(host - rec.inventory.data()),
+                            int32_t(checkpoint - rec.inventory.data()));
+                        if (!chain) {
+                            return false;
+                        }
+                        chain->disposition =
+                            common_cache_plan_disposition::valid_not_chosen_cost;
+                    }
+                }
+            }
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::host_cache_entry);
+        return true;
+    }
+
+    // fork server-context.cpp:8764  (56 lines)
+    bool cache_plan_inventory_checkpoint_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            bool recurrent,
+            common_cache_plan_record & rec) {
+        // Complete diagnostic scan. The shipped restore keeps its reverse find_if
+        // and its shipped-visited transport below.
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & candidate_target = slots[i];
+            if (!cache_plan_target_in_domain(task, candidate_target)) {
+                continue;
+            }
+            const llama_pos pos_next = task.tokens.pos_next(slot_lcps[i]);
+            const bool has_new_tokens = slot_lcps[i] < task.tokens.size();
+            const llama_pos pos_min_threshold =
+                std::max<llama_pos>(
+                    0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+            const auto vbr_now = llama_memory_vbr_state(
+                llama_get_memory(ctx_tgt), candidate_target.id, 0);
+            std::string adapter_identity;
+            bool adapter_known = true;
+            try {
+                adapter_identity = lora_config_identity(candidate_target.lora);
+            } catch (...) {
+                adapter_known = false;
+            }
+            int32_t checkpoint_ordinal = 0;
+            for (const auto & checkpoint : candidate_target.prompt.checkpoints) {
+                const bool checkpoint_lineage_matches =
+                    !recurrent ||
+                    common_prompt_checkpoint_lineage_matches(checkpoint, vbr_now);
+                const bool frontier_current =
+                    !candidate_target.frontier_ratchet_flipped ||
+                    (adapter_known && checkpoint_frontier_is_current(
+                        candidate_target, checkpoint, adapter_identity));
+                auto * row = rec.find_or_add(
+                    common_cache_plan_provider::live_context_checkpoint,
+                    checkpoint_ordinal++, COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                    candidate_target.id,
+                    cache_plan_origin_for(task, slot_lcps[i]));
+                if (!row) {
+                    return false;
+                }
+                server_cache_plan_apply_checkpoint(row,
+                    server_cache_plan_evaluate_checkpoint(
+                        !checkpoint.empty(), frontier_current, recurrent,
+                        checkpoint_lineage_matches, checkpoint.pos_min,
+                        checkpoint.pos_max, pos_next, pos_min_threshold,
+                        checkpoint.size()));
+            }
+        }
+        rec.note_inventory_complete(
+            common_cache_plan_provider::live_context_checkpoint);
+        rec.authority_inventory_complete = true;
+        return true;
+    }
+
+    // fork server-context.cpp:8821  (21 lines)
+    bool cache_plan_inventory_cold_rows(
+            const server_task & task,
+            const std::vector<uint64_t> & slot_lcps,
+            common_cache_plan_record & rec) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & candidate_target = slots[i];
+            if (!cache_plan_target_in_domain(task, candidate_target)) {
+                continue;
+            }
+            auto * cold = rec.find_or_add(
+                common_cache_plan_provider::cold_replay,
+                COMMON_CACHE_PLAN_SOURCE_AGGREGATE, 0, candidate_target.id,
+                cache_plan_origin_for(task, slot_lcps[i]));
+            if (!cold) {
+                return false;
+            }
+            cold->accept();
+        }
+        rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
+        return true;
+    }
+
+    // fork server-context.cpp:8879  (9 lines)
+    static void cache_plan_host_restore_failed(
+            server_slot & slot,
+            common_cache_plan_record * rec) {
+        if (rec) {
+            rec->restore_attempt_failed = true;
+        }
+        slot.mandatory_recovery_reset(
+            server_cache_destruction_reason::restore_failure);
+    }
+
+    // fork server-context.cpp:8896  (352 lines)
+    cache_plan_stage1_selection cache_plan_select_before_mutation(
+            const server_task & task,
+            bool observe,
+            bool is_preflight) {
+        server_slot * ret = nullptr;
+
+        bool update_cache = false;
+        bool selection_deferred_busy = false;
+
+        // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
+        // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
+        // how close the rejected candidates came)
+        float sim_best_any = 0;
+
+        // Begin the multi-stage cache-plan record before any selection-side mutation. The
+        // selection scan below is read-only; the record exists only under --cache-debug, and
+        // every row write from here on is noexcept (fixed-array record), so the shipped path
+        // cannot throw through the observer. An allocation fault is swallowed and counted.
+        std::unique_ptr<common_cache_plan_record> plan_rec;
+        if (observe) {
+            try {
+                plan_rec = std::make_unique<common_cache_plan_record>();
+                plan_rec->id_task = task.id;
+                // opaque identity evidence from already-computed keys (never raw values);
+                // identities the server has not computed stay typed unknown
+                plan_rec->identity.model_digest = llama_cache_acct_value::measured(
+                    std::hash<std::string>{}(model_name));
+                plan_rec->identity.execution_digest = llama_cache_acct_value::measured(
+                    std::hash<std::string>{}(frontier_execution_identity));
+                // SAMPLED-PREFIX TELEMETRY (not an identity): FNV-1a over at most the
+                // prompt's first 64 token ids + that sampled count. Useful for OFFLINE
+                // clustering of workload variants; it is NOT an exact family key and must
+                // never drive a shipped decision — prompts sharing 64 leading tokens merge
+                // deliberately, the folded count saturates at the window, and FNV collides.
+                // Opaque + content-minimizing like every identity digest.
+                {
+                    uint64_t h = 1469598103934665603ull;
+                    const auto fold = [&h](uint64_t v) {
+                        h = (h ^ v) * 1099511628211ull;
+                    };
+                    const size_t n = std::min<size_t>(task.tokens.size(), 64);
+                    for (size_t i = 0; i < n; i++) {
+                        fold((uint64_t)(uint32_t) task.tokens[i]);
+                    }
+                    fold((uint64_t) n);
+                    plan_rec->identity.prefix_token_digest = llama_cache_acct_value::measured(h);
+                }
+            } catch (...) {
+                if (!is_preflight && cache_plan_obs) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
+            }
+        }
+
+        // one observer row per slot a loop classifies (merge key = slot id across all
+        // loops); nullptr when the observer is off or the inventory overflowed [observer]
+        const auto slot_row = [&](const server_slot & slot, uint8_t phase) {
+            return plan_rec
+                ? plan_rec->find_or_add(
+                      common_cache_plan_provider::live_slot, slot.id, phase, slot.id,
+                      common_cache_plan_origin_for_phase(phase))
+                : (common_cache_plan_candidate *) nullptr;
+        };
+
+        // if a specific slot is requested, use it (still goes through cache update logic below)
+        if (task.id_slot != -1) {
+            ret = get_slot_by_id(task.id_slot);
+            if (ret) {
+                if (!is_preflight) {
+                    SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                }
+                if (plan_rec) {
+                    plan_rec->selection = common_cache_plan_selection::by_id;
+                    // forced selection carries no reuse verdict, but the slot WAS observed —
+                    // its row exists with disposition unavailable; finalize upgrades the
+                    // selected row from realized prefix reuse
+                    slot_row(*ret, COMMON_CACHE_PLAN_PHASE_BY_ID);
+                }
+            }
+        }
+
+        // find the slot that has at least n% prompt similarity.
+        // Observer transport [observer, noexcept]: one row per slot this loop classifies (merge key
+        // = slot id across all three loops); every evaluated survivor starts as a cost loser
+        // and the shipped winner is promoted after the scan. A nullptr row (inventory
+        // overflow) is skipped — the shipped scan never changes.
+        if (slot_prompt_similarity != 0.0f) {
+            float f_sim_best = 0;
+
+            // shipped logic written ONCE; the unobserved instantiation compiles every
+            // observer block away: literal zero work with --cache-debug off.
+            const auto similarity_scan = [&](auto obs_c) {
+                constexpr bool Obs = decltype(obs_c)::value;
+                for (server_slot & slot : slots) {
+                    if (task.id_slot != -1 && slot.id != task.id_slot) {
+                        continue; // id filter, not a classification: no row
+                    }
+
+                    [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+                    if constexpr (Obs) {
+                        row = slot_row(slot, COMMON_CACHE_PLAN_PHASE_SIMILARITY);
+                    }
+
+                    // skip the slot if it is not available
+                    if (slot.is_processing()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY); }
+                        }
+                        continue;
+                    }
+
+                    const auto & tokens = slot.prompt.tokens;
+
+                    // skip the slot if it does not contains cached tokens
+                    if (tokens.empty()) {
+                        if constexpr (Obs) {
+                            // truly stateless slot: unavailable, never coverage
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE); }
+                        }
+                        continue;
+                    }
+
+                    // fraction of the Longest Common Prefix length with respect to the input prompt length
+                    const size_t lcp_cur = tokens.get_common_prefix(task.tokens);
+                    const float  sim_cur = float(lcp_cur) / task.tokens.size();
+
+                    sim_best_any = std::max(sim_best_any, sim_cur);
+
+                    if constexpr (Obs) {
+                        server_cache_plan_apply_live(row,
+                            server_cache_plan_evaluate_live(
+                                false, true, lcp_cur, task.tokens.size()));
+                    }
+
+                    // select the current slot if the criteria match
+                    if (sim_cur > f_sim_best &&
+                        common_cache_plan_strict_similarity(
+                            sim_cur, slot_prompt_similarity)) {
+                        f_sim_best = sim_cur;
+
+                        ret = &slot;
+                    }
+                }
+            };
+            plan_rec ? similarity_scan(std::true_type{}) : similarity_scan(std::false_type{});
+
+            if (ret != nullptr) {
+                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+
+                if (task.id_slot == -1) {
+                    if (!is_preflight) {
+                        SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                                f_sim_best, slot_prompt_similarity, f_keep);
+                    }
+                    if (plan_rec) {
+                        plan_rec->selection = common_cache_plan_selection::similarity;
+                        if (auto * row = slot_row(*ret, COMMON_CACHE_PLAN_PHASE_SIMILARITY)) {
+                            row->accept();
+                            row->sim    = f_sim_best; row->sim_known    = true;
+                            row->f_keep = f_keep;   row->f_keep_known = true;
+                        }
+                    }
+                }
+
+                // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                if (f_keep < 0.5f) {
+                    update_cache = true;
+                }
+            }
+
+            if (plan_rec) {
+                plan_rec->sim_best_any       = sim_best_any;
+                plan_rec->sim_best_any_known = true;
+            }
+        }
+
+        // find the slot that has been least recently used
+        // prefer spec-capable (DFlash) slots so requests get speculative decoding
+        if (ret == nullptr) {
+            int64_t t_last = -1;
+            bool retention_value_selected = false;
+
+            const auto lru_scan = [&](auto obs_c) {
+                constexpr bool Obs = decltype(obs_c)::value;
+                for (server_slot & slot : slots) {
+                    [[maybe_unused]] common_cache_plan_candidate * row = nullptr;
+                    if constexpr (Obs) {
+                        row = slot_row(slot, COMMON_CACHE_PLAN_PHASE_LRU);
+                    }
+
+                    // skip the slot if it is not available
+                    if (slot.is_processing()) {
+                        if constexpr (Obs) {
+                            if (row) { row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY); }
+                        }
+                        continue;
+                    }
+
+                    if constexpr (Obs) {
+                        if (row) {
+                            // scalars THIS loop computes; reuse verdicts (if any) came from the
+                            // reuse-evaluating loops via the merged row
+                            row->t_last_used_us = llama_cache_acct_value::measured(
+                                (uint64_t) std::max<int64_t>(slot.t_last_used, 0));
+                            row->spec_capable       = slot.can_speculate();
+                            row->spec_capable_known = true;
+                        }
+                    }
+
+                    // strongly prefer spec-capable slots: pick a spec slot over a non-spec
+                    // slot regardless of LRU, then use LRU within the same capability tier
+                    const bool curr_spec = ret && ret->can_speculate();
+                    const bool slot_spec = slot.can_speculate();
+                    if (!ret ||
+                        (slot_spec && !curr_spec) ||
+                        (slot_spec == curr_spec && slot.t_last_used < t_last)) {
+                        t_last = slot.t_last_used;
+                        ret = &slot;
+                    }
+                }
+            };
+            plan_rec ? lru_scan(std::true_type{}) : lru_scan(std::false_type{});
+
+            // A genuinely new stream has no reusable home. Once its legacy capability tier
+            // has no empty slot, choose which resident conversation pays for the slot by the
+            // shared decayed value/cell policy. Fixed and dynamic-VBR KV use the same lineage
+            // authority and exact exclusive-cell measure here.
+            // Both preflight and selection quote the current epoch without mutating it.
+            // A later checkpoint/final publication owns any distinct-lineage admission
+            // epoch; retries, appends, and overlapping launches cannot age sleeping
+            // conversations speculatively. Incomplete/domain-ambiguous evidence uses
+            // the protection-aware historical order within the same capability tier.
+            if (ret != nullptr && live_retention_owner() != nullptr &&
+                ret->prompt.n_tokens() > 0) {
+                const auto empty_in_tier = [&](bool spec_tier) {
+                    server_slot * empty = nullptr;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing() ||
+                            slot.prompt.n_tokens() != 0 ||
+                            slot.can_speculate() != spec_tier) {
+                            continue;
+                        }
+                        if (!empty ||
+                            std::tie(slot.t_last_used, slot.id) <
+                                std::tie(empty->t_last_used, empty->id)) {
+                            empty = &slot;
+                        }
+                    }
+                    return empty;
+                };
+
+                const bool preferred_tier = ret->can_speculate();
+                server_slot * selected = empty_in_tier(preferred_tier);
+                if (!selected) {
+                    selected = empty_in_tier(!preferred_tier);
+                }
+                bool selected_by_value = false;
+                if (!selected) {
+                    const vbr_live_retention_filter broad_filter {
+                        -1, -1, nullptr,
+                        vbr_recovery_requirement::none_for_admission_progress,
+                    };
+                    bool learned = vbr_prepare_retention_wave(
+                        broad_filter, false);
+                    if (learned &&
+                        !vbr_refresh_retention_wave(broad_filter)) {
+                        learned = false;
+                    }
+                    const auto select_tier = [&](bool spec_tier,
+                            vbr_recovery_requirement recovery) {
+                        const vbr_live_retention_filter filter {
+                            -1, spec_tier ? 1 : 0, nullptr, recovery,
+                        };
+                        auto * tier = vbr_retention_victim_prepared(
+                            learned, filter);
+                        selected_by_value = learned && tier != nullptr;
+                        return tier;
+                    };
+
+                    selected = select_tier(
+                        preferred_tier,
+                        vbr_recovery_requirement::full_or_stem);
+                    if (!selected) {
+                        // Speculation is a preference, not a hard partition.
+                        selected = select_tier(
+                            !preferred_tier,
+                            vbr_recovery_requirement::full_or_stem);
+                    }
+                    if (!selected) {
+                        // Host-cache capacity is protection authority, not
+                        // scheduler admission authority. Only after neither
+                        // tier has a recoverable victim may this final progress
+                        // policy admit an undurable one.
+                        selected = select_tier(
+                            preferred_tier,
+                            vbr_recovery_requirement::none_for_admission_progress);
+                    }
+                    if (!selected) {
+                        selected = select_tier(
+                            !preferred_tier,
+                            vbr_recovery_requirement::none_for_admission_progress);
+                    }
+                }
+                // The fallback returned by vbr_retention_victim is the
+                // protection-aware LRU floor. Always adopt it: retaining the
+                // raw scan winner here could overwrite a hard-leased or
+                // deferred slot exactly when learned evidence is incomplete
+                // (including iSWA/alias cases).
+                ret = selected;
+                if (ret) {
+                    t_last = ret->t_last_used;
+                }
+                retention_value_selected =
+                    selected_by_value && ret != nullptr;
+            }
+
+            if (ret != nullptr) {
+                if (!is_preflight) {
+                    SLT_INF(*ret,
+                        "selected slot by %s, t_last = %" PRId64
+                        " (best rejected sim = %.3f)\n",
+                        retention_value_selected ? "decayed retention value" : "LRU",
+                        t_last, sim_best_any);
+                }
+
+                if (plan_rec) {
+                    plan_rec->selection = common_cache_plan_selection::lru;
+                }
+
+                update_cache = true;
+            }
+        }
+
+        if (ret && ret->is_processing()) {
+            // A by-id task targeting a busy slot is deferred by the caller.
+            // Do not replace that slot's in-flight evidence record with this
+            // retry's local record; shipped selection/mutation remains intact.
+            // Preflight retains the request-local record so PROVIDER_BUSY
+            // remains visible as typed evidence without arming the slot.
+            selection_deferred_busy = true;
+            if (!is_preflight) {
+                plan_rec.reset();
+            }
+        }
+
+        return {
+            ret,
+            update_cache,
+            selection_deferred_busy,
+            std::move(plan_rec),
+        };
+    }
+
+    // fork server-context.cpp:11294  (27 lines)
+    server_cache_plan_preflight_view cache_plan_preflight(
+            const server_task & task) {
+        assert_scheduler_thread(
+            cache_plan_preflight_scheduler_thread,
+            "cache-plan preflight must run on scheduler thread");
+        server_cache_plan_preflight_view view;
+        auto stage1 = cache_plan_select_before_mutation(
+            task, true, true);
+        if (!stage1.target) {
+            view.status = server_cache_plan_preflight_status::no_target;
+            return view;
+        }
+        if (!stage1.record) {
+            view.status = server_cache_plan_preflight_status::internal_fault;
+            return view;
+        }
+
+        cache_plan_stage1_inventory inventory;
+        cache_plan_inventory_request(
+            task, *stage1.target, stage1.update_cache, *stage1.record,
+            inventory, true);
+        if (!server_cache_plan_preflight_build_view(
+                *stage1.record, stage1.target->id, view)) {
+            view.status = server_cache_plan_preflight_status::internal_fault;
+        }
+        return view;
+    }
+
+    // fork server-context.cpp:3890  (140 lines)
+    void cache_plan_emit_budget(
+            const llama_cache_acct_snapshot & snapshot) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            llama_cache_budget_config config;
+            if (!cache_authority->sample_budget(config)) {
+                cache_plan_obs->shadow_unavailable++;
+                return;
+            }
+
+            llama_cache_budget_plan baseline;
+            baseline.accounting_serial = snapshot.serial;
+            if (!cache_authority->budget.reset(snapshot, config)) {
+                cache_plan_obs->shadow_unavailable++;
+                return;
+            }
+            const auto result = cache_authority->budget.fits(baseline);
+
+            const auto compute_json = [](
+                    const llama_cache_budget_device_input & input,
+                    uint64_t value) {
+                const llama_cache_acct_value typed =
+                    input.compute_state ==
+                        llama_cache_budget_capacity_state::known
+                        ? llama_cache_acct_value::measured(value)
+                        : llama_cache_acct_value {
+                            0, llama_cache_acct_known::unavailable,
+                        };
+                return server_json_from_ordered(
+                    common_cache_plan_value_json(typed));
+            };
+            for (const auto & group : result.groups) {
+                if (group.resource.kind !=
+                    llama_cache_budget_resource_kind::physical_device) {
+                    continue;
+                }
+                const auto input_it = std::find_if(
+                    config.devices.begin(), config.devices.end(),
+                    [&](const auto & input) {
+                        return input.backend_device ==
+                            group.resource.backend_device;
+                    });
+                if (input_it == config.devices.end()) {
+                    cache_plan_obs->shadow_unavailable++;
+                    continue;
+                }
+
+                std::string topology_digest;
+                const auto topo_it = std::find_if(
+                    snapshot.topologies.begin(), snapshot.topologies.end(),
+                    [&](const auto & row) {
+                        return row.id == input_it->domain.topology;
+                    });
+                if (topo_it != snapshot.topologies.end()) {
+                    topology_digest = common_cache_plan_sha256_hex_digest(
+                        topo_it->topology.digest.bytes());
+                }
+
+                const char * reason = "none";
+                if (group.state ==
+                    llama_cache_budget_fit_state::unavailable) {
+                    reason = group.ceiling_state ==
+                            llama_cache_budget_capacity_state::unavailable
+                        ? "capacity_unavailable"
+                        : "accounting_unavailable";
+                } else if (group.state ==
+                           llama_cache_budget_fit_state::exceeds) {
+                    reason = "budget_exceeded";
+                }
+
+                const json line = {
+                    { "accounting_serial", result.accounting_serial },
+                    { "domain", {
+                        { "residency", common_cache_acct_residency_name(
+                            input_it->domain.residency) },
+                        { "device_ordinal",
+                            input_it->domain.device_ordinal.v },
+                        { "topology_id", input_it->domain.topology.v },
+                        { "topology_digest", topology_digest.empty()
+                            ? json("unavailable")
+                            : json(topology_digest) },
+                    } },
+                    { "device", {
+                        { "name", ggml_backend_dev_name(
+                            reinterpret_cast<ggml_backend_dev_t>(
+                                const_cast<void *>(
+                                    input_it->backend_device))) },
+                        { "physical_total", input_it->physical_total },
+                        { "physical_free", input_it->physical_free },
+                        { "physical_state",
+                            llama_cache_budget_capacity_state_name(
+                                input_it->phys_state) },
+                    } },
+                    { "current_cache_resident",
+                        server_json_from_ordered(common_cache_plan_value_json(
+                            group.current_resident)) },
+                    { "current_compute_allocated",
+                        compute_json(
+                            *input_it, input_it->current_compute_allocated) },
+                    { "configured_compute_reserve",
+                        compute_json(
+                            *input_it, input_it->configured_compute_reserve) },
+                    { "reserve_provenance",
+                        llama_cache_budget_reserve_provenance_name(
+                            input_it->reserve_provenance) },
+                    { "derived_cache_ceiling",
+                        group.ceiling_state ==
+                            llama_cache_budget_capacity_state::known
+                            ? server_json_from_ordered(
+                                common_cache_plan_value_json(group.ceiling))
+                            : json(llama_cache_budget_capacity_state_name(
+                                group.ceiling_state)) },
+                    { "fit", {
+                        { "state", llama_cache_budget_fit_state_name(
+                            group.state) },
+                        { "reason", reason },
+                        { "before",
+                            server_json_from_ordered(
+                                common_cache_plan_value_json(group.before)) },
+                        { "after",
+                            server_json_from_ordered(
+                                common_cache_plan_value_json(group.after)) },
+                        { "headroom_after",
+                            group.headroom_state ==
+                                llama_cache_budget_capacity_state::known
+                                ? server_json_from_ordered(
+                                    common_cache_plan_value_json(
+                                        group.headroom_after))
+                                : json(llama_cache_budget_capacity_state_name(
+                                    group.headroom_state)) },
+                    } },
+                };
+                SRV_INF("CACHE_BUDGET %s\n", line.dump().c_str());
+            }
+        } catch (...) {
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
+
+    // fork server-context.cpp:4275  (42 lines)
+    void cache_plan_run_yield(
+            const llama_cache_acct_snapshot & snapshot,
+            std::vector<server_retention_candidate> catalog) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            std::vector<server_cache_yield_candidate> candidates;
+            if (!cache_plan_assemble_yield_candidates(catalog, candidates)) {
+                cache_authority->last_yield = {};
+                cache_authority->last_yield.accounting_serial =
+                    snapshot.serial;
+                return;
+            }
+
+            const auto preview = [&](const auto & ops,
+                                     uint64_t expected_serial,
+                                     auto & out) {
+                return cache_authority->ledger.preview_release_set(
+                    ops, expected_serial, out);
+            };
+            const auto fit = [&](const llama_cache_budget_plan & plan) {
+                // The empty baseline has no prefix preview, so probe the live
+                // ledger here to preserve the atomic-capture serial guard.
+                llama_cache_acct_release_set_preview serial_probe;
+                if (!cache_authority->ledger.preview_release_set(
+                        {}, snapshot.serial, serial_probe)) {
+                    llama_cache_budget_result unavailable;
+                    unavailable.accounting_serial = snapshot.serial;
+                    return unavailable;
+                }
+                return cache_authority->budget.fits(plan);
+            };
+            cache_authority->last_yield = server_cache_yield_plan(
+                candidates, snapshot.serial, preview, fit);
+        } catch (...) {
+            cache_authority->last_yield = {};
+            cache_authority->last_yield.accounting_serial =
+                snapshot.serial;
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
+
+    // fork server-context.cpp:4349  (95 lines)
+    void cache_plan_project_yield(
+            common_cache_plan_record & rec,
+            const server_cache_yield_result & result) noexcept {
+        try {
+            common_cache_plan_yield_record projected;
+            const auto actual_state = rec.yield.actual_state;
+            auto actual_domains = std::move(rec.yield.actual_domains);
+            if (result.accounting_serial != rec.acct.serial) {
+                throw std::runtime_error(
+                    "cache-yield record/accounting serial mismatch");
+            }
+            switch (result.status) {
+                case server_cache_yield_status::fits:
+                    projected.status = common_cache_plan_yield_status::fits;
+                    break;
+                case server_cache_yield_status::insufficient_yield:
+                    projected.status =
+                        common_cache_plan_yield_status::insufficient_yield;
+                    break;
+                case server_cache_yield_status::unsupported_required:
+                    projected.status =
+                        common_cache_plan_yield_status::unsupported_required;
+                    break;
+                case server_cache_yield_status::unavailable:
+                    projected.status = common_cache_plan_yield_status::unavailable;
+                    break;
+                case server_cache_yield_status::_count:
+                    throw std::runtime_error("invalid cache-yield status");
+            }
+
+            projected.yield_policy_version = result.yield_policy_version;
+            projected.accounting_serial = result.accounting_serial;
+            projected.selected_attention =
+                result.selected[size_t(common_retention_pool::attention)];
+            projected.selected_recurrent =
+                result.selected[size_t(common_retention_pool::recurrent)];
+            projected.unsupported = result.unsupported;
+
+            const bool selected_any =
+                !projected.selected_attention.empty() ||
+                !projected.selected_recurrent.empty();
+            if (result.status == server_cache_yield_status::fits) {
+                if (result.projected_fit.accounting_serial !=
+                        result.accounting_serial ||
+                    result.projected_fit.state !=
+                        llama_cache_budget_fit_state::fits) {
+                    throw std::runtime_error(
+                        "cache-yield projection serial/state mismatch");
+                }
+                projected.plan_state = selected_any
+                    ? common_cache_plan_yield_plan_state::planned
+                    : common_cache_plan_yield_plan_state::not_required;
+                // Baseline-fit rows remain in the server pre-image as serial-bound
+                // evidence, but no-eviction wire records carry no projected action.
+                if (selected_any) {
+                    if (result.plan.empty() ||
+                        result.projected_fit.domains.empty()) {
+                        throw std::runtime_error(
+                            "cache-yield planned projection is empty");
+                    }
+                    projected.projected_domains.reserve(
+                        result.projected_fit.domains.size());
+                    for (const auto & row : result.projected_fit.domains) {
+                        common_cache_plan_yield_domain lowered;
+                        if (!server_cache_yield_lower_domain(row, lowered)) {
+                            throw std::runtime_error(
+                                "non-domain cache-yield projection row");
+                        }
+                        projected.projected_domains.push_back(
+                            std::move(lowered));
+                    }
+                }
+            } else {
+                projected.plan_state =
+                    common_cache_plan_yield_plan_state::unavailable;
+            }
+
+            // Shadow yield never executes an eviction. Destruction authority may fill this already-versioned
+            // slot only after it has authoritative post-mutation measurements.
+            if (rec.destruction.state ==
+                    common_cache_plan_destruction_state::executed) {
+                projected.actual_state = actual_state;
+                projected.actual_domains = std::move(actual_domains);
+            } else {
+                projected.actual_state =
+                    common_cache_plan_yield_actual_state::not_observed;
+            }
+            rec.yield = std::move(projected);
+        } catch (...) {
+            rec.yield = {};
+            if (cache_plan_obs) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+        }
+    }
+
+    // fork server-context.cpp:4320  (24 lines)
+    void cache_plan_emit_yield(
+            const server_cache_yield_result & result) noexcept {
+        if (!cache_plan_obs) {
+            return;
+        }
+        try {
+            const json line = {
+                { "status", server_cache_yield_status_name(result.status) },
+                { "yield_policy_version", result.yield_policy_version },
+                { "accounting_serial", result.accounting_serial },
+                { "n_selected_attention",
+                    result.selected[size_t(
+                        common_retention_pool::attention)].size() },
+                { "n_selected_recurrent",
+                    result.selected[size_t(
+                        common_retention_pool::recurrent)].size() },
+                { "n_plan_entries", result.plan.size() },
+                { "n_unsupported", result.unsupported.size() },
+            };
+            SRV_INF("CACHE_YIELD %s\n", line.dump().c_str());
+        } catch (...) {
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
+
+    // fork server-context.cpp:4451  (133 lines)
+    void cache_plan_finalize(server_slot & slot, bool ttft_known = true) {
+        if (!slot.cache_plan) {
+            return;
+        }
+        try {
+            auto & rec = *slot.cache_plan;
+
+            // once-only: outcome != unknown IS the finalized state; a second finalization
+            // attempt on the same record is an observer fault, never a second emission
+            if (rec.outcome != common_cache_plan_outcome::unknown) {
+                if (cache_plan_obs) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
+                slot.cache_plan.reset();
+                return;
+            }
+
+            rec.n_prompt_tokens   = llama_cache_acct_value::measured((uint64_t) slot.task->n_tokens());
+            rec.n_reused_tokens   = llama_cache_acct_value::measured(slot.stats.n_prompt_cached);
+            rec.n_replayed_tokens = llama_cache_acct_value::measured(slot.stats.n_prompt_processed);
+            if (ttft_known) {
+                rec.ttft_us = llama_cache_acct_value::measured(
+                    (uint64_t) (slot.stats.t_prompt_ms() * 1000.0));
+            }
+
+            // live-slot evidence comes from the FINAL post-trim state, not the selection
+            // heuristics: realized prefix reuse IS live-slot delivery (with the default zero
+            // similarity threshold an LRU pick can still reuse its own prefix), and a
+            // stage-1 heuristic reject is superseded by that fact. PROVENANCE guard (): a
+            // host restore replaces the slot state wholesale, so a positive final reuse
+            // count after host delivery is the HOST's prefix — never attributed to the
+            // original live slot.
+            {
+                const auto * host = rec.selected_row(common_cache_plan_provider::host_cache_entry);
+                const auto * active = rec.selected_row(common_cache_plan_provider::active_context_checkpoint);
+                const auto * attention = rec.selected_row(common_cache_plan_provider::active_attention_prefix);
+                auto *       live = rec.selected_row(common_cache_plan_provider::live_slot);
+                if (slot.stats.n_prompt_cached > 0 && !(host && host->delivered) &&
+                    !(active && active->delivered) && !(attention && attention->delivered) && live) {
+                    live->disposition = common_cache_plan_disposition::accepted;
+                    live->delivered   = true;
+                    live->reason      = COMMON_CACHE_PLAN_REASON_NONE;
+                    live->lcp_tokens  = llama_cache_acct_value::measured(slot.stats.n_prompt_cached);
+                }
+            }
+
+            // cold replay is the always-valid floor: it always has a row, and it delivered
+            // exactly when nothing else did
+            if (auto * cold = rec.find_or_add(
+                    common_cache_plan_provider::cold_replay,
+                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE, uint8_t(0), rec.id_slot,
+                    rec.selection)) {
+                cold->disposition = common_cache_plan_disposition::accepted;
+                rec.select(common_cache_plan_provider::cold_replay, cold);
+                rec.note_inventory_complete(common_cache_plan_provider::cold_replay);
+            }
+
+            // chosen = the TERMINAL delivered provider (delivery is data recorded at each
+            // site; the causal chain is emitted separately, so composition is not lost)
+            const common_cache_plan_provider terminal_order[] = {
+                common_cache_plan_provider::active_attention_prefix,
+                common_cache_plan_provider::active_context_checkpoint,
+                common_cache_plan_provider::live_context_checkpoint,
+                common_cache_plan_provider::host_cache_entry,
+                common_cache_plan_provider::live_slot,
+            };
+            const common_cache_plan_candidate * delivered_row = nullptr;
+            for (const auto prov : terminal_order) {
+                const auto * c = rec.selected_row(prov);
+                if (c && c->delivered) {
+                    delivered_row = c;
+                    rec.chosen    = prov;
+                    break;
+                }
+            }
+
+            if (delivered_row) {
+                rec.outcome = common_cache_plan_outcome::restored;
+            } else if (rec.restore_attempt_failed) {
+                rec.outcome = common_cache_plan_outcome::restore_failed_fell_back_cold;
+                rec.chosen  = common_cache_plan_provider::cold_replay;
+            } else {
+                rec.outcome = common_cache_plan_outcome::cold;
+                rec.chosen  = common_cache_plan_provider::cold_replay;
+            }
+            if (rec.chosen == common_cache_plan_provider::cold_replay) {
+                if (auto * cold = rec.selected_row(common_cache_plan_provider::cold_replay)) {
+                    cold->delivered = true;
+                }
+            }
+
+            // A composed plan is a first-class candidate: a
+            // multi-provider delivery (host snapshot + checkpoint continuation) gets ONE
+            // chain row — DELIVERED, since it is what actually ran — and the chain IS the
+            // complete shipped plan. The bare checkpoint row becomes component-only: its
+            // state was reachable only through the delivered host entry, so it can never
+            // enter the root optimum as a standalone plan.
+            common_cache_plan_compose_chains(rec);
+
+            if (cache_plan_obs) {
+                if (!cache_plan_observe_live_memory(false)) {
+                    cache_plan_obs->shadow_unavailable++;
+                }
+                rec.acct = cache_authority->ledger.snapshot();
+                auto retention_candidates =
+                    cache_authority->retention.candidate_snapshot();
+                cache_plan_emit_budget(rec.acct);
+                cache_plan_run_yield(
+                    rec.acct, std::move(retention_candidates));
+                cache_plan_project_yield(rec, cache_authority->last_yield);
+                cache_plan_emit_yield(cache_authority->last_yield);
+            }
+
+            if (cache_plan_obs) {
+                json out = server_json_from_ordered(
+                    common_cache_plan_record_json(rec));
+                cache_plan_obs->records_finalized++;
+                out["observer"] = json {
+                    { "records_finalized",  cache_plan_obs->records_finalized },
+                    { "shadow_unavailable", cache_plan_obs->shadow_unavailable },
+                };
+
+                SRV_INF("CACHE_PLAN %s\n", out.dump().c_str());
+                slot.cache_plan_json = std::move(out); // built once; /slots reuses it verbatim
+            }
+            slot.cache_plan.reset();
+        } catch (...) {
+            if (cache_plan_obs) {
+                cache_plan_obs->shadow_unavailable++;
+            }
+            slot.cache_plan.reset();
+        }
+    }
+
+    // fork server-context.cpp:9257  (12 lines)
+    void cache_plan_derive_incoming_adapter(
+            const server_task & task,
+            const server_slot & target,
+            cache_plan_stage1_inventory & out) {
+        out.incoming_loras = task.params.lora.empty()
+            ? params_base.lora_adapters
+            : construct_lora_list(task.params.lora);
+        out.incoming_adapter = lora_config_identity(out.incoming_loras);
+        out.incoming_adapter_ready = true;
+        out.incoming_adapter_matches =
+            are_lora_equal(out.incoming_loras, target.lora);
+    }
+
+    // fork server-context.cpp:8843  (35 lines)
+    void cache_plan_inventory_before_mutation(
+            const server_task & task,
+            server_slot & target,
+            const std::string & incoming_adapter,
+            common_cache_plan_record & rec,
+            cache_plan_host_source_registry & source_registry) {
+        rec.id_slot = target.id;
+        rec.n_prompt_tokens = llama_cache_acct_value::measured(task.tokens.size());
+        rec.identity.adapter_config_digest = llama_cache_acct_value::measured(
+            std::hash<std::string>{}(incoming_adapter));
+
+        source_registry.begin(prompt_cache.get());
+
+        std::vector<uint64_t> slot_lcps;
+        slot_lcps.reserve(slots.size());
+        for (const auto & slot : slots) {
+            slot_lcps.push_back(slot.prompt.tokens.get_common_prefix(task.tokens));
+        }
+        const bool recurrent = llama_model_is_recurrent(model_tgt) ||
+                               llama_model_is_hybrid(model_tgt);
+
+        // A fixed record is an honest bounded surface, not a promise that a
+        // cross-product always fits. Any failed append latches provider
+        // overflow (or derived_plans_incomplete); stop paying work immediately.
+        if (!cache_plan_inventory_live_rows(task, slot_lcps, rec) ||
+            !cache_plan_inventory_host_rows(
+                task, slot_lcps, incoming_adapter, recurrent, rec,
+                source_registry) ||
+            !cache_plan_inventory_checkpoint_rows(
+                task, slot_lcps, recurrent, rec) ||
+            !cache_plan_inventory_cold_rows(task, slot_lcps, rec)) {
+            GGML_ASSERT(rec.inventory_saturated());
+            return;
+        }
+    }
+
+    // fork server-context.cpp:9270  (32 lines)
+    void cache_plan_inventory_request(
+            const server_task & task,
+            server_slot & target,
+            bool update_cache,
+            common_cache_plan_record & rec,
+            cache_plan_stage1_inventory & out,
+            bool preflight) {
+        cache_plan_host_source_registry source_registry(
+            !preflight);
+        cache_plan_derive_incoming_adapter(task, target, out);
+        cache_plan_inventory_before_mutation(
+            task, target, out.incoming_adapter, rec, source_registry);
+
+        const auto semantics = server_cache_plan_preflight_semantics_for(
+            preflight,
+            task.type == SERVER_TASK_TYPE_COMPLETION,
+            update_cache,
+            prompt_cache != nullptr,
+            out.incoming_adapter_matches);
+        out.host_lookup_enabled = semantics.host_lookup_enabled;
+        // Selection observes the pre-launch inventory. Do not advertise that
+        // state when the request will clear it; preserve the aLoRA exception
+        // using the same predicate as launch_slot_with_task.
+        if (preflight && (!task.params.cache_prompt ||
+                (!out.incoming_adapter_matches &&
+                 lora_should_clear_cache(target.lora, out.incoming_loras)))) {
+            rec.destruction_legacy_plan_candidate = -1;
+            return;
+        }
+        rec.destruction_legacy_plan_candidate = server_cache_plan_legacy_candidate(
+            rec, target.id, out.host_lookup_enabled);
     }
 
 };
