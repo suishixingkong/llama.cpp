@@ -879,6 +879,48 @@ inline server_slot_prompt_admission server_slot_prompt_admission_check(
     return server_slot_prompt_admission::accepted;
 }
 
+// fork 9l-d3c: retention owner plan + cache-lifecycle default (fork server-task.h 1266-1305)
+inline bool server_cache_lifecycle_default(
+        bool explicitly_enabled,
+        bool prompt_cache_enabled,
+        bool cache_control_api_enabled) noexcept {
+    return explicitly_enabled || prompt_cache_enabled ||
+        cache_control_api_enabled;
+}
+
+// Retention metadata is payload-independent. Fixed host caching and dynamic VBR both need the
+// same lineage/prefix owner even though VBR cannot serialize tier-changing KV state yet.
+enum class server_retention_owner_kind : uint8_t {
+    none = 0,
+    standalone_metadata,
+    authority,
+};
+
+struct server_retention_owner_plan {
+    server_retention_owner_kind owner = server_retention_owner_kind::none;
+    bool prompt_shadow_workspace = false;
+    bool prefix_tracking = false;
+};
+
+inline server_retention_owner_plan server_retention_owner_plan_for(
+        bool cache_debug,
+        bool cache_lifecycle,
+        bool prompt_cache_enabled,
+        bool vbr_dynamic,
+        bool retention_capacity) noexcept {
+    server_retention_owner_plan out;
+    if (cache_debug || cache_lifecycle) {
+        out.owner = server_retention_owner_kind::authority;
+    } else if (prompt_cache_enabled || vbr_dynamic) {
+        out.owner = server_retention_owner_kind::standalone_metadata;
+    }
+    out.prompt_shadow_workspace = prompt_cache_enabled &&
+        (out.owner == server_retention_owner_kind::standalone_metadata ||
+         cache_debug || retention_capacity);
+    out.prefix_tracking = vbr_dynamic || out.prompt_shadow_workspace;
+    return out;
+}
+
 struct server_prompt_cache;
 
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
