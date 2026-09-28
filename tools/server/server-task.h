@@ -988,6 +988,14 @@ struct server_prompt_cache_vbr_replacement_diagnostics {
 };
 
 
+// fork 9l-c: server_prompt_retention_publish_exact_prefix decl (fork server-task.h 1335-1340)
+bool server_prompt_retention_publish_exact_prefix(
+    server_retention_sidecar_store & retention,
+    const server_retention_instance_key & key,
+    const server_prompt & prompt,
+    const std::string & adapter_config_key,
+    int64_t coverage_tokens) noexcept;
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -1054,6 +1062,9 @@ struct server_prompt_cache {
     server_retention_sidecar_store * retention_obs = nullptr;
 // fork 9l-b: lease_obs member (fork server-task.h 1697)
     server_cache_lease_table * lease_obs = nullptr;
+
+// fork 9l-c: lease execution identity (fork server-task.h 1698)
+    const std::string * lease_execution_identity = nullptr;
     // fork server-task.h:1651 (the fork marks this private; this struct has no access specifiers)
     // Reused by the scheduler-owned durability classifier. Durable stems
     // accumulate across capture waves, so this arena follows the full host

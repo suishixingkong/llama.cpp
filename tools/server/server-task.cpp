@@ -2626,6 +2626,163 @@ static bool server_prompt_retention_exact_scope(
         prompt.tokens, adapter_config_key, coverage_tokens, out);
 }
 
+// fork 9l-c: publish_exact_prefix + mirror_prefix + mirror_lease + clone mode + mirror_artifact_clone
+bool server_prompt_retention_publish_exact_prefix(
+        server_retention_sidecar_store & retention,
+        const server_retention_instance_key & key,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) noexcept {
+    if (!retention.prefix_tracking_enabled()) {
+        return true;
+    }
+    std::string scope;
+    if (!server_prompt_retention_exact_scope(
+            prompt, adapter_identity, coverage_tokens, scope)) {
+        return retention.publish_prefix(
+            key, {}, prompt.tokens.retention_token_ids());
+    }
+    return retention.publish_prefix(
+        key, scope, prompt.tokens.retention_token_ids());
+}
+
+static void server_prompt_cache_mirror_prefix(
+        server_prompt_cache & cache,
+        const server_retention_instance_key & key,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) noexcept {
+    if (cache.retention_obs) {
+        (void) server_prompt_retention_publish_exact_prefix(
+            *cache.retention_obs, key, prompt, adapter_identity,
+            coverage_tokens);
+    }
+}
+
+static void server_prompt_cache_mirror_lease(
+        server_prompt_cache & cache,
+        bool mirrored,
+        const server_cache_lease_subject * source,
+        const server_cache_lease_subject & destination,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens) noexcept {
+    if (!mirrored || !cache.lease_obs) {
+        return;
+    }
+    try {
+        server_cache_lease_identity identity;
+        if (destination.valid() &&
+            cache.lease_execution_identity &&
+            server_cache_lease_build_identity(
+                *cache.lease_execution_identity, adapter_identity,
+                prompt.tokens, coverage_tokens, identity)) {
+            if (source) {
+                (void) cache.lease_obs->artifact_cloned(
+                    *source, destination, identity);
+            } else {
+                (void) cache.lease_obs->artifact_rebound(
+                    destination.artifact, identity);
+            }
+        } else {
+            cache.lease_obs->artifact_identity_unavailable(destination);
+        }
+    } catch (...) {
+        cache.lease_obs->artifact_identity_unavailable(destination);
+    }
+}
+
+enum class server_prompt_cache_prefix_clone_mode : uint8_t {
+    publish_from_prompt = 0,
+    share_source,
+    publish_stem,
+    branch_prefix,
+};
+
+static bool server_prompt_cache_mirror_artifact_clone(
+        server_prompt_cache & cache,
+        const server_retention_instance_key & source_key,
+        common_retention_artifact_kind source_kind,
+        int32_t source_slot,
+        const server_retention_instance_key & destination_key,
+        common_retention_artifact_kind destination_kind,
+        int32_t destination_slot,
+        const server_prompt & prompt,
+        const std::string & adapter_identity,
+        int64_t coverage_tokens,
+        server_prompt_cache_prefix_clone_mode prefix_mode =
+            server_prompt_cache_prefix_clone_mode::publish_from_prompt,
+        int64_t source_turn_tokens = -1)
+        noexcept {
+    if (!cache.retention_obs) {
+        return true;
+    }
+
+    common_chat_msg_spans no_spans;
+    bool cloned = false;
+    bool prefix_prepared = false;
+    switch (prefix_mode) {
+        case server_prompt_cache_prefix_clone_mode::publish_stem:
+            cloned = source_turn_tokens > 0 && coverage_tokens > 0 &&
+                coverage_tokens <= source_turn_tokens &&
+                cache.retention_obs->publish(
+                    destination_key, common_retention_pool::attention,
+                    no_spans, true, uint64_t(source_turn_tokens),
+                    uint64_t(coverage_tokens), true,
+                    nullptr, nullptr, &source_key);
+            break;
+        case server_prompt_cache_prefix_clone_mode::branch_prefix:
+            cloned = coverage_tokens > 0 &&
+                cache.retention_obs->branch_prefix(
+                    source_key, destination_key,
+                    uint64_t(coverage_tokens), true);
+            break;
+        case server_prompt_cache_prefix_clone_mode::publish_from_prompt:
+            if (coverage_tokens > 0) {
+                std::string scope;
+                cloned = server_prompt_retention_exact_scope(
+                        prompt, adapter_identity, coverage_tokens, scope) &&
+                    cache.retention_obs->clone_exact_prefix(
+                        source_key, destination_key, scope,
+                        prompt.tokens.retention_token_ids());
+                prefix_prepared = cloned;
+            }
+            break;
+        case server_prompt_cache_prefix_clone_mode::share_source:
+            cloned = cache.retention_obs->clone(
+                source_key, destination_key);
+            break;
+    }
+    const bool indexed = cloned && (prefix_prepared ||
+        (destination_kind == common_retention_artifact_kind::checkpoint ||
+         (prefix_mode == server_prompt_cache_prefix_clone_mode::share_source
+              ? cache.retention_obs->clone_prefix(
+                    source_key, destination_key)
+              : server_prompt_retention_publish_exact_prefix(
+                    *cache.retention_obs, destination_key, prompt,
+                    adapter_identity, coverage_tokens))));
+    const server_cache_lease_subject source {
+        cache.retention_obs->artifact_id(source_key),
+        source_kind,
+        source_slot,
+    };
+    const server_cache_lease_subject destination {
+        cache.retention_obs->artifact_id(destination_key),
+        destination_kind,
+        destination_slot,
+    };
+    // A divergent prefix is a new lineage, not a continuation of the parent.
+    // In particular it must not inherit the parent's hard/soft lease. The
+    // ordinary exact restore and shared-source publication modes remain true
+    // clones and keep their existing lease transfer semantics.
+    if (prefix_mode != server_prompt_cache_prefix_clone_mode::branch_prefix) {
+        server_prompt_cache_mirror_lease(
+            cache, indexed, &source, destination, prompt,
+            adapter_identity, coverage_tokens);
+    }
+    return indexed;
+}
+
 // fork 9l-a: prepare_vbr_restore + release_vbr_restore + candidate impl (fork server-task.cpp 3059-3374)
 bool server_prompt_cache::prepare_vbr_restore(
         const server_tokens & request_tokens,
@@ -3204,4 +3361,92 @@ void server_prompt_cache::release_vbr_occupied_replacement(
     ticket.recovery_pin_.reset();
     ticket.incoming_ = {};
     ticket.clear();
+}
+
+// fork 9l-c: prepare_vbr_restore_destination (fork server-task.cpp 8263-8348)
+bool server_prompt_cache::prepare_vbr_restore_destination(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        int32_t id_slot) noexcept {
+    if (!candidate.ready() || candidate.cache_ != this || id_slot < 0 ||
+        !retention_obs || !destination.tokens.empty() ||
+        !destination.checkpoints.empty() || destination.sequence_epoch != 0) {
+        return false;
+    }
+    if (candidate.prepared_slot_ >= 0) {
+        return candidate.prepared_slot_ == id_slot &&
+            candidate.prepared_destination_ == &destination;
+    }
+    auto * source = candidate.source_;
+    const auto source_key =
+        server_retention_instance_key::for_host_entry(source);
+    const auto destination_key =
+        server_retention_instance_key::for_slot(id_slot);
+    if (retention_obs->artifact_id(destination_key).v != 0) {
+        return false;
+    }
+    try {
+        if (candidate.requires_prefix_projection_) {
+            if (source->prompt.tokens.has_media() ||
+                !source->prompt.checkpoints.empty() ||
+                uint64_t(source->prompt.n_tokens()) !=
+                    candidate.source_tokens_ ||
+                candidate.prefix_tokens_ >= candidate.source_tokens_) {
+                return false;
+            }
+            candidate.prepared_prompt_ = std::make_unique<server_prompt>();
+            candidate.prepared_prompt_->tokens =
+                source->prompt.tokens.clone_text_prefix(
+                    size_t(candidate.prefix_tokens_));
+            candidate.prepared_prompt_->sequence_epoch =
+                source->prompt.sequence_epoch;
+            if (!candidate.prepared_prompt_->checkpoints.empty() ||
+                candidate.prepared_prompt_->tokens.has_media() ||
+                candidate.prepared_prompt_->tokens.pos_next() !=
+                    candidate.selected_next_position_) {
+                candidate.prepared_prompt_.reset();
+                return false;
+            }
+        } else {
+            candidate.prepared_prompt_ =
+                std::make_unique<server_prompt>(source->prompt.clone());
+        }
+    } catch (...) {
+        candidate.prepared_prompt_.reset();
+        return false;
+    }
+    bool mirrored = false;
+    if (candidate.requires_prefix_projection_) {
+        // Divergence inside the parent is a new probationary lineage. Keep
+        // source credit in the prepared-launch ticket, publish only the
+        // shortened destination prefix, and admit it only when the scheduler
+        // consumes the successful launch terminal.
+        mirrored = server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            destination_key, common_retention_artifact_kind::live_slot,
+            id_slot, *candidate.prepared_prompt_,
+            source->adapter_config_key,
+            int64_t(candidate.prefix_tokens_),
+            server_prompt_cache_prefix_clone_mode::branch_prefix);
+    } else {
+        mirrored = server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            destination_key, common_retention_artifact_kind::live_slot,
+            id_slot, *candidate.prepared_prompt_,
+            source->adapter_config_key,
+            int64_t(candidate.prefix_tokens_),
+            server_prompt_cache_prefix_clone_mode::share_source);
+    }
+    if (!mirrored ||
+        !retention_obs->prepare_for_launch(source_key, destination_key)) {
+        retention_obs->abandon_prepared_launch(destination_key);
+        retention_obs->retire(destination_key);
+        candidate.prepared_prompt_.reset();
+        return false;
+    }
+    candidate.prepared_slot_ = id_slot;
+    candidate.prepared_destination_ = &destination;
+    return true;
 }
