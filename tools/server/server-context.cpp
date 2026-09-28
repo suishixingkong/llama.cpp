@@ -9109,6 +9109,9 @@ private:
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
     std::vector<int32_t> vbr_retention_candidate_by_seq;
     std::vector<uint8_t> vbr_retention_seen_by_seq;
+    // fork 9l-d4b3 (fork server-context.cpp 3546-3547)
+    std::vector<server_anchor_parent_rank> vbr_idle_parent_values;
+    std::vector<int32_t> vbr_idle_durability_order;
     std::vector<uint8_t> vbr_durable_sources_by_seq;
     std::vector<uint8_t> vbr_durable_stems_by_seq;
 
@@ -9144,6 +9147,76 @@ private:
     uint64_t vbr_automatic_restore_occupied_attempts = 0;
     uint64_t vbr_automatic_restore_occupied_succeeded = 0;
     uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
+
+    // fork 9l-d4b3 (fork server-context.cpp 3576-3599)
+    static constexpr uint64_t VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES =
+        16ull*1024ull*1024ull*1024ull;
+    static constexpr int64_t VBR_READINESS_SCAN_INTERVAL_MS = 1000;
+    // Prompt-boundary sealing lets first-token sampling and unrelated slots
+    // proceed, but the source slot's next KV-mutating decode waits for the
+    // exact iSWA rows to seal. Bound that inter-token hold even before the
+    // estimator has a model-specific sample.
+    static constexpr uint64_t VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US =
+        5000000;
+    struct vbr_idle_capture_candidate {
+        int32_t slot_id = -1;
+        uint64_t manifest_id = 0;
+        std::array<uint8_t, 32> attempt_identity = {};
+        std::array<uint8_t, 32> full_source_identity = {};
+        uint64_t tier_epoch = 0;
+        uint64_t tier_epoch_swa = 0;
+        bool refresh = false;
+        bool stem_requested = false;
+        bool stemmed = false;
+        bool prepressure = false;
+        bool active_prompt_frontier = false;
+        uint64_t selected_tokens = 0;
+        server_prompt_cache_vbr_publication_metadata publication;
+    };
+
+    // fork 9l-d4b3 (fork server-context.cpp 3601-3629)
+    uint64_t vbr_automatic_exact_capture_max_bytes() const noexcept {
+        if (params_base.cache_ram_mib < 0) {
+            return VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES;
+        }
+        const uint64_t configured =
+            uint64_t(params_base.cache_ram_mib)*1024ull*1024ull;
+        return std::min(configured, VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES);
+    }
+    struct vbr_idle_exact_capture_work {
+        server_queue::idle_capture_session session;
+        server_vbr_explicit_host_capture capture;
+        server_vbr_artifact_capture_output transfer;
+        vbr_idle_capture_candidate candidate;
+        server_prompt_cache_vbr_capacity_claim capacity;
+        server_vbr_capture_readiness_reservation readiness;
+        std::thread worker;
+        std::atomic<bool> complete { false };
+        int64_t started_us = 0;
+        int64_t transfer_started_us = 0;
+        int64_t transfer_deadline_us = 0;
+
+        ~vbr_idle_exact_capture_work() {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    };
+    std::unique_ptr<vbr_idle_exact_capture_work>
+        vbr_idle_exact_capture;
+
+    // fork 9l-d4b3 (fork server-context.cpp 3632-3642)
+    uint64_t vbr_capture_readiness_generation = 0;
+    // Decode can cross hundreds of ubatch boundaries while the durable/live
+    // frontier inventory is unchanged.  Bound the expensive catalog/retention
+    // classification cadence; the ordinary idle callback and worker
+    // completion wake remain immediate mutation-driven terminals.
+    int64_t vbr_capture_readiness_next_scan_ms = 0;
+    // SWA/iSWA cannot reconstruct an earlier prompt boundary after sliding
+    // rows have been recycled.  While this is nonnegative, the exact-capture
+    // selector is restricted to the named DONE_PROMPT slot so it can seal the
+    // frontier before the first generated token mutates that state.
+    int32_t vbr_prompt_boundary_capture_slot = -1;
 
     // fork 9l-d2c: cache-control authority (fork server-context.cpp 3642-3648).
     // Lazily constructed by its scheduler-only cache-control task; the fork's
