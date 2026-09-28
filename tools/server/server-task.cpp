@@ -2943,3 +2943,265 @@ void server_prompt_cache_vbr_restore_candidate::clear() noexcept {
     adopted_destination_ = nullptr;
     prepared_prompt_.reset();
 }
+
+// fork 9l-b: owner_is_current (fork server-task.cpp 3376-3383)
+static bool server_prompt_cache_vbr_owner_is_current(
+        const server_prompt_cache_state * state,
+        const server_prompt_cache_vbr_owner & owner) noexcept {
+    const auto * variants = state ? state->payload.vbr_variants() : nullptr;
+    return variants && owner &&
+        (variants->compact_current() == owner ||
+         variants->quality_anchor() == owner);
+}
+
+// fork 9l-b: replacement ticket impl (fork server-task.cpp 3385-3619)
+server_prompt_cache_vbr_replacement_ticket::
+~server_prompt_cache_vbr_replacement_ticket() {
+    if (cache_) {
+        cache_->release_vbr_occupied_replacement(*this);
+    }
+}
+
+server_prompt_cache_vbr_replacement_ticket::
+server_prompt_cache_vbr_replacement_ticket(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept {
+    *this = std::move(other);
+}
+
+server_prompt_cache_vbr_replacement_ticket &
+server_prompt_cache_vbr_replacement_ticket::operator=(
+        server_prompt_cache_vbr_replacement_ticket && other) noexcept {
+    if (this != &other) {
+        if (cache_) {
+            cache_->release_vbr_occupied_replacement(*this);
+        }
+        cache_ = other.cache_;
+        incoming_ = std::move(other.incoming_);
+        recovery_source_ = other.recovery_source_;
+        recovery_owner_ = std::move(other.recovery_owner_);
+        recovery_pin_ = std::move(other.recovery_pin_);
+        recovery_ops_ = std::move(other.recovery_ops_);
+        incumbent_ = other.incumbent_;
+        incumbent_family_current_ = other.incumbent_family_current_;
+        incumbent_family_ = other.incumbent_family_;
+        incoming_family_ = other.incoming_family_;
+        execution_identity_ = std::move(other.execution_identity_);
+        adapter_config_key_ = std::move(other.adapter_config_key_);
+        replacement_prompt_ = std::move(other.replacement_prompt_);
+        provisional_key_ = other.provisional_key_;
+        destination_slot_ = other.destination_slot_;
+        incoming_prefix_tokens_ = other.incoming_prefix_tokens_;
+        incumbent_tokens_ = other.incumbent_tokens_;
+        incumbent_live_lcp_ = other.incumbent_live_lcp_;
+        incumbent_sequence_epoch_ = other.incumbent_sequence_epoch_;
+        incoming_token_digest_ = other.incoming_token_digest_;
+        incumbent_token_digest_ = other.incumbent_token_digest_;
+        incumbent_lease_identity_ = std::move(other.incumbent_lease_identity_);
+        incumbent_artifact_ = other.incumbent_artifact_;
+        incumbent_lineage_ = other.incumbent_lineage_;
+        incoming_owner_artifact_ = other.incoming_owner_artifact_;
+        recovery_owner_artifact_ = other.recovery_owner_artifact_;
+        recovery_host_artifact_ = other.recovery_host_artifact_;
+        provisional_artifact_ = other.provisional_artifact_;
+        publish_prepared_ = other.publish_prepared_;
+        published_ = other.published_;
+        other.clear();
+    }
+    return *this;
+}
+
+bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
+    if (published_ || !cache_ || !incoming_.ready() || incoming_.cache_ != cache_ ||
+        !recovery_source_ ||
+        !recovery_owner_ || !recovery_pin_ || !recovery_pin_->valid() ||
+        !incumbent_ || !incumbent_family_current_ ||
+        *incumbent_family_current_ != incumbent_family_ ||
+        !replacement_prompt_ || destination_slot_ < 0 ||
+        incoming_prefix_tokens_ <= incumbent_live_lcp_ ||
+        incumbent_tokens_ == 0 || incumbent_sequence_epoch_ == 0 ||
+        incumbent_artifact_.v == 0 || incumbent_lineage_ == 0 ||
+        incoming_owner_artifact_.v == 0 ||
+        recovery_owner_artifact_.v == 0 ||
+        recovery_host_artifact_.v == 0 || provisional_artifact_.v == 0 ||
+        !incumbent_lease_identity_.valid() ||
+        !recovery_pin_->binds_exact(
+            recovery_host_artifact_, recovery_ops_) ||
+        incumbent_->sequence_epoch != incumbent_sequence_epoch_ ||
+        incumbent_->n_tokens() <= 0 ||
+        uint64_t(incumbent_->n_tokens()) != incumbent_tokens_ ||
+        incumbent_->tokens.has_media() ||
+        replacement_prompt_->tokens.has_media() ||
+        !replacement_prompt_->checkpoints.empty() ||
+        replacement_prompt_->sequence_epoch !=
+            incoming_.source_->prompt.sequence_epoch ||
+        uint64_t(replacement_prompt_->n_tokens()) !=
+            incoming_prefix_tokens_ ||
+        !server_prompt_cache_vbr_owner_is_current(
+            incoming_.source_, incoming_.payload_) ||
+        recovery_source_->payload.vbr_compact_owner() != recovery_owner_ ||
+        recovery_source_->adapter_config_key != adapter_config_key_ ||
+        recovery_source_->vbr_execution_identity != execution_identity_ ||
+        recovery_source_->cache_family != incumbent_family_ ||
+        recovery_source_->prompt.sequence_epoch !=
+            incumbent_sequence_epoch_ ||
+        recovery_source_->prompt.n_tokens() != incumbent_->n_tokens() ||
+        recovery_source_->recovery_pins == 0 ||
+        recovery_owner_->reference_artifact() !=
+            recovery_owner_artifact_ ||
+        incoming_.payload_->reference_artifact() !=
+            incoming_owner_artifact_ ||
+        !cache_->retention_obs ||
+        cache_->retention_obs->artifact_id(
+            server_retention_instance_key::for_slot(destination_slot_)) !=
+                incumbent_artifact_ ||
+        cache_->retention_obs->artifact_id(provisional_key_) !=
+            provisional_artifact_ ||
+        !cache_->retention_obs->prepared_for_launch(provisional_key_)) {
+        return false;
+    }
+    std::array<uint8_t, 32> digest = {};
+    std::array<uint8_t, 32> incoming_digest = {};
+    std::array<uint8_t, 32> recovery_digest = {};
+    common_retention_lineage_record lineage;
+    const auto recovery_key =
+        server_retention_instance_key::for_host_entry(recovery_source_);
+    if (!incumbent_->tokens.retention_token_digest(digest) ||
+        !replacement_prompt_->tokens.retention_token_digest(incoming_digest) ||
+        !recovery_source_->prompt.tokens.retention_token_digest(
+            recovery_digest)) {
+        return false;
+    }
+    const auto lease = cache_->lease_obs
+        ? cache_->lease_obs->inspect_range(
+            incumbent_artifact_, incumbent_lease_identity_,
+            incumbent_sequence_epoch_, 0, incumbent_tokens_)
+        : server_cache_lease_evaluation {};
+    return digest == incumbent_token_digest_ &&
+        incoming_digest == incoming_token_digest_ &&
+        recovery_digest == incumbent_token_digest_ &&
+        cache_->retention_obs->lineage_for_instance(
+            server_retention_instance_key::for_slot(destination_slot_),
+            lineage) &&
+        lineage.lineage_id == incumbent_lineage_ &&
+        cache_->retention_obs->artifact_id(recovery_key) ==
+            recovery_host_artifact_ &&
+        recovery_ops_.size() == 1 && recovery_ops_.front() &&
+        lease.state == server_cache_lease_eval_state::known &&
+        !server_cache_lease_is_hard(lease);
+}
+
+const server_prompt &
+server_prompt_cache_vbr_replacement_ticket::replacement_prompt()
+        const noexcept {
+    static const server_prompt empty;
+    return replacement_prompt_ ? *replacement_prompt_ : empty;
+}
+
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_replacement_ticket::incoming_payload() const noexcept {
+    return incoming_.payload_;
+}
+
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_replacement_ticket::recovery_payload() const noexcept {
+    return recovery_owner_;
+}
+
+int32_t server_prompt_cache_vbr_replacement_ticket::destination_slot()
+        const noexcept {
+    return destination_slot_;
+}
+
+uint64_t
+server_prompt_cache_vbr_replacement_ticket::incoming_prefix_tokens()
+        const noexcept {
+    return incoming_prefix_tokens_;
+}
+
+uint64_t server_prompt_cache_vbr_replacement_ticket::incumbent_tokens()
+        const noexcept {
+    return incumbent_tokens_;
+}
+
+uint64_t server_prompt_cache_vbr_replacement_ticket::incumbent_live_lcp()
+        const noexcept {
+    return incumbent_live_lcp_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::incumbent_artifact()
+        const noexcept {
+    return incumbent_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::incoming_owner_artifact()
+        const noexcept {
+    return incoming_owner_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::recovery_owner_artifact()
+        const noexcept {
+    return recovery_owner_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::recovery_host_artifact()
+        const noexcept {
+    return recovery_host_artifact_;
+}
+
+llama_cache_acct_artifact_id
+server_prompt_cache_vbr_replacement_ticket::provisional_artifact()
+        const noexcept {
+    return provisional_artifact_;
+}
+
+void server_prompt_cache_vbr_replacement_ticket::clear() noexcept {
+    incoming_ = {};
+    cache_ = nullptr;
+    recovery_source_ = nullptr;
+    recovery_owner_.reset();
+    recovery_pin_.reset();
+    recovery_ops_.clear();
+    incumbent_ = nullptr;
+    incumbent_family_current_ = nullptr;
+    incumbent_family_ = {};
+    incoming_family_ = {};
+    execution_identity_.clear();
+    adapter_config_key_.clear();
+    replacement_prompt_.reset();
+    provisional_key_ = {};
+    destination_slot_ = -1;
+    incoming_prefix_tokens_ = 0;
+    incumbent_tokens_ = 0;
+    incumbent_live_lcp_ = 0;
+    incumbent_sequence_epoch_ = 0;
+    incoming_token_digest_ = {};
+    incumbent_token_digest_ = {};
+    incumbent_lease_identity_ = {};
+    incumbent_artifact_ = {};
+    incumbent_lineage_ = 0;
+    incoming_owner_artifact_ = {};
+    recovery_owner_artifact_ = {};
+    recovery_host_artifact_ = {};
+    provisional_artifact_ = {};
+    publish_prepared_ = false;
+    published_ = false;
+}
+
+// fork 9l-b: release_vbr_occupied_replacement (fork server-task.cpp 7927-7939)
+void server_prompt_cache::release_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept {
+    if (ticket.cache_ != this) {
+        return;
+    }
+    if (retention_obs && ticket.provisional_key_.instance != 0) {
+        retention_obs->abandon_prepared_launch(ticket.provisional_key_);
+        retention_obs->retire(ticket.provisional_key_);
+    }
+    ticket.recovery_pin_.reset();
+    ticket.incoming_ = {};
+    ticket.clear();
+}
