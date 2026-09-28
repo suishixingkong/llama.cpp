@@ -174,6 +174,12 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // fork 9l-d2c: optional declared-family policy input (fork server-task.h
+    // 186-190). The wire layer supplies only this opaque token; scheduler
+    // launch resolves the strong binding locally, so an HTTP worker cannot
+    // inject a policy value into a task.
+    server_cache_control_token cache_family_binding_token;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
@@ -268,6 +274,7 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.cache_family_binding_token = cache_family_binding_token;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723

@@ -3599,22 +3599,51 @@ private:
         }
     }
 
-    bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                // if lora has changed, check to see if the cache should be cleared
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.clear();
-                } else {
-                    SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
-                }
-                slot.lora = task_loras;
+    bool launch_slot_with_task(
+            server_slot & slot,
+            server_task && task,
+            bool reclaim_before_launch = false) {
+        // Defensive backstop for any future caller which does not pass through
+        // process_single_task's group-wide preselection admission.
+        prepare_prompt_tokens_for_launch(slot, task);
+        if (!admit_task_for_slot(slot, task)) {
+            return false;
+        }
+
+        common_cache_family_binding incoming_family;
+        if (server_cache_family_resolve_for_launch(
+                cache_control_authority.get(),
+                task.cache_family_binding_token,
+                incoming_family) != server_cache_control_status::ok) {
+            send_error(
+                task, "cache family binding is unavailable",
+                ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        // process per-request lora adapters (fall back to the server's base adapters when the
+        // request carries none). Identity is checked for both branches: a slot that computed
+        // its prompt state under one adapter set must not silently continue it under a different
+        // one. The previous code checked equality only for the per-request branch and rebound the
+        // no-lora branch unconditionally, so a request with no `lora` field could keep the KV/
+        // recurrent state built under a per-request adapter. Also use prompt_clear() (not the
+        // struct-only prompt.clear()) so the recurrent state is reset too on hybrid models — a
+        // token-only clear leaves stale recurrent state that the reprocess would continue from.
+        const auto task_loras = task.params.lora.empty()
+            ? params_base.lora_adapters
+            : construct_lora_list(task.params.lora);
+
+
+        if (!are_lora_equal(task_loras, slot.lora)) {
+            // called only after establishing inequality, as lora_should_clear_cache requires
+            if (lora_should_clear_cache(slot.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+                slot.prompt_clear();
+            } else {
+                SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-        } else {
-            slot.lora = params_base.lora_adapters;
+            slot.lora = task_loras;
+            slot.vbr_adapter_config_identity_valid = false;
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -3686,6 +3715,19 @@ private:
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
+            // VBR exact-frontier reuse requires the complete raw vocabulary
+            // row. Backend sampling exposes only its selected/candidate tail.
+            use_backend_sampling &= !params_base.vbr_prompt_cache;
+
+            // fork 9l-d2c FORK-DIFF: the fork also clears backend sampling
+            // for speculation here -- "use_backend_sampling &= !slot.can_speculate();".
+            // `git log --all -S` finds no upstream revision that ever carried
+            // that guard, so it is a fork speculative-decoding addition rather
+            // than a VBR one, and the upstream launch path this port inherits
+            // keeps its own behaviour instead.
+            // diffusion self-spec needs raw logits for acceptance checking
+            use_backend_sampling &= !slot.diff_self_spec;
+
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
@@ -3709,10 +3751,103 @@ private:
             slot.smpl.reset();
         }
 
-        // the per-request limit takes priority over the global one
+        // The per-request generation limit takes priority over the global one.
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
-        slot.task = std::make_unique<const server_task>(std::move(task));
+        // Complete the last ordinary fallible launch allocation before an
+        // automatic import can atomically publish live KV/prompt metadata.
+        auto launched_task =
+            std::make_unique<const server_task>(std::move(task));
+        size_t restored_prefix = SIZE_MAX;
+        const bool automatically_restored = try_automatic_vbr_restore(
+            slot, *launched_task, incoming_family, &restored_prefix);
+        slot.vbr_imported_complete_frontier = automatically_restored
+            ? uint64_t(restored_prefix) : 0;
+
+        const size_t retained_prefix = restored_prefix != SIZE_MAX
+            ? restored_prefix
+            : slot.prompt.tokens.get_common_prefix(launched_task->tokens);
+
+        if (reclaim_before_launch &&
+            server_vbr_dynamic_active(params_base) &&
+            launched_task->n_tokens() > 0) {
+            vbr_reclaim_before_degrade(
+                slot.id,
+                uint32_t(launched_task->n_tokens() - retained_prefix),
+                "launch");
+        }
+
+        // The binding follows retained immutable content. Only a full-prefix
+        // append/resume keeps the existing lineage; a branch/replacement
+        // adopts the incoming declaration even when BOS or a shared system
+        // prefix overlaps. Children carry the opaque token and later copy the
+        // parent's resolved slot binding.
+        // A live-prefix lease binds the execution/adapter/media identity while
+        // its proven token boundary lives in the lease frontier. Preserve the
+        // sidecar artifact only when the entire decoded ledger is an exact
+        // prefix of the incoming request. That is an append of the same
+        // physical live copy: inspect must report partially_stale until renew.
+        // A trim, branch, or zero-overlap replacement retires the artifact and
+        // keeps subject_lost as the fail-closed identity-change terminal.
+        const bool append_continuity =
+            !slot.prompt.tokens.empty() &&
+            retained_prefix == slot.prompt.tokens.size();
+        const auto live_retention_key =
+            server_retention_instance_key::for_slot(slot.id);
+        const bool prepared_host_restore = slot.retention_obs &&
+            slot.retention_obs->prepared_for_launch(live_retention_key);
+        const bool useful_reused_prefix =
+            server_prompt_cache_retention_reuse_is_useful(
+                retained_prefix, &launched_task->params.message_spans);
+        const bool reused_live_prefix =
+            !prepared_host_restore && useful_reused_prefix &&
+            slot.retention_obs &&
+            slot.retention_obs->acquire_lineage_ticket(
+                live_retention_key, slot.retention_reuse_source);
+        slot.retention_reuse_pending = reused_live_prefix;
+        slot.retention_reuse_tokens = reused_live_prefix
+            ? uint64_t(retained_prefix) : 0;
+        slot.retention_branch_pending =
+            reused_live_prefix && !append_continuity;
+        slot.retention_request_succeeded = false;
+        slot.retention_geometry_failed = false;
+        if (slot.retention_obs && !append_continuity &&
+            !prepared_host_restore) {
+            slot.retention_obs->retire(
+                live_retention_key);
+        }
+        slot.cache_family = common_cache_family_follow_lineage(
+            slot.cache_family, incoming_family, retained_prefix,
+            slot.prompt.tokens.size());
+        slot.task = std::move(launched_task);
+
+        if (prepared_host_restore) {
+            server_retention_lineage_ticket restored_source;
+            if (slot.retention_obs->consume_prepared_launch(
+                    live_retention_key, restored_source)) {
+                if (useful_reused_prefix) {
+                    (void) slot.retention_obs->credit_reuse(restored_source);
+                }
+                slot.retention_obs->release_lineage_ticket(restored_source);
+                server_retention_lineage_ticket restored_destination;
+                const bool acquired_destination =
+                    slot.retention_obs->acquire_lineage_ticket(
+                        live_retention_key, restored_destination);
+                const bool admitted_destination = acquired_destination &&
+                    slot.retention_obs->activate_lineage_ticket(
+                        restored_destination);
+                if (acquired_destination) {
+                    slot.retention_obs->release_lineage_ticket(
+                        restored_destination);
+                }
+                if (!admitted_destination) {
+                    // Observation must never compromise a launched request.
+                    // Drop the unpublishable provisional shadow state and
+                    // continue with the already-restored live KV.
+                    slot.retention_obs->retire_slot(slot.id);
+                }
+            }
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -8216,6 +8351,17 @@ private:
     uint64_t vbr_automatic_restore_occupied_attempts = 0;
     uint64_t vbr_automatic_restore_occupied_succeeded = 0;
     uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
+
+    // fork 9l-d2c: cache-control authority (fork server-context.cpp 3642-3648).
+    // Lazily constructed by its scheduler-only cache-control task; the fork's
+    // destroy() closes it before prompt_cache because host proofs point into
+    // cache list nodes, and declaring it after the artifact store is the
+    // secondary reverse-destruction guard for retained package proofs. With no
+    // control route/flag ported yet nothing allocates it -- which is exactly
+    // the fork's own production state ("production allocates and executes
+    // nothing"). The declaration exists so that the launch prologue's family
+    // resolution is verbatim (fork 10280-10290).
+    std::unique_ptr<server_cache_control_authority> cache_control_authority;
     // ---------------------------------------------------------------------
     // group A: cache-plan observation face + the retention wave it calls.
     // Bodies verbatim from the fork; the fork coordinates are on each header
