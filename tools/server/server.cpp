@@ -136,6 +136,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
                                && params.model.hf_repo.empty()
                                && params.model.docker_repo.empty();
 
+    // fork 9l-d3d: cache-lifecycle resolution (fork server.cpp 140-144)
+    // The control surface requires lifecycle authority, so requesting the
+    // surface implies its internal substrate. Prompt-cache-driven lifecycle
+    // is resolved later, after the cache is actually constructed.
+    params.cache_lifecycle = server_cache_lifecycle_default(
+        params.cache_lifecycle, false, params.cache_control_api);
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
 

@@ -2656,10 +2656,154 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // fork 9l-d3d: VBR quality-anchor budget (fork server-context.cpp 7683-7695)
+            if (params_base.vbr_prompt_cache &&
+                params_base.vbr_anchor_cache_mib > 0) {
+                const uint64_t anchor_bytes =
+                    uint64_t(params_base.vbr_anchor_cache_mib)*1024*1024;
+                if (anchor_bytes > SIZE_MAX) {
+                    SRV_ERR("%s", "--vbr-anchor-cache-mib exceeds this platform's addressable size\n");
+                    return false;
+                }
+                prompt_cache->quality_anchor_budget_enabled = true;
+                prompt_cache->limit_anchor_size = size_t(anchor_bytes);
+                SRV_INF("VBR quality-anchor cache enabled, size limit: %d MiB\n",
+                        params_base.vbr_anchor_cache_mib);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        // fork 9l-d3d: cache authority substrate, constructed and configured (fork server-context.cpp 7701-7827)
+        // Retention-capacity policy is the normal fixed-cache owner. Explicit
+        // --cache-lifecycle still enables the transaction substrate without a
+        // host cache; cache-disabled defaults remain zero-state.
+        params_base.cache_lifecycle = server_cache_lifecycle_default(
+            params_base.cache_lifecycle, prompt_cache != nullptr,
+            params_base.cache_control_api);
+        const bool retention_capacity = prompt_cache != nullptr;
+        const auto retention_owner_plan = server_retention_owner_plan_for(
+            params_base.cache_debug,
+            params_base.cache_lifecycle,
+            prompt_cache != nullptr,
+            server_vbr_dynamic_active(params_base),
+            retention_capacity);
+        const auto live_retention_pool =
+            (llama_model_is_recurrent(model_tgt) ||
+             llama_model_is_hybrid(model_tgt))
+                ? common_retention_pool::recurrent
+                : common_retention_pool::attention;
+
+        // Cache authority substrate, constructed and configured under
+        // (cache_debug || cache_lifecycle). Neither flag remains the strictly-zero-work legacy
+        // path; debug alone observes the shared substrate, while lifecycle enables publication
+        // admission without allocating or emitting a cache-plan observer.
+        if (params_base.cache_debug) {
+            cache_plan_obs = std::make_unique<server_cache_plan_observer>();
+        }
+        if (retention_owner_plan.owner ==
+                server_retention_owner_kind::authority) {
+            cache_authority = std::make_unique<server_cache_authority>();
+        } else if (retention_owner_plan.owner ==
+                server_retention_owner_kind::standalone_metadata) {
+            cache_retention_metadata =
+                std::make_unique<server_retention_sidecar_store>();
+        }
+        if (retention_owner_plan.owner !=
+                server_retention_owner_kind::none) {
+            // Live-slot retention is representation-neutral. Fixed and
+            // dynamic-VBR memories both expose exact per-sequence exclusive
+            // cell counts; unsupported composite topologies fail closed to
+            // the protected LRU floor.
+            vbr_retention_candidates.resize(slots.size());
+            vbr_retention_candidate_by_seq.resize(slots.size());
+            vbr_retention_seen_by_seq.resize(slots.size());
+            vbr_exclusive_cells_by_seq.resize(slots.size());
+        }
+
+        // Cache-plan observer, constructed only under params_base.cache_debug: the observer
+        // object and both surfaces exist iff the flag is set. Off = strictly zero observer work
+        // It records the shared authority substrate above, owned by server_context.
+        if (retention_owner_plan.owner ==
+                server_retention_owner_kind::authority) {
+            GGML_ASSERT(cache_authority);
+            // Policy substrate is live under either gate. CACHE_PLAN JSON/log
+            // emission remains below behind cache_plan_obs/cache_debug, but
+            // lifecycle-only operation must still inspect WS-D leases before
+            // every censused destructive primitive.
+            cache_authority->destruction.lease_context = &cache_authority->leases;
+            cache_authority->destruction.lease_evaluator =
+                server_cache_lease_evaluate_request;
+            server_wire_live_retention_metadata(
+                cache_authority->retention, slots, live_retention_pool);
+            for (auto & slot : slots) {
+                slot.destruction_obs = &cache_authority->destruction;
+                slot.lease_obs = &cache_authority->leases;
+                slot.lease_execution_identity = &frontier_execution_identity;
+                slot.lifecycle_authority = params_base.cache_lifecycle
+                    ? cache_authority.get()
+                    : nullptr;
+                slot.cache_debug_observability = params_base.cache_debug;
+            }
+            if (prompt_cache) {
+                prompt_cache->debug_observability = params_base.cache_debug;
+                prompt_cache->retention_capacity_authority = retention_capacity;
+                prompt_cache->destruction_obs = &cache_authority->destruction;
+                prompt_cache->retention_obs = &cache_authority->retention;
+                prompt_cache->lease_obs = &cache_authority->leases;
+                prompt_cache->lease_execution_identity =
+                    &frontier_execution_identity;
+                // Debug shadow observes whichever fixed-host authority is
+                // active. Lifecycle keeps its certified price selector; observation
+                // only compares the decayed projection against that choice.
+                server_request_retention_prefix_tracking(
+                    cache_authority->retention, prompt_cache.get(),
+                    retention_owner_plan);
+                if (retention_capacity) {
+                    SRV_INF("%s\n", "decayed-frequency host-cache authority is enabled");
+                }
+            } else if (retention_owner_plan.prefix_tracking) {
+                server_request_retention_prefix_tracking(
+                    cache_authority->retention, nullptr,
+                    retention_owner_plan);
+            }
+            if (params_base.cache_lifecycle) {
+                llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set(
+                    vbr_hard_seal_guard {
+                        [this]() {
+                            return cache_authority != nullptr &&
+                                server_cache_has_hard_lease(
+                                    &cache_authority->leases);
+                        },
+                        [this](const vbr_hard_seal_subject &,
+                               const std::vector<vbr_hard_seal_range> & ranges) {
+                            for (const auto & range : ranges) {
+                                const auto slot = std::find_if(
+                                    slots.begin(), slots.end(),
+                                    [&](const server_slot & value) {
+                                        return value.id == range.sequence;
+                                    });
+                                if (slot != slots.end() &&
+                                    slot->hard_lease_blocks_live_range(
+                                        range.first_token, range.token_count)) {
+                                    return vbr_hard_seal_guard_result::hard_lease_blocked;
+                                }
+                            }
+                            return vbr_hard_seal_guard_result::allow;
+                        },
+                    });
+            }
+        }
+        if (cache_retention_metadata) {
+            // The retention sidecar owns payload-independent live lineage metadata for both the normal fixed
+            // host-cache path and dynamic VBR. This does not enable lifecycle accounting,
+            // leases, host-state serialization, or victim authority.
+            server_wire_standalone_retention_metadata(
+                *cache_retention_metadata, slots, prompt_cache.get(),
+                live_retention_pool, retention_owner_plan);
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",

@@ -1194,6 +1194,12 @@ struct server_prompt_cache {
     // class (118 members, 69 out-of-line bodies, 26 types) stays out until a
     // consumer lands. Verbatim from the fork; coordinates on each line.
     // ---------------------------------------------------------------------
+
+    // fork server-task.h:1371-1374
+    // Independent quality-only pool, in bytes. Zero is the valid
+    // compact-only configuration: anchors are optional and are stripped
+    // without invalidating their compact current artifact.
+    size_t limit_anchor_size = 0;
     // fork server-task.h:1375-1377
     // Explicit VBR restore product gate. Keeping this false preserves literal zero
     // anchor work unless a nonzero --vbr-anchor-cache-mib pool is requested.
