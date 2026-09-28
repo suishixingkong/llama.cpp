@@ -1294,24 +1294,12 @@ struct server_slot {
     // fork server-context.cpp:1562
     bool vbr_idle_stem_retry = false;
     // fork server-context.cpp:1567
-// fork 9l-a: artifact store member + counters
-
     uint64_t vbr_imported_complete_frontier = 0;
-    // the frozen ledger but is destroyed before it. It exists only for an
-    // armed dynamic-VBR memory after the one-shot manifest and ring admission.
-    std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
-    server_vbr_prompt_cache_support_status vbr_prompt_cache_support =
-        server_vbr_prompt_cache_support_status::supported;
-    server_vbr_artifact_capture_status vbr_prompt_cache_store_status =
-        server_vbr_artifact_capture_status::unavailable;
-    server_vbr_artifact_store_create_diagnostics
-        vbr_prompt_cache_store_diagnostics;
-    uint64_t vbr_automatic_restore_attempts = 0;
-    uint64_t vbr_automatic_restore_succeeded = 0;
-    uint64_t vbr_automatic_restore_quality_fallbacks = 0;
-    uint64_t vbr_automatic_restore_occupied_attempts = 0;
-    uint64_t vbr_automatic_restore_occupied_succeeded = 0;
-    uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
+    // NOTE (9l-d2d): 9l-a also declared the artifact store and the six
+    // automatic-restore counters on this line. They are server_context_impl
+    // members (fork 3562-3575), not server_slot members; nothing referenced
+    // them until 9l-d2d landed their first reader, so the misplacement
+    // compiled. They now live in the impl's member block, next to the knobs.
     // FORK-DIFF: the fork declares this inside the diffusion self-speculation
     // group (diff_draft_length, the mask/think token ids, diff_prev_logits, ...).
     // Only the flag itself is read by the SWA-window eligibility predicate, and
@@ -3034,6 +3022,581 @@ private:
                 return true;
         }
         GGML_ABORT("invalid slot prompt admission");
+    }
+
+// fork 9l-d2d: the automatic VBR restore body (fork server-context.cpp 9698-10270)
+    bool try_automatic_vbr_restore(
+            server_slot & slot,
+            const server_task & task,
+            const common_cache_family_binding & incoming_family,
+            size_t * restored_prefix = nullptr) noexcept {
+        if (restored_prefix) {
+            *restored_prefix = SIZE_MAX;
+        }
+        try {
+            if (!params_base.vbr_prompt_cache || !prompt_cache ||
+                !vbr_artifact_store ||
+                task.type != SERVER_TASK_TYPE_COMPLETION || task.is_child() ||
+                task.is_parent() || task.tokens.empty() ||
+                !task.params.cache_prompt ||
+                automatic_vbr_cache_support(
+                    task.tokens, slot.lora, slot.can_speculate()) !=
+                    server_vbr_prompt_cache_support_status::supported ||
+                slot.state != SLOT_STATE_IDLE || slot.is_processing()) {
+                return false;
+            }
+            const bool construction_empty =
+                slot.prompt.tokens.empty() &&
+                slot.prompt.checkpoints.empty() &&
+                slot.prompt.sequence_epoch == 0;
+            const bool occupied_candidate =
+                !slot.prompt.tokens.empty() &&
+                !slot.prompt.tokens.has_media() &&
+                slot.prompt.sequence_epoch != 0;
+            if (!construction_empty && !occupied_candidate) {
+                return false;
+            }
+            server_prompt_cache_vbr_restore_candidate candidate;
+            const auto adapter_identity = lora_config_identity(slot.lora);
+            if (!prompt_cache->prepare_vbr_restore(
+                    task.tokens, frontier_execution_identity,
+                    adapter_identity, candidate,
+                    !ctx_dft && !slot.can_speculate())) {
+                if (occupied_candidate) {
+                    SLT_INF(slot, "%s",
+                            "automatic occupied VBR restore refused: no exact host candidate\n");
+                }
+                return false;
+            }
+            const auto restore_event_for = [](
+                    const server_prompt_cache_vbr_owner & payload) noexcept {
+                bool draft_image = false;
+                bool accelerator_image = false;
+                if (payload) {
+                    for (const auto & companion :
+                            payload->package().companions()) {
+                        draft_image |= companion.descriptor.kind ==
+                            vbr_artifact_companion_kind::required_spec_payload;
+                        accelerator_image |= companion.descriptor.kind ==
+                            vbr_artifact_companion_kind::typed_accelerator;
+                    }
+                }
+                if (!draft_image) {
+                    return common_speculative_sequence_event::
+                        target_restored_without_draft;
+                }
+                return accelerator_image
+                    ? common_speculative_sequence_event::
+                        composite_image_restored
+                    : common_speculative_sequence_event::draft_image_restored;
+            };
+            const int32_t plan_source_id = candidate.source_id();
+            const uint64_t plan_prefix_tokens = candidate.prefix_tokens();
+            const auto observe_vbr_delivery = [&] (
+                    uint64_t delivered_payload_bytes) noexcept {
+                if (!slot.cache_plan || plan_source_id < 0) {
+                    return;
+                }
+                auto & rec = *slot.cache_plan;
+                auto * row = rec.find_or_add(
+                    common_cache_plan_provider::host_cache_entry,
+                    plan_source_id, COMMON_CACHE_PLAN_PHASE_HOST_SCAN,
+                    slot.id, rec.selection);
+                if (!row) {
+                    return;
+                }
+                row->payload_kind =
+                    common_cache_plan_payload_kind::vbr_artifact;
+                row->lcp_tokens = llama_cache_acct_value::measured(
+                    plan_prefix_tokens);
+                row->payload_bytes = llama_cache_acct_value::measured(
+                    delivered_payload_bytes);
+                row->accept();
+                row->delivered = true;
+                rec.select(common_cache_plan_provider::host_cache_entry, row);
+                rec.note_inventory_complete(
+                    common_cache_plan_provider::host_cache_entry);
+            };
+            llama_memory_i * memory = nullptr;
+            bool cleared_for_empty_handoff = false;
+            const bool occupied_prefix_projection =
+                occupied_candidate && candidate.requires_prefix_projection();
+            vbr_artifact_attention_prefix_projection occupied_projection;
+            if (occupied_candidate) {
+                const auto occupied_projection_status =
+                    occupied_prefix_projection
+                    ? vbr_artifact_store->prepare_host_prefix_projection(
+                        candidate.payload(),
+                        task.tokens.retention_token_ids(),
+                        candidate.prefix_tokens(), occupied_projection)
+                    : vbr_artifact_prefix_projection_status::projected;
+                if (occupied_projection_status !=
+                        vbr_artifact_prefix_projection_status::projected) {
+                    SLT_DBG(
+                        slot,
+                        "automatic occupied VBR prefix projection refused: status=%u\n",
+                        unsigned(occupied_projection_status));
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    return false;
+                }
+                memory = llama_get_memory(ctx_tgt);
+                if (!memory) {
+                    SLT_DBG(slot, "%s",
+                            "automatic occupied VBR restore refused: no memory\n");
+                    return false;
+                }
+                if (!cache_plan_observe_live_memory(false)) {
+                    SLT_DBG(slot, "%s",
+                            "automatic occupied VBR restore refused: live accounting unavailable\n");
+                    return false;
+                }
+                if (memory->seq_pos_min(slot.id) < 0 ||
+                    memory->seq_pos_max(slot.id) < 0) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    SLT_DBG(slot, "%s",
+                            "automatic occupied VBR restore refused: live sequence absent\n");
+                    return false;
+                }
+
+                // Exact rollback keeps the existing atomic occupied path. A
+                // one-slot server may instead hand off through an empty target
+                // when the idle incumbent and incoming request both have
+                // useful durable host prefixes. This is the same destructive
+                // rebind the subsequent cold path would perform, moved before
+                // import so failure naturally falls through to cold prefill.
+                server_vbr_empty_handoff_gate handoff_gate;
+                handoff_gate.slot_count = slots.size();
+                handoff_gate.incoming_prefix = candidate.prefix_tokens();
+                handoff_gate.hard_lease =
+                    slot.hard_lease_blocks_live_prefix();
+                handoff_gate.deferred_task =
+                    queue_tasks.has_deferred_for_slot(slot.id);
+                handoff_gate.incumbent_supported =
+                    automatic_vbr_cache_support(
+                        slot.prompt.tokens, slot.lora,
+                        slot.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported;
+                server_prompt_cache_vbr_restore_candidate durable_incumbent;
+                bool durable_incumbent_prepared = false;
+                if (server_vbr_empty_handoff_lookup_allowed(handoff_gate)) {
+                    handoff_gate.incumbent_lcp =
+                        slot.prompt.tokens.get_common_prefix(task.tokens);
+                    if (candidate.prefix_tokens() >
+                            handoff_gate.incumbent_lcp) {
+                        // The incumbent witness must itself be a sealed host
+                        // frontier. A projection from some longer artifact is
+                        // not recovery authority for destructive handoff.
+                        durable_incumbent_prepared =
+                            prompt_cache->prepare_vbr_restore(
+                                slot.prompt.tokens,
+                                frontier_execution_identity,
+                                adapter_identity, durable_incumbent, false,
+                                &slot.cache_family);
+                        handoff_gate.durable_incumbent_prefix =
+                            durable_incumbent.prefix_tokens();
+                        handoff_gate.exact_incumbent_durable =
+                            durable_incumbent_prepared &&
+                            durable_incumbent.prefix_tokens() ==
+                                uint64_t(slot.prompt.n_tokens());
+                        handoff_gate.family_matches =
+                            durable_incumbent.cache_family() ==
+                                slot.cache_family;
+                    }
+                }
+                const bool handoff_eligible = durable_incumbent_prepared &&
+                    server_vbr_empty_handoff_allowed(handoff_gate);
+                if (handoff_eligible &&
+                    slot.prompt_clear_after_vbr_publication(
+                        server_cache_destruction_reason::live_prefix_replace)) {
+                    // Hybrid/iSWA memory may contain payload-complete children
+                    // which a per-sequence erase cannot empty. With one slot,
+                    // clearing the whole tree cannot affect another request.
+                    llama_memory_clear(memory, false);
+                    memory->breathe();
+                    cleared_for_empty_handoff = true;
+                    SLT_DBG(
+                        slot,
+                        "automatic VBR host handoff cleared idle source "
+                        "prefix=%" PRIu64 " incoming=%" PRIu64 "\n",
+                        durable_incumbent.prefix_tokens(),
+                        candidate.prefix_tokens());
+                }
+            }
+            if (occupied_candidate && !cleared_for_empty_handoff) {
+                server_prompt_cache_vbr_replacement_ticket ticket;
+                server_prompt_cache_vbr_replacement_diagnostics
+                    replacement_diagnostics;
+                if (!prompt_cache->prepare_vbr_occupied_replacement(
+                        std::move(candidate), slot.prompt, slot.cache_family,
+                        incoming_family, slot.id,
+                        frontier_execution_identity, adapter_identity,
+                        ticket, &replacement_diagnostics)) {
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    SLT_DBG(
+                        slot,
+                        "automatic occupied VBR ticket refused: states=%llu "
+                        "digest_matches=%llu raw_compares=%llu\n",
+                        (unsigned long long) replacement_diagnostics.
+                            recovery_states_visited,
+                        (unsigned long long) replacement_diagnostics.
+                            recovery_digest_matches,
+                        (unsigned long long) replacement_diagnostics.
+                            recovery_raw_token_comparisons);
+                    return false;
+                }
+
+                struct occupied_publish_state {
+                    server_prompt_cache * cache = nullptr;
+                    server_prompt_cache_vbr_replacement_ticket * ticket = nullptr;
+                    bool published = false;
+                } state { prompt_cache.get(), &ticket, false };
+
+                server_vbr_artifact_import_target request;
+                request.memory = memory;
+                request.destination = slot.id;
+                request.execution_identity = frontier_execution_identity;
+                request.adapter_config_identity = adapter_identity;
+                request.previously_observed = true;
+                request.draft_context = ctx_dft;
+                request.accelerator = slot.get_spec();
+                request.frontier_logits = &slot.frontier_logits.values;
+                request.frontier_logits_count = uint32_t(
+                    llama_vocab_n_tokens(vocab));
+                request.publish_context = &state;
+                request.prepare_publish = [](
+                    void * opaque,
+                    const std::vector<llama_token> & tokens,
+                    uint64_t sequence_epoch) noexcept {
+                    auto * current = static_cast<occupied_publish_state *>(opaque);
+                    return current && current->cache && current->ticket &&
+                        current->ticket->ready() &&
+                        tokens.size() ==
+                            current->ticket->incoming_prefix_tokens() &&
+                        sequence_epoch == current->ticket->
+                            replacement_prompt().sequence_epoch &&
+                        current->cache->prepare_vbr_occupied_replacement_publish(
+                            *current->ticket);
+                };
+                request.publish = [](void * opaque) noexcept {
+                    auto * current = static_cast<occupied_publish_state *>(opaque);
+                    GGML_ASSERT(current && current->cache && current->ticket);
+                    current->cache->publish_vbr_occupied_replacement(
+                        *current->ticket);
+                    current->published = true;
+                };
+
+                vbr_automatic_restore_attempts++;
+                vbr_automatic_restore_occupied_attempts++;
+                const int64_t started = ggml_time_us();
+                const uint64_t prefix_tokens = ticket.incoming_prefix_tokens();
+                const uint64_t incumbent_lcp = ticket.incumbent_live_lcp();
+                const auto restore_event =
+                    restore_event_for(ticket.incoming_payload());
+                const bool incoming_frontier_logits = std::any_of(
+                    ticket.incoming_payload()->package().companions().begin(),
+                    ticket.incoming_payload()->package().companions().end(),
+                    [](const auto & companion) {
+                        return companion.descriptor.kind ==
+                            vbr_artifact_companion_kind::frontier_logits;
+                    });
+                if (restored_prefix) {
+                    *restored_prefix = size_t(incumbent_lcp);
+                }
+                const auto imported = occupied_prefix_projection
+                    ? vbr_artifact_store->
+                        import_host_occupied_prefix_replacement(
+                            std::move(request), ticket.incoming_payload(),
+                            ticket.recovery_payload(),
+                            std::move(occupied_projection))
+                    : vbr_artifact_store->import_host_occupied_replacement(
+                            std::move(request), ticket.incoming_payload(),
+                            ticket.recovery_payload());
+                if (imported.status !=
+                        server_vbr_artifact_import_status::ok) {
+                    GGML_ASSERT(!state.published);
+                    vbr_automatic_restore_occupied_fallbacks++;
+                    size_t failure_prefix = size_t(incumbent_lcp);
+                    const bool quarantined =
+                        server_vbr_apply_occupied_restore_failure_to_slot(
+                            imported.adopt_status, imported.recovery,
+                            size_t(incumbent_lcp), failure_prefix, slot);
+                    if (restored_prefix) {
+                        *restored_prefix = failure_prefix;
+                    }
+                    SLT_DBG(
+                        slot,
+                        "automatic occupied VBR restore refused: status=%s "
+                        "guard=%s schedule=%s destination=%s validation=%s "
+                        "stage=%s adopt=%s phase=%s "
+                        "recovery=%s reset=%s\n",
+                        server_vbr_artifact_import_status_name(imported.status),
+                        vbr_occupied_replacement_guard_status_name(
+                            imported.occupied_guard_status),
+                        vbr_import_schedule_status_name(
+                            imported.schedule_status),
+                        vbr_import_destination_status_name(
+                            imported.destination_status),
+                        vbr_manifest_validation_status_name(
+                            imported.validation_status),
+                        vbr_adopt_stage_status_name(imported.stage_status),
+                        vbr_adopt_status_name(imported.adopt_status),
+                        vbr_adopt_phase_name(imported.phase),
+                        vbr_adopt_recovery_outcome_name(imported.recovery),
+                        quarantined ? "true" : "false");
+                    return false;
+                }
+                GGML_ASSERT(state.published);
+                prompt_cache->commit_vbr_occupied_replacement(
+                    ticket, slot.prompt, slot.cache_family, slot.id);
+                if (!occupied_prefix_projection &&
+                    (imported.decision == vbr_import_decision::native_import ||
+                     imported.decision == vbr_import_decision::live_rebased)) {
+                    mark_exact_vbr_restore_durable(slot, *memory);
+                }
+                common_speculative_sequence_transition(
+                    slot.get_spec(), slot.id, restore_event);
+                if (incoming_frontier_logits) {
+                    slot.bind_frontier_logits_to_prompt();
+                } else {
+                    slot.clear_frontier_logits();
+                }
+                SLT_DBG(slot,
+                        "restored frontier logits: count=%zu authenticated=%d\n",
+                        slot.frontier_logits.values.size(),
+                        slot.frontier_logits_matches());
+                vbr_automatic_restore_succeeded++;
+                vbr_automatic_restore_occupied_succeeded++;
+                const uint64_t delivered_payload_bytes =
+                    imported.payload_bytes <=
+                            UINT64_MAX - imported.companion_bytes
+                        ? imported.payload_bytes + imported.companion_bytes
+                        : 0;
+                observe_vbr_delivery(delivered_payload_bytes);
+                if (restored_prefix) {
+                    *restored_prefix = size_t(prefix_tokens);
+                }
+                SLT_INF(
+                    slot,
+                    "automatic occupied VBR restore old_lcp=%" PRIu64
+                    " prefix=%" PRIu64 " status=%s h2d_bytes=%" PRIu64
+                    " h2d_chunks=%" PRIu64 " duration_ms=%.3f "
+                    "occupied=%" PRIu64 "/%" PRIu64
+                    " fallbacks=%" PRIu64 "\n",
+                    incumbent_lcp, prefix_tokens,
+                    server_vbr_artifact_import_status_name(imported.status),
+                    imported.h2d_bytes, imported.h2d_chunks,
+                    (ggml_time_us() - started)/1000.0,
+                    vbr_automatic_restore_occupied_succeeded,
+                    vbr_automatic_restore_occupied_attempts,
+                    vbr_automatic_restore_occupied_fallbacks);
+                return true;
+            }
+
+            vbr_artifact_attention_prefix_projection prefix_projection =
+                cleared_for_empty_handoff
+                    ? std::move(occupied_projection)
+                    : vbr_artifact_attention_prefix_projection {};
+            bool prefix_projection_ready =
+                cleared_for_empty_handoff && candidate.requires_prefix_projection();
+            const auto prepare_prefix_projection = [&](bool refresh = false) noexcept {
+                if (!candidate.requires_prefix_projection()) {
+                    return true;
+                }
+                if (prefix_projection_ready && !refresh) {
+                    return true;
+                }
+                prefix_projection_ready =
+                    vbr_artifact_store->prepare_host_prefix_projection(
+                           candidate.payload(),
+                           task.tokens.retention_token_ids(),
+                           candidate.prefix_tokens(), prefix_projection) ==
+                    vbr_artifact_prefix_projection_status::projected;
+                return prefix_projection_ready;
+            };
+            if (!prepare_prefix_projection()) {
+                return false;
+            }
+            memory = llama_get_memory(ctx_tgt);
+            if (!memory) {
+                return false;
+            }
+            // An explicitly erased construction-empty slot has already
+            // abandoned its old prompt lineage, but the physical memory tree
+            // is normally cleared later by the cold prompt path.  Artifact
+            // validation runs before that path and must not see stale
+            // recurrent/QSA companion state.  Clear this destination across
+            // every child now; failure remains a soft cold-replay fallback.
+            // Other unified-KV sequences are untouched.
+            const bool empty_destination =
+                construction_empty || cleared_for_empty_handoff;
+            if (empty_destination &&
+                !memory->seq_rm(slot.id, -1, -1)) {
+                return false;
+            }
+            if (empty_destination) {
+                // seq_rm drops membership immediately; dynamic VBR releases
+                // its now-phantom pool watermark at the idle boundary.  Run
+                // that boundary before snapshotting so the target is truly an
+                // empty import destination rather than merely cell-empty.
+                memory->breathe();
+            }
+            if (!cache_plan_observe_live_memory(false)) {
+                return false;
+            }
+            const bool target_ready =
+                memory && memory->seq_pos_min(slot.id) < 0 &&
+                memory->seq_pos_max(slot.id) < 0;
+            if (!target_ready ||
+                !prompt_cache->prepare_vbr_restore_destination(
+                    candidate, slot.prompt, slot.id)) {
+                return false;
+            }
+
+            struct publish_state {
+                server_prompt_cache * cache = nullptr;
+                server_prompt_cache_vbr_restore_candidate * candidate = nullptr;
+                bool published = false;
+            } state { prompt_cache.get(), &candidate, false };
+
+            const auto make_request = [&]() {
+                server_vbr_artifact_import_target request;
+                request.memory = memory;
+                request.destination = slot.id;
+                request.execution_identity = frontier_execution_identity;
+                request.adapter_config_identity = adapter_identity;
+                request.previously_observed = false;
+                request.draft_context = ctx_dft;
+                request.accelerator = slot.get_spec();
+                request.frontier_logits = &slot.frontier_logits.values;
+                request.frontier_logits_count = uint32_t(
+                    llama_vocab_n_tokens(vocab));
+                request.publish_context = &state;
+                request.prepare_publish = [](
+                    void * opaque,
+                    const std::vector<llama_token> & tokens,
+                    uint64_t sequence_epoch) noexcept {
+                const auto * current = static_cast<const publish_state *>(opaque);
+                if (!current || !current->candidate ||
+                    !current->candidate->ready() ||
+                    !current->candidate->payload()) {
+                    return false;
+                }
+                const auto & package = current->candidate->payload()->package();
+                return package && tokens.size() ==
+                           current->candidate->prefix_tokens() &&
+                       sequence_epoch ==
+                           package.manifest().identity.sequence_epoch;
+                };
+                request.publish = [](void * opaque) noexcept {
+                    auto * current = static_cast<publish_state *>(opaque);
+                    GGML_ASSERT(
+                        current && current->cache && current->candidate);
+                    current->published =
+                        current->cache->publish_vbr_restore(
+                            *current->candidate);
+                    GGML_ASSERT(current->published);
+                };
+                return request;
+            };
+
+            vbr_automatic_restore_attempts++;
+            const int64_t started = ggml_time_us();
+            auto import_selected = [&]() {
+                return candidate.requires_prefix_projection()
+                    ? vbr_artifact_store->import_host_prefix_payload(
+                        make_request(), candidate.payload(),
+                        std::move(prefix_projection))
+                    : vbr_artifact_store->import_host_payload(
+                        make_request(), candidate.payload());
+            };
+            auto imported = import_selected();
+            bool used_compact_fallback = false;
+            if (server_vbr_artifact_import_variant_fallback_safe(imported) &&
+                candidate.use_fallback_payload()) {
+                GGML_ASSERT(!state.published);
+                if (!prepare_prefix_projection(true)) {
+                    return false;
+                }
+                imported = import_selected();
+                used_compact_fallback =
+                    imported.status == server_vbr_artifact_import_status::ok;
+            }
+            if (imported.status != server_vbr_artifact_import_status::ok) {
+                SLT_DBG(
+                    slot,
+                    "automatic VBR host restore refused: status=%s "
+                    "validation=%s schedule=%s decision=%s adopt=%s "
+                    "phase=%s units=%u companions=%u rollback=%llu\n",
+                    server_vbr_artifact_import_status_name(imported.status),
+                    vbr_manifest_validation_status_name(
+                        imported.validation_status),
+                    vbr_import_schedule_status_name(imported.schedule_status),
+                    vbr_import_decision_name(imported.decision),
+                    vbr_adopt_status_name(imported.adopt_status),
+                    vbr_adopt_phase_name(imported.phase), imported.units,
+                    imported.companions,
+                    static_cast<unsigned long long>(imported.rollback_count));
+                return false;
+            }
+            GGML_ASSERT(state.published);
+            const uint64_t prefix_tokens = candidate.prefix_tokens();
+            const int32_t source_id = candidate.source_id();
+            const bool exact_reusable_restore =
+                !candidate.requires_prefix_projection() &&
+                (imported.decision == vbr_import_decision::native_import ||
+                 imported.decision == vbr_import_decision::live_rebased);
+            const auto restore_event =
+                restore_event_for(candidate.payload());
+            if (candidate.requires_prefix_projection()) {
+                slot.cache_family = incoming_family;
+            }
+            const bool committed = prompt_cache->commit_vbr_restore(
+                candidate, slot.prompt, slot.cache_family, slot.id);
+            GGML_ASSERT(committed);
+            if (!committed) {
+                return false;
+            }
+            if (exact_reusable_restore) {
+                mark_exact_vbr_restore_durable(slot, *memory);
+            }
+            common_speculative_sequence_transition(
+                slot.get_spec(), slot.id, restore_event);
+            slot.bind_frontier_logits_to_prompt();
+            SLT_DBG(slot,
+                    "restored frontier logits: count=%zu authenticated=%d\n",
+                    slot.frontier_logits.values.size(),
+                    slot.frontier_logits_matches());
+            if (used_compact_fallback) {
+                vbr_automatic_restore_quality_fallbacks++;
+            }
+            vbr_automatic_restore_succeeded++;
+            const uint64_t delivered_payload_bytes =
+                imported.payload_bytes <= UINT64_MAX - imported.companion_bytes
+                    ? imported.payload_bytes + imported.companion_bytes
+                    : 0;
+            observe_vbr_delivery(delivered_payload_bytes);
+            if (restored_prefix) {
+                *restored_prefix = size_t(prefix_tokens);
+            }
+            SLT_INF(
+                slot,
+                "automatic VBR host restore source=%d prefix=%" PRIu64
+                " status=%s compact_fallback=%d duration_ms=%.3f "
+                "total=%" PRIu64 "/%" PRIu64 " quality_fallbacks=%" PRIu64
+                "\n",
+                source_id, prefix_tokens,
+                server_vbr_artifact_import_status_name(imported.status),
+                int(used_compact_fallback),
+                (ggml_time_us() - started)/1000.0,
+                vbr_automatic_restore_succeeded,
+                vbr_automatic_restore_attempts,
+                vbr_automatic_restore_quality_fallbacks);
+            return true;
+        } catch (...) {
+            // Automatic reuse is a cache optimization. Allocation or identity
+            // preparation failure must remain a soft cold-launch fallback.
+            return false;
+        }
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -7632,6 +8195,27 @@ private:
     int64_t vbr_reclaim_cells_needed_for_test = -1;
     uint64_t vbr_reclaim_initial_cells_for_test = 0;
     size_t vbr_pool_state_index_for_test = 0;
+
+    // fork 9l-d2d: artifact store + automatic-restore counters, on the class that
+    // owns them (fork server-context.cpp 3562-3575). 9l-a had declared these in
+    // server_slot, where nothing could resolve them; they moved here when 9l-d2d
+    // landed their first reader.
+    // Artifact machinery is a lifecycle-authority sibling: it references
+    // the frozen ledger but is destroyed before it. It exists only for an
+    // armed dynamic-VBR memory after the one-shot manifest and ring admission.
+    std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    server_vbr_prompt_cache_support_status vbr_prompt_cache_support =
+        server_vbr_prompt_cache_support_status::supported;
+    server_vbr_artifact_capture_status vbr_prompt_cache_store_status =
+        server_vbr_artifact_capture_status::unavailable;
+    server_vbr_artifact_store_create_diagnostics
+        vbr_prompt_cache_store_diagnostics;
+    uint64_t vbr_automatic_restore_attempts = 0;
+    uint64_t vbr_automatic_restore_succeeded = 0;
+    uint64_t vbr_automatic_restore_quality_fallbacks = 0;
+    uint64_t vbr_automatic_restore_occupied_attempts = 0;
+    uint64_t vbr_automatic_restore_occupied_succeeded = 0;
+    uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
     // ---------------------------------------------------------------------
     // group A: cache-plan observation face + the retention wave it calls.
     // Bodies verbatim from the fork; the fork coordinates are on each header
