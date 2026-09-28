@@ -1050,6 +1050,42 @@ struct server_prompt_cache_vbr_pressure_citation {
     size_t count = 0;
 };
 
+// fork 9l-d4b2: server_prompt_cache_vbr_publication_metadata (fork server-task.h 887-920)
+// Move-only preparation of the logical metadata for one fresh VBR host
+// publication. It owns the detached list node, cloned token frontier, and
+// provisional retention/prefix association before artifact D2H begins.
+// This is deliberately not a cache-capacity claim: final payload union and
+// victim authority remain with server_prompt_cache::publish().
+class server_prompt_cache_vbr_publication_metadata {
+public:
+    server_prompt_cache_vbr_publication_metadata() = default;
+    ~server_prompt_cache_vbr_publication_metadata();
+    server_prompt_cache_vbr_publication_metadata(
+        const server_prompt_cache_vbr_publication_metadata &) = delete;
+    server_prompt_cache_vbr_publication_metadata & operator=(
+        const server_prompt_cache_vbr_publication_metadata &) = delete;
+    server_prompt_cache_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept;
+    server_prompt_cache_vbr_publication_metadata & operator=(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept;
+
+    bool ready() const noexcept;
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    const server_prompt * source_ = nullptr;
+    int32_t source_slot_ = -1;
+    llama_cache_acct_artifact_id source_artifact_;
+    llama_cache_acct_artifact_id destination_artifact_;
+    uint64_t source_sequence_epoch_ = 0;
+    uint64_t coverage_tokens_ = 0;
+    std::array<uint8_t, 32> source_prefix_digest_ = {};
+    bool stem_ = false;
+    std::list<server_prompt_cache_state> entry_;
+    friend struct server_prompt_cache;
+};
+
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
     invalid,
     fit,
@@ -1292,6 +1328,9 @@ struct server_prompt_cache {
     // candidate bound rather than the <=8 manifests admitted by one wave.
     mutable std::vector<server_prompt_cache_vbr_frontier_query *>
         vbr_stem_witness_arena;
+    // fork 9l-d4b2 (fork server-task.h 1661-1662)
+    void abandon_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
 
     // fork server-task.h:1391-1397  (7 lines)
     // Exact immutable VBR-frontier presence query. This alone is not a clear

@@ -2134,6 +2134,88 @@ void server_prompt_cache_vbr_capacity_claim::clear() noexcept {
 }
 
 
+// fork 9l-d4b2: server_prompt_cache_vbr_publication_metadata members (fork server-task.cpp 2780-2845)
+server_prompt_cache_vbr_publication_metadata::
+~server_prompt_cache_vbr_publication_metadata() {
+    if (cache_) {
+        cache_->abandon_vbr_publication_metadata(*this);
+    }
+}
+
+server_prompt_cache_vbr_publication_metadata::
+server_prompt_cache_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept
+    : cache_(other.cache_),
+      source_(other.source_),
+      source_slot_(other.source_slot_),
+      source_artifact_(other.source_artifact_),
+      destination_artifact_(other.destination_artifact_),
+      source_sequence_epoch_(other.source_sequence_epoch_),
+      coverage_tokens_(other.coverage_tokens_),
+      source_prefix_digest_(other.source_prefix_digest_),
+      stem_(other.stem_) {
+    entry_.splice(entry_.end(), other.entry_);
+    other.clear();
+}
+
+server_prompt_cache_vbr_publication_metadata &
+server_prompt_cache_vbr_publication_metadata::operator=(
+        server_prompt_cache_vbr_publication_metadata && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (cache_) {
+        cache_->abandon_vbr_publication_metadata(*this);
+    }
+    cache_ = other.cache_;
+    source_ = other.source_;
+    source_slot_ = other.source_slot_;
+    source_artifact_ = other.source_artifact_;
+    destination_artifact_ = other.destination_artifact_;
+    source_sequence_epoch_ = other.source_sequence_epoch_;
+    coverage_tokens_ = other.coverage_tokens_;
+    source_prefix_digest_ = other.source_prefix_digest_;
+    stem_ = other.stem_;
+    entry_.splice(entry_.end(), other.entry_);
+    other.clear();
+    return *this;
+}
+
+bool server_prompt_cache_vbr_publication_metadata::ready() const noexcept {
+    return cache_ && source_ && source_slot_ >= 0 &&
+        source_artifact_.v != 0 && destination_artifact_.v != 0 &&
+        coverage_tokens_ != 0 && entry_.size() == 1 &&
+        entry_.front().prompt.n_tokens() >= 0 &&
+        uint64_t(entry_.front().prompt.n_tokens()) == coverage_tokens_;
+}
+
+void server_prompt_cache_vbr_publication_metadata::clear() noexcept {
+    cache_ = nullptr;
+    source_ = nullptr;
+    source_slot_ = -1;
+    source_artifact_ = {};
+    destination_artifact_ = {};
+    source_sequence_epoch_ = 0;
+    coverage_tokens_ = 0;
+    source_prefix_digest_ = {};
+    stem_ = false;
+    entry_.clear();
+}
+
+// fork 9l-d4b2: server_prompt_cache::abandon_vbr_publication_metadata (fork server-task.cpp 4128-4139)
+void server_prompt_cache::abandon_vbr_publication_metadata(
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    if (prepared.cache_ != this) {
+        return;
+    }
+    if (retention_obs && prepared.entry_.size() == 1) {
+        retention_obs->retire(
+            server_retention_instance_key::for_host_entry(
+                &prepared.entry_.front()));
+    }
+    prepared.clear();
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
