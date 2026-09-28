@@ -189,6 +189,20 @@ server_speculative_decode_terminal_resolve(
     return server_speculative_decode_terminal::success;
 }
 
+// fork 9l-d2a: family-binding resolution for launch (fork server-context.cpp 1474-1485)
+static server_cache_control_status server_cache_family_resolve_for_launch(
+        server_cache_control_authority * authority,
+        server_cache_control_token token,
+        common_cache_family_binding & out) noexcept {
+    out = {};
+    if (!token) {
+        return server_cache_control_status::ok;
+    }
+    return authority
+        ? authority->resolve_family_binding(token, out)
+        : server_cache_control_status::not_found;
+}
+
 bool server_vbr_empty_handoff_lookup_allowed(
         const server_vbr_empty_handoff_gate & gate) noexcept {
     return gate.slot_count == 1 && !gate.hard_lease &&
@@ -1379,6 +1393,11 @@ struct server_slot {
         frontier_logits.clear();
     }
 
+// fork 9l-d2a: server_slot::clear_frontier_logits (fork server-context.cpp 1994-1996)
+    void clear_frontier_logits() noexcept {
+        frontier_logits.clear();
+    }
+
     // fork server-context.cpp:2054-2076
     bool prompt_clear_after_vbr_publication(
             server_cache_destruction_reason reason =
@@ -1586,6 +1605,64 @@ struct server_slot {
 // save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
 // restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
 // (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
+// fork 9l-d2a: occupied-restore failure classification + its test entry (fork server-context.cpp 3196-3210, 3243-3282)
+static bool server_vbr_apply_occupied_restore_failure_to_slot(
+        vbr_adopt_status adopt_status,
+        vbr_adopt_recovery_outcome recovery,
+        size_t incumbent_prefix,
+        size_t & retained_prefix,
+        server_slot & slot) noexcept {
+    const bool quarantined = adopt_status == vbr_adopt_status::quarantined ||
+        recovery == vbr_adopt_recovery_outcome::quarantined;
+    retained_prefix = quarantined ? 0 : incumbent_prefix;
+    if (quarantined) {
+        slot.mandatory_recovery_reset(
+            server_cache_destruction_reason::restore_failure);
+    }
+    return quarantined;
+}
+
+server_vbr_occupied_quarantine_reset_result
+server_vbr_occupied_quarantine_reset_for_test() {
+    const common_cache_family_binding family {
+        common_cache_family_id { 41 }, common_cache_family_role::branch,
+    };
+    server_slot replay_slot {};
+    replay_slot.id = 0;
+    replay_slot.prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3 }, false);
+    replay_slot.prompt.sequence_epoch = 7;
+    replay_slot.cache_family = family;
+    size_t retained_prefix = 3;
+    server_vbr_occupied_quarantine_reset_result result;
+    result.replay_preserved_prefix =
+        !server_vbr_apply_occupied_restore_failure_to_slot(
+            vbr_adopt_status::transfer_failed,
+            vbr_adopt_recovery_outcome::replayed,
+            retained_prefix, retained_prefix, replay_slot) &&
+        retained_prefix == 3;
+    result.replay_preserved_slot = replay_slot.prompt.n_tokens() == 3 &&
+        replay_slot.prompt.sequence_epoch == 7 &&
+        replay_slot.cache_family == family;
+
+    server_slot slot {};
+    slot.id = 0;
+    slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    slot.prompt.sequence_epoch = 7;
+    slot.cache_family = family;
+    result.quarantined =
+        server_vbr_apply_occupied_restore_failure_to_slot(
+            vbr_adopt_status::transfer_failed,
+            vbr_adopt_recovery_outcome::quarantined,
+            retained_prefix, retained_prefix, slot);
+    result.retained_prefix_zero = retained_prefix == 0;
+    result.prompt_cleared = slot.prompt.tokens.empty() &&
+        slot.prompt.sequence_epoch == 0;
+    result.family_cleared = slot.cache_family ==
+        common_cache_family_binding {};
+    return result;
+}
+
 static bool server_vbr_dynamic_active(const common_params & params) {
     return params.vbr_dynamic();
 }
@@ -6394,6 +6471,75 @@ private:
             return false;
         }
         return true;
+    }
+
+// fork 9l-d2a: exact-restore durability marking (fork server-context.cpp 11379-11406, 11550-11587)
+    static std::array<uint8_t, 32> vbr_idle_capture_attempt_digest(
+            const vbr_artifact_identity_block & identity,
+            const std::array<uint8_t, 32> & token_identity_digest,
+            uint64_t tier_epoch,
+            uint64_t tier_epoch_swa) {
+        llama_sha256_writer attempt_hash;
+        static constexpr char ATTEMPT_DOMAIN[] =
+            "buun.vbr.idle-capture-attempt/v2";
+        attempt_hash.string(
+            ATTEMPT_DOMAIN, sizeof(ATTEMPT_DOMAIN) - 1);
+        attempt_hash.string(
+            identity.execution_identity.data(),
+            identity.execution_identity.size());
+        attempt_hash.string(
+            identity.adapter_config_identity.data(),
+            identity.adapter_config_identity.size());
+        attempt_hash.string(
+            identity.media_content_identity.data(),
+            identity.media_content_identity.size());
+        attempt_hash.u64(identity.sequence_epoch);
+        attempt_hash.u64(uint64_t(identity.token_count));
+        attempt_hash.u64(uint64_t(identity.next_position));
+        attempt_hash.bytes(
+            token_identity_digest.data(), token_identity_digest.size());
+        attempt_hash.u64(tier_epoch);
+        attempt_hash.u64(tier_epoch_swa);
+        return attempt_hash.finish();
+    }
+
+    static std::array<uint8_t, 32> vbr_idle_publication_identity(
+            const std::array<uint8_t, 32> & token_identity_digest,
+            uint64_t tier_epoch,
+            uint64_t tier_epoch_swa) {
+        llama_sha256_writer published_hash;
+        static constexpr char PUBLISHED_DOMAIN[] =
+            "buun.vbr.idle-capture-published/v1";
+        published_hash.string(
+            PUBLISHED_DOMAIN, sizeof(PUBLISHED_DOMAIN) - 1);
+        published_hash.bytes(
+            token_identity_digest.data(), token_identity_digest.size());
+        published_hash.u64(tier_epoch);
+        published_hash.u64(tier_epoch_swa);
+        return published_hash.finish();
+    }
+
+    void mark_exact_vbr_restore_durable(
+            server_slot & slot, llama_memory_i & memory) {
+        std::array<uint8_t, 32> token_digest = {};
+        vbr_artifact_identity_block identity;
+        server_vbr_artifact_capture_status status;
+        if (!slot.prompt.tokens.retention_token_digest(token_digest) ||
+            !build_capture_identity_fields(slot, identity, status)) {
+            return;
+        }
+        const auto representation = memory.vbr_representation_identity();
+        slot.vbr_idle_capture_source_reset();
+        slot.vbr_idle_capture_published_identity =
+            vbr_idle_publication_identity(
+                token_digest, representation.tier_epoch,
+                representation.tier_epoch_swa);
+        slot.vbr_idle_capture_representation_valid = true;
+        slot.vbr_idle_capture_attempt_identity =
+            vbr_idle_capture_attempt_digest(
+                identity, token_digest, representation.tier_epoch,
+                representation.tier_epoch_swa);
+        slot.vbr_idle_capture_terminal = true;
     }
 
     bool build_capture_request(

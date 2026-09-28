@@ -30,6 +30,19 @@ server_speculative_decode_terminal_resolve(
     bool selected_exception,
     bool speculative_ok) noexcept;
 
+// fork 9l-d2a: occupied-quarantine reset test result (fork server-context.h 85-95)
+struct server_vbr_occupied_quarantine_reset_result {
+    bool replay_preserved_prefix = false;
+    bool replay_preserved_slot = false;
+    bool quarantined = false;
+    bool retained_prefix_zero = false;
+    bool prompt_cleared = false;
+    bool family_cleared = false;
+};
+
+server_vbr_occupied_quarantine_reset_result
+server_vbr_occupied_quarantine_reset_for_test();
+
 // Inputs to the empty-slot handoff decision. The scheduler fills these from the
 // live slot table; the predicates below are pure so the policy can be reasoned
 // about (and tested) without a server.

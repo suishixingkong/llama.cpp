@@ -174,6 +174,25 @@ static void test_stem_matches() {
     CHECK(!server_vbr_stem_matches_capture_source(false, a, b));
 }
 
+// --- server_vbr_occupied_quarantine_reset_for_test ---------------------------
+// A runtime consumer for server_vbr_apply_occupied_restore_failure_to_slot: the
+// helper builds a live-looking slot, drives the classifier down both of its arms
+// and reports what survived. Every one of the six fields must hold. The
+// load-bearing half is `retained_prefix_zero`: the classifier is
+// `retained_prefix = quarantined ? 0 : incumbent_prefix`, so a swapped ternary
+// (or a missed `mandatory_recovery_reset`) flips exactly this field while the
+// replay arm still passes.
+static void test_occupied_quarantine_reset() {
+    const auto result = server_vbr_occupied_quarantine_reset_for_test();
+
+    CHECK(result.replay_preserved_prefix);  // a replayed (non-quarantined) failure keeps the prefix
+    CHECK(result.replay_preserved_slot);    // ... and leaves the slot's tokens/epoch/family intact
+    CHECK(result.quarantined);              // a quarantine-class failure is reported as such
+    CHECK(result.retained_prefix_zero);     // ... and collapses the retained prefix to zero
+    CHECK(result.prompt_cleared);           // mandatory_recovery_reset ran: tokens + epoch cleared
+    CHECK(result.family_cleared);           // ... and the declared cache family was dropped too           // ... and the declared cache family was dropped too
+}
+
 // --- server_tokens::media_content_identity ----------------------------------
 static void test_media_content_identity() {
     server_tokens tokens(llama_tokens { 1, 2, 3 }, false);
@@ -479,6 +498,7 @@ int main() {
     test_empty_handoff();
     test_live_source_displacement();
     test_stem_matches();
+    test_occupied_quarantine_reset();
     test_media_content_identity();
     test_lease_build_identity();
     test_lora_config_identity();
