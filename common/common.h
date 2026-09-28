@@ -779,6 +779,21 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    // fork 9l-d3a: cache-plan / lifecycle flags (fork common.h 913-931).
+    // Cache-plan observer: strictly zero observer work when disabled.
+    bool cache_debug = false;
+
+    // Trusted-local, single-principal cache-control HTTP surface. Server
+    // startup enables its required cache-lifecycle authority; this flag also
+    // registers the reviewed routes.
+    bool cache_control_api = false;
+
+    // Cache-lifecycle authority substrate (accounting-gated admission). The
+    // parser value records an explicit request; server initialization also
+    // enables it automatically when the prompt cache is present. It remains
+    // independent of --cache-debug.
+    bool cache_lifecycle = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
     std::string server_tools_runtime;

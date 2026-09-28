@@ -4529,6 +4529,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.endpoint_slots = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
+
+    // fork 9l-d3a: cache-plan / lifecycle flags (fork arg.cpp 4725 / 4739 / 4753)
+    add_opt(common_arg(
+        {"--cache-debug"},
+        string_format("log observed cache reuse decisions per request and expose the last record in /slots (default: %s)", params.cache_debug ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_debug = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
+
+    add_opt(common_arg(
+        {"--cache-control-api"},
+        string_format("expose trusted-local cache-control routes and enable their required cache-lifecycle authority (default: %s)", params.cache_control_api ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_control_api = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_CONTROL_API"));
+
+    add_opt(common_arg(
+        {"--cache-lifecycle"},
+        string_format("explicitly enable cache-lifecycle authority (accounting-gated admission); it is enabled automatically with the prompt cache, independent of --cache-debug (explicit default: %s)", params.cache_lifecycle ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_lifecycle = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_LIFECYCLE"));
+
     add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",

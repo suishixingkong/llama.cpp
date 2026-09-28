@@ -23,6 +23,7 @@
 #include "llama-vram-ledger.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -1360,6 +1361,18 @@ const llama_cparams & llama_context::get_cparams() const {
 
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
+}
+
+// fork 9l-d3a: physical backend lookup for a device (fork llama-context.cpp 1269-1278)
+ggml_backend_t llama_context::backend_for_device(
+        ggml_backend_dev_t device) const {
+    const auto backend = std::find_if(
+        backends.begin(), backends.end(),
+        [&](const auto & candidate) {
+            return candidate &&
+                   ggml_backend_get_device(candidate.get()) == device;
+        });
+    return backend == backends.end() ? nullptr : backend->get();
 }
 
 uint32_t llama_context::n_ctx() const {

@@ -62,6 +62,10 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // fork 9l-d3a: physical backend lookup for a device (fork llama-context.h 295-296)
+    ggml_backend_t backend_for_device(
+        ggml_backend_dev_t device) const;
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
