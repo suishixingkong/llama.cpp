@@ -1462,6 +1462,32 @@ struct server_slot {
         return server_cache_checkpoint_drop_impl(first, last);
     }
 
+    // fork 9k-b2-iii: observe_checkpoint_drop + checkpoint_drop (fork 2183-2206)
+    server_cache_destruction_admission observe_checkpoint_drop(
+            server_cache_destruction_reason reason,
+            llama_cache_acct_artifact_id artifact = {}) {
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_observe_drop(context, reason, artifact);
+    }
+
+    checkpoint_iterator checkpoint_drop(
+            checkpoint_iterator first,
+            checkpoint_iterator last,
+            server_cache_destruction_reason reason) {
+        if (destruction_obs && first != last) {
+            (void) observe_checkpoint_drop(
+                reason,
+                retention_obs ? retention_obs->artifact_id(
+                    server_retention_instance_key::for_checkpoint(
+                        id, &*first))
+                    : llama_cache_acct_artifact_id{});
+        }
+        // Legacy/pass-through release owner. retention accounting's certified path calls the
+        // raw list eraser first, commits the prepared exact release, then
+        // retires only the descriptor through retire_after_committed_release.
+        return checkpoint_drop_joined_impl(first, last);
+    }
+
     // fork server-context.cpp:2224-2226  — the token_ledger_truncate row's physical
     // choke point. The fallback arm of the restore/trim transaction truncates the
     // ledger to 0 when a rejected suffix trim has already cleared everything.
@@ -5250,13 +5276,41 @@ private:
                                 }
                             }
 
+                            // fork 9k-b2-iii: lineage-guarded checkpoint invalidation (fork 17147-17185)
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // pos_next may have been rewound by restore and is not an
+                                // invalidation frontier. Use the real physical end of the incoming
+                                // prompt, as upstream #24891 does, plus the logical true LCP as a
+                                // lineage guard. A checkpoint after the true LCP may describe the old
+                                // branch even when its position fits inside the new prompt; recurrent
+                                // state makes that especially dangerous because it summarizes every
+                                // preceding token. Checkpoint.n_tokens is the architecture-neutral
+                                // capture frontier (unlike recurrent pos_min), so checkpoints through
+                                // the true LCP survive even when restore rewound n_past below them.
+                                // This changes only checkpoint metadata retention; checkpoint selection
+                                // (strict pos_max < pos_next) and epoch rejection above are
+                                // untouched. Every retained checkpoint is on the verified common
+                                // lineage and within the new physical prompt; erasure can only cause
+                                // replay, never install a different state.
+                                const llama_pos prompt_pos_end = input_tokens.pos_next();
+                                const llama_pos common_pos_end = slot.prompt.tokens.pos_next(n_past_common);
+
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                    const bool beyond_prompt = cur.pos_max > prompt_pos_end;
+                                    const bool beyond_lcp    = cur.n_tokens > (int64_t) n_past_common;
+                                    const bool invalidated   = beyond_prompt || beyond_lcp;
+
+                                    if (invalidated) {
+                                        SLT_TRC(slot,
+                                                "erased invalidated context checkpoint "
+                                                "(pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                                ", n_swa = %d, prompt_pos_end = %d, common_pos_end = %d, size = %.3f MiB)\n",
+                                                cur.pos_min, cur.pos_max, cur.n_tokens, n_swa,
+                                                prompt_pos_end, common_pos_end, (float) cur.size() / 1024 / 1024);
+                                        it = slot.checkpoint_drop(
+                                            it, std::next(it),
+                                            server_cache_destruction_reason::checkpoint_invalidated);
                                     } else {
                                         ++it;
                                     }

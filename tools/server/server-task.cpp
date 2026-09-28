@@ -2544,3 +2544,19 @@ void server_cache_checkpoint_ring_changed(
     context.floor_refusal =
         common_cache_plan_destruction_reason::mandatory_anchor;
 }
+
+// fork 9k-b2-iii: server_cache_checkpoint_observe_drop (fork server-task.cpp 4458-4471)
+server_cache_destruction_admission server_cache_checkpoint_observe_drop(
+        const server_cache_checkpoint_authority_context & context,
+        server_cache_destruction_reason reason,
+        llama_cache_acct_artifact_id artifact) noexcept {
+    server_cache_destruction_request request;
+    request.cls = server_cache_destruction_class::checkpoint_drop;
+    request.reason = reason;
+    request.add_target(
+        server_cache_destruction_target_kind::checkpoint_ring,
+        context.slot_id, artifact);
+    request.add_yield(
+        llama_cache_acct_category::checkpoint_state_payload);
+    return server_cache_retention_admit(context.destruction, request);
+}
