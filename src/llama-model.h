@@ -730,6 +730,11 @@ struct llama_model {
     size_t n_devices() const;
     const float * tensor_split() const;
 
+    // fork 9l-d3b: effective, non-cumulative split weights in physical-device
+    // order (fork llama-model.h 797). Unlike params.tensor_split this is
+    // populated for automatic placement too.
+    const std::vector<float> & resolved_tensor_split() const;
+
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
 

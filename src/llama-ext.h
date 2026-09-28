@@ -93,6 +93,15 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+// fork 9l-d3b: copies the effective, non-cumulative model split weights in
+// physical-device order. Passing nullptr/zero capacity returns the required
+// element count. Unlike llama_model_params::tensor_split, automatic placement
+// is resolved (fork llama-ext.h 132-139).
+LLAMA_API size_t llama_model_resolved_tensor_split(
+        const struct llama_model * model,
+        float * weights,
+        size_t capacity);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);

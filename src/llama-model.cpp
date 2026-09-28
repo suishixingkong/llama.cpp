@@ -1182,6 +1182,10 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    // fork 9l-d3b: effective, non-cumulative split weights in the physical
+    // device order. Unlike params.tensor_split, this is populated for
+    // automatic placement too (fork llama-model.cpp 1401-1404).
+    std::vector<float> tensor_split_resolved;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1486,6 +1490,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // sum and normalize the splits to get the split points
+    // fork 9l-d3b: record the effective split in physical-device order before
+    // the cumulative/normalised rewrite below (fork llama-model.cpp 1860-1874)
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        // Tensor parallelism exposes one meta device to the model loader. Its
+        // split callback, however, distributes rows across the physical
+        // devices recorded here and treats an all-zero user split as equal.
+        const size_t n_split_devices = get_split_state_ud.n_devices;
+        pimpl->tensor_split_resolved.resize(n_split_devices, 1.0f);
+        if (tensor_split != nullptr &&
+            std::any_of(tensor_split, tensor_split + n_split_devices,
+                        [](float x) { return x != 0.0f; })) {
+            std::copy(tensor_split, tensor_split + n_split_devices,
+                      pimpl->tensor_split_resolved.begin());
+        }
+    } else {
+        pimpl->tensor_split_resolved = splits;
+    }
+
     float split_sum = 0.0f;
     for (size_t i = 0; i < n_devices(); ++i) {
         split_sum += splits[i];
@@ -1912,6 +1934,11 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+// fork 9l-d3b: the recorded effective split (fork llama-model.cpp 2650-2652)
+const std::vector<float> & llama_model::resolved_tensor_split() const {
+    return pimpl->tensor_split_resolved;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -3305,6 +3332,23 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+// fork 9l-d3b: the C entry point for the recorded effective split
+// (fork llama-model.cpp 4688-4701)
+size_t llama_model_resolved_tensor_split(
+        const struct llama_model * model,
+        float * weights,
+        size_t capacity) {
+    if (model == nullptr) {
+        return 0;
+    }
+    const auto & resolved = model->resolved_tensor_split();
+    const size_t n = std::min(capacity, resolved.size());
+    if (weights != nullptr && n > 0) {
+        std::copy_n(resolved.data(), n, weights);
+    }
+    return resolved.size();
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
