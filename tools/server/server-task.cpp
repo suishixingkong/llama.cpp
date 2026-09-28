@@ -3363,6 +3363,355 @@ void server_prompt_cache::release_vbr_occupied_replacement(
     ticket.clear();
 }
 
+// fork 9l-d1: host recovery pin helpers (fork server-task.cpp 4688-4692, 4734-4751)
+void release_host_recovery_pin(void * context) noexcept {
+    auto * state = static_cast<server_prompt_cache_state *>(context);
+    GGML_ASSERT(state && state->recovery_pins > 0);
+    state->recovery_pins--;
+}
+
+server_cache_recovery_pin acquire_host_recovery_pin(
+        server_prompt_cache_state & state,
+        std::vector<llama_cache_acct_artifact_id> artifacts,
+        std::vector<llama_cache_acct_op_id> ops) noexcept {
+    if (state.recovery_pins == std::numeric_limits<uint32_t>::max()) {
+        return {};
+    }
+    state.recovery_pins++;
+    auto pin = server_cache_recovery_pin::acquire(
+        &state,
+        release_host_recovery_pin,
+        std::move(artifacts),
+        std::move(ops));
+    if (!pin.valid()) {
+        state.recovery_pins--;
+    }
+    return pin;
+}
+
+// fork 9l-d1: occupied-replacement push side (fork server-task.cpp 7941-8261)
+bool server_prompt_cache::prepare_vbr_occupied_replacement(
+        server_prompt_cache_vbr_restore_candidate && incoming,
+        server_prompt & incumbent,
+        common_cache_family_binding & incumbent_family,
+        const common_cache_family_binding & incoming_family,
+        int32_t id_slot,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt_cache_vbr_replacement_diagnostics * diagnostics) noexcept {
+    ticket = {};
+    if (diagnostics) {
+        *diagnostics = {};
+    }
+    if (!incoming.ready() || incoming.cache_ != this || id_slot < 0 ||
+        incoming.prepared_slot_ >= 0 || incoming.prepared_destination_ ||
+        incoming.adopted_destination_ || incoming.prepared_prompt_ ||
+        !incoming.source_ || !retention_obs || !lease_obs ||
+        execution_identity.empty() || adapter_config_key.empty() ||
+        !lease_execution_identity ||
+        *lease_execution_identity != execution_identity ||
+        incumbent.tokens.empty() || incumbent.tokens.has_media() ||
+        incumbent.sequence_epoch == 0 ||
+        incoming.source_->prompt.tokens.has_media() ||
+        !incoming.source_->prompt.checkpoints.empty() ||
+        uint64_t(incoming.source_->prompt.n_tokens()) !=
+            incoming.source_tokens_ ||
+        incoming.prefix_tokens_ > incoming.source_tokens_) {
+        return false;
+    }
+    const uint64_t incumbent_tokens = uint64_t(incumbent.n_tokens());
+    const uint64_t live_lcp = incumbent.tokens.get_common_prefix(
+        incoming.source_->prompt.tokens);
+    if (incoming.prefix_tokens_ <= live_lcp) {
+        return false;
+    }
+
+    const auto incumbent_key =
+        server_retention_instance_key::for_slot(id_slot);
+    server_retention_candidate incumbent_retention;
+    if (!retention_obs->candidate_for_instance(
+            incumbent_key, incumbent_retention) ||
+        incumbent_retention.avail !=
+            server_retention_candidate_availability::available ||
+        incumbent_retention.record.kind !=
+            common_retention_artifact_kind::live_slot ||
+        incumbent_retention.artifact_id.v == 0 ||
+        incumbent_retention.lineage.lineage_id == 0) {
+        return false;
+    }
+    const auto incumbent_artifact = incumbent_retention.artifact_id;
+
+    std::array<uint8_t, 32> incumbent_digest = {};
+    std::array<uint8_t, 32> incoming_digest = {};
+    server_cache_lease_identity incumbent_lease_identity;
+    if (!incumbent.tokens.retention_token_digest(incumbent_digest) ||
+        !server_cache_lease_build_identity(
+            execution_identity, adapter_config_key, incumbent.tokens,
+            int64_t(incumbent_tokens), incumbent_lease_identity)) {
+        return false;
+    }
+    const auto incumbent_lease = lease_obs->inspect_range(
+        incumbent_artifact, incumbent_lease_identity,
+        incumbent.sequence_epoch, 0, incumbent_tokens);
+    if (incumbent_lease.state != server_cache_lease_eval_state::known ||
+        server_cache_lease_is_hard(incumbent_lease)) {
+        return false;
+    }
+
+    iterator recovery = states.end();
+    for (auto current = states.begin(); current != states.end(); ++current) {
+        if (diagnostics) {
+            ++diagnostics->recovery_states_visited;
+        }
+        if (current->adapter_config_key != adapter_config_key ||
+            current->vbr_execution_identity != execution_identity ||
+            current->cache_family != incumbent_family ||
+            current->prompt.sequence_epoch != incumbent.sequence_epoch ||
+            current->prompt.n_tokens() != incumbent.n_tokens() ||
+            current->prompt.tokens.has_media() ||
+            !current->prompt.checkpoints.empty() ||
+            !current->payload.vbr_artifact()) {
+            continue;
+        }
+        std::array<uint8_t, 32> current_digest = {};
+        if (!current->prompt.tokens.retention_token_digest(current_digest) ||
+            current_digest != incumbent_digest) {
+            continue;
+        }
+        if (diagnostics) {
+            ++diagnostics->recovery_digest_matches;
+        }
+        if (recovery != states.end()) {
+            return false;
+        }
+        recovery = current;
+    }
+    if (recovery == states.end() ||
+        recovery->recovery_pins == std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const auto recovery_owner = recovery->payload.vbr_compact_owner();
+    const auto incoming_owner_artifact =
+        incoming.payload_->reference_artifact();
+    const auto recovery_owner_artifact =
+        recovery_owner ? recovery_owner->reference_artifact()
+                       : llama_cache_acct_artifact_id {};
+    if (!recovery_owner || incoming_owner_artifact.v == 0 ||
+        recovery_owner_artifact.v == 0) {
+        return false;
+    }
+    bool raw_token_comparison = false;
+    const bool frontier_matches = server_prompt_cache_vbr_frontier_matches(
+            recovery->prompt, recovery->payload,
+            execution_identity, adapter_config_key,
+            &raw_token_comparison);
+    if (diagnostics) {
+        diagnostics->recovery_raw_token_comparisons +=
+            raw_token_comparison ? 1 : 0;
+    }
+    if (!frontier_matches) {
+        return false;
+    }
+
+    server_retention_candidate recovery_retention;
+    const auto recovery_key =
+        server_retention_instance_key::for_host_entry(&*recovery);
+    if (!retention_obs->candidate_for_instance(
+            recovery_key, recovery_retention) ||
+        recovery_retention.avail !=
+            server_retention_candidate_availability::available ||
+        recovery_retention.artifact_id.v == 0 ||
+        !recovery_retention.provenance_op) {
+        return false;
+    }
+    std::vector<llama_cache_acct_op_id> recovery_ops;
+    std::unique_ptr<server_cache_recovery_pin> recovery_pin;
+    std::unique_ptr<server_prompt> replacement;
+    try {
+        recovery_ops.push_back(recovery_retention.provenance_op);
+        auto pin = acquire_host_recovery_pin(
+            *recovery, { recovery_retention.artifact_id }, recovery_ops);
+        if (!pin.valid() || !pin.binds_exact(
+                recovery_retention.artifact_id, recovery_ops)) {
+            return false;
+        }
+        recovery_pin = std::make_unique<server_cache_recovery_pin>(
+            std::move(pin));
+        replacement = std::make_unique<server_prompt>();
+        if (incoming.requires_prefix_projection_) {
+            replacement->tokens =
+                incoming.source_->prompt.tokens.clone_text_prefix(
+                    size_t(incoming.prefix_tokens_));
+            replacement->sequence_epoch =
+                incoming.source_->prompt.sequence_epoch;
+        } else {
+            *replacement = incoming.source_->prompt.clone();
+        }
+    } catch (...) {
+        return false;
+    }
+    if (!replacement || replacement->tokens.has_media() ||
+        !replacement->checkpoints.empty() ||
+        uint64_t(replacement->n_tokens()) != incoming.prefix_tokens_ ||
+        replacement->tokens.pos_next() != incoming.selected_next_position_ ||
+        !replacement->tokens.retention_token_digest(incoming_digest)) {
+        return false;
+    }
+
+    const auto source_key =
+        server_retention_instance_key::for_host_entry(incoming.source_);
+    const server_retention_instance_key provisional_key {
+        common_retention_artifact_kind::live_slot,
+        id_slot,
+        reinterpret_cast<uintptr_t>(replacement.get()),
+    };
+    if (provisional_key.instance == 0 ||
+        retention_obs->artifact_id(provisional_key).v != 0 ||
+        !server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::host_entry, -1,
+            provisional_key, common_retention_artifact_kind::live_slot,
+            id_slot, *replacement, adapter_config_key,
+            int64_t(incoming.prefix_tokens_),
+            incoming.requires_prefix_projection_
+                ? server_prompt_cache_prefix_clone_mode::branch_prefix
+                : server_prompt_cache_prefix_clone_mode::share_source) ||
+        !retention_obs->prepare_for_launch(source_key, provisional_key) ||
+        retention_obs->artifact_id(incumbent_key) != incumbent_artifact) {
+        retention_obs->abandon_prepared_launch(provisional_key);
+        retention_obs->retire(provisional_key);
+        return false;
+    }
+
+    server_prompt_cache_vbr_replacement_ticket prepared;
+    try {
+        prepared.cache_ = this;
+        prepared.incoming_ = std::move(incoming);
+        prepared.recovery_source_ = &*recovery;
+        prepared.recovery_owner_ = recovery_owner;
+        prepared.recovery_pin_ = std::move(recovery_pin);
+        prepared.recovery_ops_ = std::move(recovery_ops);
+        prepared.incumbent_ = &incumbent;
+        prepared.incumbent_family_current_ = &incumbent_family;
+        prepared.incumbent_family_ = incumbent_family;
+        prepared.incoming_family_ = incoming_family;
+        prepared.execution_identity_ = execution_identity;
+        prepared.adapter_config_key_ = adapter_config_key;
+        prepared.replacement_prompt_ = std::move(replacement);
+        prepared.provisional_key_ = provisional_key;
+        prepared.destination_slot_ = id_slot;
+        prepared.incoming_prefix_tokens_ =
+            prepared.incoming_.prefix_tokens_;
+        prepared.incumbent_tokens_ = incumbent_tokens;
+        prepared.incumbent_live_lcp_ = live_lcp;
+        prepared.incumbent_sequence_epoch_ = incumbent.sequence_epoch;
+        prepared.incoming_token_digest_ = incoming_digest;
+        prepared.incumbent_token_digest_ = incumbent_digest;
+        prepared.incumbent_lease_identity_ =
+            std::move(incumbent_lease_identity);
+        prepared.incumbent_artifact_ = incumbent_artifact;
+        prepared.incumbent_lineage_ =
+            incumbent_retention.lineage.lineage_id;
+        prepared.incoming_owner_artifact_ = incoming_owner_artifact;
+        prepared.recovery_owner_artifact_ = recovery_owner_artifact;
+        prepared.recovery_host_artifact_ =
+            recovery_retention.artifact_id;
+        prepared.provisional_artifact_ =
+            retention_obs->artifact_id(provisional_key);
+    } catch (...) {
+        retention_obs->abandon_prepared_launch(provisional_key);
+        retention_obs->retire(provisional_key);
+        return false;
+    }
+    if (!prepared.ready()) {
+        return false;
+    }
+    ticket = std::move(prepared);
+    return ticket.ready();
+}
+
+bool server_prompt_cache::prepare_vbr_occupied_replacement_publish(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept {
+    if (!ticket.ready() || ticket.cache_ != this || ticket.published_ ||
+        !retention_obs) {
+        return false;
+    }
+    const auto occupied_key =
+        server_retention_instance_key::for_slot(ticket.destination_slot_);
+    if (!retention_obs->prepared_launch_destination_swappable(
+            ticket.provisional_key_, occupied_key)) {
+        return false;
+    }
+    ticket.publish_prepared_ = true;
+    return true;
+}
+
+void server_prompt_cache::publish_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept {
+    static_assert(std::is_nothrow_swappable_v<server_prompt>);
+    GGML_ASSERT(ticket.cache_ == this);
+    GGML_ASSERT(ticket.publish_prepared_);
+    GGML_ASSERT(!ticket.published_);
+    GGML_ASSERT(ticket.ready());
+    GGML_ASSERT(ticket.incumbent_ != nullptr);
+    GGML_ASSERT(ticket.replacement_prompt_ != nullptr);
+    const auto occupied_key =
+        server_retention_instance_key::for_slot(ticket.destination_slot_);
+    // The scheduler resolved every refusal before entering the adopter's
+    // no-fail region. This consumes two existing hash nodes and cannot allocate.
+    const bool rebound = retention_obs->swap_prepared_launch_destination(
+        ticket.provisional_key_, occupied_key);
+    GGML_ASSERT(rebound);
+    using std::swap;
+    swap(*ticket.incumbent_, *ticket.replacement_prompt_);
+    *ticket.incumbent_family_current_ = ticket.incoming_family_;
+    ticket.publish_prepared_ = false;
+    ticket.published_ = true;
+}
+
+void server_prompt_cache::commit_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept {
+    const bool valid =
+        ticket.cache_ == this && ticket.published_ && !ticket.publish_prepared_ &&
+        ticket.incumbent_ == &destination && ticket.destination_slot_ == id_slot &&
+        retention_obs &&
+        retention_obs->artifact_id(
+            server_retention_instance_key::for_slot(id_slot)) ==
+                ticket.provisional_artifact_ &&
+        ticket.incoming_.source_ && ticket.incoming_.payload_ &&
+        ticket.incoming_.payload_->reference_artifact() ==
+            ticket.incoming_owner_artifact_ &&
+        ticket.recovery_owner_ &&
+        ticket.recovery_owner_->reference_artifact() ==
+            ticket.recovery_owner_artifact_ &&
+        ticket.recovery_pin_ &&
+        ticket.recovery_pin_->binds_exact(
+            ticket.recovery_host_artifact_, ticket.recovery_ops_) &&
+        !destination.tokens.has_media() && destination.checkpoints.empty() &&
+        uint64_t(destination.n_tokens()) == ticket.incoming_prefix_tokens_ &&
+        destination.sequence_epoch ==
+            ticket.incoming_.source_->prompt.sequence_epoch;
+    GGML_ASSERT(valid);
+    std::array<uint8_t, 32> destination_digest = {};
+    GGML_ASSERT(destination.tokens.retention_token_digest(destination_digest));
+    GGML_ASSERT(destination_digest == ticket.incoming_token_digest_);
+    GGML_ASSERT(&destination_family == ticket.incumbent_family_current_);
+    GGML_ASSERT(destination_family == ticket.incoming_family_);
+    if (destruction_obs) {
+        destruction_obs->note_host_restore(true);
+    }
+    // Both durable host owners and the old prompt image remain held until this
+    // post-adopt terminal. Releasing them cannot affect the installed slot.
+    ticket.recovery_pin_.reset();
+    ticket.recovery_owner_.reset();
+    ticket.incoming_ = {};
+    ticket.clear();
+}
+
 // fork 9l-c: prepare_vbr_restore_destination (fork server-task.cpp 8263-8348)
 bool server_prompt_cache::prepare_vbr_restore_destination(
         server_prompt_cache_vbr_restore_candidate & candidate,
@@ -3448,5 +3797,77 @@ bool server_prompt_cache::prepare_vbr_restore_destination(
     }
     candidate.prepared_slot_ = id_slot;
     candidate.prepared_destination_ = &destination;
+    return true;
+}
+
+// fork 9l-d1: vbr restore publish/commit (fork server-task.cpp 8350-8419)
+bool server_prompt_cache::publish_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
+    if (!candidate.ready() || candidate.cache_ != this ||
+        candidate.prepared_slot_ < 0 || !candidate.prepared_destination_ ||
+        !candidate.prepared_prompt_ ||
+        candidate.adopted_destination_ || !retention_obs ||
+        !retention_obs->prepared_for_launch(
+            server_retention_instance_key::for_slot(
+                candidate.prepared_slot_))) {
+        return false;
+    }
+    auto & destination = *candidate.prepared_destination_;
+    if (!destination.tokens.empty() || !destination.checkpoints.empty() ||
+        destination.sequence_epoch != 0) {
+        return false;
+    }
+    destination = std::move(*candidate.prepared_prompt_);
+    candidate.adopted_destination_ = &destination;
+    return true;
+}
+
+bool server_prompt_cache::commit_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept {
+    if (!candidate.ready() || candidate.cache_ != this ||
+        candidate.prepared_slot_ != id_slot || !retention_obs ||
+        candidate.adopted_destination_ != &destination) {
+        return false;
+    }
+    auto * source = candidate.source_;
+    const auto * variants = source ? source->payload.vbr_variants() : nullptr;
+    const bool selected_owner_matches = variants &&
+        (variants->compact_current() == candidate.payload_ ||
+         variants->quality_anchor() == candidate.payload_);
+    if (!source || source->recovery_pins == 0 ||
+        !selected_owner_matches ||
+        !retention_obs->prepared_for_launch(
+            server_retention_instance_key::for_slot(id_slot))) {
+        release_vbr_restore(candidate);
+        return false;
+    }
+    // Exact continuation restores the parent's family. A projected prefix is
+    // a new request branch; its caller-provided incoming family must survive
+    // the restore instead of inheriting the parent's cache provenance.
+    if (!candidate.requires_prefix_projection_) {
+        destination_family = candidate.cache_family_;
+    }
+    if (destruction_obs) {
+        destruction_obs->note_host_restore(true);
+    }
+    if (debug_observability) {
+        try {
+            debug_lifecycle_emissions++;
+            SRV_INF(
+                "CACHE_HOST_LIFECYCLE {\"mode\":\"vbr_non_consuming\","
+                "\"payload_kind\":\"vbr_artifact\","
+                "\"source_id\":%d,\"host_entries\":%zu,"
+                "\"host_bytes\":%zu,\"prefix_tokens\":%" PRIu64 "}\n",
+                candidate.source_id_, states.size(), size(),
+                candidate.prefix_tokens_);
+        } catch (...) {
+            // Observability cannot change a committed restore terminal.
+        }
+    }
+    --source->recovery_pins;
+    candidate.clear();
     return true;
 }

@@ -1024,6 +1024,10 @@ struct server_prompt_cache {
 
     std::list<server_prompt_cache_state> states;
 
+// fork 9l-d1: iterator typedefs (fork server-task.h 1362-1363)
+    using iterator = std::list<server_prompt_cache_state>::iterator;
+    using const_iterator = std::list<server_prompt_cache_state>::const_iterator;
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
@@ -1059,12 +1063,19 @@ struct server_prompt_cache {
         server_prompt_cache_state & state,
         int32_t & source_id) noexcept;
     // fork server-task.h:1696
+// fork 9l-d1: destruction observer member (fork server-task.h 1695)
+    server_cache_destruction_observer * destruction_obs = nullptr;
+
     server_retention_sidecar_store * retention_obs = nullptr;
 // fork 9l-b: lease_obs member (fork server-task.h 1697)
     server_cache_lease_table * lease_obs = nullptr;
 
 // fork 9l-c: lease execution identity (fork server-task.h 1698)
     const std::string * lease_execution_identity = nullptr;
+
+// fork 9l-d1: debug observability members (fork server-task.h 1701, 1703)
+    bool debug_observability = false;
+    uint64_t debug_lifecycle_emissions = 0;
     // fork server-task.h:1651 (the fork marks this private; this struct has no access specifiers)
     // Reused by the scheduler-owned durability classifier. Durable stems
     // accumulate across capture waves, so this arena follows the full host
@@ -1122,6 +1133,22 @@ struct server_prompt_cache {
         server_prompt & destination,
         int32_t id_slot) noexcept;
 
+// fork 9l-d1: publish_vbr_restore + commit_vbr_restore decls (fork server-task.h 1504-1517)
+    // The adopter's allocation-free final publish hook. Only this method can
+    // mint the receipt consumed by commit: it installs the cache-prepared
+    // exact-or-projected source prompt into the construction-empty destination.
+    bool publish_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    // Scheduler metadata terminal after the store's atomic adopt transaction
+    // has returned success. This must never be used as the adopt publish hook:
+    // every fallible retention operation was completed by the destination
+    // preparation above, outside the library no-fail region.
+    bool commit_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept;
+
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     friend class server_prompt_cache_vbr_restore_candidate;
@@ -1129,6 +1156,39 @@ struct server_prompt_cache {
     void release_vbr_occupied_replacement(
         server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
     friend class server_prompt_cache_vbr_replacement_ticket;
+
+// fork 9l-d1: occupied-replacement decls (fork server-task.h 1519-1549)
+    // CPU-only preparation for an occupied destination. The incoming
+    // candidate must be exact (not a parent projection) and must improve the
+    // live common prefix. Preparation clones all replacement metadata into a
+    // private provisional launch association without mutating or retiring the
+    // incumbent slot. The occupied importer consumes the ticket through its
+    // allocation-free composite KV/prompt/retention publication callback.
+    bool prepare_vbr_occupied_replacement(
+        server_prompt_cache_vbr_restore_candidate && incoming,
+        server_prompt & incumbent,
+        common_cache_family_binding & incumbent_family,
+        const common_cache_family_binding & incoming_family,
+        int32_t id_slot,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt_cache_vbr_replacement_diagnostics * diagnostics =
+            nullptr) noexcept;
+    // The scheduler calls the fallible read half before entering the adopter's
+    // no-fail terminal. Publication swaps the already-existing sidecar
+    // association and prompt storage without first clearing the incumbent.
+    bool prepare_vbr_occupied_replacement_publish(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
+    void publish_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket) noexcept;
+    // Post-adopt metadata terminal. The replacement is a request branch and
+    // therefore publishes the separately bound incoming request family.
+    void commit_vbr_occupied_replacement(
+        server_prompt_cache_vbr_replacement_ticket & ticket,
+        server_prompt & destination,
+        common_cache_family_binding & destination_family,
+        int32_t id_slot) noexcept;
 
     // fork server-task.h:1691
     llama_cache_acct_ledger * acct = nullptr;
