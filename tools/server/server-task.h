@@ -184,6 +184,9 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+// fork 9l-d2b: one-shot prompt-preparation gate (fork server-task.h 201)
+    bool prompt_tokens_prepared = false;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -842,6 +845,31 @@ inline bool server_prompt_cache_retention_reuse_is_useful(
     return false;
 // fork 9l-a: capacity enum + vbr restore candidate
 
+}
+
+// fork 9l-d2b: slot prompt-admission decision (fork server-task.h 1242-1264)
+enum class server_slot_prompt_admission : uint8_t {
+    accepted,
+    batch_too_large,
+    context_too_large,
+};
+
+// This admission check runs before launch mutates the selected slot's
+// retention lineage. Keep the split/non-split boundaries identical to the
+// decode path: split prompts need one cell of generation headroom, while an
+// unsplit prompt may exactly fill the context.
+inline server_slot_prompt_admission server_slot_prompt_admission_check(
+        bool can_split,
+        size_t n_tokens,
+        size_t n_ubatch,
+        size_t n_ctx) noexcept {
+    if (!can_split && n_tokens > n_ubatch) {
+        return server_slot_prompt_admission::batch_too_large;
+    }
+    if (n_tokens > n_ctx || (can_split && n_tokens == n_ctx)) {
+        return server_slot_prompt_admission::context_too_large;
+    }
+    return server_slot_prompt_admission::accepted;
 }
 
 struct server_prompt_cache;

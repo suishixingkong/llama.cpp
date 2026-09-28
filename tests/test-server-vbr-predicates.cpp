@@ -493,12 +493,59 @@ static void test_retention_token_identity() {
     }
 }
 
+// fork 9l-d2b: server_slot_prompt_admission_check is a pure predicate the launch
+// consumer will call from 9l-d2c on, so nothing exercises it yet. A transcription
+// error in `n_tokens > n_ctx || (can_split && n_tokens == n_ctx)` -- e.g. dropping
+// the `can_split &&` guard, or checking the batch limit for splittable prompts --
+// would still compile and would only show up as a wrong HTTP status much later.
+static void test_prompt_admission_check() {
+    using A = server_slot_prompt_admission;
+
+    struct row {
+        bool   can_split;
+        size_t n_tokens;
+        size_t n_ubatch;
+        size_t n_ctx;
+        A      want;
+    };
+    const row rows[] = {
+        // splittable: the batch bound does not apply, and the context bound reserves
+        // one cell of generation headroom (n_tokens == n_ctx is already too large).
+        { true,   10,  10, 100, A::accepted           },
+        { true,   99,  10, 100, A::accepted           },
+        { true,  100,  10, 100, A::context_too_large  },
+        { true,  101,  10, 100, A::context_too_large  },
+        { true,    1,   1,   1, A::context_too_large  },
+        // unsplittable: the batch bound is checked FIRST and wins, and an unsplit
+        // prompt is allowed to exactly fill the context.
+        { false,  10,  10, 100, A::accepted           },
+        { false,  11,  10, 100, A::batch_too_large    },
+        { false,  10,  10,  10, A::accepted           },
+        { false,  11,  10,  10, A::batch_too_large    },
+        { false, 200,  10, 100, A::batch_too_large    }, // batch beats context
+        { false, 100, 200, 100, A::accepted           },
+        { false, 101, 200, 100, A::context_too_large  },
+    };
+    for (const auto & r : rows) {
+        const A got = server_slot_prompt_admission_check(
+            r.can_split, r.n_tokens, r.n_ubatch, r.n_ctx);
+        CHECK(got == r.want);
+    }
+
+    // A frozen pair of boundary identities, so a reordered condition that happens to
+    // agree on the table above still gets caught: equality at the context bound is
+    // refused ONLY when the prompt can be split.
+    CHECK((server_slot_prompt_admission_check(true,  100, 100, 100) == A::context_too_large));
+    CHECK((server_slot_prompt_admission_check(false, 100, 100, 100) == A::accepted));
+}
+
 int main() {
     test_decode_terminal();
     test_empty_handoff();
     test_live_source_displacement();
     test_stem_matches();
     test_occupied_quarantine_reset();
+    test_prompt_admission_check();
     test_media_content_identity();
     test_lease_build_identity();
     test_lora_config_identity();

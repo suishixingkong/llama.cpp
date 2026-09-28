@@ -1961,6 +1961,18 @@ private:
 
     bool sleeping = false;
 
+// fork 9l-d2b: prompt-admission geometry test door (fork server-context.cpp 5111-5120)
+    struct slot_prompt_admission_geometry {
+        bool can_split = true;
+        int32_t n_ubatch = 0;
+    };
+
+    // Deterministic model-free door for the rejected-launch regression. No
+    // production caller installs an override.
+    const slot_prompt_admission_geometry * prompt_admission_geometry_for_test =
+        nullptr;
+    uint64_t prompt_selection_calls_for_test = 0;
+
     // MTP <-> mmproj GPU swap state: the MTP draft context is destroyed for the duration of
     // a media encode so the projector can use its VRAM, then recreated
     bool mmproj_gpu_swap   = false;
@@ -2796,6 +2808,11 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+
+// fork 9l-d2b: selection-call counter for the rejected-launch regression (fork server-context.cpp 9304-9306)
+        if (prompt_admission_geometry_for_test) {
+            prompt_selection_calls_for_test++;
+        }
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -2953,6 +2970,70 @@ private:
             }
         }
         return output;
+    }
+
+// fork 9l-d2b: prompt-token preparation gate + slot admission (fork server-context.cpp 9522-9527, 9648-9695)
+    void prepare_prompt_tokens_for_launch(
+            const server_slot & slot,
+            server_task & task) {
+        if (task.prompt_tokens_prepared) {
+            return;
+        }
+        // The fork continues with a diff-self-spec prompt rewrite (fork 9529-9645:
+        // <think> block stripping + looped-content truncation).  That belongs to the
+        // separate diff-self-spec feature: the port declares server_slot::diff_self_spec
+        // but never sets it true, and the rewrite needs two members the port does not
+        // have (diff_think_open_id / diff_think_close_id).  Landing it here would add
+        // dead code plus unported members, so only the gate is ported.
+        (void) slot;
+        task.prompt_tokens_prepared = true;
+    }
+
+    bool admit_task_for_slot(
+            const server_slot & slot,
+            server_task & task) {
+        const int32_t n_ubatch = prompt_admission_geometry_for_test
+            ? prompt_admission_geometry_for_test->n_ubatch
+            : llama_n_ubatch(ctx_tgt);
+        const bool can_split = prompt_admission_geometry_for_test
+            ? prompt_admission_geometry_for_test->can_split
+            : (!task.need_embd() ||
+               (llama_get_memory(ctx_tgt) &&
+                llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST));
+        switch (server_slot_prompt_admission_check(
+                can_split, task.tokens.size(), n_ubatch, slot.n_ctx)) {
+            case server_slot_prompt_admission::batch_too_large:
+                send_error(
+                    task,
+                    string_format(
+                        "input (%d tokens) is too large to process. increase the physical batch "
+                        "size (current batch size: %d)",
+                        task.n_tokens(), n_ubatch),
+                    ERROR_TYPE_SERVER);
+                return false;
+            case server_slot_prompt_admission::context_too_large:
+                if (!can_split) {
+                    send_error(
+                        task.id,
+                        string_format(
+                            "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                            task.n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                        task.n_tokens(), slot.n_ctx);
+                } else {
+                    send_error(
+                        task.id,
+                        string_format(
+                            "request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
+                            task.n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                        task.n_tokens(), slot.n_ctx);
+                }
+                return false;
+            case server_slot_prompt_admission::accepted:
+                return true;
+        }
+        GGML_ABORT("invalid slot prompt admission");
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -7539,10 +7620,18 @@ private:
     std::vector<uint8_t> vbr_retention_seen_by_seq;
     std::vector<uint8_t> vbr_durable_sources_by_seq;
     std::vector<uint8_t> vbr_durable_stems_by_seq;
+
+// fork 9l-d2b: reclaim refusal ledger (fork server-context.cpp 3553)
+    std::vector<uint8_t> vbr_reclaim_refused_by_seq;
     std::vector<uint32_t> vbr_exclusive_cells_by_seq;
     size_t vbr_retention_candidate_count = 0;
     uint64_t vbr_retention_projection_epoch = 0;
     const std::vector<uint32_t> * vbr_exclusive_cells_for_test = nullptr;
+
+// fork 9l-d2b: reclaim/pool-state test knobs (fork server-context.cpp 3557-3559)
+    int64_t vbr_reclaim_cells_needed_for_test = -1;
+    uint64_t vbr_reclaim_initial_cells_for_test = 0;
+    size_t vbr_pool_state_index_for_test = 0;
     // ---------------------------------------------------------------------
     // group A: cache-plan observation face + the retention wave it calls.
     // Bodies verbatim from the fork; the fork coordinates are on each header
@@ -8008,12 +8097,51 @@ private:
     }
 
     // fork server-context.cpp:5537-5543  (7 lines)
+// fork 9l-d2b: the reclaim pool-state probe (fork server-context.cpp 5511-5535)
+    llama_memory_vbr_state_data vbr_pool_state(
+            uint32_t n_tokens_extra) noexcept {
+        if (vbr_reclaim_cells_needed_for_test >= 0 &&
+            vbr_exclusive_cells_for_test) {
+            uint64_t remaining = 0;
+            for (const auto & slot : slots) {
+                if (slot.prompt.n_tokens() > 0 && slot.id >= 0 &&
+                    size_t(slot.id) < vbr_exclusive_cells_for_test->size()) {
+                    remaining += (*vbr_exclusive_cells_for_test)[size_t(slot.id)];
+                }
+            }
+            vbr_pool_state_index_for_test++;
+            const uint64_t reclaimed =
+                vbr_reclaim_initial_cells_for_test >= remaining
+                ? vbr_reclaim_initial_cells_for_test - remaining : 0;
+            llama_memory_vbr_state_data result;
+            result.deficit_raw = std::max<int64_t>(
+                0, vbr_reclaim_cells_needed_for_test -
+                    int64_t(std::min<uint64_t>(reclaimed, INT64_MAX)));
+            result.bpv_if_degraded = result.deficit_raw > 0 ? 4.0 : 16.0;
+            return result;
+        }
+        return llama_memory_vbr_state(
+            llama_get_memory(ctx_tgt), -1, n_tokens_extra);
+    }
+
     bool vbr_clear_idle_source(server_slot & slot) {
         if (params_base.vbr_prompt_cache) {
             return slot.prompt_clear_after_vbr_publication();
         }
         slot.prompt_clear(server_cache_destruction_reason::idle_reclaim);
         return true;
+    }
+
+// fork 9l-d2b: the reclaim victim clearer (fork server-context.cpp 5545-5554)
+    bool vbr_clear_reclaim_victim(server_slot & slot) {
+        if (vbr_reclaim_cells_needed_for_test >= 0) {
+            if (slot.retention_obs) {
+                slot.retention_obs->retire_slot(slot.id);
+            }
+            slot.prompt.clear();
+            return true;
+        }
+        return vbr_clear_idle_source(slot);
     }
 
     // fork server-context.cpp:5579  (25 lines)
@@ -8460,6 +8588,70 @@ private:
             }
         }
         return cleared;
+    }
+
+// fork 9l-d2b: reclaim-before-degrade (fork server-context.cpp 6020-6077)
+    // reclaim-before-degrade: when the incoming work's projected footprint would push the
+    // degrade ladder BELOW the quality floor, pay with idle caches instead of tiers. Above the
+    // floor the trade inverts — a within-band degrade is near-lossless and cheaper than
+    // destroying another conversation's re-prefillable cache, so caches are kept. Policy reads
+    // deficit_raw only: page-exact and free-VRAM independent, so WHETHER a cache is erased
+    // never depends on driver jitter or co-tenants (the cache's own live clamp still handles
+    // those with tier degrades).
+    void vbr_reclaim_before_degrade(int except_id, uint32_t n_tokens_extra, const char * reason) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reclaim_floor_bpv <= 0.0f) {
+            return;
+        }
+        auto st = vbr_pool_state(n_tokens_extra);
+        if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
+            return;
+        }
+        if (params_base.vbr_prompt_cache) {
+            std::fill(
+                vbr_reclaim_refused_by_seq.begin(),
+                vbr_reclaim_refused_by_seq.end(), uint8_t(0));
+        }
+        const vbr_live_retention_filter filter {
+            except_id, -1,
+            params_base.vbr_prompt_cache
+                ? &vbr_reclaim_refused_by_seq : nullptr,
+        };
+        bool learned_available = vbr_prepare_retention_wave(filter);
+        int cleared = 0;
+        while (st.deficit_raw > 0 &&
+               st.bpv_if_degraded <
+                    (double) params_base.vbr_reclaim_floor_bpv) {
+            auto * victim = vbr_retention_victim(
+                learned_available, filter);
+            if (!victim) {
+                break;
+            }
+            SLT_WRN(*victim,
+                "vbr reclaim (%s): clearing %d cached tokens (%s order)\n",
+                reason, (int) victim->prompt.n_tokens(),
+                learned_available ? "decayed-value" : "oldest-idle");
+            if (!vbr_clear_reclaim_victim(*victim)) {
+                SLT_INF(*victim,
+                    "vbr reclaim (%s): kept — full-slot lease refused displacement\n",
+                    reason);
+                if (victim->id >= 0 &&
+                    size_t(victim->id) <
+                        vbr_reclaim_refused_by_seq.size()) {
+                    vbr_reclaim_refused_by_seq[
+                        size_t(victim->id)] = 1;
+                    continue;
+                }
+                break;
+            }
+            cleared++;
+            st = vbr_pool_state(n_tokens_extra);
+        }
+        if (cleared > 0) {
+            SRV_WRN("vbr reclaim (%s): cleared %d idle slot(s), residual deficit %.2f MiB, projected %.3f bpv (floor %.3f)\n",
+                    reason, cleared, st.deficit_raw / 1024.0 / 1024.0,
+                    st.bpv_if_degraded,
+                    (double) params_base.vbr_reclaim_floor_bpv);
+        }
     }
 
     // fork server-context.cpp:6083-6134  (52 lines, includes the fork's doc comment)
