@@ -12,7 +12,40 @@
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
+// fork 9l-d4a: idle capture state (fork server-queue.h 16)
+struct server_queue_idle_capture_state;
+
 struct server_queue {
+    // fork 9l-d4a: move-only idle capture session (fork server-queue.h 34-61)
+public:
+    // Move-only cancellation session for one synchronous idle capture. Task
+    // arrivals cancel it; they never wait for or reject normal queue work.
+    class idle_capture_session {
+    public:
+        idle_capture_session() noexcept = default;
+        idle_capture_session(idle_capture_session && other) noexcept;
+        idle_capture_session & operator=(
+            idle_capture_session && other) noexcept;
+        ~idle_capture_session();
+
+        idle_capture_session(const idle_capture_session &) = delete;
+        idle_capture_session & operator=(
+            const idle_capture_session &) = delete;
+
+        explicit operator bool() const noexcept;
+        bool continue_capture() const noexcept;
+        void cancel() noexcept;
+
+    private:
+        std::shared_ptr<server_queue_idle_capture_state> state_;
+        uint64_t generation_ = 0;
+        idle_capture_session(
+            std::shared_ptr<server_queue_idle_capture_state> state,
+            uint64_t generation) noexcept;
+        void reset() noexcept;
+        friend struct server_queue;
+    };
+
 private:
     int id = 0;
     bool running  = false;
@@ -29,6 +62,11 @@ private:
 
     std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
+    // fork 9l-d4a: idle capture members (fork server-queue.h 78-81)
+    std::shared_ptr<server_queue_idle_capture_state> idle_capture_state;
+    uint64_t idle_capture_generation = 0;
+    bool idle_capture_stopped = false;
+    std::atomic<bool> idle_maintenance_requested { false };
 
     // used by yield_to_queue, all fields are guarded by mutex_tasks
     struct worker_t {
@@ -61,7 +99,24 @@ public:
         return false;
     }
 
-    ~server_queue() { worker_stop(); }
+    ~server_queue();
+
+    // fork 9l-d4a: idle capture entry points (fork server-queue.h 192-205)
+    // Acquires only while both queues are empty and no prior session is live.
+    // Allocation occurs only on the first enabled automatic-capture attempt.
+    idle_capture_session try_begin_idle_capture() noexcept;
+
+    // Scheduler-only prompt-boundary variant. update_slots() keeps one
+    // synthetic NEXT_RESPONSE wake queued while it is evaluating a live
+    // request; that wake is not external work and may coexist with the
+    // synchronous SWA frontier capture. Any real/deferred task still wins.
+    idle_capture_session try_begin_prompt_boundary_capture() noexcept;
+
+    // Worker-safe scheduler wake used only to run the registered idle
+    // maintenance callback. It never fabricates a task or bypasses task
+    // priority; a concurrently queued task wins and cancels the capture.
+    void request_idle_maintenance() noexcept;
+
 
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
@@ -151,6 +206,8 @@ public:
     }
 
 private:
+    // fork 9l-d4a (fork server-queue.h 252)
+    void cancel_idle_capture_locked() noexcept;
     void cleanup_pending_task(int id_target);
 
     // process all pending tasks in the queue

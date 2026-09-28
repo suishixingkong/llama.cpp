@@ -21,6 +21,153 @@
 // server_queue
 //
 
+// fork 9l-d4a: the idle capture subsystem (fork server-queue.cpp 25-169)
+struct server_queue_idle_capture_state {
+    std::atomic<uint64_t> active_generation { 0 };
+    std::atomic<bool> cancelled { false };
+};
+
+server_queue::idle_capture_session::idle_capture_session(
+        std::shared_ptr<server_queue_idle_capture_state> state,
+        uint64_t generation) noexcept
+    : state_(std::move(state)), generation_(generation) {
+}
+
+server_queue::idle_capture_session::idle_capture_session(
+        idle_capture_session && other) noexcept
+    : state_(std::move(other.state_)), generation_(other.generation_) {
+    other.generation_ = 0;
+}
+
+server_queue::idle_capture_session &
+server_queue::idle_capture_session::operator=(
+        idle_capture_session && other) noexcept {
+    if (this != &other) {
+        reset();
+        state_ = std::move(other.state_);
+        generation_ = other.generation_;
+        other.generation_ = 0;
+    }
+    return *this;
+}
+
+server_queue::idle_capture_session::~idle_capture_session() {
+    reset();
+}
+
+server_queue::idle_capture_session::operator bool() const noexcept {
+    return state_ && generation_ != 0 &&
+        state_->active_generation.load(std::memory_order_acquire) ==
+            generation_;
+}
+
+bool server_queue::idle_capture_session::continue_capture() const noexcept {
+    return bool(*this) &&
+        !state_->cancelled.load(std::memory_order_acquire);
+}
+
+void server_queue::idle_capture_session::cancel() noexcept {
+    if (state_) {
+        state_->cancelled.store(true, std::memory_order_release);
+    }
+}
+
+void server_queue::idle_capture_session::reset() noexcept {
+    if (state_ && generation_ != 0) {
+        uint64_t expected = generation_;
+        (void) state_->active_generation.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    generation_ = 0;
+    state_.reset();
+}
+
+server_queue::~server_queue() {
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        idle_capture_stopped = true;
+        cancel_idle_capture_locked();
+        running = false;
+    }
+    condition_tasks.notify_all();
+    worker_stop();
+}
+
+void server_queue::cancel_idle_capture_locked() noexcept {
+    if (idle_capture_state) {
+        idle_capture_state->cancelled.store(true, std::memory_order_release);
+    }
+}
+
+server_queue::idle_capture_session
+server_queue::try_begin_idle_capture() noexcept {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (idle_capture_stopped || worker.busy || !queue_tasks.empty() ||
+        !queue_tasks_deferred.empty() || !queue_tasks_unhandled.empty()) {
+        return {};
+    }
+    try {
+        if (!idle_capture_state) {
+            idle_capture_state =
+                std::make_shared<server_queue_idle_capture_state>();
+        }
+        if (idle_capture_state->active_generation.load(
+                std::memory_order_acquire) != 0) {
+            return {};
+        }
+        if (++idle_capture_generation == 0) {
+            ++idle_capture_generation;
+        }
+        idle_capture_state->cancelled.store(
+            false, std::memory_order_relaxed);
+        idle_capture_state->active_generation.store(
+            idle_capture_generation, std::memory_order_release);
+        return idle_capture_session(
+            idle_capture_state, idle_capture_generation);
+    } catch (...) {
+        return {};
+    }
+}
+
+server_queue::idle_capture_session
+server_queue::try_begin_prompt_boundary_capture() noexcept {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    const bool only_scheduler_wakes = std::all_of(
+        queue_tasks.begin(), queue_tasks.end(), [](const server_task & task) {
+            return task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
+        });
+    if (idle_capture_stopped || worker.busy || !only_scheduler_wakes ||
+        !queue_tasks_deferred.empty() || !queue_tasks_unhandled.empty()) {
+        return {};
+    }
+    try {
+        if (!idle_capture_state) {
+            idle_capture_state =
+                std::make_shared<server_queue_idle_capture_state>();
+        }
+        if (idle_capture_state->active_generation.load(
+                std::memory_order_acquire) != 0) {
+            return {};
+        }
+        if (++idle_capture_generation == 0) {
+            ++idle_capture_generation;
+        }
+        idle_capture_state->cancelled.store(false, std::memory_order_relaxed);
+        idle_capture_state->active_generation.store(
+            idle_capture_generation, std::memory_order_release);
+        return idle_capture_session(
+            idle_capture_state, idle_capture_generation);
+    } catch (...) {
+        return {};
+    }
+}
+
+void server_queue::request_idle_maintenance() noexcept {
+    idle_maintenance_requested.store(true, std::memory_order_release);
+    condition_tasks.notify_one();
+}
+
 static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
