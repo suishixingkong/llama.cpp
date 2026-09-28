@@ -1574,6 +1574,14 @@ struct server_slot {
         retention_reuse_tokens = 0;
     }
 
+    // fork 9l-d2e: abandon a staged launch when the scheduler drops the task (fork server-context.cpp 2485-2489)
+    void abandon_retention_prepared_launch() noexcept {
+        if (retention_obs) {
+            retention_obs->abandon_prepared_launch(
+                server_retention_instance_key::for_slot(id));
+        }
+    }
+
     // ---- group A slot state (verbatim declarations from the fork) ----
 
     common_retention_pool retention_pool = common_retention_pool::attention;
@@ -4503,6 +4511,7 @@ private:
                     // slot scheduling logic
                     //
 
+                    // fork 9l-d2e: unified-KV cell admission + retention abort paths (fork server-context.cpp 14423-14494)
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
@@ -4513,6 +4522,7 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        slot->abandon_retention_prepared_launch();
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -4523,16 +4533,56 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            slot->cache_plan.reset();
+                            slot->abandon_retention_prepared_launch();
                             queue_tasks.defer(std::move(task));
                             break;
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                            slot->cache_plan.reset();
+                            slot->abandon_retention_prepared_launch();
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        // Unified KV: check if launching this task would overflow the shared cell pool.
+                        // Use max(current, planned) since a just-launched slot hasn't filled yet.
+                        if (params_base.kv_unified && task.n_tokens() > 0) {
+                            int64_t cells_committed = 0;
+                            for (const auto & s : slots) {
+                                if (s.is_processing() && s.task) {
+                                    cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens());
+                                }
+                            }
+                            const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
+                            if (cells_available < (int64_t) task.n_tokens()) {
+                                // never-fits: reject instead of deferring forever (silent hang)
+                                if (task.n_tokens() > slot->n_ctx) {
+                                    send_error(task.id,
+                                               string_format(
+                                                   "request (%d tokens) exceeds the total context size (%d tokens), try increasing it",
+                                                   task.n_tokens(), slot->n_ctx),
+                                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot->n_ctx);
+                                    slot->cache_plan.reset();
+                                    slot->abandon_retention_prepared_launch();
+                                    break; // drop the task
+                                }
+                                SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
+                                        id_task, task.n_tokens(), cells_available, cells_committed);
+                                slot->cache_plan.reset();
+                                slot->abandon_retention_prepared_launch();
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
+
+                        if (!launch_slot_with_task(
+                                *slot, std::move(task), true)) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            slot->cache_plan.reset();
+                            slot->abandon_retention_prepared_launch();
+                            break; // drop the task
+                        }
                     }
 
                     if (!params_base.vbr_prompt_cache &&
