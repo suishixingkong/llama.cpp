@@ -2356,6 +2356,14 @@ static bool server_prompt_cache_vbr_frontier_matches(
     }
 }
 
+// fork 9l-a: exact-scope fwd decl
+
+static bool server_prompt_retention_exact_scope(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key,
+        int64_t coverage_tokens,
+        std::string & out) noexcept;
+
 // fork server-task.cpp:2590-2605  (16 lines)
 bool server_prompt_cache::contains_vbr_frontier(
         const server_prompt & prompt,
@@ -2559,4 +2567,379 @@ server_cache_destruction_admission server_cache_checkpoint_observe_drop(
     request.add_yield(
         llama_cache_acct_category::checkpoint_state_payload);
     return server_cache_retention_admit(context.destruction, request);
+}
+
+// fork 9l-a: server_prompt_retention_exact_scope (fork server-task.cpp 3811-3865)
+static bool server_prompt_retention_exact_scope(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key,
+        int64_t coverage_tokens,
+        std::string & out) noexcept {
+    out.clear();
+    if (coverage_tokens < 0 ||
+        uint64_t(coverage_tokens) > tokens.size()) {
+        return false;
+    }
+    try {
+        std::string media_identity;
+        if (!tokens.media_content_identity(
+                coverage_tokens, media_identity)) {
+            return false;
+        }
+        const uint64_t adapter_size = adapter_config_key.size();
+        const uint64_t media_size = media_identity.size();
+        size_t total = sizeof(adapter_size);
+        if (adapter_size > SIZE_MAX - total) {
+            return false;
+        }
+        total += size_t(adapter_size);
+        if (sizeof(media_size) > SIZE_MAX - total) {
+            return false;
+        }
+        total += sizeof(media_size);
+        if (media_size > SIZE_MAX - total) {
+            return false;
+        }
+        total += size_t(media_size);
+        out.reserve(total);
+        out.append(
+            reinterpret_cast<const char *>(&adapter_size),
+            sizeof(adapter_size));
+        out.append(adapter_config_key);
+        out.append(
+            reinterpret_cast<const char *>(&media_size),
+            sizeof(media_size));
+        out.append(media_identity);
+        return true;
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+}
+
+static bool server_prompt_retention_exact_scope(
+        const server_prompt & prompt,
+        const std::string & adapter_config_key,
+        int64_t coverage_tokens,
+        std::string & out) noexcept {
+    return server_prompt_retention_exact_scope(
+        prompt.tokens, adapter_config_key, coverage_tokens, out);
+}
+
+// fork 9l-a: prepare_vbr_restore + release_vbr_restore + candidate impl (fork server-task.cpp 3059-3374)
+bool server_prompt_cache::prepare_vbr_restore(
+        const server_tokens & request_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        bool allow_prefix_projection,
+        const common_cache_family_binding * required_family) noexcept {
+    candidate = {};
+    // The first automatic-import slice is text-only. A later-media suffix has
+    // a different exact DF scope from its cached media stem; fail closed until
+    // a dedicated frontier-media lookup authority is wired.
+    if (request_tokens.empty() || request_tokens.has_media() ||
+        execution_identity.empty() ||
+        adapter_config_key.empty() || !retention_obs ||
+        !retention_obs->prefix_tracking_enabled() ||
+        !retention_obs->prefix_tracking_available()) {
+        return false;
+    }
+    try {
+        std::string scope;
+        if (!server_prompt_retention_exact_scope(
+                request_tokens, adapter_config_key,
+                int64_t(request_tokens.size()), scope)) {
+            return false;
+        }
+        struct selection {
+            server_prompt_cache_state * best;
+            const server_tokens * request;
+            const std::string * execution;
+            const std::string * adapter;
+            const common_cache_family_binding * required_family;
+            uint64_t prefix;
+            uint64_t source_tokens;
+            llama_pos selected_next_position;
+            bool quality;
+            uint64_t artifact;
+            bool projected;
+        } exact {
+            nullptr, &request_tokens, &execution_identity,
+            &adapter_config_key, required_family,
+            0, 0, -1, false, 0, false,
+        };
+        const auto select =
+            [](void * opaque, const server_retention_instance_key & key,
+               uint64_t prefix) noexcept {
+                auto & current = *static_cast<selection *>(opaque);
+                if (key.kind != common_retention_artifact_kind::host_entry ||
+                    key.owner_slot != -1 || key.instance == 0 ||
+                    prefix < current.prefix) {
+                    return true;
+                }
+                auto * state = reinterpret_cast<server_prompt_cache_state *>(
+                    key.instance);
+                const uint64_t source_tokens = state && state->prompt.n_tokens() > 0
+                    ? uint64_t(state->prompt.n_tokens()) : 0;
+                if (!state || state->payload.kind() !=
+                        server_prompt_cache_payload_kind::vbr_artifact ||
+                    state->adapter_config_key != *current.adapter ||
+                    state->vbr_execution_identity != *current.execution ||
+                    (current.required_family &&
+                     state->cache_family != *current.required_family) ||
+                    source_tokens == 0 ||
+                    (current.projected
+                        ? prefix >= source_tokens ||
+                          state->prompt.tokens.has_media() ||
+                          !state->prompt.checkpoints.empty()
+                        : source_tokens != prefix) ||
+                    state->recovery_pins == UINT32_MAX) {
+                    return true;
+                }
+                const auto * artifact = state->payload.vbr_artifact();
+                if (!artifact || !artifact->package()) {
+                    return true;
+                }
+                const auto & manifest = artifact->package().manifest();
+                const llama_pos selected_next =
+                    current.request->pos_next(int64_t(prefix));
+                // The retention callback is reached through this state's
+                // immutable indexed token block, and stage_vbr authenticated
+                // that block against the sealed package before publication.
+                // Re-scanning the complete parent here for every alias would
+                // turn an 8192-owner terminal into O(owners*tokens).
+                if (selected_next <= 0 ||
+                    manifest.identity.token_count <= 0 ||
+                    uint64_t(manifest.identity.token_count) != source_tokens ||
+                    state->prompt.tokens.pos_next() !=
+                        manifest.identity.next_position ||
+                    (!current.projected && selected_next !=
+                        manifest.identity.next_position)) {
+                    return true;
+                }
+                const auto * variants = state->payload.vbr_variants();
+                const bool quality = variants && variants->quality_anchor();
+                const auto & preferred = quality
+                    ? variants->quality_anchor()
+                    : variants->compact_current();
+                const uint64_t artifact_id = preferred
+                    ? preferred->reference_artifact().v : 0;
+                if (artifact_id == 0) {
+                    return true;
+                }
+                if (prefix == current.prefix && current.best &&
+                    (quality < current.quality ||
+                     (quality == current.quality &&
+                      artifact_id >= current.artifact))) {
+                    return true;
+                }
+                current.best = state;
+                current.prefix = prefix;
+                current.source_tokens = source_tokens;
+                current.selected_next_position = selected_next;
+                current.quality = quality;
+                current.artifact = artifact_id;
+                return true;
+            };
+        const bool indexed_attention = retention_obs->visit_prefix_instances(
+            common_retention_pool::attention, scope,
+            request_tokens.retention_token_ids(), &exact, select);
+        const bool indexed_recurrent = retention_obs->visit_prefix_instances(
+            common_retention_pool::recurrent, scope,
+            request_tokens.retention_token_ids(), &exact, select);
+        if (!indexed_attention || !indexed_recurrent) {
+            return false;
+        }
+        selection projected {
+            nullptr, &request_tokens, &execution_identity,
+            &adapter_config_key, required_family,
+            0, 0, -1, false, 0, true,
+        };
+        if (allow_prefix_projection) {
+            if (!retention_obs->visit_common_prefix_instances(
+                    common_retention_pool::attention, scope,
+                    request_tokens.retention_token_ids(), &projected,
+                    select)) {
+                return false;
+            }
+        }
+        const auto better = [](const selection & left,
+                               const selection & right) noexcept {
+            return left.best &&
+                (!right.best || left.prefix > right.prefix ||
+                 (left.prefix == right.prefix &&
+                  (left.quality > right.quality ||
+                   (left.quality == right.quality &&
+                    left.artifact < right.artifact))));
+        };
+        const selection & selected = allow_prefix_projection &&
+                better(projected, exact)
+            ? projected : exact;
+        if (!selected.best) {
+            return false;
+        }
+        const auto * variants = selected.best->payload.vbr_variants();
+        if (!variants || !variants->compact_current()) {
+            return false;
+        }
+        auto compact = variants->compact_current();
+        auto preferred = variants->quality_anchor()
+            ? variants->quality_anchor() : compact;
+        ++selected.best->recovery_pins;
+        candidate.cache_ = this;
+        candidate.source_ = selected.best;
+        candidate.payload_ = std::move(preferred);
+        if (variants->quality_anchor()) {
+            candidate.fallback_payload_ = std::move(compact);
+        }
+        candidate.cache_family_ = selected.best->cache_family;
+        candidate.prefix_tokens_ = selected.prefix;
+        candidate.source_tokens_ = selected.source_tokens;
+        candidate.selected_next_position_ = selected.selected_next_position;
+        candidate.requires_prefix_projection_ = selected.projected;
+        int32_t selected_source_id = -1;
+        (void) cache_plan_get_source_id(*selected.best, selected_source_id);
+        candidate.source_id_ = selected_source_id;
+        return true;
+    } catch (...) {
+        candidate = {};
+        return false;
+    }
+}
+
+void server_prompt_cache::release_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
+    if (candidate.cache_ != this) {
+        return;
+    }
+    if (!candidate.source_) {
+        candidate.clear();
+        return;
+    }
+    if (candidate.prepared_slot_ >= 0 &&
+        !candidate.adopted_destination_ && retention_obs) {
+        const auto destination =
+            server_retention_instance_key::for_slot(candidate.prepared_slot_);
+        retention_obs->abandon_prepared_launch(destination);
+        retention_obs->retire(destination);
+    }
+    // The pin excludes every cache eraser, so the prepared node's stable
+    // std::list address remains authoritative until this capability releases
+    // it. No list scan is needed on the restore/rollback path.
+    GGML_ASSERT(candidate.source_->recovery_pins > 0);
+    --candidate.source_->recovery_pins;
+    candidate.clear();
+}
+
+server_prompt_cache_vbr_restore_candidate::
+~server_prompt_cache_vbr_restore_candidate() {
+    if (cache_) {
+        cache_->release_vbr_restore(*this);
+    }
+}
+
+server_prompt_cache_vbr_restore_candidate::
+server_prompt_cache_vbr_restore_candidate(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept {
+    *this = std::move(other);
+}
+
+server_prompt_cache_vbr_restore_candidate &
+server_prompt_cache_vbr_restore_candidate::operator=(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept {
+    if (this != &other) {
+        if (cache_) {
+            cache_->release_vbr_restore(*this);
+        }
+        cache_ = other.cache_;
+        source_ = other.source_;
+        payload_ = std::move(other.payload_);
+        fallback_payload_ = std::move(other.fallback_payload_);
+        cache_family_ = other.cache_family_;
+        prefix_tokens_ = other.prefix_tokens_;
+        source_tokens_ = other.source_tokens_;
+        selected_next_position_ = other.selected_next_position_;
+        requires_prefix_projection_ = other.requires_prefix_projection_;
+        source_id_ = other.source_id_;
+        prepared_slot_ = other.prepared_slot_;
+        prepared_destination_ = other.prepared_destination_;
+        adopted_destination_ = other.adopted_destination_;
+        prepared_prompt_ = std::move(other.prepared_prompt_);
+        other.clear();
+    }
+    return *this;
+}
+
+bool server_prompt_cache_vbr_restore_candidate::ready() const noexcept {
+    return cache_ && source_ && payload_ && prefix_tokens_ > 0 &&
+        source_tokens_ >= prefix_tokens_ && selected_next_position_ > 0 &&
+        requires_prefix_projection_ == (prefix_tokens_ < source_tokens_);
+}
+
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_restore_candidate::payload() const noexcept {
+    return payload_;
+}
+
+const server_prompt_cache_vbr_owner &
+server_prompt_cache_vbr_restore_candidate::fallback_payload()
+        const noexcept {
+    return fallback_payload_;
+}
+
+bool server_prompt_cache_vbr_restore_candidate::use_fallback_payload()
+        noexcept {
+    if (!ready() || !fallback_payload_ || adopted_destination_) {
+        return false;
+    }
+    payload_ = std::move(fallback_payload_);
+    return true;
+}
+
+const common_cache_family_binding &
+server_prompt_cache_vbr_restore_candidate::cache_family() const noexcept {
+    return cache_family_;
+}
+
+uint64_t server_prompt_cache_vbr_restore_candidate::prefix_tokens()
+        const noexcept {
+    return prefix_tokens_;
+}
+
+uint64_t server_prompt_cache_vbr_restore_candidate::source_tokens()
+        const noexcept {
+    return source_tokens_;
+}
+
+llama_pos server_prompt_cache_vbr_restore_candidate::selected_next_position()
+        const noexcept {
+    return selected_next_position_;
+}
+
+bool server_prompt_cache_vbr_restore_candidate::requires_prefix_projection()
+        const noexcept {
+    return requires_prefix_projection_;
+}
+
+int32_t server_prompt_cache_vbr_restore_candidate::source_id()
+        const noexcept {
+    return source_id_;
+}
+
+void server_prompt_cache_vbr_restore_candidate::clear() noexcept {
+    cache_ = nullptr;
+    source_ = nullptr;
+    payload_.reset();
+    fallback_payload_.reset();
+    cache_family_ = {};
+    prefix_tokens_ = 0;
+    source_tokens_ = 0;
+    selected_next_position_ = -1;
+    requires_prefix_projection_ = false;
+    source_id_ = -1;
+    prepared_slot_ = -1;
+    prepared_destination_ = nullptr;
+    adopted_destination_ = nullptr;
+    prepared_prompt_.reset();
 }

@@ -840,7 +840,72 @@ inline bool server_prompt_cache_retention_reuse_is_useful(
         }
     }
     return false;
+// fork 9l-a: capacity enum + vbr restore candidate
+
 }
+
+struct server_prompt_cache;
+
+enum class server_prompt_cache_vbr_capacity_status : uint8_t {
+    invalid,
+    fit,
+    incoming_exceeds_hard_limit,
+    pressure_cited,
+    pressure_batch_unsupported,
+};
+
+// Move-only, non-consuming citation of one immutable VBR host entry. Exact
+// stored prefixes are preferred; on an exact miss the capability may name a
+// shorter projected LCP and its selected logical frontier. The highest-quality
+// same-frontier owner is preferred; compact current remains available as a
+// bounded fallback when destination negotiation refuses it.
+// The source list node is pinned until commit or destruction; the shared
+// payload owner independently keeps catalog bytes alive. Raw node identity is
+// deliberately private so callers cannot forge or double-release a pin.
+class server_prompt_cache_vbr_restore_candidate {
+public:
+    server_prompt_cache_vbr_restore_candidate() = default;
+    ~server_prompt_cache_vbr_restore_candidate();
+    server_prompt_cache_vbr_restore_candidate(
+        const server_prompt_cache_vbr_restore_candidate &) = delete;
+    server_prompt_cache_vbr_restore_candidate & operator=(
+        const server_prompt_cache_vbr_restore_candidate &) = delete;
+    server_prompt_cache_vbr_restore_candidate(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept;
+    server_prompt_cache_vbr_restore_candidate & operator=(
+        server_prompt_cache_vbr_restore_candidate && other) noexcept;
+
+    bool ready() const noexcept;
+    const server_prompt_cache_vbr_owner & payload() const noexcept;
+    const server_prompt_cache_vbr_owner & fallback_payload() const noexcept;
+    bool use_fallback_payload() noexcept;
+    const common_cache_family_binding & cache_family() const noexcept;
+    uint64_t prefix_tokens() const noexcept;
+    uint64_t source_tokens() const noexcept;
+    llama_pos selected_next_position() const noexcept;
+    bool requires_prefix_projection() const noexcept;
+    int32_t source_id() const noexcept;
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    server_prompt_cache_state * source_ = nullptr;
+    server_prompt_cache_vbr_owner payload_;
+    server_prompt_cache_vbr_owner fallback_payload_;
+    common_cache_family_binding cache_family_;
+    uint64_t prefix_tokens_ = 0;
+    uint64_t source_tokens_ = 0;
+    llama_pos selected_next_position_ = -1;
+    bool requires_prefix_projection_ = false;
+    int32_t source_id_ = -1;
+    int32_t prepared_slot_ = -1;
+    server_prompt * prepared_destination_ = nullptr;
+    server_prompt * adopted_destination_ = nullptr;
+    std::unique_ptr<server_prompt> prepared_prompt_;
+    friend struct server_prompt_cache;
+    friend class server_prompt_cache_vbr_replacement_ticket;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -932,6 +997,39 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_frontier_batch_diagnostics * diagnostics =
             nullptr)
         const noexcept;
+
+// fork 9l-a: prepare/release decls
+
+    // Select and pin the longest VBR artifact whose complete token block is an
+    // exact prefix of the incoming text-only request. On an exact miss, select
+    // the eligible host artifact with the longest nonzero common prefix. At an
+    // equal frontier, prefer a quality anchor while retaining compact-current
+    // as a bounded pre-adoption fallback.
+    // Media-bearing automatic restore is deliberately deferred until lookup
+    // owns a frontier-media authority.
+    // A non-null required_family constrains selection at the index owner so a
+    // higher-ranked foreign-family row cannot mask a compatible candidate.
+    // This is deliberately separate
+    // from fixed-state load()/contains(): VBR restoration is an adopt
+    // transaction, not a serialized state-image restore.
+    bool prepare_vbr_restore(
+        const server_tokens & request_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        bool allow_prefix_projection = true,
+        const common_cache_family_binding * required_family = nullptr) noexcept;
+    // Fallible retention/lease preparation for a construction-empty live
+    // destination. Cancellation rolls this provisional association back;
+    // commit consumes it only after successful artifact adoption.
+    bool prepare_vbr_restore_destination(
+        server_prompt_cache_vbr_restore_candidate & candidate,
+        server_prompt & destination,
+        int32_t id_slot) noexcept;
+
+    void release_vbr_restore(
+        server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
+    friend class server_prompt_cache_vbr_restore_candidate;
 
     // fork server-task.h:1691
     llama_cache_acct_ledger * acct = nullptr;

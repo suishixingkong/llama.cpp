@@ -1280,7 +1280,24 @@ struct server_slot {
     // fork server-context.cpp:1562
     bool vbr_idle_stem_retry = false;
     // fork server-context.cpp:1567
+// fork 9l-a: artifact store member + counters
+
     uint64_t vbr_imported_complete_frontier = 0;
+    // the frozen ledger but is destroyed before it. It exists only for an
+    // armed dynamic-VBR memory after the one-shot manifest and ring admission.
+    std::unique_ptr<server_vbr_artifact_store> vbr_artifact_store;
+    server_vbr_prompt_cache_support_status vbr_prompt_cache_support =
+        server_vbr_prompt_cache_support_status::supported;
+    server_vbr_artifact_capture_status vbr_prompt_cache_store_status =
+        server_vbr_artifact_capture_status::unavailable;
+    server_vbr_artifact_store_create_diagnostics
+        vbr_prompt_cache_store_diagnostics;
+    uint64_t vbr_automatic_restore_attempts = 0;
+    uint64_t vbr_automatic_restore_succeeded = 0;
+    uint64_t vbr_automatic_restore_quality_fallbacks = 0;
+    uint64_t vbr_automatic_restore_occupied_attempts = 0;
+    uint64_t vbr_automatic_restore_occupied_succeeded = 0;
+    uint64_t vbr_automatic_restore_occupied_fallbacks = 0;
     // FORK-DIFF: the fork declares this inside the diffusion self-speculation
     // group (diff_draft_length, the mask/think token ids, diff_prev_logits, ...).
     // Only the flag itself is read by the SWA-window eligibility predicate, and
