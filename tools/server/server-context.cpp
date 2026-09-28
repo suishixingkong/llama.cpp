@@ -9218,6 +9218,162 @@ private:
     // frontier before the first generated token mutates that state.
     int32_t vbr_prompt_boundary_capture_slot = -1;
 
+    // fork 9l-d4b4 (fork server-context.cpp 11408-11458, 11605-11635)
+    static bool vbr_idle_capture_attempt_suppressed(
+            const std::array<uint8_t, 32> & recorded,
+            const std::array<uint8_t, 32> & current,
+            bool terminal,
+            int64_t retry_after_ms,
+            int64_t now_ms) noexcept {
+        return recorded == current &&
+            (terminal || now_ms < retry_after_ms);
+    }
+    static bool vbr_idle_admission_refusal_suppressed(
+            const server_vbr_idle_refusal_witness & recorded,
+            const std::array<uint8_t, 32> & current_attempt,
+            uint64_t accounting_serial,
+            uint64_t retention_epoch,
+            const server_cache_lease_retry_witness & lease) noexcept {
+        if (!recorded.valid ||
+            recorded.attempt_identity != current_attempt ||
+            recorded.accounting_serial == 0 ||
+            recorded.accounting_serial != accounting_serial ||
+            recorded.retention_epoch == 0 ||
+            recorded.retention_epoch != retention_epoch) {
+            return false;
+        }
+        if (!recorded.lease_tracked) {
+            return true;
+        }
+        return lease.available &&
+            lease.event_ordinal == recorded.lease_event_ordinal &&
+            (recorded.lease_next_expiry_ns == 0 ||
+             lease.now_ns < recorded.lease_next_expiry_ns);
+    }
+    static bool vbr_idle_admission_refusal_suppressed(
+            const std::vector<server_vbr_idle_refusal_witness> & recorded,
+            const std::array<uint8_t, 32> & current_attempt,
+            uint64_t accounting_serial,
+            uint64_t retention_epoch,
+            const server_cache_lease_retry_witness & lease) noexcept {
+        const auto found = std::lower_bound(
+            recorded.begin(), recorded.end(), current_attempt,
+            [](const server_vbr_idle_refusal_witness & value,
+               const std::array<uint8_t, 32> & attempt) {
+                return value.attempt_identity < attempt;
+            });
+        return found != recorded.end() &&
+            found->attempt_identity == current_attempt &&
+            vbr_idle_admission_refusal_suppressed(
+                *found, current_attempt, accounting_serial,
+                retention_epoch, lease);
+    }
+    static bool vbr_idle_release_isolated_retry(
+            size_t candidate_count,
+            size_t successful_captures,
+            bool isolated_retry,
+            bool terminal,
+            bool idle,
+            bool processing) noexcept {
+        return candidate_count == 1 && successful_captures != 0 &&
+            isolated_retry && !terminal && idle && !processing;
+    }
+
+    static uint64_t vbr_idle_capacity_retry_manifest(
+            const uint64_t * ranked,
+            size_t ranked_count,
+            const uint64_t * admitted,
+            size_t admitted_count) noexcept {
+        if (!ranked || !admitted) {
+            return 0;
+        }
+        for (size_t i = 0; i < ranked_count; ++i) {
+            if (ranked[i] == 0) {
+                continue;
+            }
+            for (size_t j = 0; j < admitted_count; ++j) {
+                if (ranked[i] == admitted[j]) {
+                    return ranked[i];
+                }
+            }
+        }
+        return 0;
+    }
+
+    // fork 9l-d4b4 (fork server-context.cpp 12100-12171)
+    server_vbr_capture_readiness_input vbr_capture_readiness_input_for(
+            const server_slot & source,
+            const vbr_explicit_capture_pretransfer_quote & quote,
+            bool reserve_decode_runway) const
+            noexcept {
+        server_vbr_capture_readiness_input input;
+        input.source_slot = source.id;
+        input.candidate_transfer_bytes = quote.planned_packed_bytes;
+        input.candidate_host_bytes =
+            quote.conservative_host_resident_bytes;
+        input.candidate_metadata_bytes = quote.metadata_bytes;
+        input.publication_margin_us = 5000;
+        // The prompt-cache capacity claim is the canonical host reservation
+        // and may cite bounded victims. Do not second-guess that transaction
+        // with a scalar current-size comparison here.
+        input.host_capacity_bytes = 0;
+        input.host_committed_bytes = prompt_cache ? prompt_cache->size() : 0;
+        input.pinned_lane_slots_available = vbr_idle_exact_capture ? 0 : 1;
+        input.queue_slots_available = vbr_idle_exact_capture ? 0 : 1;
+        // Usage below is global across the unified memory tree, so capacity
+        // must come from that same global authority rather than the selected
+        // sequence's per-slot context limit.
+        uint64_t admitted_logical_growth = 0;
+        for (const auto & slot : slots) {
+            const uint64_t live = uint64_t(std::max<int64_t>(
+                0, slot.prompt.n_tokens()));
+            if (slot.is_processing() && slot.task) {
+                const uint64_t target = uint64_t(std::max<int32_t>(
+                    0, slot.task->n_tokens()));
+                const uint64_t growth = target > live ? target-live : 0;
+                if (admitted_logical_growth <= UINT64_MAX-growth) {
+                    admitted_logical_growth += growth;
+                } else {
+                    admitted_logical_growth = UINT64_MAX;
+                }
+            }
+        }
+        uint64_t projected_cells = 0;
+        auto * memory = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+        if (!memory || !memory->vbr_capture_readiness_cells(
+                admitted_logical_growth,
+                input.device_committed_cells,
+                projected_cells,
+                input.device_capacity_cells) ||
+            projected_cells < input.device_committed_cells) {
+            input.device_capacity_cells = 0;
+        } else {
+            input.admitted_growth_cells =
+                projected_cells-input.device_committed_cells;
+        }
+        // Decode-driven pre-pressure capture must leave enough device runway
+        // for the active request to keep advancing while the background D2H
+        // completes. A normal idle capture is cancelled before a new request
+        // mutates the source, so reserving that same runway would permanently
+        // reject every useful frontier in the upper half of a context.
+        input.emergency_cells = reserve_decode_runway
+            ? std::min<uint64_t>(
+                SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS,
+                input.device_capacity_cells)
+            : 0;
+        input.conservative_bandwidth_bytes_per_second =
+            vbr_capture_readiness_estimator
+                ? vbr_capture_readiness_estimator->
+                    conservative_bandwidth_bytes_per_second()
+                : 0;
+        input.conservative_growth_cells_per_second =
+            reserve_decode_runway && vbr_capture_readiness_estimator
+                ? vbr_capture_readiness_estimator->
+                    conservative_growth_cells_per_second()
+                : 0;
+        return input;
+    }
+
     // fork 9l-d2c: cache-control authority (fork server-context.cpp 3642-3648).
     // Lazily constructed by its scheduler-only cache-control task; the fork's
     // destroy() closes it before prompt_cache because host proofs point into
