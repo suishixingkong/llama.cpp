@@ -1822,6 +1822,46 @@ private:
     bool armed_ = false;
 };
 
+// fork 9l-d3c2: retention metadata wiring for standalone owners (fork server-context.cpp 3373-3410)
+static void server_wire_live_retention_metadata(
+        server_retention_sidecar_store & owner,
+        std::vector<server_slot> & slots,
+        common_retention_pool pool) {
+    for (auto & slot : slots) {
+        slot.retention_obs = &owner;
+        slot.retention_pool = pool;
+    }
+}
+
+static void server_request_retention_prefix_tracking(
+        server_retention_sidecar_store & owner,
+        server_prompt_cache * prompt_cache,
+        const server_retention_owner_plan & plan) {
+    bool workspace_ready = !plan.prompt_shadow_workspace;
+    if (prompt_cache && plan.prompt_shadow_workspace) {
+        workspace_ready = prompt_cache->enable_retention_shadow();
+    }
+    if (plan.prefix_tracking && workspace_ready) {
+        (void) owner.enable_prefix_tracking();
+    }
+}
+
+static void server_wire_standalone_retention_metadata(
+        server_retention_sidecar_store & owner,
+        std::vector<server_slot> & slots,
+        server_prompt_cache * prompt_cache,
+        common_retention_pool pool,
+        const server_retention_owner_plan & plan) {
+    GGML_ASSERT(plan.owner ==
+        server_retention_owner_kind::standalone_metadata);
+    owner.configure(nullptr, {}, nullptr);
+    server_wire_live_retention_metadata(owner, slots, pool);
+    if (prompt_cache) {
+        prompt_cache->retention_obs = &owner;
+    }
+    server_request_retention_prefix_tracking(owner, prompt_cache, plan);
+}
+
 //
 // server_context_impl (private implementation)
 //

@@ -1814,6 +1814,33 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+// fork 9l-d3c2: the shadow workspace allocator (fork server-task.cpp 1838-1862)
+bool server_prompt_cache::enable_retention_shadow() noexcept {
+    if (!retention_shadow_rows) {
+        retention_shadow_rows.reset(new (std::nothrow)
+            server_prompt_cache_shadow_row[
+                SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES]);
+    }
+    if (!retention_shadow_rows || !retention_capacity_authority) {
+        return bool(retention_shadow_rows);
+    }
+    if (retention_shadow_artifacts && retention_shadow_lineages) {
+        return true;
+    }
+    std::unique_ptr<server_prompt_cache_shadow_artifact_slot[]> artifacts(
+        new (std::nothrow) server_prompt_cache_shadow_artifact_slot[
+            SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY]);
+    std::unique_ptr<server_prompt_cache_shadow_lineage_slot[]> lineages(
+        new (std::nothrow) server_prompt_cache_shadow_lineage_slot[
+            SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY]);
+    if (!artifacts || !lineages) {
+        return false;
+    }
+    retention_shadow_artifacts = std::move(artifacts);
+    retention_shadow_lineages = std::move(lineages);
+    return true;
+}
+
 //
 // server_prompt_cache
 //

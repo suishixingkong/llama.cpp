@@ -19,6 +19,8 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "server-cache-lease.h"
+// fork 9l-d3c2: the shadow workspace constants live in the retention sidecar header
+#include "server-retention-sidecar.h"
 
 
 // group A phase 2: verbatim from the fork server-task.h
@@ -739,6 +741,71 @@ struct server_prompt {
     }
 };
 
+// fork 9l-d3c2: prompt-shadow workspace types (fork server-task.h 1137-1199)
+constexpr size_t SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES =
+    SERVER_RETENTION_MAX_CANDIDATES;
+
+enum class server_prompt_cache_shadow_status : uint8_t {
+    unavailable = 0,
+    complete,
+};
+
+struct server_prompt_cache_shadow_event {
+    server_prompt_cache_shadow_status status =
+        server_prompt_cache_shadow_status::unavailable;
+    server_cache_destruction_reason reason =
+        server_cache_destruction_reason::host_capacity;
+    uint64_t competition_epoch = 0;
+    uint64_t candidate_count = 0;
+    llama_cache_acct_artifact_id incumbent_artifact;
+    llama_cache_acct_artifact_id proposed_artifact;
+    uint64_t incumbent_lineage = 0;
+    uint64_t proposed_lineage = 0;
+    common_retention_pool proposed_pool = common_retention_pool::attention;
+    uint64_t proposed_lost_work = 0;
+    uint64_t proposed_resource = 0;
+    bool agrees = false;
+};
+
+struct server_prompt_cache_shadow_snapshot {
+    uint64_t pressure_waves = 0;
+    uint64_t choices = 0;
+    uint64_t complete = 0;
+    uint64_t unavailable = 0;
+    uint64_t agreements = 0;
+    uint64_t disagreements = 0;
+    server_prompt_cache_shadow_event last;
+};
+
+struct server_prompt_cache_shadow_row {
+    llama_cache_acct_artifact_id artifact_id;
+    server_retention_instance_key instance_key;
+    common_retention_artifact_kind kind =
+        common_retention_artifact_kind::live_slot;
+    common_retention_stamp stamp;
+    common_retention_lineage_record lineage;
+    uint64_t external_shared_coverage_tokens = 0;
+    uint64_t resource = 0;
+    bool backing_known = false;
+    bool releasable = false;
+};
+
+constexpr size_t SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY =
+    2*SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES;
+
+struct server_prompt_cache_shadow_artifact_slot {
+    uint64_t artifact_id = 0;
+    uint32_t row_index = 0;
+};
+
+struct server_prompt_cache_shadow_lineage_slot {
+    uint64_t lineage_id = 0;
+    uint64_t maximum_coverage = 0;
+    uint64_t second_coverage = 0;
+    uint32_t maximum_count = 0;
+    common_retention_pool pool = common_retention_pool::attention;
+};
+
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_cache_payload payload;
@@ -1279,6 +1346,24 @@ struct server_prompt_cache {
     ~server_prompt_cache() {
         detach_active_storage_accounting();
     }
+
+// fork 9l-d3c2: destination gate for the shadow workspace (fork server-task.h 1702)
+    bool retention_capacity_authority = false;
+
+// fork 9l-d3c2: shadow workspace allocator + snapshot accessor (fork server-task.h 1730-1734)
+    bool enable_retention_shadow() noexcept;
+
+    server_prompt_cache_shadow_snapshot retention_shadow_snapshot() const noexcept {
+        return retention_shadow;
+    }
+
+// fork 9l-d3c2: the four shadow members (fork server-task.h 1796-1801)
+    std::unique_ptr<server_prompt_cache_shadow_row[]> retention_shadow_rows;
+    std::unique_ptr<server_prompt_cache_shadow_artifact_slot[]>
+        retention_shadow_artifacts;
+    std::unique_ptr<server_prompt_cache_shadow_lineage_slot[]>
+        retention_shadow_lineages;
+    server_prompt_cache_shadow_snapshot retention_shadow;
 
 };
 
