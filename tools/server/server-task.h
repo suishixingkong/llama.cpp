@@ -798,6 +798,11 @@ struct server_prompt_cache_shadow_artifact_slot {
     uint32_t row_index = 0;
 };
 
+// fork server-task.h:1111 -- forward declaration so publish_authority can be
+// spelled as a pointer member (the fork declares it just before its own payload
+// leaf struct, which this tree does not carry).
+struct server_cache_authority;
+
 struct server_prompt_cache_shadow_lineage_slot {
     uint64_t lineage_id = 0;
     uint64_t maximum_coverage = 0;
@@ -1342,6 +1347,11 @@ struct server_prompt_cache {
 
     // fork server-task.h:1691
     llama_cache_acct_ledger * acct = nullptr;
+
+    // fork server-task.h:1692-1694
+    // Immutable-host-restore lifecycle authority. Null keeps the consuming legacy path. When present, it
+    // gates publication, makes restore non-consuming, and prepares explicit-eviction releases.
+    server_cache_authority * publish_authority = nullptr;
 
     // FORK-DIFF: the fork's destructor body also calls clear_accounting(),
     // a different (not yet landed) member of the same rewrite. Only the

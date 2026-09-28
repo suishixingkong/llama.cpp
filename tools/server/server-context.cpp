@@ -2251,6 +2251,16 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        // fork 9l-d3e: resolve the host prompt-cache policy from the CLI (fork server-context.cpp 6263-6271)
+        const auto vbr_prompt_cache_mode =
+            common_vbr_prompt_cache_mode_for(params_base);
+        const bool vbr_prompt_cache_automatic =
+            vbr_prompt_cache_mode ==
+                common_vbr_prompt_cache_mode::enabled_automatic;
+        params_base.vbr_prompt_cache =
+            vbr_prompt_cache_automatic ||
+            vbr_prompt_cache_mode ==
+                common_vbr_prompt_cache_mode::enabled_explicit;
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -2803,6 +2813,544 @@ private:
             server_wire_standalone_retention_metadata(
                 *cache_retention_metadata, slots, prompt_cache.get(),
                 live_retention_pool, retention_owner_plan);
+        }
+
+        // fork 9l-d3e: capture manifest + the VBR artifact store (fork server-context.cpp 7829-8365)
+        std::vector<std::string> gpu_descs;
+        std::vector<vbr_artifact_portable_topology>
+            capture_topologies;
+        std::vector<vbr_explicit_capture_runtime_pool>
+            capture_runtime_pools;
+        std::vector<vbr_explicit_capture_pool_binding>
+            capture_pool_bindings;
+        std::vector<vbr_capture_lane> capture_lanes;
+        uint32_t capture_attention_children = 0;
+        bool capture_manifest_enabled = false;
+        size_t capture_resolved_split_count = 0;
+        const char * capture_topology_failure =
+            "cache_authority_unavailable";
+        const bool capture_requested =
+            params_base.cache_lifecycle &&
+            server_vbr_dynamic_active(params_base);
+        int ngl_eff = 0;
+        if (cache_authority) {
+            capture_topology_failure = "topology_not_built";
+            const auto observer_domain = llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::not_applicable);
+            const auto host_domain = llama_cache_acct_resource_domain::non_device(
+                llama_cache_acct_residency::pageable_host);
+
+            // Manifest ordering: resolve effective placement, build/intern every
+            // usable device domain, and retain its
+            // runtime device binding BEFORE the one-shot producer manifest is configured.
+            // The topology must use the loader's effective placement weights.
+            // Raw CLI weights are all zero for automatic multi-device placement,
+            // while the loader has already resolved them from device capacity.
+            std::vector<ggml_backend_dev_t> gpu_devices;
+            std::vector<std::string> gpu_identities;
+            if (params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                const int32_t n_model_devices =
+                    llama_model_n_devices(model_tgt);
+                for (int32_t i = 0; i < n_model_devices; ++i) {
+                    auto * dev = llama_model_get_device(model_tgt, i);
+                    if (dev != nullptr &&
+                        ggml_backend_dev_type(dev) ==
+                            GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(
+                            ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
+            } else if (!params_base.devices.empty()) {
+                // the explicit --device list is nullptr-TERMINATED (parse_device_list);
+                // "none" is a single nullptr -> empty -> "cpu"
+                for (auto * dev : params_base.devices) {
+                    if (dev) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    auto * dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu_devices.push_back(dev);
+                        gpu_descs.push_back(ggml_backend_dev_description(dev));
+                        gpu_identities.push_back(
+                            std::string(ggml_backend_dev_name(dev)) + "\n" +
+                            ggml_backend_dev_description(dev));
+                    }
+                }
+            }
+            // Auto-fit writes the resolved layer count back into params. A remaining
+            // negative sentinel means the loader's negative-is-all default.
+            ngl_eff = params_base.n_gpu_layers >= 0
+                ? params_base.n_gpu_layers
+                : llama_model_n_layer(model_tgt) + 1;
+            if (ngl_eff > 0 && !gpu_identities.empty()) {
+                std::vector<float> resolved_split(gpu_identities.size());
+                const size_t resolved_count =
+                    llama_model_resolved_tensor_split(
+                        model_tgt, resolved_split.data(),
+                        resolved_split.size());
+                capture_resolved_split_count = resolved_count;
+                llama_cache_acct_shard_topology topology;
+                const int32_t topology_main_device =
+                    params_base.split_mode == LLAMA_SPLIT_MODE_NONE
+                        ? 0
+                        : params_base.main_gpu;
+                if (resolved_count == gpu_identities.size() &&
+                    llama_cache_acct_build_shard_topology(
+                        gpu_identities,
+                        int16_t(params_base.split_mode),
+                        topology_main_device,
+                        resolved_split.data(),
+                        topology)) {
+                    if (capture_requested) {
+                        capture_topologies.push_back(topology);
+                    }
+                    for (size_t i = 0; i < gpu_identities.size(); ++i) {
+                        llama_cache_acct_resource_domain domain;
+                        if (!cache_authority->ledger.make_device_domain(
+                                topology,
+                                llama_cache_acct_device_ordinal{ uint16_t(i) },
+                                domain)) {
+                            cache_authority_config_failed(true);
+                            cache_authority->live_device_domains.clear();
+                            break;
+                        }
+                        cache_authority->live_device_domains.push_back({
+                            gpu_devices[i], domain,
+                        });
+                    }
+                    if (cache_authority->configured) {
+                        capture_topology_failure =
+                            "runtime_pool_discovery_failed";
+                    } else {
+                        capture_topology_failure =
+                            "device_domain_unavailable";
+                    }
+                } else {
+                    capture_topology_failure =
+                        resolved_count == gpu_identities.size()
+                            ? "invalid_resolved_split"
+                            : "resolved_split_device_mismatch";
+                    cache_authority_config_failed(true);
+                }
+            } else {
+                capture_topology_failure = ngl_eff <= 0
+                    ? "no_gpu_layers"
+                    : "no_gpu_model_device";
+            }
+
+            // Capture construction discovery is read-only and occurs before the
+            // one-shot C manifest. Every attention child and every pool must
+            // be armed and exactly attributable to a topology device.
+            if (capture_requested &&
+                cache_authority->configured &&
+                capture_topologies.size() == 1 &&
+                vbr_explicit_capture_runtime_pools(
+                    *llama_get_memory(ctx_tgt),
+                    capture_runtime_pools,
+                    capture_attention_children)) {
+                capture_topology_failure =
+                    "runtime_pool_binding_failed";
+                for (const auto & pool : capture_runtime_pools) {
+                    const auto domain = std::find_if(
+                        cache_authority->live_device_domains.begin(),
+                        cache_authority->live_device_domains.end(),
+                        [&](const auto & binding) {
+                            return binding.device ==
+                                pool.backend_device;
+                        });
+                    if (domain ==
+                        cache_authority->live_device_domains.end()) {
+                        capture_pool_bindings.clear();
+                        capture_lanes.clear();
+                        break;
+                    }
+                    auto lane = std::find_if(
+                        capture_lanes.begin(), capture_lanes.end(),
+                        [&](const auto & candidate) {
+                            return candidate.device ==
+                                pool.backend_device;
+                        });
+                    uint32_t lane_index = 0;
+                    if (lane == capture_lanes.end()) {
+                        ggml_backend_t ring_backend = pool.backend;
+                        if (ring_backend == nullptr) {
+                            ring_backend =
+                                ctx_tgt->backend_for_device(
+                                    pool.backend_device);
+                            if (ring_backend == nullptr) {
+                                capture_pool_bindings.clear();
+                                capture_lanes.clear();
+                                break;
+                            }
+                        }
+                        lane_index = uint32_t(capture_lanes.size());
+                        capture_lanes.push_back({
+                            pool.backend_device, ring_backend, false,
+                        });
+                    } else {
+                        lane_index = uint32_t(
+                            lane - capture_lanes.begin());
+                    }
+                    capture_pool_bindings.push_back({
+                        pool.instance_id,
+                        pool.device,
+                        0,
+                        domain->domain.device_ordinal.v,
+                        lane_index,
+                    });
+                }
+                capture_manifest_enabled =
+                    !capture_pool_bindings.empty() &&
+                    !capture_lanes.empty() &&
+                    capture_pool_bindings.size() ==
+                        capture_runtime_pools.size();
+                if (capture_manifest_enabled) {
+                    capture_topology_failure = "none";
+                }
+            }
+
+            // C schema-v2 completeness manifest is owned by configuration, not by either
+            // producer. Device/live-memory rows are part of this SAME one-shot call; no
+            // producer is allowed to append its own domain after cells exist.
+            // Artifact cells and the pinned domain therefore precede ring-budget
+            // admission. If that later admission refuses the ring, these manifested
+            // cells remain certified measured-zero. This is intentional, harmless,
+            // limited to lifecycle+armed VBR, and must not become a second manifest.
+            std::vector<llama_cache_acct_completeness_requirement> required;
+            required.reserve(
+                4 + cache_authority->live_device_domains.size());
+            required.push_back({
+                observer_domain, llama_cache_acct_producer::observer_init,
+            });
+            if (prompt_cache) {
+                required.push_back({
+                    host_domain, llama_cache_acct_producer::host_cache,
+                });
+            }
+            required.push_back({
+                host_domain, llama_cache_acct_producer::retention_sidecar,
+            });
+            const auto pinned_domain =
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pinned_host);
+            if (capture_manifest_enabled) {
+                required.push_back({
+                    pinned_domain,
+                    llama_cache_acct_producer::retention_sidecar,
+                });
+            }
+            for (const auto & binding : cache_authority->live_device_domains) {
+                required.push_back({
+                    binding.domain, llama_cache_acct_producer::live_memory,
+                });
+            }
+            if (!cache_authority->ledger.configure_required_producers(
+                    required.data(), required.size())) {
+                cache_authority_config_failed(false);
+            }
+            if (capture_manifest_enabled) {
+                // Capture reservations span pageable metadata/companions and
+                // topology-qualified device payloads. This runs BEFORE the
+                // ordinary host/live producers below, so it co-initializes every
+                // host-scope participating cell in this domain to measured-zero —
+                // including the legacy host-cache cells (full_snapshot/checkpoint_state/
+                // typed_accelerator) — so the host domain is complete when the
+                // store's first host reservation prices it. The later host-accounting block
+                // re-gauges those same cells to the same 0 (gauge_set is idempotent),
+                // so this co-init is load-bearing but behavior-neutral.
+                if (!server_vbr_artifact_store_observe_empty_accounting(
+                        cache_authority->ledger, host_domain)) {
+                    cache_authority_config_failed(true);
+                }
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    if (!server_vbr_artifact_store_observe_empty_accounting(
+                            cache_authority->ledger,
+                            binding.domain)) {
+                        cache_authority_config_failed(true);
+                    }
+                }
+                if (!server_vbr_artifact_store_configure_pinned_accounting(
+                        cache_authority->ledger, pinned_domain)) {
+                    cache_authority_config_failed(true);
+                }
+            }
+            cache_authority->retention.configure(
+                &cache_authority->ledger, host_domain, &cache_authority->leases);
+            for (const auto measure : {
+                    llama_cache_acct_measure::logical_payload,
+                    llama_cache_acct_measure::resident_allocated,
+                    llama_cache_acct_measure::reserved }) {
+                cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::
+                        artifact_descriptor_metadata,
+                    host_domain, measure, 0);
+            }
+
+            // Host-cache absence is itself an observed zero. Initialize the
+            // transactional leaves before an optional cache attaches; later C
+            // transactions update these same resident/reserved cells.
+            for (const auto cat : {
+                    llama_cache_acct_category::full_snapshot_payload,
+                    llama_cache_acct_category::checkpoint_state_payload,
+                    llama_cache_acct_category::typed_accelerator_payload,
+                    llama_cache_acct_category::transfer_staging }) {
+                for (const auto measure : {
+                        llama_cache_acct_measure::logical_payload,
+                        llama_cache_acct_measure::resident_allocated,
+                        llama_cache_acct_measure::reserved }) {
+                    cache_authority->ledger.gauge_set(
+                        cat, host_domain, measure, 0);
+                }
+            }
+            if (prompt_cache) {
+                // Empty-cache gauges are real observations. Certification follows them,
+                // rather than merely proving that wiring code ran.
+                (void) cache_authority->ledger.certify_complete(
+                    host_domain, llama_cache_acct_producer::host_cache);
+            }
+            if (capture_manifest_enabled) {
+                for (const auto category : {
+                        llama_cache_acct_category::
+                            artifact_reference_metadata,
+                        llama_cache_acct_category::transfer_staging,
+                        llama_cache_acct_category::codec_workspace }) {
+                    for (const auto measure : {
+                            llama_cache_acct_measure::logical_payload,
+                            llama_cache_acct_measure::resident_allocated,
+                            llama_cache_acct_measure::reserved }) {
+                        cache_authority->ledger.gauge_set(
+                            category, host_domain, measure, 0);
+                    }
+                }
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    for (const auto category : {
+                            llama_cache_acct_category::unit_version_payload,
+                            llama_cache_acct_category::clean_stash_payload,
+                            llama_cache_acct_category::transfer_staging,
+                            llama_cache_acct_category::codec_workspace }) {
+                        for (const auto measure : {
+                                llama_cache_acct_measure::logical_payload,
+                                llama_cache_acct_measure::resident_allocated,
+                                llama_cache_acct_measure::reserved }) {
+                            cache_authority->ledger.gauge_set(
+                                category, binding.domain, measure, 0);
+                        }
+                    }
+                }
+            }
+            (void) cache_authority->ledger.certify_complete(
+                host_domain,
+                llama_cache_acct_producer::retention_sidecar);
+            // the parked rolling-window tape's zero is OBSERVED, not implied: an explicit
+            // measured-zero gauge, distinct from every unknown cell
+            cache_authority->ledger.gauge_set(
+                    llama_cache_acct_category::rolling_window_tape,
+                    observer_domain,
+                    llama_cache_acct_measure::logical_payload, 0);
+            (void) cache_authority->ledger.certify_complete(
+                observer_domain, llama_cache_acct_producer::observer_init);
+
+            // Observe real resident allocations before certifying live_memory. A failed
+            // attribution leaves every affected domain unavailable; a measured zero is
+            // valid (e.g. no recurrent layers on an attention-only target).
+            if (!cache_plan_observe_live_memory(true)) {
+                cache_authority_config_failed(true);
+            }
+            if (!cache_plan_configure_budget()) {
+                cache_authority_config_failed(true);
+            }
+            if (capture_manifest_enabled) {
+                std::vector<llama_cache_acct_resource_domain>
+                    capture_accounting_domains;
+                capture_accounting_domains.reserve(
+                    2 + cache_authority->live_device_domains.size());
+                capture_accounting_domains.push_back(host_domain);
+                capture_accounting_domains.push_back(pinned_domain);
+                for (const auto & binding :
+                        cache_authority->live_device_domains) {
+                    capture_accounting_domains.push_back(
+                        binding.domain);
+                }
+                if (!server_vbr_artifact_store_verify_accounting(
+                        cache_authority->ledger,
+                        capture_accounting_domains)) {
+                    cache_authority_config_failed(true);
+                }
+            }
+
+            // Establish an initial coherent budget object so lifecycle-only is a fully configured
+            // authority, not merely a set of producer pointers. Each admission re-samples physical
+            // capacity before composing, because free memory is time-sensitive.
+            if (!cache_authority->sample_budget(cache_authority->budget_config) ||
+                !cache_authority->budget.reset(
+                    cache_authority->ledger.snapshot(),
+                    cache_authority->budget_config)) {
+                cache_authority_config_failed(false);
+            }
+
+            if (capture_manifest_enabled &&
+                cache_authority->configured) {
+                server_vbr_artifact_store_config config;
+                config.ledger = &cache_authority->ledger;
+                config.pinned_domain = pinned_domain;
+                config.topologies = capture_topologies;
+                config.pool_bindings = capture_pool_bindings;
+                config.lanes = capture_lanes;
+                config.attention_children =
+                    capture_attention_children;
+                static constexpr uint64_t RING_FLOOR =
+                    64ull*1024*1024;
+                static constexpr size_t RING_CHUNK =
+                    8ull*1024*1024;
+                const uint64_t lane_floor =
+                    uint64_t(config.lanes.size())*2*RING_CHUNK;
+                config.ring_bytes = std::min<uint64_t>(
+                    VBR_CAPTURE_PINNED_RING_MAX_BYTES,
+                    std::max<uint64_t>(RING_FLOOR, lane_floor));
+                config.chunk_bytes = RING_CHUNK;
+                config.budget_context = cache_authority.get();
+                config.sample_budget = [](
+                        void * context,
+                        llama_cache_budget_config & output) noexcept {
+                    auto * authority =
+                        static_cast<server_cache_authority *>(context);
+                    return authority->sample_budget(output);
+                };
+                server_vbr_artifact_capture_status status;
+                server_vbr_artifact_store_create_diagnostics diagnostics;
+                vbr_artifact_store =
+                    server_vbr_artifact_store::create(
+                        config, status, &diagnostics);
+                vbr_prompt_cache_store_status = status;
+                vbr_prompt_cache_store_diagnostics = diagnostics;
+                if (!vbr_artifact_store) {
+                    SRV_WRN(
+                        "VBR_ARTIFACT_CAPTURE store unavailable status=%s "
+                        "failure=%s ring_status=%s ring_failure=%s "
+                        "attention_children=%u lanes=%zu "
+                        "requested_ring=%" PRIu64
+                        " attempted_ring=%" PRIu64
+                        " chunk=%zu\n",
+                        server_vbr_artifact_capture_status_name(status),
+                        server_vbr_artifact_store_create_failure_name(
+                            diagnostics.failure),
+                        vbr_capture_stream_status_name(
+                            diagnostics.ring_status),
+                        vbr_capture_ring_create_failure_name(
+                            diagnostics.ring_failure),
+                        diagnostics.attention_children,
+                        diagnostics.lane_count,
+                        diagnostics.requested_ring_bytes,
+                        diagnostics.attempted_ring_bytes,
+                        diagnostics.chunk_bytes);
+                } else {
+                    vbr_capture_readiness_estimator = std::make_unique<
+                        server_vbr_capture_readiness_estimator>();
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::supported;
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE store ready "
+                        "attention_children=%u lanes=%zu "
+                        "requested_ring=%" PRIu64
+                        " constructed_ring=%" PRIu64
+                        " chunk=%zu\n",
+                        diagnostics.attention_children,
+                        diagnostics.lane_count,
+                        diagnostics.requested_ring_bytes,
+                        diagnostics.constructed_ring_bytes,
+                        diagnostics.chunk_bytes);
+                }
+            }
+
+            if (params_base.vbr_prompt_cache && !vbr_artifact_store) {
+                // Classify failures that occur before the store constructor as
+                // explicitly as constructor-owned failures. Automatic
+                // activation continues live-only; an explicit request remains
+                // a strict startup contract.
+                if (!capture_manifest_enabled) {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            artifact_topology_unavailable;
+                    SRV_WRN(
+                        "VBR_ARTIFACT_CAPTURE topology unavailable "
+                        "reason=%s devices=%zu resolved_split=%zu "
+                        "topologies=%zu runtime_pools=%zu bindings=%zu "
+                        "lanes=%zu attention_children=%u\n",
+                        capture_topology_failure,
+                        gpu_identities.size(),
+                        capture_resolved_split_count,
+                        capture_topologies.size(),
+                        capture_runtime_pools.size(),
+                        capture_pool_bindings.size(),
+                        capture_lanes.size(),
+                        capture_attention_children);
+                } else if (!cache_authority->configured) {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            accounting_unavailable;
+                } else {
+                    vbr_prompt_cache_support =
+                        server_vbr_prompt_cache_support_status::
+                            artifact_store_unavailable;
+                }
+                const auto fallback =
+                    server_vbr_prompt_cache_fallback_action_for(
+                        vbr_prompt_cache_automatic,
+                        vbr_prompt_cache_support);
+                if (fallback ==
+                        server_vbr_prompt_cache_fallback_action::live_only) {
+                    params_base.vbr_prompt_cache = false;
+                    params_base.cache_idle_slots = false;
+                    params_base.cache_ram_mib = 0;
+                    prompt_cache.reset();
+                    SRV_WRN(
+                        "automatic dynamic VBR host caching "
+                        "fallback=live_only reason=%s store_status=%s "
+                        "store_failure=%s; cache-ram disabled\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            vbr_prompt_cache_support),
+                        server_vbr_artifact_capture_status_name(
+                            vbr_prompt_cache_store_status),
+                        server_vbr_artifact_store_create_failure_name(
+                            vbr_prompt_cache_store_diagnostics.failure));
+                } else {
+                    SRV_ERR(
+                        "--vbr-prompt-cache is unavailable reason=%s "
+                        "store_status=%s store_failure=%s\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            vbr_prompt_cache_support),
+                        server_vbr_artifact_capture_status_name(
+                            vbr_prompt_cache_store_status),
+                        server_vbr_artifact_store_create_failure_name(
+                            vbr_prompt_cache_store_diagnostics.failure));
+                    return false;
+                }
+            }
+
+            if (prompt_cache) {
+                prompt_cache->acct = &cache_authority->ledger;
+                if (params_base.cache_lifecycle) {
+                    prompt_cache->publish_authority =
+                        cache_authority.get();
+                }
+            }
+        }
+
+        if (cache_plan_obs) {
+            SRV_INF("%s", "cache-debug enabled: observed cache decisions per request (JSON log + /slots.cache_plan)\n");
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -8017,6 +8565,9 @@ private:
         vbr_idle_frontier_queries;
     // fork server-context.cpp:3540
     std::unique_ptr<server_retention_sidecar_store> cache_retention_metadata;
+    // fork server-context.cpp:3630-3631
+    std::unique_ptr<server_vbr_capture_readiness_estimator>
+        vbr_capture_readiness_estimator;
 
     // fork server-context.cpp:5464  (6 lines)
     server_retention_sidecar_store * live_retention_owner() noexcept {
@@ -8546,6 +9097,14 @@ private:
     }
 
     std::unique_ptr<server_cache_plan_observer> cache_plan_obs;
+
+    // fork 9l-d3e: the authority configuration failure hook (fork server-context.cpp 3657-3662)
+    void cache_authority_config_failed(bool mirror_to_shadow) noexcept {
+        cache_authority->configured = false;
+        if (mirror_to_shadow && cache_plan_obs) {
+            cache_plan_obs->shadow_unavailable++;
+        }
+    }
     std::thread::id cache_plan_preflight_scheduler_thread;
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
     std::vector<int32_t> vbr_retention_candidate_by_seq;
