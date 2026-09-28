@@ -995,6 +995,61 @@ inline server_retention_owner_plan server_retention_owner_plan_for(
 
 struct server_prompt_cache;
 
+// fork 9l-d4b1: the capacity-claim value layer (fork server-task.h 872-885, 922-959)
+enum class server_prompt_cache_vbr_refresh_status : uint8_t {
+    updated_with_anchor = 0,
+    updated_compact_only,
+    unchanged,
+    not_found,
+    ambiguous,
+    busy,
+    budget_refused,
+    accounting_unavailable,
+    invalid,
+    internal_error,
+    _count,
+};
+
+// Scheduler-thread citation that the complete conservative fresh-capture
+// batch fits the ordinary prompt-cache limits. Pressure support is limited to
+// one incoming row and at most two canonically selected compact VBR victims;
+// the ordinary publication terminal remains the sole eviction authority.
+class server_prompt_cache_vbr_capacity_claim {
+public:
+    server_prompt_cache_vbr_capacity_claim() = default;
+    ~server_prompt_cache_vbr_capacity_claim() = default;
+    server_prompt_cache_vbr_capacity_claim(
+        const server_prompt_cache_vbr_capacity_claim &) = delete;
+    server_prompt_cache_vbr_capacity_claim & operator=(
+        const server_prompt_cache_vbr_capacity_claim &) = delete;
+    server_prompt_cache_vbr_capacity_claim(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept;
+    server_prompt_cache_vbr_capacity_claim & operator=(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept;
+
+    bool ready() const noexcept { return cache_ != nullptr; }
+    bool requires_publication_revalidation() const noexcept {
+        return ready() && victim_count_ != 0;
+    }
+
+private:
+    void clear() noexcept;
+    server_prompt_cache * cache_ = nullptr;
+    std::array<server_prompt_cache_state *, 2> victims_ {};
+    std::array<llama_cache_acct_artifact_id, 2> victim_artifacts_ {};
+    size_t victim_count_ = 0;
+    llama_cache_acct_artifact_id destination_artifact_;
+    uint64_t incoming_compact_bytes_ = 0;
+    size_t incoming_tokens_ = 0;
+    std::thread::id scheduler_owner_;
+    friend struct server_prompt_cache;
+};
+
+struct server_prompt_cache_vbr_pressure_citation {
+    std::array<llama_cache_acct_artifact_id, 2> artifacts {};
+    size_t count = 0;
+};
+
 enum class server_prompt_cache_vbr_capacity_status : uint8_t {
     invalid,
     fit,

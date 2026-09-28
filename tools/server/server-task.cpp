@@ -2089,6 +2089,51 @@ static size_t server_prompt_cache_effective_token_limit(
     return std::max<size_t>(limit_tokens, limit_size / size_per_token);
 }
 
+// fork 9l-d4b1: server_prompt_cache_vbr_capacity_claim members (fork server-task.cpp 2094-2136)
+
+server_prompt_cache_vbr_capacity_claim::
+server_prompt_cache_vbr_capacity_claim(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept
+    : cache_(other.cache_),
+      victims_(other.victims_),
+      victim_artifacts_(other.victim_artifacts_),
+      victim_count_(other.victim_count_),
+      destination_artifact_(other.destination_artifact_),
+      incoming_compact_bytes_(other.incoming_compact_bytes_),
+      incoming_tokens_(other.incoming_tokens_),
+      scheduler_owner_(other.scheduler_owner_) {
+    other.clear();
+}
+
+server_prompt_cache_vbr_capacity_claim &
+server_prompt_cache_vbr_capacity_claim::operator=(
+        server_prompt_cache_vbr_capacity_claim && other) noexcept {
+    if (this != &other) {
+        cache_ = other.cache_;
+        victims_ = other.victims_;
+        victim_artifacts_ = other.victim_artifacts_;
+        victim_count_ = other.victim_count_;
+        destination_artifact_ = other.destination_artifact_;
+        incoming_compact_bytes_ = other.incoming_compact_bytes_;
+        incoming_tokens_ = other.incoming_tokens_;
+        scheduler_owner_ = other.scheduler_owner_;
+        other.clear();
+    }
+    return *this;
+}
+
+void server_prompt_cache_vbr_capacity_claim::clear() noexcept {
+    cache_ = nullptr;
+    victims_ = {};
+    victim_artifacts_ = {};
+    victim_count_ = 0;
+    destination_artifact_ = {};
+    incoming_compact_bytes_ = 0;
+    incoming_tokens_ = 0;
+    scheduler_owner_ = {};
+}
+
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
