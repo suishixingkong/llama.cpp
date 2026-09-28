@@ -1331,6 +1331,15 @@ struct server_prompt_cache {
     // fork 9l-d4b2 (fork server-task.h 1661-1662)
     void abandon_vbr_publication_metadata(
         server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    // fork 9l-d4b5a (fork server-task.h 1653-1660)
+    bool prepare_vbr_publication_metadata_impl(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        bool stem,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
 
     // fork server-task.h:1391-1397  (7 lines)
     // Exact immutable VBR-frontier presence query. This alone is not a clear
@@ -1367,6 +1376,42 @@ struct server_prompt_cache {
     // This is deliberately separate
     // from fixed-state load()/contains(): VBR restoration is an adopt
     // transaction, not a serialized state-image restore.
+    // fork 9l-d4b5a (fork server-task.h 1429-1453)
+    bool preview_vbr_compact_refresh_capacity(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        uint64_t incoming_compact_bytes) const noexcept;
+
+    // Preallocate and provisionally index one fresh logical VBR host node.
+    // Dropping the move-only metadata rolls back its retention association.
+    bool prepare_vbr_publication_metadata(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    // Prepare a shorter immutable host frontier from an exact prefix of a
+    // longer live prompt. Coverage is a logical-token boundary and must be
+    // strictly inside the source; the full-frontier API above retains its
+    // historical source-prefix sharing behavior.
+    bool prepare_vbr_stem_publication_metadata(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+
+    // fork 9l-d4b5a (fork server-task.h 1475-1476)
+    bool consume_vbr_publication_capacity(
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept;
+
+    // fork 9l-d4b5a (fork server-task.h 1598-1599)
+    bool vbr_retention_source_available(
+            int32_t source_slot) const noexcept;
+
+
     bool prepare_vbr_restore(
         const server_tokens & request_tokens,
         const std::string & execution_identity,

@@ -3119,6 +3119,184 @@ bool server_prompt_cache::prepare_vbr_restore(
     }
 }
 
+// fork 9l-d4b5a: consume_vbr_publication_capacity (fork server-task.cpp 2276-2285)
+bool server_prompt_cache::consume_vbr_publication_capacity(
+        server_prompt_cache_vbr_capacity_claim & claim) noexcept {
+    if (!claim.ready() || claim.cache_ != this ||
+        claim.scheduler_owner_ != std::this_thread::get_id() ||
+        claim.victim_count_ != 0) {
+        return false;
+    }
+    claim.clear();
+    return true;
+}
+
+// fork 9l-d4b5a: preview_vbr_compact_refresh_capacity (fork server-task.cpp 3006-3057)
+bool server_prompt_cache::preview_vbr_compact_refresh_capacity(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        uint64_t incoming_compact_bytes) const noexcept {
+    if (incoming_compact_bytes == 0 || execution_identity.empty() ||
+        adapter_config_key.empty()) {
+        return false;
+    }
+    try {
+        const_iterator target = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact ||
+                it->adapter_config_key != adapter_config_key ||
+                it->vbr_execution_identity != execution_identity ||
+                !server_prompt_cache_vbr_frontier_matches(
+                    source_prompt, it->payload, execution_identity,
+                    adapter_config_key)) {
+                continue;
+            }
+            if (target != states.end()) {
+                return false;
+            }
+            target = it;
+        }
+        if (target == states.end() || target->recovery_pins != 0) {
+            return false;
+        }
+        if (limit_size == 0) {
+            return true;
+        }
+        const auto * variants = target->payload.vbr_variants();
+        const auto compact = variants ? variants->compact_current() : nullptr;
+        if (!compact) {
+            return false;
+        }
+        const uint64_t committed = size();
+        // Only claim release credit when this logical row is the sole compact
+        // owner. Shared owners remain charged until the exact refresh terminal
+        // proves their union after publication.
+        const uint64_t replaceable =
+            target->payload.vbr_retirement_exclusive()
+                ? compact->resident_bytes() : 0;
+        const uint64_t base = committed >= replaceable
+            ? committed-replaceable : committed;
+        return incoming_compact_bytes <= UINT64_MAX-base &&
+            fits_bytes(base+incoming_compact_bytes);
+    } catch (...) {
+        return false;
+    }
+}
+
+// fork 9l-d4b5a: the publication-metadata preparation trio (fork server-task.cpp 4023-4033, 4035-4045, 4047-4126)
+bool server_prompt_cache::prepare_vbr_publication_metadata(
+        const server_prompt & source_prompt,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    return prepare_vbr_publication_metadata_impl(
+        source_prompt, source_prompt.n_tokens(), false,
+        execution_identity, std::move(adapter_config_key), source_slot,
+        prepared);
+}
+bool server_prompt_cache::prepare_vbr_stem_publication_metadata(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    return prepare_vbr_publication_metadata_impl(
+        source_prompt, coverage_tokens, true, execution_identity,
+        std::move(adapter_config_key), source_slot, prepared);
+}
+bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
+        const server_prompt & source_prompt,
+        int64_t coverage_tokens,
+        bool stem,
+        const std::string & execution_identity,
+        std::string adapter_config_key,
+        int32_t source_slot,
+        server_prompt_cache_vbr_publication_metadata & prepared) noexcept {
+    if (prepared.ready() || !acct || !retention_obs || source_slot < 0 ||
+        execution_identity.empty() || adapter_config_key.empty() ||
+        source_prompt.tokens.empty() ||
+        coverage_tokens <= 0 ||
+        coverage_tokens > source_prompt.n_tokens() ||
+        (stem && source_prompt.sequence_epoch == 0) ||
+        !retention_obs->prefix_tracking_enabled() ||
+        !retention_obs->prefix_tracking_available() ||
+        !vbr_retention_source_available(source_slot)) {
+        return false;
+    }
+    std::array<uint8_t, 32> source_prefix_digest = {};
+    if (stem &&
+        !source_prompt.tokens.retention_token_prefix_digest(
+            size_t(coverage_tokens), source_prefix_digest)) {
+        return false;
+    }
+    std::list<server_prompt_cache_state> entry;
+    try {
+        entry.emplace_back();
+        auto & state = entry.front();
+        state.prompt.tokens = source_prompt.tokens.clone();
+        if (stem) {
+            state.prompt.tokens.keep_first(size_t(coverage_tokens));
+        }
+        state.prompt.sequence_epoch = source_prompt.sequence_epoch;
+        state.adapter_config_key = std::move(adapter_config_key);
+        state.vbr_execution_identity = execution_identity;
+    } catch (...) {
+        return false;
+    }
+    auto & state = entry.front();
+    const auto source_key =
+        server_retention_instance_key::for_slot(source_slot);
+    const auto destination_key =
+        server_retention_instance_key::for_host_entry(&state);
+    const bool mirrored =
+        !server_fault("vbr_prompt_cache_prefix_fail") &&
+        server_prompt_cache_mirror_artifact_clone(
+            *this,
+            source_key, common_retention_artifact_kind::live_slot,
+            source_slot,
+            destination_key, common_retention_artifact_kind::host_entry,
+            -1,
+            state.prompt, state.adapter_config_key,
+            state.prompt.n_tokens(),
+            stem ? server_prompt_cache_prefix_clone_mode::publish_stem
+                 : server_prompt_cache_prefix_clone_mode::publish_from_prompt,
+            source_prompt.n_tokens());
+    if (!mirrored) {
+        retention_obs->retire(destination_key);
+        return false;
+    }
+    const auto source_artifact = retention_obs->artifact_id(source_key);
+    const auto destination_artifact =
+        retention_obs->artifact_id(destination_key);
+    if (source_artifact.v == 0 || destination_artifact.v == 0) {
+        retention_obs->retire(destination_key);
+        return false;
+    }
+    prepared.cache_ = this;
+    prepared.source_ = &source_prompt;
+    prepared.source_slot_ = source_slot;
+    prepared.source_artifact_ = source_artifact;
+    prepared.destination_artifact_ = destination_artifact;
+    prepared.source_sequence_epoch_ = source_prompt.sequence_epoch;
+    prepared.coverage_tokens_ = uint64_t(coverage_tokens);
+    prepared.source_prefix_digest_ = source_prefix_digest;
+    prepared.stem_ = stem;
+    prepared.entry_.splice(prepared.entry_.end(), entry);
+    return true;
+}
+
+// fork 9l-d4b5a: vbr_retention_source_available (fork server-task.cpp 7272-7277)
+bool server_prompt_cache::vbr_retention_source_available(
+        int32_t source_slot) const noexcept {
+    return !retention_obs || source_slot < 0 ||
+        retention_obs->clone_source_available(
+            server_retention_instance_key::for_slot(source_slot));
+}
+
 void server_prompt_cache::release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
     if (candidate.cache_ != this) {
