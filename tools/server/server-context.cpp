@@ -4668,41 +4668,584 @@ private:
                                 }
 
                         // fork 9k-b2-i: !complete_vbr_import guard (fork 16566)
+                                // fork 9k-b2-ii: checkpoint selection rewrite (fork 16566-17144)
                                 if (!complete_vbr_import && pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
+                                    // Current attention-content lineage epoch(s). A recurrent-only
+                                    // checkpoint remains valid across a lossless in-place retier, but not
+                                    // across occupied-cell reuse, clear/reset, or state adoption. All-zero
+                                    // when VBR is inactive, so this rejects nothing then.
+                                    const auto vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+                                    const bool recurrent =
+                                        llama_model_is_recurrent(model_tgt) ||
+                                        llama_model_is_hybrid(model_tgt);
+
+                                    // [obs] count checkpoints rejected specifically for changed attention
+                                    // lineage, to explain a resulting cold reprocess in /slots
+                                    int n_ckpt_rejected_vbr = 0;
+
+                                    // B/observer candidate transport: which scan is authoritative
+                                    // (legacy vs frontier) is decided AFTER both run, so each
+                                    // lambda notes its visits into a fixed stack buffer
+                                    // (classification + scalars the scan itself touched —
+                                    // noexcept, no allocation); once the ratchet picks the
+                                    // authoritative scan, ONLY that buffer becomes candidate
+                                    // rows. The declared domain stays the shipped-visited set.
+                                    struct ckpt_obs_visit {
+                                        common_cache_plan_reason cls;
+                                        int32_t  pos_max;
+                                        uint64_t bytes;
+                                    };
+                                    struct ckpt_obs_buf {
+                                        // deliberately NO default member initializers: the
+                                        // disabled path pays a stack reservation and nothing
+                                        // else; fields are initialized
+                                        // only under the observer flag below
+                                        std::array<ckpt_obs_visit, COMMON_CACHE_PLAN_MAX_CANDIDATES> v;
+                                        uint32_t n;
+                                        bool     overflow;
+                                        // cls NONE = eligible (the short-circuiting selection)
+                                        void note(common_cache_plan_reason cls, int32_t pos_max, uint64_t bytes) noexcept {
+                                            if (n >= v.size()) { overflow = true; return; }
+                                            v[n++] = { cls, pos_max, bytes };
+                                        }
+                                    };
+                                    ckpt_obs_buf obs_legacy_buf, obs_frontier_buf;
+                                    const bool ckpt_obs_on = slot.cache_plan != nullptr;
+                                    if (ckpt_obs_on) {
+                                        obs_legacy_buf.n   = 0; obs_legacy_buf.overflow   = false;
+                                        obs_frontier_buf.n = 0; obs_frontier_buf.overflow = false;
+                                    }
+
+                                    // Legacy selection remains authoritative while the
+                                    // computation-frontier path runs in shadow. The shipped
+                                    // predicate is instantiated once; observer bookkeeping
+                                    // compiles away from the unobserved instantiation.
+                                    const auto make_legacy_pred = [&](auto obs_c) {
+                                        return [&, obs_c](const auto & cur) {
+                                            constexpr bool Obs = decltype(obs_c)::value;
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
+                                            // A capture is durable only after its target payload is
+                                            // complete. Old/foreign half-filled entries must never
+                                            // reach the mutating restore path.
+                                            [[maybe_unused]] uint64_t obs_bytes = 0;
+                                            if constexpr (Obs) { obs_bytes = (uint64_t) cur.size(); }
+                                            const bool checkpoint_lineage_matches =
+                                                !recurrent ||
+                                                common_prompt_checkpoint_lineage_matches(cur, vbr_now);
+                                            const auto evaluation =
+                                                server_cache_plan_evaluate_checkpoint(
+                                                    !cur.empty(), true, recurrent,
+                                                    checkpoint_lineage_matches,
+                                                    cur.pos_min, cur.pos_max, pos_next,
+                                                    pos_min_thold, obs_bytes);
+                                            const bool ok = server_cache_plan_viable(
+                                                evaluation.reason);
+                                            if (!cur.empty() && !checkpoint_lineage_matches) {
+                                                n_ckpt_rejected_vbr++;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
+                                            if constexpr (Obs) {
+                                                obs_legacy_buf.note(
+                                                    ok ? COMMON_CACHE_PLAN_REASON_NONE
+                                                       : evaluation.reason,
+                                                    cur.pos_max, obs_bytes);
+                                            }
+                                            return ok;
+                                        };
+                                    };
+                                    const auto it_legacy = ckpt_obs_on
+                                        ? std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                       slot.prompt.checkpoints.rend(),
+                                                       make_legacy_pred(std::true_type{}))
+                                        : std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                       slot.prompt.checkpoints.rend(),
+                                                       make_legacy_pred(std::false_type{}));
+
+                                    // Shadow the same choice from the dual-written logical
+                                    // frontier. pos_min remains the physical attention-coverage
+                                    // guard until plan_resume lands; logical eligibility comes
+                                    // from next_position rather than pos_max.
+                                    std::string frontier_adapter_identity;
+                                    bool frontier_eligible = false;
+                                    // Per-selector lineage-rejection count: after the frontier
+                                    // selector becomes authoritative, this scan's epoch
+                                    // rejections are distinct from the legacy scan's.
+                                    int n_ckpt_rejected_vbr_frontier = 0;
+                                    auto it_frontier =
+                                        slot.prompt.checkpoints.rend();
+                                    bool frontier_shadow_available = true;
+                                    try {
+                                        frontier_adapter_identity =
+                                            lora_config_identity(slot.lora);
+                                        const auto make_frontier_pred = [&](auto obs_c) {
+                                            return [&, obs_c](const auto & cur) {
+                                                constexpr bool Obs = decltype(obs_c)::value;
+                                                [[maybe_unused]] uint64_t obs_bytes = 0;
+                                                if constexpr (Obs) { obs_bytes = (uint64_t) cur.size(); }
+                                                if (slot.frontier_ratchet_flipped &&
+                                                    server_fault(
+                                                        "frontier_disagree_after_flip")) {
+                                                    if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID, cur.pos_max, obs_bytes); }
+                                                    return false;
+                                                }
+                                                if (cur.empty() ||
+                                                    !checkpoint_frontier_is_current(
+                                                        slot, cur,
+                                                        frontier_adapter_identity)) {
+                                                    if constexpr (Obs) {
+                                                        obs_frontier_buf.note(cur.empty()
+                                                            ? COMMON_CACHE_PLAN_REASON_PAYLOAD_EMPTY
+                                                            : COMMON_CACHE_PLAN_REASON_FRONTIER_INVALID, cur.pos_max, obs_bytes);
+                                                    }
+                                                    return false;
+                                                }
+                                                frontier_eligible = true;
+                                                if (recurrent) {
+                                                    if (!common_prompt_checkpoint_lineage_matches(
+                                                            cur, vbr_now)) {
+                                                        n_ckpt_rejected_vbr_frontier++;
+                                                        if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED, cur.pos_max, obs_bytes); }
+                                                        return false;
+                                                    }
+                                                    const bool ok = cur.computation_frontier.next_position <=
+                                                           pos_next;
+                                                    if constexpr (Obs) { obs_frontier_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                    return ok;
+                                                }
+                                                if (cur.computation_frontier.next_position - 1 >
+                                                    pos_next) {
+                                                    if constexpr (Obs) { obs_frontier_buf.note(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                    return false;
+                                                }
+                                                const bool ok = cur.pos_min < pos_min_thold ||
+                                                       cur.pos_min == 0;
+                                                if constexpr (Obs) { obs_frontier_buf.note(ok ? COMMON_CACHE_PLAN_REASON_NONE : COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT, cur.pos_max, obs_bytes); }
+                                                return ok;
+                                            };
+                                        };
+                                        it_frontier = ckpt_obs_on
+                                            ? std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                           slot.prompt.checkpoints.rend(),
+                                                           make_frontier_pred(std::true_type{}))
+                                            : std::find_if(slot.prompt.checkpoints.rbegin(),
+                                                           slot.prompt.checkpoints.rend(),
+                                                           make_frontier_pred(std::false_type{}));
+                                    } catch (const std::exception & e) {
+                                        // Shadow bookkeeping must never make the
+                                        // authoritative legacy selector less available.
+                                        frontier_shadow_available = false;
+                                        SLT_WRN(slot,
+                                                "FRONTIER_RATCHET "
+                                                "event=shadow_unavailable "
+                                                "action=keep_legacy error=%s\n",
+                                                e.what());
+                                    }
+
+                                    const auto choice_index = [&](const auto & choice) {
+                                        return choice ==
+                                                slot.prompt.checkpoints.rend()
+                                            ? int64_t(-1)
+                                            : (int64_t) std::distance(
+                                                slot.prompt.checkpoints.rbegin(),
+                                                choice);
+                                    };
+                                    const int64_t legacy_choice =
+                                        choice_index(it_legacy);
+                                    const int64_t frontier_choice =
+                                        choice_index(it_frontier);
+                                    bool use_frontier = false;
+                                    if (frontier_shadow_available) {
+                                        use_frontier =
+                                            slot.frontier_ratchet_selection(
+                                                frontier_eligible,
+                                                it_legacy == it_frontier,
+                                                legacy_choice,
+                                                frontier_choice);
+                                    } else {
+                                        slot.frontier_ratchet_disagreement(
+                                            "checkpoint_selection_shadow_unavailable",
+                                            legacy_choice, -2);
+                                    }
+                                    auto it = use_frontier ? it_frontier : it_legacy;
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    bool vbr_preflight_rejected = false;
+
+                                    // B candidate transport [observer, noexcept]: the AUTHORITATIVE
+                                    // scan's visit buffer becomes checkpoint candidate rows.
+                                    // Reverse visit positions are translated to the stable
+                                    // forward container ordinal before row identity joins.
+                                    // The short-circuit
+                                    // leaves later siblings outside the declared domain —
+                                    // recorded as truncation, never extrapolated.
+                                    if (slot.cache_plan) {
+                                        auto & rec = *slot.cache_plan;
+                                        const auto & buf = use_frontier ? obs_frontier_buf : obs_legacy_buf;
+                                        int32_t checkpoint_host_source = -1;
+                                        if (const auto * host = rec.selected_row(
+                                                common_cache_plan_provider::host_cache_entry);
+                                            host && host->delivered && host->source_id >= 0) {
+                                            checkpoint_host_source = host->source_id;
+                                        }
+                                        for (uint32_t i = 0; i < buf.n; i++) {
+                                            const int32_t checkpoint_source =
+                                                server_cache_plan_checkpoint_source_id_from_reverse(
+                                                    slot.prompt.checkpoints.size(), i,
+                                                    checkpoint_host_source);
+                                            if (checkpoint_source < 0) {
+                                                rec.inventory_states[size_t(
+                                                    common_cache_plan_provider::live_context_checkpoint)] =
+                                                    common_cache_plan_inventory_state::overflowed;
+                                                break;
+                                            }
+                                            auto * row = rec.find_or_add(
+                                                common_cache_plan_provider::live_context_checkpoint,
+                                                checkpoint_source,
+                                                COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                slot.id, rec.selection);
+                                            if (!row) {
+                                                break; // record inventory overflowed (state latched)
+                                            }
+                                            row->lcp_tokens    = llama_cache_acct_value::measured(
+                                                (uint64_t) std::max<int32_t>(buf.v[i].pos_max, 0));
+                                            row->payload_bytes = llama_cache_acct_value::measured(buf.v[i].bytes);
+                                            row->component_only = checkpoint_host_source >= 0;
+                                            row->dependent_host_source_id = checkpoint_host_source;
+                                            if (buf.v[i].cls == COMMON_CACHE_PLAN_REASON_NONE) {
+                                                // the scan's first eligible entry = the shipped selection;
+                                                // restore failures below demote it via note_reject
+                                                row->accept();
+                                                rec.select(
+                                                    common_cache_plan_provider::live_context_checkpoint, row);
+                                            } else {
+                                                row->note_reject(buf.v[i].cls);
+                                            }
+                                        }
+                                        if (buf.overflow) {
+                                            rec.inventory_states[size_t(common_cache_plan_provider::live_context_checkpoint)] =
+                                                common_cache_plan_inventory_state::overflowed;
+                                        } else if (!do_reset && buf.n < slot.prompt.checkpoints.size()) {
+                                            if (!rec.authority_inventory_complete) {
+                                                rec.note_inventory_truncated(common_cache_plan_provider::live_context_checkpoint);
+                                            }
+                                        } else {
+                                            rec.note_inventory_complete(common_cache_plan_provider::live_context_checkpoint);
+                                        }
+                                    }
+
+                                    if (!do_reset) {
+                                        // A live_rebased PARTIAL_ONLY restore keeps the
+                                        // current attention representation. Prove the current-tier
+                                        // footprint fits before either the restore or its later
+                                        // suffix trim mutates state, then hold a scoped retier
+                                        // freeze across both. This consumer performs no bounded
+                                        // replay inside the scope, so n_tokens_extra is exactly 0.
+                                        const auto preflight =
+                                            llama_memory_vbr_retier_preflight(
+                                                llama_get_memory(ctx_tgt), 0);
+                                        if (preflight.active) {
+                                            const bool preflight_fault =
+                                                server_fault("vbr_retier_preflight_fail");
+                                            const bool preflight_fits =
+                                                preflight.fits && !preflight_fault;
+                                            SLT_INF(slot,
+                                                    "VBR_RETIER_PREFLIGHT owner=server_checkpoint_restore "
+                                                    "result=%s fault=%u pools=%u watermark=%u needed=%" PRIu64
+                                                    " available=%" PRIu64 " physical_growth=%" PRIu64
+                                                    " physical_free=%" PRIu64 " max_deficit=%" PRId64 "\n",
+                                                    preflight_fits ? "fits" : "reject",
+                                                    preflight_fault ? 1u : 0u,
+                                                    preflight.pools,
+                                                    preflight.watermark_cells,
+                                                    preflight.bytes_needed,
+                                                    preflight.bytes_available,
+                                                    preflight.physical_growth_needed,
+                                                    preflight.physical_growth_available,
+                                                    preflight.max_deficit);
+                                            if (!preflight_fits) {
+                                                SLT_WRN(slot, "%s",
+                                                        "checkpoint restore rejected before mutation: "
+                                                        "current VBR tiers cannot cover the frozen footprint\n");
+                                                slot.cache_status =
+                                                    "full reprocess: VBR frozen-footprint preflight rejected";
+                                                vbr_preflight_rejected = true;
+                                                do_reset = true;
+                                            } else {
+                                                vbr_restore_freeze =
+                                                    std::make_unique<server_vbr_retier_freeze_scope>(
+                                                        llama_get_memory(ctx_tgt),
+                                                        "server_checkpoint_restore");
+                                                if (!vbr_restore_freeze->active()) {
+                                                    SLT_ERR(slot, "%s",
+                                                            "VBR preflight was active but scoped freeze acquisition failed\n");
+                                                    vbr_restore_freeze.reset();
+                                                    do_reset = true;
+                                                    // cache-plan observer: an attempted restore failed on
+                                                    // infrastructure, not eligibility
+                                                    if (slot.cache_plan) {
+                                                        if (auto * sel_row = slot.cache_plan->selected_row(
+                                                                common_cache_plan_provider::live_context_checkpoint)) {
+                                                            sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_BUSY);
+                                                        }
+                                                        slot.cache_plan->restore_attempt_failed = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->accel.spec.view());
+                                        // note: keep the raw size-checked restore (instead of it->load_tgt which aborts on
+                                        //       mismatch) so a failed restore falls back to a full re-process (do_reset)
+                                        const size_t checkpoint_size = it->data_tgt.size();
+                                        const size_t n = do_reset ? 0 :
+                                            llama_state_seq_set_data_ext(
+                                                ctx_tgt,
+                                                it->data_tgt.view().data(),
+                                                checkpoint_size, slot.id,
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (!do_reset && n != checkpoint_size) {
+                                            SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
+                                            do_reset = true;
+                                            if (slot.cache_plan) {
+                                                if (auto * sel_row = slot.cache_plan->selected_row(
+                                                        common_cache_plan_provider::live_context_checkpoint)) {
+                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                }
+                                                slot.cache_plan->restore_attempt_failed = true;
+                                            }
+                                        } else if (!do_reset && !it->try_load_dft(
+                                                       ctx_dft, slot.id,
+                                                       LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            SLT_ERR(slot,
+                                                    "failed to restore draft checkpoint "
+                                                    "(n_tokens = %" PRId64 ", size = %.3f MiB) -- "
+                                                    "falling back to full prompt processing\n",
+                                                    it->n_tokens,
+                                                    (float) it->data_dft.size() / 1024 / 1024);
+                                            do_reset = true;
+                                            if (slot.cache_plan) {
+                                                if (auto * sel_row = slot.cache_plan->selected_row(
+                                                        common_cache_plan_provider::live_context_checkpoint)) {
+                                                    sel_row->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                                                }
+                                                slot.cache_plan->restore_attempt_failed = true;
+                                            }
+                                        } else if (!do_reset) {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            if (slot.retention_reuse_pending &&
+                                                slot.retention_reuse_tokens != 0) {
+                                                // Credit only the stateful
+                                                // frontier actually restored,
+                                                // not a longer raw token LCP
+                                                // whose recurrent companion
+                                                // was unavailable.
+                                                slot.retention_reuse_tokens =
+                                                    std::min<uint64_t>(
+                                                        slot.retention_reuse_tokens,
+                                                        uint64_t(n_past));
+                                            }
+
+                                            // Attention/SWA follows upstream #24891: the
+                                            // checkpoint's logical token count bounds the true LCP
+                                            // retained in bookkeeping. Recurrent/hybrid PARTIAL_ONLY
+                                            // restore is different: it installs recurrent state only
+                                            // at the checkpoint frontier, so even a matching later
+                                            // token prefix is not backed by that state. Cap to n_past,
+                                            // which was derived from BOTH restored pos_next and
+                                            // checkpoint.n_tokens. Thus keep_first below can never
+                                            // claim a token beyond the restored recurrent frontier;
+                                            // the conservative replay changes work only, never output.
+                                            if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+                                                n_past_keep = std::min(n_past_keep, (size_t) n_past);
+                                            } else {
+                                                n_past_keep = std::min(n_past_keep, (size_t) it->n_tokens);
+                                            }
+
+                                            // Invalidate branch-local state before applying the
+                                            // optional accelerator image. This ordering lets legacy
+                                            // DFlash clear an old ring while preserving the newly
+                                            // authenticated checkpoint ring installed below.
+                                            const bool draft_image_restored =
+                                                !it->data_dft.empty() &&
+                                                it->data_dft_full_sequence;
+                                            common_speculative_sequence_transition(
+                                                slot.get_spec(), slot.id,
+                                                draft_image_restored
+                                                    ? (!it->accel.spec.empty()
+                                                        ? common_speculative_sequence_event::composite_image_restored
+                                                        : common_speculative_sequence_event::draft_image_restored)
+                                                    : common_speculative_sequence_event::target_restored_without_draft);
+
+                                            // A sequence transition invalidates deferred branch
+                                            // state. Apply the matching checkpoint state only after
+                                            // that invalidation; doing this in the opposite order
+                                            // immediately discards a restored MTP carry.
+                                            const bool spec_state_ok =
+                                                it->accel.spec.empty() ||
+                                                common_speculative_set_state(
+                                                    slot.get_spec(), slot.id,
+                                                    it->accel.spec.view());
+
+                                            bool checkpoint_aux_ok = spec_state_ok;
+                                            if (!spec_state_ok) {
+                                                SLT_ERR(slot,
+                                                    "failed to restore checkpoint speculative state "
+                                                    "(n_tokens = %" PRId64 ", state size = %zu) -- failing closed\n",
+                                                    it->n_tokens, it->accel.spec.size());
+                                            }
+                                            if (slot.can_speculate() && !it->accel.ring.empty() &&
+                                                (!common_speculative_ring_state_matches_frontier(
+                                                     slot.get_spec(),
+                                                     it->accel.ring.view().data(),
+                                                     it->accel.ring.size(),
+                                                     llama_pos(it->n_tokens)-1) ||
+                                                 !common_speculative_ring_state_load(
+                                                     slot.get_spec(),
+                                                     it->accel.ring.view().data(),
+                                                     it->accel.ring.size()))) {
+                                                SLT_ERR(slot,
+                                                        "failed to restore checkpoint DFlash ring state "
+                                                        "(n_tokens = %" PRId64 ", ring size = %zu) -- failing closed\n",
+                                                        it->n_tokens, it->accel.ring.size());
+                                                checkpoint_aux_ok = false;
+                                            }
+
+                                            if (!checkpoint_aux_ok) {
+                                                do_reset = true;
+                                                if (slot.cache_plan) {
+                                                    if (auto * sel_row = slot.cache_plan->selected_row(
+                                                            common_cache_plan_provider::live_context_checkpoint)) {
+                                                        sel_row->note_reject(COMMON_CACHE_PLAN_REASON_ACCELERATOR_UNRESTORABLE);
+                                                    }
+                                                    slot.cache_plan->restore_attempt_failed = true;
+                                                }
+                                            } else {
+                                                checkpoint_tgt_recurrent_installed =
+                                                    llama_model_is_hybrid(model_tgt);
+                                                checkpoint_dft_recurrent_installed =
+                                                    ctx_dft && model_dft &&
+                                                    llama_model_is_hybrid(model_dft) &&
+                                                    !it->data_dft.empty();
+                                                checkpoint_installed_pos = it->pos_max;
+
+                                                // The checkpoint that successfully
+                                                // restored this task is now part of this task's active
+                                                // lineage. Adopt it here, unconditionally, rather than
+                                                // relying on a later create-time dedup: ordinary
+                                                // mid-prompt batches suppress checkpoint creation, and
+                                                // the next min-step thinning pass could otherwise erase
+                                                // the exact anchor we just restored.
+                                                it->id_task = slot.task->id;
+
+                                                SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                                slot.cache_status = "restored context checkpoint";
+                                                // Transport the shipped
+                                                // restore's own values into the observer row.
+                                                // This site IS the delivery point — recorded
+                                                // as data, never inferred.
+                                                if (slot.cache_plan) {
+                                                    if (auto * sel_row = slot.cache_plan->selected_row(
+                                                            common_cache_plan_provider::live_context_checkpoint)) {
+                                                        sel_row->accept();
+                                                        sel_row->delivered = true;
+                                                        // logical restored token count, not the physical
+                                                        // pos_max position; bytes = every applied component
+                                                        // across target, draft, and accelerators.
+                                                        sel_row->lcp_tokens =
+                                                            llama_cache_acct_value::measured((uint64_t) std::max(n_past, 0));
+                                                        sel_row->payload_bytes =
+                                                            llama_cache_acct_value::measured((uint64_t) it->size());
+                                                        // rows the AUTHORITATIVE shipped scan
+                                                        // actually visited (frontier after a
+                                                        // frontier-selector flip, else legacy) + that same
+                                                        // selector's epoch rejections
+                                                        sel_row->siblings_scanned =
+                                                            (use_frontier
+                                                                ? obs_frontier_buf.n
+                                                                : obs_legacy_buf.n);
+                                                        sel_row->siblings_rejected_epoch = (uint32_t)
+                                                            (use_frontier ? n_ckpt_rejected_vbr_frontier
+                                                                          : n_ckpt_rejected_vbr);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
 
                                     if (do_reset) {
+                                        // The restore transaction is being abandoned. Clear
+                                        // speculative branch/ring state at the same semantic
+                                        // boundary; the p0=0 memory trim below performs the
+                                        // corresponding target/draft physical reset.
+                                        common_speculative_sequence_transition(
+                                            slot.get_spec(), slot.id,
+                                            common_speculative_sequence_event::full_clear);
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        // [obs] explain the cold reprocess: a checkpoint rejected for a
+                                        // changed VBR representation is the common surprising cause
+                                        slot.cache_status = vbr_preflight_rejected
+                                            ? "full reprocess: VBR frozen-footprint preflight rejected"
+                                            : n_ckpt_rejected_vbr > 0
+                                                ? "full reprocess: checkpoint(s) rejected -- attention lineage changed"
+                                                : "full reprocess: no reusable context checkpoint";
+                                        // cache-plan observer stage-3: the same shipped classification, as a
+                                        // closed reason on the checkpoint candidate row. A
+                                        // concrete restore-failure reason recorded at its
+                                        // failure site takes precedence — the generic
+                                        // eligibility classification applies only to a row
+                                        // with no reason yet.
+                                        if (slot.cache_plan) {
+                                            const int n_rejected_sel = use_frontier
+                                                ? n_ckpt_rejected_vbr_frontier
+                                                : n_ckpt_rejected_vbr;
+                                            // the selected row carries a concrete restore-failure
+                                            // reason from its failure site; when the scan selected
+                                            // NOTHING, the provider-level classification rides one
+                                            // aggregate row (source -1). Per-sibling verdicts are
+                                            // already in the inventory from the scan transport.
+                                            auto * row = slot.cache_plan->selected_row(
+                                                common_cache_plan_provider::live_context_checkpoint);
+                                            if (!row) {
+                                                row = slot.cache_plan->find_or_add(
+                                                    common_cache_plan_provider::live_context_checkpoint,
+                                                    COMMON_CACHE_PLAN_SOURCE_AGGREGATE,
+                                                    COMMON_CACHE_PLAN_PHASE_CKPT_SCAN,
+                                                    slot.id, slot.cache_plan->selection);
+                                            }
+                                            if (row) {
+                                                row->siblings_scanned =
+                                                    (use_frontier
+                                                        ? obs_frontier_buf.n
+                                                        : obs_legacy_buf.n);
+                                                row->siblings_rejected_epoch = (uint32_t) n_rejected_sel;
+                                                if (row->reason == COMMON_CACHE_PLAN_REASON_NONE) {
+                                                    if (vbr_preflight_rejected) {
+                                                        // restoring would demand a retier under the frozen
+                                                        // footprint: a representation-tier fit failure
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_TIER_UNSUPPORTED);
+                                                    } else if (n_rejected_sel > 0) {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_REPRESENTATION_EPOCH_CHANGED);
+                                                    } else if (slot.prompt.checkpoints.empty()) {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_PROVIDER_UNAVAILABLE);
+                                                    } else {
+                                                        row->note_reject(COMMON_CACHE_PLAN_REASON_COVERAGE_INSUFFICIENT);
+                                                    }
+                                                }
+                                            }
+                                            // This reset discards everything already
+                                            // installed for the request (pos_next/n_past go
+                                            // to zero) — revoke historical deliveries; cold
+                                            // fallback dominates them
+                                            slot.cache_plan->revoke_deliveries();
+                                        }
                                         pos_next = 0;
                                         n_past = 0;
+                                        n_past_keep = 0;
                                     }
                                 }
                             }
