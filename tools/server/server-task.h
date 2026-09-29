@@ -1284,6 +1284,11 @@ struct server_prompt_cache {
 
     void update();
 
+    // fork 9l-d4b6f (fork server-task.h 1643-1645)
+    iterator destroy_entry(
+            iterator it,
+            server_cache_destruction_reason reason);
+
     // ---------------------------------------------------------------------
     // group C tip: the only part of the server_prompt_cache rewrite that the
     // cache-plan observation face actually calls. Everything else in that
@@ -1559,6 +1564,12 @@ struct server_prompt_cache {
     server_prompt_cache_shadow_snapshot retention_shadow_snapshot() const noexcept {
         return retention_shadow;
     }
+
+    // fork 9l-d4b6f (fork server-task.h 1791-1794)
+    iterator destroy_entry_impl(
+            iterator it,
+            server_cache_destruction_reason reason,
+            iterator recovery);
 
 // fork 9l-d3c2: the four shadow members (fork server-task.h 1796-1801)
     std::unique_ptr<server_prompt_cache_shadow_row[]> retention_shadow_rows;

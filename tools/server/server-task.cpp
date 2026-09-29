@@ -2699,6 +2699,65 @@ bool server_prompt_cache::mark_vbr_frontiers(
     }
 }
 
+// fork 9l-d4b6f: server_prompt_cache_observe_drop (fork server-task.cpp 4266-4322)
+static server_cache_destruction_admission server_prompt_cache_observe_drop(
+        server_prompt_cache & cache,
+        const server_prompt_cache_state & state,
+        server_cache_destruction_reason reason) noexcept {
+    if (!cache.destruction_obs) {
+        return {};
+    }
+
+    server_cache_destruction_request request;
+    request.cls    = server_cache_destruction_class::host_artifact_drop;
+    request.reason = reason;
+    request.add_target(
+        server_cache_destruction_target_kind::host_artifact,
+        -1,
+        cache.retention_obs ? cache.retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&state))
+            : llama_cache_acct_artifact_id{});
+
+    const auto & ops = state.release_ops();
+    llama_cache_acct_release_set_preview preview;
+    const bool known = cache.acct && !ops.empty() &&
+        cache.acct->preview_release_set(
+            ops, cache.acct->serial(), preview, true);
+    if (known) {
+        // The ledger has already aggregated the complete logical owner by
+        // (category, domain). At most two measures per bounded accounting
+        // category enter the fixed destruction request, independent of the
+        // checkpoint-ring cardinality and shared-allocation fanout.
+        for (const auto & row : preview.yield_rows) {
+            for (const auto measure : {
+                    llama_cache_acct_measure::logical_payload,
+                    llama_cache_acct_measure::resident_allocated }) {
+                server_cache_destruction_yield value;
+                value.category = row.category;
+                value.measure  = measure;
+                value.domain_known = true;
+                value.domain = row.domain;
+                value.value = llama_cache_acct_value::measured(
+                    measure == llama_cache_acct_measure::logical_payload
+                        ? row.logical_payload : row.resident_allocated);
+                request.add_yield(value);
+            }
+        }
+    } else {
+        // One bounded unavailable pair preserves fail-closed lease behavior
+        // without turning a large logical checkpoint ring into request
+        // overflow.
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated }) {
+            server_cache_destruction_yield value;
+            value.measure = measure;
+            request.add_yield(value);
+        }
+    }
+    return server_cache_retention_admit(cache.destruction_obs, request);
+}
+
 // fork 9l-d4b6d: the retirement manifest (fork server-task.cpp 4362-4419)
 struct server_prompt_cache_retirement_manifest {
     server_retention_instance_key host;
@@ -2757,6 +2816,20 @@ static void server_prompt_cache_retire_entry(
             server_retention_instance_key::for_checkpoint(
                 -1, &checkpoint));
     }
+}
+
+// fork 9l-d4b6f: server_prompt_cache_destroy_entry_impl + destroy_entry (fork server-task.cpp 4421-4432)
+static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it) {
+    GGML_ASSERT(it->recovery_pins == 0);
+    return cache.states.erase(it);
+}
+
+server_prompt_cache::iterator server_prompt_cache::destroy_entry(
+        iterator it,
+        server_cache_destruction_reason reason) {
+    return destroy_entry_impl(it, reason, states.end());
 }
 
 void server_cache_checkpoint_ring_changed(
@@ -5510,6 +5583,110 @@ void commit_certified_host_destruction(
     certified.pin = {};
 }
 } // namespace
+
+// fork 9l-d4b6f: server_prompt_cache::destroy_entry_impl (fork server-task.cpp 7124-7225)
+server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
+        iterator it,
+        server_cache_destruction_reason reason,
+        iterator recovery) {
+    const auto admission = server_prompt_cache_observe_drop(*this, *it, reason);
+    // This pass-through owns exactly one accounting terminal outside the raw
+    // physical primitive. Victim ordering belongs to the caller (historical
+    // lifecycle floor or retention-capacity authority); either route executes the
+    // same exact terminal through a freshly prepared capability.
+    const auto & release_ops = it->release_ops();
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+
+    llama_cache_prepared_release_set prepared;
+    server_prompt_cache_retirement_manifest retirement;
+    // The legacy-fallback manifest is captured independently from recovery proof's
+    // certified manifest: a refused exact-redundancy proof must still execute
+    // the historical retirement terminal. Both are read-only snapshots; only
+    // the selected terminal retires them after the physical erase.
+    const bool retirement_ready = publish_authority && acct &&
+        server_prompt_cache_capture_retirement(*this, it, retirement);
+    bool capability_ready = false;
+    host_destruction_certification redundant;
+    if (publish_authority && acct &&
+        reason == server_cache_destruction_reason::host_dedup &&
+        recovery != states.end()) {
+        redundant = certify_host_destruction(
+            *this, it, recovery, admission.sequence, false, true);
+    }
+    if (publish_authority && acct) {
+        std::vector<llama_cache_acct_op_id> ops;
+        bool setup_ok = retirement_ready;
+        try {
+            ops.reserve(release_ops.size());
+            for (const auto op : release_ops) {
+                if (op) {
+                    ops.push_back(op);
+                }
+            }
+        } catch (...) {
+            setup_ok = false;
+        }
+
+        if (!redundant.ready && setup_ok && !ops.empty()) {
+            const uint64_t serial = acct->serial();
+            prepared = llama_cache_prepare_release_set(
+                *acct, ops, serial);
+            capability_ready = prepared.ready();
+        }
+    }
+
+    if (!capability_ready && !redundant.ready) {
+        server_prompt_cache_retire_entry(*this, it);
+    }
+    auto next = server_prompt_cache_destroy_entry_impl(*this, it);
+    if (redundant.ready) {
+        // recovery proof certify→mutate→commit boundary. Like immutable host restore, publication and
+        // dedup run synchronously on update_slots. The physical list erase has
+        // no callback or C producer; the immediate capability commit is the
+        // only ledger terminal, so no ledger write can interleave. The
+        // recovery pin remains live across both operations and prevents the
+        // cited survivor from entering this raw primitive.
+        commit_certified_host_destruction(
+            *this, redundant, scheduler_owner);
+        if (destruction_obs) {
+            destruction_obs->note_redundant_host_executed(
+                admission.sequence, redundant.projected_bytes);
+        }
+    } else if (capability_ready) {
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        // immutable host restore prepare→mutate→commit boundary. destroy_entry() is called
+        // synchronously by update_slots-owned prompt-cache publication/load
+        // maintenance. The raw erase only destroys value storage: it has no
+        // callback and no C producer. The very next operation commits the
+        // prepared release, so no scheduler-owned ledger write can interleave.
+        // A future asynchronous producer invalidates this proof and must add
+        // a real claim/lock before this authority remains enabled.
+        // The same-frame assertion above is a machine-checked refactor
+        // tripwire: the CMake contract scan deliberately string-matches it.
+        const auto release_status = prepared.commit();
+        GGML_ASSERT(release_status ==
+                    llama_cache_conditional_release_status::released);
+        server_prompt_cache_retire_manifest(*this, retirement);
+        if (destruction_obs) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, true);
+        }
+    } else if (acct) {
+        // Preparation is fail-closed with respect to the new capability, but
+        // immutable host restore does not yet own host victim selection: retain the bounded
+        // legacy FIFO/dedup behavior and its exactly-one release terminal.
+        for (const auto op : release_ops) {
+            if (op) {
+                (void) acct->release(op);
+            }
+        }
+        if (publish_authority && destruction_obs) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, false);
+        }
+    }
+    return next;
+}
 
 // fork 9l-d1: occupied-replacement push side (fork server-task.cpp 7941-8261)
 bool server_prompt_cache::prepare_vbr_occupied_replacement(
