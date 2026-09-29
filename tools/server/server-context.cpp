@@ -9863,6 +9863,1829 @@ private:
         return reset_pending(1);
     }
 
+    // fork 9l-d4b6v: publish_idle_vbr_batch (fork server-context.cpp 12548-14368)
+    size_t publish_idle_vbr_batch(
+            server_queue::idle_capture_session & capture_session,
+            bool readiness_only = false) noexcept {
+        if (!params_base.vbr_prompt_cache || !prompt_cache ||
+            !vbr_artifact_store ||
+            !capture_session.continue_capture()) {
+            return 0;
+        }
+
+        try {
+
+        struct candidate {
+            server_slot * slot = nullptr;
+            const common_prompt_checkpoint * checkpoint = nullptr;
+            uint64_t manifest_id = 0;
+            std::array<uint8_t, 32> attempt_identity = {};
+            std::array<uint8_t, 32> full_source_identity = {};
+            uint64_t tier_epoch = 0;
+            uint64_t tier_epoch_swa = 0;
+            bool refresh = false;
+            bool stem_requested = false;
+            bool stemmed = false;
+            uint64_t selected_tokens = 0;
+            server_prompt_cache_vbr_publication_metadata publication;
+        };
+        std::vector<candidate> candidates;
+        std::vector<vbr_projected_capture_manifest_request> manifests;
+        size_t displaced_existing = 0;
+        size_t displacement_attempts = 0;
+        size_t capture_attempts = 0;
+        bool refresh_selected = false;
+
+        uint64_t total_token_references = 0;
+        static constexpr uint64_t MAX_IDLE_TOKEN_REFERENCES = 1024ull*1024;
+        auto * memory = llama_get_memory(ctx_tgt);
+        if (!memory) {
+            return 0;
+        }
+        const bool requires_coordinated_tree_clear = n_swa > 0 ||
+            llama_model_is_recurrent(model_tgt) ||
+            llama_model_is_hybrid(model_tgt);
+        const bool may_displace_live_source =
+            server_vbr_live_source_displacement_allowed(
+                params_base.kv_unified, slots.size());
+        bool projected_attention_layout_supported = false;
+        {
+            std::vector<llama_memory_tree_child> tree;
+            if (llama_memory_tree_collect(memory, tree)) {
+                bool has_attention = false;
+                bool supported = true;
+                for (const auto & node : tree) {
+                    if (node.recurrent != nullptr) {
+                        continue;
+                    }
+                    if (node.attention == nullptr ||
+                        node.dependency_mode !=
+                            checkpoint_child_dependency_mode::live_guarded) {
+                        supported = false;
+                        break;
+                    }
+                    has_attention = true;
+                }
+                projected_attention_layout_supported =
+                    supported && has_attention;
+            }
+        }
+        const auto representation =
+            memory->vbr_representation_identity();
+        const auto slot_by_id = [&](int32_t id) -> server_slot * {
+            return id >= 0 && size_t(id) < slots.size() &&
+                    slots[size_t(id)].id == id
+                ? &slots[size_t(id)] : nullptr;
+        };
+        const auto base_eligible = [&](const server_slot & idle) {
+            const bool prompt_boundary =
+                vbr_prompt_boundary_capture_slot >= 0 &&
+                idle.id == vbr_prompt_boundary_capture_slot;
+            if (vbr_prompt_boundary_capture_slot >= 0 && !prompt_boundary) {
+                return false;
+            }
+            const bool source_state_ready = prompt_boundary
+                ? idle.is_processing() && idle.state == SLOT_STATE_DONE_PROMPT
+                : !idle.is_processing() && idle.state == SLOT_STATE_IDLE;
+            return source_state_ready &&
+                idle.prompt.n_tokens() > 0 &&
+                automatic_vbr_cache_support(
+                    idle.prompt.tokens, idle.lora,
+                    idle.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported &&
+                !idle.hard_lease_blocks_live_prefix() &&
+                prompt_cache->vbr_retention_source_available(idle.id);
+        };
+
+        // A host-only cache is a normal steady state after successful
+        // displacement. Avoid walking its complete retention catalog on every
+        // idle tick when no live source can produce capture work.
+        bool any_live_source = false;
+        for (auto & idle : slots) {
+            if (!capture_session.continue_capture()) {
+                return 0;
+            }
+            const auto support = automatic_vbr_cache_support(
+                idle.prompt.tokens, idle.lora,
+                idle.can_speculate());
+            if (support != idle.vbr_idle_support_status) {
+                idle.vbr_idle_support_status = support;
+                if (support !=
+                        server_vbr_prompt_cache_support_status::supported) {
+                    SLT_DBG(
+                        idle,
+                        "VBR_IDLE_CAPTURE fallback=live_only reason=%s\n",
+                        server_vbr_prompt_cache_support_status_name(
+                            support));
+                }
+            }
+            if (base_eligible(idle)) {
+                any_live_source = true;
+            }
+        }
+        if (!any_live_source) {
+            return 0;
+        }
+
+        // Decode-driven readiness is allowed to sample frequently, but a
+        // stable already-published frontier or a cooling-down refusal must
+        // not pay retention ranking and a host-catalog pass again. Token and
+        // media digests are cached by server_tokens; this is one scalar slot
+        // walk and leaves the ordinary idle/mutation terminal unchanged.
+        if (readiness_only) {
+            bool work_due = false;
+            const int64_t now_ms = ggml_time_ms();
+            for (auto & idle : slots) {
+                if (!base_eligible(idle)) {
+                    continue;
+                }
+                std::array<uint8_t, 32> token_digest = {};
+                vbr_artifact_identity_block identity;
+                server_vbr_artifact_capture_status identity_status;
+                if (!idle.prompt.tokens.retention_token_digest(
+                        token_digest) ||
+                    !build_capture_identity_fields(
+                        idle, identity, identity_status)) {
+                    continue;
+                }
+                const auto publication = vbr_idle_publication_identity(
+                    token_digest, representation.tier_epoch,
+                    representation.tier_epoch_swa);
+                if (idle.vbr_idle_capture_representation_valid &&
+                    idle.vbr_idle_capture_published_identity == publication) {
+                    continue;
+                }
+                const auto attempt = vbr_idle_capture_attempt_digest(
+                    identity, token_digest, representation.tier_epoch,
+                    representation.tier_epoch_swa);
+                if (vbr_idle_capture_attempt_suppressed(
+                        idle.vbr_idle_capture_attempt_identity, attempt,
+                        idle.vbr_idle_capture_terminal,
+                        idle.vbr_idle_capture_retry_after_ms, now_ms)) {
+                    continue;
+                }
+                work_due = true;
+                break;
+            }
+            if (!work_due) {
+                return 0;
+            }
+        }
+        try {
+            candidates.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+            manifests.reserve(VBR_PROJECTED_CAPTURE_MAX_MANIFESTS);
+        } catch (...) {
+            return 0;
+        }
+
+        // The bounded wave is a retention decision, not a slot-number
+        // lottery. Snapshot the current competition epoch without aging it,
+        // then rank all eligible live parents from coldest to hottest. The
+        // reverse order feeds scarce capture bandwidth; the forward order is
+        // retained for cheap displacement of already-durable sources after
+        // capture completes. No token vectors are copied until selection.
+        const vbr_live_retention_filter retention_filter { -1, -1, nullptr };
+        bool ranked = vbr_prepare_retention_wave(
+            retention_filter, false, false);
+        if (ranked) {
+            for (size_t i = 0; i < vbr_retention_candidate_count; ++i) {
+                auto & value = vbr_retention_candidates[i];
+                const auto * slot = slot_by_id(value.slot_id);
+                value.eligible = slot && base_eligible(*slot);
+            }
+            ranked = server_anchor_parent_values_prepared(
+                vbr_retention_candidates.data(),
+                vbr_retention_candidate_count,
+                vbr_retention_projection_epoch,
+                vbr_idle_parent_values);
+        }
+        size_t durability_order_count = 0;
+        if (ranked) {
+            ranked = server_idle_durability_order(
+                vbr_idle_parent_values,
+                vbr_idle_durability_order.data(),
+                vbr_idle_durability_order.size(),
+                durability_order_count);
+            if (ranked) {
+                for (size_t i = 0; i < durability_order_count; ++i) {
+                    if (!slot_by_id(vbr_idle_durability_order[i])) {
+                        ranked = false;
+                        break;
+                    }
+                }
+            }
+            if (!ranked) {
+                durability_order_count = 0;
+            }
+        }
+        if (!ranked) {
+            durability_order_count = 0;
+            for (const auto & idle : slots) {
+                if (!base_eligible(idle)) {
+                    continue;
+                }
+                if (durability_order_count >=
+                        vbr_idle_durability_order.size()) {
+                    return 0;
+                }
+                vbr_idle_durability_order[durability_order_count++] = idle.id;
+            }
+            std::sort(
+                vbr_idle_durability_order.begin(),
+                vbr_idle_durability_order.begin() +
+                    durability_order_count,
+                [&](int32_t lhs, int32_t rhs) {
+                    const auto * left = slot_by_id(lhs);
+                    const auto * right = slot_by_id(rhs);
+                    return left && right
+                        ? std::tie(left->t_last_used, left->id) <
+                              std::tie(right->t_last_used, right->id)
+                        : lhs < rhs;
+                });
+        }
+
+        // Classify every ranked live frontier in one host-cache pass. Canonical
+        // artifact identities narrow the scan; the cache then authenticates
+        // the complete token block before calling a row durable.
+        size_t frontier_query_count = 0;
+        try {
+            if (vbr_durable_stems_by_seq.size() != slots.size()) {
+                return 0;
+            }
+            std::fill(
+                vbr_durable_stems_by_seq.begin(),
+                vbr_durable_stems_by_seq.end(), uint8_t(0));
+            for (size_t order = 0; order < durability_order_count; ++order) {
+                if (!capture_session.continue_capture()) {
+                    return 0;
+                }
+                auto * selected = slot_by_id(
+                    vbr_idle_durability_order[order]);
+                if (!selected || !base_eligible(*selected)) {
+                    continue;
+                }
+                if (frontier_query_count >=
+                        vbr_idle_frontier_queries.size()) {
+                    return 0;
+                }
+                auto & query =
+                    vbr_idle_frontier_queries[frontier_query_count];
+                query.slot_id = selected->id;
+                query.prompt = &selected->prompt;
+                server_vbr_artifact_capture_status identity_status;
+                if (!build_capture_identity_fields(
+                        *selected, query.identity, identity_status)) {
+                    continue;
+                }
+                query.durable = false;
+                query.expected_stem_artifact =
+                    selected->vbr_idle_stem_source_valid
+                    ? selected->vbr_idle_stem_host_artifact
+                    : llama_cache_acct_artifact_id {};
+                query.stem_durable = false;
+                frontier_query_count++;
+            }
+            if (!prompt_cache->mark_vbr_frontiers(
+                    vbr_idle_frontier_queries.data(),
+                    frontier_query_count) ||
+                !capture_session.continue_capture()) {
+                return 0;
+            }
+            for (size_t i = 0; i < frontier_query_count; ++i) {
+                const auto & query = vbr_idle_frontier_queries[i];
+                if (query.slot_id < 0 || size_t(query.slot_id) >=
+                        vbr_durable_sources_by_seq.size()) {
+                    return 0;
+                }
+                vbr_durable_sources_by_seq[size_t(query.slot_id)] =
+                    query.durable ? 1 : 0;
+                vbr_durable_stems_by_seq[size_t(query.slot_id)] =
+                    query.stem_durable ? 1 : 0;
+            }
+        } catch (...) {
+            return 0;
+        }
+
+        const auto durable_at_snapshot = [&](const server_slot & idle) {
+            return idle.id >= 0 &&
+                size_t(idle.id) < vbr_durable_sources_by_seq.size() &&
+                vbr_durable_sources_by_seq[size_t(idle.id)] != 0;
+        };
+        for (size_t order = durability_order_count; order > 0; --order) {
+            auto * selected = slot_by_id(
+                vbr_idle_durability_order[order - 1]);
+            if (!selected || !base_eligible(*selected)) {
+                continue;
+            }
+            auto & idle = *selected;
+            if (capture_attempts + displacement_attempts ==
+                    VBR_PROJECTED_CAPTURE_MAX_MANIFESTS) {
+                break;
+            }
+            const bool durable = durable_at_snapshot(idle);
+            std::array<uint8_t, 32> token_identity_digest = {};
+            if (durable &&
+                !idle.prompt.tokens.retention_token_digest(
+                    token_identity_digest)) {
+                continue;
+            }
+            const auto durable_identity = durable
+                ? vbr_idle_publication_identity(
+                    token_identity_digest,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa)
+                : std::array<uint8_t, 32> {};
+            const bool representation_changed = durable &&
+                (!idle.vbr_idle_capture_representation_valid ||
+                 idle.vbr_idle_capture_published_identity !=
+                    durable_identity);
+            // Refresh and fresh publication have different cache terminals.
+            // Keep each projected wave homogeneous so neither class can make
+            // the other fail admission forever on a stable ranking.
+            if ((representation_changed && !manifests.empty()) ||
+                (!representation_changed && refresh_selected)) {
+                continue;
+            }
+            // Scalar refresh performs one exact physical-union admission.
+            // Bound that global work to one row per synchronous idle wave;
+            // remaining durable sources drain on later quiet ticks. Initial
+            // publications still share the normal <=8-manifest projection.
+            if (representation_changed && refresh_selected) {
+                continue;
+            }
+            if (durable && !representation_changed) {
+                // Existing durable rows are displaced only after the capture
+                // wave, in ascending retention value. Clearing them here
+                // would mutate the shared pool before the selected high-value
+                // projections have transferred.
+                continue;
+            }
+            const uint64_t token_references =
+                uint64_t(idle.prompt.n_tokens());
+            if (token_references > MAX_IDLE_TOKEN_REFERENCES -
+                    total_token_references) {
+                continue;
+            }
+            ++capture_attempts;
+            if (!durable &&
+                !idle.prompt.tokens.retention_token_digest(
+                    token_identity_digest)) {
+                continue;
+            }
+            vbr_projected_capture_manifest_request manifest;
+            manifest.manifest_id = uint64_t(idle.id) + 1;
+            manifest.sequence = idle.id;
+            server_vbr_artifact_capture_status identity_status;
+            if (!build_capture_identity_fields(
+                    idle, manifest.identity, identity_status)) {
+                continue;
+            }
+            manifest.text_only = !idle.prompt.tokens.has_media() &&
+                manifest.identity.next_position ==
+                    manifest.identity.token_count;
+            const auto full_source_identity =
+                vbr_idle_capture_attempt_digest(
+                    manifest.identity,
+                    token_identity_digest,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa);
+            const auto * refusal_retention =
+                idle.vbr_idle_admission_refusals.empty()
+                    ? nullptr : live_retention_owner();
+            const bool refusal_currency_available =
+                refusal_retention && cache_authority;
+            const uint64_t refusal_accounting_serial =
+                refusal_currency_available
+                    ? cache_authority->ledger.serial() : 0;
+            const uint64_t refusal_retention_epoch =
+                refusal_currency_available
+                    ? refusal_retention->competition_epoch_value() : 0;
+            const auto refusal_lease = refusal_currency_available &&
+                    idle.lease_obs
+                ? idle.lease_obs->retry_witness(false)
+                : server_cache_lease_retry_witness {};
+            const auto refusal_suppressed = [&] (
+                    const std::array<uint8_t, 32> & attempt) noexcept {
+                return refusal_currency_available &&
+                    vbr_idle_admission_refusal_suppressed(
+                        idle.vbr_idle_admission_refusals, attempt,
+                        refusal_accounting_serial,
+                        refusal_retention_epoch, refusal_lease);
+            };
+
+            // Stateful prefixes may only be cut at an already sealed context
+            // checkpoint.  The checkpoint owns the exact recurrent/draft/
+            // accelerator image for that frontier; the attention capture
+            // below is then bound to the same token count.  iSWA remains
+            // excluded here because its PARTIAL_ONLY checkpoint contains
+            // tier-sensitive attention bytes rather than a recurrent-only
+            // companion.
+            const common_prompt_checkpoint * checkpoint_frontier = nullptr;
+            bool checkpoint_candidate_seen = false;
+            std::array<uint8_t, 32> attempt_identity =
+                full_source_identity;
+            const bool matching_stem_source =
+                server_vbr_stem_matches_capture_source(
+                    idle.vbr_idle_stem_source_valid,
+                    idle.vbr_idle_stem_source_identity,
+                    full_source_identity);
+            const bool stem_already_durable = matching_stem_source &&
+                idle.id >= 0 &&
+                size_t(idle.id) < vbr_durable_stems_by_seq.size() &&
+                vbr_durable_stems_by_seq[size_t(idle.id)] != 0;
+            // Reuse demand reopens checkpoint selection when the durable stem
+            // belongs to a different source or frontier. If the authenticated
+            // host witness already seals this exact demanded frontier, consume
+            // the demand instead of repeating an idempotent companion/D2H
+            // capture on every later branch hit.
+            if (idle.vbr_reuse_capture_frontier != 0 &&
+                stem_already_durable &&
+                idle.vbr_idle_stem_source_valid &&
+                idle.vbr_idle_stem_source_identity ==
+                    full_source_identity &&
+                idle.vbr_idle_stem_coverage_tokens ==
+                    idle.vbr_reuse_capture_frontier) {
+                idle.vbr_reuse_capture_frontier = 0;
+            }
+            if (!durable &&
+                (!stem_already_durable ||
+                 idle.vbr_reuse_capture_frontier != 0) &&
+                (!matching_stem_source ||
+                 idle.vbr_reuse_capture_frontier != 0) &&
+                n_swa == 0 &&
+                (llama_model_is_hybrid(model_tgt) || ctx_dft ||
+                 idle.can_speculate())) {
+                bool demanded_checkpoint_seen = false;
+                const auto consider_checkpoint = [&] (
+                        const common_prompt_checkpoint & checkpoint,
+                        bool demanded) {
+                    if (checkpoint_frontier || checkpoint.empty() ||
+                        !checkpoint.computation_frontier.valid() ||
+                        checkpoint.n_tokens <= 0 ||
+                        checkpoint.n_tokens >= idle.prompt.n_tokens() ||
+                        checkpoint.computation_frontier.sequence_epoch !=
+                            idle.prompt.sequence_epoch ||
+                        (ctx_dft && checkpoint.data_dft.empty())) {
+                        return;
+                    }
+                    checkpoint_candidate_seen = true;
+                    demanded_checkpoint_seen |= demanded;
+                    vbr_artifact_identity_block checkpoint_identity;
+                    std::array<uint8_t, 32> checkpoint_token_digest = {};
+                    if (!build_capture_identity_fields(
+                            idle, checkpoint_identity, identity_status,
+                            checkpoint.n_tokens) ||
+                        checkpoint_identity.next_position !=
+                            checkpoint.computation_frontier.next_position ||
+                        !idle.prompt.tokens.retention_token_prefix_digest(
+                            size_t(checkpoint.n_tokens),
+                            checkpoint_token_digest)) {
+                        return;
+                    }
+                    const auto checkpoint_attempt =
+                        vbr_idle_capture_attempt_digest(
+                            checkpoint_identity, checkpoint_token_digest,
+                            representation.tier_epoch,
+                            representation.tier_epoch_swa);
+                    if (refusal_suppressed(checkpoint_attempt)) {
+                        return;
+                    }
+                    checkpoint_frontier = &checkpoint;
+                    manifest.identity = std::move(checkpoint_identity);
+                    token_identity_digest = checkpoint_token_digest;
+                    attempt_identity = checkpoint_attempt;
+                };
+
+                // Reuse demand wins over size/recency: for a stateful tree a
+                // newer checkpoint cannot be projected backward across its
+                // companion. Find the exact frontier that actually served a
+                // prior branch before considering ordinary newest-first work.
+                if (idle.vbr_reuse_capture_frontier != 0) {
+                    for (auto it = idle.prompt.checkpoints.rbegin();
+                         it != idle.prompt.checkpoints.rend(); ++it) {
+                        if (uint64_t(std::max<int64_t>(0, it->n_tokens)) ==
+                                idle.vbr_reuse_capture_frontier) {
+                            consider_checkpoint(*it, true);
+                            break;
+                        }
+                    }
+                    if (demanded_checkpoint_seen && !checkpoint_frontier) {
+                        continue;
+                    }
+                    if (!demanded_checkpoint_seen) {
+                        idle.vbr_reuse_capture_frontier = 0;
+                    }
+                }
+                if (!checkpoint_frontier) {
+                    for (auto it = idle.prompt.checkpoints.rbegin();
+                         it != idle.prompt.checkpoints.rend(); ++it) {
+                        consider_checkpoint(*it, false);
+                        if (checkpoint_frontier) {
+                            break;
+                        }
+                    }
+                }
+                // A refusal belongs to one sealed frontier, not the whole
+                // source. Walk newest-to-oldest until a frontier is not
+                // suppressed; if all current frontiers have stable refusal
+                // evidence, wait for capacity/lease/retention currency to
+                // change instead of falling through to an unrelated live
+                // companion capture.
+                if (checkpoint_candidate_seen && !checkpoint_frontier) {
+                    continue;
+                }
+            }
+            bool checkpoint_stem = checkpoint_frontier != nullptr;
+
+            bool stem_retry = false;
+            const bool matching_attempt_stem_source =
+                server_vbr_stem_matches_capture_source(
+                    idle.vbr_idle_stem_source_valid,
+                    idle.vbr_idle_stem_source_identity,
+                    attempt_identity);
+            const bool durable_stem = idle.id >= 0 &&
+                size_t(idle.id) < vbr_durable_stems_by_seq.size() &&
+                vbr_durable_stems_by_seq[size_t(idle.id)] != 0;
+            if (!checkpoint_stem && !durable &&
+                !idle.prompt.tokens.has_media() &&
+                matching_attempt_stem_source) {
+                if (idle.vbr_idle_stem_coverage_tokens != 0 &&
+                    durable_stem) {
+                    continue;
+                }
+                // A coordinated recurrent/SWA tree cannot manufacture an
+                // attention-only retry. Drop the stale witness and let the
+                // next quiet tick select a sealed checkpoint again; do not
+                // fall through and immediately replace the useful frontier
+                // with the full source under the same host-capacity pressure.
+                if (requires_coordinated_tree_clear) {
+                    idle.vbr_idle_stem_source_valid = false;
+                    idle.vbr_idle_stem_host_artifact = {};
+                    continue;
+                }
+                idle.vbr_idle_stem_source_valid = false;
+                idle.vbr_idle_stem_host_artifact = {};
+                idle.vbr_idle_stem_retry = true;
+            }
+            if (!checkpoint_stem && !durable &&
+                !requires_coordinated_tree_clear &&
+                !idle.prompt.tokens.has_media()) {
+                stem_retry = idle.vbr_idle_stem_retry &&
+                    idle.vbr_idle_stem_source_identity ==
+                        attempt_identity;
+            }
+
+            if (refusal_suppressed(attempt_identity)) {
+                continue;
+            }
+
+            if ((stem_retry || checkpoint_stem) &&
+                ggml_time_ms() < idle.vbr_idle_capture_retry_after_ms) {
+                continue;
+            }
+
+            // A stem retry owns a singleton projection because it changes the
+            // frontier of the complete physical union. Earlier exact rows
+            // finish first; a later quiet tick then isolates this source.
+            if ((stem_retry || checkpoint_stem) && !manifests.empty()) {
+                continue;
+            }
+
+            if (!stem_retry && !checkpoint_stem &&
+                vbr_idle_capture_attempt_suppressed(
+                    idle.vbr_idle_capture_attempt_identity,
+                    attempt_identity, idle.vbr_idle_capture_terminal,
+                    idle.vbr_idle_capture_retry_after_ms, ggml_time_ms())) {
+                continue;
+            }
+            server_prompt_cache_vbr_publication_metadata publication;
+            const bool prompt_boundary_stem =
+                vbr_prompt_boundary_capture_slot == idle.id;
+            if (!representation_changed) {
+                const bool prepared = checkpoint_stem || prompt_boundary_stem
+                    ? prompt_cache->prepare_vbr_stem_publication_metadata(
+                        idle.prompt,
+                        checkpoint_stem
+                            ? checkpoint_frontier->n_tokens
+                            : manifest.identity.token_count,
+                        manifest.identity.execution_identity,
+                        manifest.identity.adapter_config_identity,
+                        idle.id, publication)
+                    : !stem_retry &&
+                        prompt_cache->prepare_vbr_publication_metadata(
+                            idle.prompt,
+                            manifest.identity.execution_identity,
+                            manifest.identity.adapter_config_identity,
+                            idle.id, publication);
+                if (!prepared && !stem_retry) {
+                    continue;
+                }
+            }
+            const int64_t trace_token_count = manifest.identity.token_count;
+            const llama_pos trace_next_position =
+                manifest.identity.next_position;
+            manifest.token_block.reserve(
+                size_t(manifest.identity.token_count));
+            for (int64_t i = 0; i < manifest.identity.token_count; ++i) {
+                manifest.token_block.push_back(
+                    idle.prompt.tokens[size_t(i)]);
+            }
+            try {
+                manifests.push_back(std::move(manifest));
+                candidates.push_back({
+                    &idle, checkpoint_frontier,
+                    uint64_t(idle.id) + 1, attempt_identity,
+                    full_source_identity,
+                    representation.tier_epoch,
+                    representation.tier_epoch_swa,
+                    representation_changed,
+                    stem_retry || checkpoint_stem || prompt_boundary_stem,
+                    checkpoint_stem || prompt_boundary_stem,
+                    checkpoint_stem
+                        ? uint64_t(checkpoint_frontier->n_tokens)
+                        : prompt_boundary_stem
+                            ? uint64_t(manifest.identity.token_count) : 0,
+                    std::move(publication),
+                });
+                total_token_references += token_references;
+                refresh_selected |= representation_changed;
+                if (params_base.cache_debug) {
+                    const auto & selected = candidates.back();
+                    SRV_INF(
+                        "VBR_CAPTURE_TRACE event=candidate slot=%d manifest=%" PRIu64
+                        " attempt=%02x%02x%02x%02x%02x%02x%02x%02x "
+                        "tokens=%" PRId64 " next=%d durable=%d refresh=%d "
+                        "stem_requested=%d checkpoint=%d prepressure=%d "
+                        "prior_same=%d prior_terminal=%d retry_in_ms=%" PRId64
+                        " published_identity_valid=%d "
+                        "tier_epoch=%" PRIu64 " tier_epoch_swa=%" PRIu64 "\n",
+                        idle.id, selected.manifest_id,
+                        unsigned(selected.attempt_identity[0]),
+                        unsigned(selected.attempt_identity[1]),
+                        unsigned(selected.attempt_identity[2]),
+                        unsigned(selected.attempt_identity[3]),
+                        unsigned(selected.attempt_identity[4]),
+                        unsigned(selected.attempt_identity[5]),
+                        unsigned(selected.attempt_identity[6]),
+                        unsigned(selected.attempt_identity[7]),
+                        trace_token_count, int(trace_next_position),
+                        int(durable), int(representation_changed),
+                        int(selected.stem_requested), int(checkpoint_stem),
+                        int(readiness_only),
+                        int(idle.vbr_idle_capture_attempt_identity ==
+                            selected.attempt_identity),
+                        int(idle.vbr_idle_capture_terminal),
+                        std::max<int64_t>(
+                            0, idle.vbr_idle_capture_retry_after_ms-
+                                ggml_time_ms()),
+                        int(idle.vbr_idle_capture_representation_valid),
+                        selected.tier_epoch,
+                        selected.tier_epoch_swa);
+                }
+                if (readiness_only) {
+                    break;
+                }
+                // A payload-complete iSWA child is one exact artifact-wide
+                // dependency. It cannot be partitioned across the projected
+                // <=8-manifest union, so capture one ranked source per idle
+                // wave through the exact host handoff below.
+                if (stem_retry || checkpoint_stem ||
+                    requires_coordinated_tree_clear || ctx_dft ||
+                    idle.can_speculate()) {
+                    break;
+                }
+            } catch (...) {
+                return 0;
+            }
+        }
+        const auto displace_existing_sources = [&]() {
+            // iSWA owns one shared payload-complete child. Removing a single
+            // sequence cannot empty that child, so its live aliases are
+            // reclaimed atomically below only after every resident slot has
+            // a durable host frontier.
+            if (requires_coordinated_tree_clear ||
+                !may_displace_live_source) {
+                return;
+            }
+            for (size_t order = 0;
+                 order < durability_order_count &&
+                 capture_attempts + displacement_attempts <
+                    VBR_PROJECTED_CAPTURE_MAX_MANIFESTS;
+                 ++order) {
+                auto * selected = slot_by_id(
+                    vbr_idle_durability_order[order]);
+                if (!selected || !base_eligible(*selected) ||
+                    !durable_at_snapshot(*selected)) {
+                    continue;
+                }
+                auto & idle = *selected;
+                const std::string & adapter_key =
+                    idle.vbr_adapter_config_identity;
+                std::array<uint8_t, 32> token_identity_digest = {};
+                if (!idle.prompt.tokens.retention_token_digest(
+                        token_identity_digest)) {
+                    continue;
+                }
+                const auto current_publication_identity =
+                    vbr_idle_publication_identity(
+                        token_identity_digest,
+                        representation.tier_epoch,
+                        representation.tier_epoch_swa);
+                const bool representation_changed =
+                    !idle.vbr_idle_capture_representation_valid ||
+                    idle.vbr_idle_capture_published_identity !=
+                        current_publication_identity;
+                if (representation_changed ||
+                    automatic_vbr_cache_support(
+                        idle.prompt.tokens, idle.lora,
+                        idle.can_speculate()) !=
+                        server_vbr_prompt_cache_support_status::supported ||
+                    !capture_session.continue_capture() ||
+                    !prompt_cache->contains_vbr_frontier(
+                        idle.prompt, frontier_execution_identity,
+                        adapter_key)) {
+                    continue;
+                }
+                ++displacement_attempts;
+                if (idle.prompt_clear_after_vbr_publication()) {
+                    ++displaced_existing;
+                }
+            }
+        };
+        if (manifests.empty()) {
+            if (readiness_only) {
+                return 0;
+            }
+            displace_existing_sources();
+            return displaced_existing;
+        }
+        if (!cache_plan_observe_live_memory(false)) {
+            return 0;
+        }
+
+        std::vector<server_vbr_projected_host_publish_result> captured;
+        server_vbr_projected_host_capture_diagnostics diagnostics;
+        server_prompt_cache_vbr_capacity_claim capacity_claim;
+        bool has_refresh_candidate = false;
+        bool has_fresh_candidate = false;
+        for (const auto & candidate : candidates) {
+            has_refresh_candidate |= candidate.refresh;
+            has_fresh_candidate |= !candidate.refresh;
+        }
+        const int64_t started = ggml_time_us();
+
+        const bool stateful_companion_capture =
+            requires_coordinated_tree_clear || ctx_dft ||
+            (!candidates.empty() && candidates.front().slot &&
+             (candidates.front().slot->can_speculate() ||
+              candidates.front().checkpoint != nullptr));
+        const bool projected_stateful_capture =
+            !readiness_only && stateful_companion_capture &&
+            projected_attention_layout_supported &&
+            candidates.size() == 1 && manifests.size() == 1;
+        const bool exact_companion_capture = readiness_only ||
+            (stateful_companion_capture && !projected_stateful_capture);
+        // Bound every capture by configured durable host capacity (and the
+        // library's 16 GiB per-wave ceiling), not by a small transport-window
+        // constant that would silently truncate long reusable prefixes. The
+        // transfer probes the queue-owned cancellation token between bounded
+        // chunks, so newly posted work interrupts a large idle wave promptly.
+        const uint64_t runway = vbr_automatic_exact_capture_max_bytes();
+        if (runway == 0 || !capture_session.continue_capture()) {
+            return 0;
+        }
+        if (projected_stateful_capture) {
+            auto & candidate = candidates.front();
+            vbr_explicit_capture_request stateful_request;
+            server_vbr_artifact_capture_status request_status;
+            if (!candidate.slot || !build_capture_request(
+                    *candidate.slot, stateful_request, request_status,
+                    candidate.checkpoint)) {
+                return 0;
+            }
+            auto & manifest = manifests.front();
+            const auto & expected = manifest.identity;
+            const auto & observed = stateful_request.identity;
+            if (stateful_request.sequence != manifest.sequence ||
+                observed.execution_identity != expected.execution_identity ||
+                observed.adapter_config_identity !=
+                    expected.adapter_config_identity ||
+                observed.media_content_identity !=
+                    expected.media_content_identity ||
+                observed.sequence_epoch != expected.sequence_epoch ||
+                observed.token_count != expected.token_count ||
+                observed.next_position != expected.next_position ||
+                stateful_request.token_block != manifest.token_block) {
+                return 0;
+            }
+            manifest.companions = std::move(stateful_request.companions);
+        }
+        if (exact_companion_capture) {
+            if (candidates.size() != 1 || manifests.size() != 1 ||
+                !capture_session.continue_capture()) {
+                return 0;
+            }
+            auto & candidate = candidates.front();
+            vbr_explicit_capture_request exact_request;
+            server_vbr_artifact_capture_status request_status;
+            if (!candidate.slot || !build_capture_request(
+                    *candidate.slot, exact_request, request_status,
+                    candidate.checkpoint)) {
+                return 0;
+            }
+            auto background =
+                std::make_unique<vbr_idle_exact_capture_work>();
+            background->session = std::move(capture_session);
+            background->started_us = started;
+            struct exact_admission_context {
+                server_context_impl * owner = nullptr;
+                server_queue::idle_capture_session * session = nullptr;
+                const server_slot * source = nullptr;
+                server_prompt_cache * cache = nullptr;
+                server_prompt_cache_vbr_publication_metadata * publication =
+                    nullptr;
+                server_prompt_cache_vbr_capacity_claim * capacity = nullptr;
+                server_vbr_capture_readiness_reservation * readiness = nullptr;
+                uint64_t generation = 0;
+                server_prompt_cache_vbr_capacity_status capacity_status =
+                    server_prompt_cache_vbr_capacity_status::invalid;
+                server_vbr_capture_readiness_status readiness_status =
+                    server_vbr_capture_readiness_status::invalid;
+                bool refresh = false;
+                bool prepressure = false;
+                bool prompt_boundary = false;
+            } exact_admission {
+                this, &background->session, candidate.slot,
+                prompt_cache.get(),
+                &candidate.publication, &background->capacity,
+                &background->readiness,
+                ++vbr_capture_readiness_generation,
+                server_prompt_cache_vbr_capacity_status::invalid,
+                server_vbr_capture_readiness_status::invalid,
+                candidate.refresh, readiness_only,
+                vbr_prompt_boundary_capture_slot == candidate.slot->id,
+            };
+            // Prompt-boundary sealing protects the immutable prompt rows while
+            // first-token sampling and unrelated slots continue. The source
+            // slot alone waits before its next KV mutation, so use the explicit
+            // inter-token deadline below instead of charging the ordinary
+            // decode-growth runway twice.
+            exact_admission.prepressure = readiness_only &&
+                vbr_prompt_boundary_capture_slot < 0;
+            if (vbr_capture_readiness_generation == 0) {
+                exact_admission.generation =
+                    ++vbr_capture_readiness_generation;
+            }
+            exact_request.max_packed_bytes = runway;
+            exact_request.pretransfer_context = &exact_admission;
+            exact_request.pretransfer_admit = [](
+                    void * opaque,
+                    const vbr_explicit_capture_pretransfer_quote & quote)
+                    noexcept {
+                auto * context =
+                    static_cast<exact_admission_context *>(opaque);
+                if (!context || !context->session ||
+                    !context->session->continue_capture()) {
+                    return false;
+                }
+                if (!context->owner || !context->source ||
+                    !context->readiness) {
+                    return false;
+                }
+                context->readiness_status =
+                    server_vbr_capture_readiness_admit(
+                        context->owner->vbr_capture_readiness_input_for(
+                            *context->source, quote,
+                            context->prepressure),
+                        context->generation, *context->readiness);
+                if (context->readiness_status !=
+                        server_vbr_capture_readiness_status::ready) {
+                    return false;
+                }
+                if (context->prompt_boundary &&
+                    context->readiness->forecast_capture_us >
+                        VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US) {
+                    context->readiness_status =
+                        server_vbr_capture_readiness_status::deadline_missed;
+                    context->readiness->reset();
+                    return false;
+                }
+                if (context->refresh) {
+                    return context->cache && context->source &&
+                        context->cache->preview_vbr_compact_refresh_capacity(
+                            context->source->prompt,
+                            context->owner->frontier_execution_identity,
+                            lora_config_identity(context->source->lora),
+                            quote.conservative_host_resident_bytes) &&
+                        context->session->continue_capture();
+                }
+                auto * publication = context->publication;
+                return context->cache && context->capacity && publication &&
+                    publication->ready() &&
+                    context->cache->prepare_vbr_publication_capacity(
+                        &publication, 1,
+                        quote.conservative_host_resident_bytes,
+                        *context->capacity, &context->capacity_status) &&
+                    context->session->continue_capture();
+            };
+            exact_request.continue_context = background.get();
+            exact_request.continue_transfer = [](void * opaque) noexcept {
+                const auto * work = static_cast<const
+                    vbr_idle_exact_capture_work *>(opaque);
+                return work && work->session.continue_capture() &&
+                    (work->transfer_deadline_us <= 0 ||
+                     ggml_time_us() <= work->transfer_deadline_us);
+            };
+            const auto exact = vbr_artifact_store->prepare_host_payload(
+                *memory, std::move(exact_request), background->capture);
+            const uint64_t exact_bytes =
+                exact.pretransfer.planned_packed_bytes;
+            if (params_base.cache_debug) {
+                SRV_INF(
+                    "VBR_CAPTURE_TRACE event=prepared slot=%d manifest=%" PRIu64
+                    " attempt=%02x%02x%02x%02x%02x%02x%02x%02x "
+                    "mode=exact status=%s library_status=%s phase=%s "
+                    "payload=%" PRIu64 " stash=%" PRIu64
+                    " companion=%" PRIu64 " metadata=%" PRIu64
+                    " planned=%" PRIu64 " host=%" PRIu64
+                    " controllers=%u units=%u companions=%u "
+                    "readiness=%u capacity=%u\n",
+                    candidate.slot->id, candidate.manifest_id,
+                    unsigned(candidate.attempt_identity[0]),
+                    unsigned(candidate.attempt_identity[1]),
+                    unsigned(candidate.attempt_identity[2]),
+                    unsigned(candidate.attempt_identity[3]),
+                    unsigned(candidate.attempt_identity[4]),
+                    unsigned(candidate.attempt_identity[5]),
+                    unsigned(candidate.attempt_identity[6]),
+                    unsigned(candidate.attempt_identity[7]),
+                    server_vbr_artifact_capture_status_name(exact.status),
+                    vbr_explicit_capture_status_name(exact.library_status),
+                    vbr_explicit_capture_phase_name(exact.phase),
+                    exact.pretransfer.payload_bytes,
+                    exact.pretransfer.stash_bytes,
+                    exact.pretransfer.companion_bytes,
+                    exact.pretransfer.metadata_bytes,
+                    exact.pretransfer.planned_packed_bytes,
+                    exact.pretransfer.conservative_host_resident_bytes,
+                    exact.pretransfer.controllers, exact.pretransfer.units,
+                    exact.pretransfer.companions,
+                    unsigned(exact_admission.readiness_status),
+                    unsigned(exact_admission.capacity_status));
+            }
+            const bool exact_size_ok =
+                vbr_explicit_capture_pretransfer_quote_admissible(
+                    exact.pretransfer, runway);
+            if (exact.status != server_vbr_artifact_capture_status::ok ||
+                !background->capture.ready_for_transfer() ||
+                !exact_size_ok ||
+                !background->session.continue_capture()) {
+                SRV_DBG(
+                    "VBR_IDLE_CAPTURE exact-complete refused status=%s "
+                    "library_status=%s phase=%s generation=%s bytes=%" PRIu64
+                    " readiness=%u capacity=%u duration_ms=%.3f\n",
+                    server_vbr_artifact_capture_status_name(exact.status),
+                    vbr_explicit_capture_status_name(exact.library_status),
+                    vbr_explicit_capture_phase_name(exact.phase),
+                    vbr_explicit_generation_failure_name(
+                        exact.generation_failure), exact_bytes,
+                    unsigned(exact_admission.readiness_status),
+                    unsigned(exact_admission.capacity_status),
+                    (ggml_time_us() - started)/1000.0);
+                candidate.slot->vbr_idle_capture_attempt_identity =
+                    candidate.attempt_identity;
+                candidate.slot->vbr_idle_capture_terminal =
+                    exact.library_status ==
+                        vbr_explicit_capture_status::unsupported_layout ||
+                    exact.library_status ==
+                        vbr_explicit_capture_status::not_armed;
+                candidate.slot->vbr_idle_capture_retry_after_ms =
+                    candidate.slot->vbr_idle_capture_terminal
+                        ? 0 : ggml_time_ms() + 5000;
+                return 0;
+            }
+            background->candidate.slot_id = candidate.slot->id;
+            background->candidate.manifest_id = candidate.manifest_id;
+            background->candidate.attempt_identity =
+                candidate.attempt_identity;
+            background->candidate.full_source_identity =
+                candidate.full_source_identity;
+            background->candidate.tier_epoch = candidate.tier_epoch;
+            background->candidate.tier_epoch_swa =
+                candidate.tier_epoch_swa;
+            background->candidate.refresh = candidate.refresh;
+            background->candidate.stem_requested =
+                candidate.stem_requested;
+            background->candidate.stemmed = candidate.stemmed;
+            background->candidate.prepressure = readiness_only;
+            background->candidate.active_prompt_frontier =
+                vbr_prompt_boundary_capture_slot == candidate.slot->id;
+            background->candidate.selected_tokens =
+                candidate.selected_tokens;
+            background->candidate.publication =
+                std::move(candidate.publication);
+            vbr_idle_exact_capture = std::move(background);
+            auto * worker = vbr_idle_exact_capture.get();
+            try {
+                worker->transfer_started_us = ggml_time_us();
+                if (worker->candidate.active_prompt_frontier) {
+                    worker->transfer_deadline_us =
+                        worker->transfer_started_us+
+                        int64_t(VBR_PROMPT_BOUNDARY_CAPTURE_DEADLINE_US);
+                }
+                worker->worker = std::thread([this, worker]() noexcept {
+                    worker->transfer =
+                        vbr_artifact_store->transfer_host_payload(
+                            worker->capture);
+                    if (params_base.cache_debug) {
+                        const auto & identity =
+                            worker->candidate.attempt_identity;
+                        SRV_INF(
+                            "VBR_CAPTURE_TRACE event=transfer_complete slot=%d "
+                            "manifest=%" PRIu64
+                            " attempt=%02x%02x%02x%02x%02x%02x%02x%02x "
+                            "status=%s library_status=%s phase=%s "
+                            "payload=%" PRIu64 " stash=%" PRIu64
+                            " companion=%" PRIu64 " chunks=%" PRIu64
+                            " duration_ms=%.3f\n",
+                            worker->candidate.slot_id,
+                            worker->candidate.manifest_id,
+                            unsigned(identity[0]), unsigned(identity[1]),
+                            unsigned(identity[2]), unsigned(identity[3]),
+                            unsigned(identity[4]), unsigned(identity[5]),
+                            unsigned(identity[6]), unsigned(identity[7]),
+                            server_vbr_artifact_capture_status_name(
+                                worker->transfer.status),
+                            vbr_explicit_capture_status_name(
+                                worker->transfer.library_status),
+                            vbr_explicit_capture_phase_name(
+                                worker->transfer.phase),
+                            worker->transfer.payload_bytes,
+                            worker->transfer.stash_bytes,
+                            worker->transfer.companion_bytes,
+                            worker->transfer.chunks,
+                            (ggml_time_us()-worker->transfer_started_us)/1000.0);
+                    }
+                    worker->complete.store(
+                        true, std::memory_order_release);
+                    queue_tasks.request_idle_maintenance();
+                });
+            } catch (...) {
+                candidate.slot->vbr_idle_capture_attempt_identity =
+                    candidate.attempt_identity;
+                candidate.slot->vbr_idle_capture_terminal = false;
+                candidate.slot->vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                vbr_idle_exact_capture.reset();
+                return 0;
+            }
+            SRV_DBG(
+                "VBR_IDLE_CAPTURE exact-background admitted bytes=%" PRIu64
+                " prepare_ms=%.3f\n",
+                exact_bytes, (ggml_time_us() - started)/1000.0);
+            return 0;
+        } else {
+        std::vector<server_prompt_cache_vbr_publication_metadata *>
+            admitted_publications;
+        try {
+            admitted_publications.reserve(candidates.size());
+        } catch (...) {
+            return 0;
+        }
+        struct idle_admission_context {
+            server_context_impl * owner = nullptr;
+            server_queue::idle_capture_session * session = nullptr;
+            server_prompt_cache * cache = nullptr;
+            std::vector<candidate> * candidates = nullptr;
+            std::vector<server_prompt_cache_vbr_publication_metadata *> *
+                admitted = nullptr;
+            server_prompt_cache_vbr_capacity_claim * capacity = nullptr;
+            bool has_refresh = false;
+            bool has_fresh = false;
+            uint64_t tier_epoch = 0;
+            uint64_t tier_epoch_swa = 0;
+            server_prompt_cache_vbr_capacity_status capacity_status =
+                server_prompt_cache_vbr_capacity_status::invalid;
+            bool capacity_refused = false;
+            uint64_t capacity_retry_manifest_id = 0;
+        } admission_state {
+            this, &capture_session, prompt_cache.get(), &candidates,
+            &admitted_publications, &capacity_claim,
+            has_refresh_candidate, has_fresh_candidate,
+            representation.tier_epoch, representation.tier_epoch_swa,
+        };
+        server_vbr_projected_capture_admission admission;
+        admission.context = &admission_state;
+        admission.frontier = candidates.size() == 1 &&
+                candidates.front().stem_requested &&
+                !candidates.front().stemmed
+            ? vbr_projected_capture_frontier_policy {
+                vbr_projected_capture_frontier_mode::
+                    longest_attention_stem,
+                SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS,
+                prompt_cache->limit_size,
+                prompt_cache->limit_size == 0
+                    ? prompt_cache->limit_tokens : 0,
+            }
+            : vbr_projected_capture_frontier_policy {};
+        admission.prepare = [](
+                void * opaque,
+                const server_vbr_projected_capture_admission::quote & quote)
+                noexcept {
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
+            if (!context || !context->cache || !context->candidates ||
+                !session || !session->continue_capture()) {
+                return false;
+            }
+            if (context->has_refresh) {
+                return !context->has_fresh && session->continue_capture();
+            }
+            for (const auto & durable : quote.durable) {
+                auto found = std::find_if(
+                    context->candidates->begin(),
+                    context->candidates->end(),
+                    [&](const candidate & value) {
+                        return !value.refresh &&
+                            value.manifest_id == durable.manifest_id;
+                    });
+                if (found == context->candidates->end() || !found->slot ||
+                    durable.selected_token_count == 0 ||
+                    durable.selected_token_count > uint64_t(INT64_MAX) ||
+                    durable.selected_token_count >
+                        durable.requested_token_count) {
+                    return false;
+                }
+                const uint64_t expected_requested_tokens = found->stemmed
+                    ? found->selected_tokens
+                    : uint64_t(found->slot->prompt.n_tokens());
+                if (expected_requested_tokens == 0 ||
+                    durable.requested_token_count !=
+                        expected_requested_tokens) {
+                    return false;
+                }
+                if (found->publication.ready()) {
+                    if (durable.stemmed ||
+                        (found->stem_requested && !found->stemmed)) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (!found->stem_requested) {
+                    return false;
+                }
+                vbr_artifact_identity_block selected_identity;
+                server_vbr_artifact_capture_status identity_status;
+                if (!context->owner ||
+                    !context->owner->build_capture_identity_fields(
+                        *found->slot, selected_identity, identity_status,
+                        int64_t(durable.selected_token_count)) ||
+                    selected_identity.next_position !=
+                        durable.selected_next_position) {
+                    return false;
+                }
+                std::array<uint8_t, 32> selected_token_digest = {};
+                if (!found->slot->prompt.tokens.
+                        retention_token_prefix_digest(
+                            size_t(durable.selected_token_count),
+                            selected_token_digest)) {
+                    return false;
+                }
+                found->attempt_identity = vbr_idle_capture_attempt_digest(
+                    selected_identity, selected_token_digest,
+                    context->tier_epoch, context->tier_epoch_swa);
+                // `durable.stemmed` says the core planner shortened the
+                // submitted request. A sealed checkpoint request is already a
+                // shorter semantic frontier before it reaches that planner, so
+                // an exact projection of it must retain the server-owned stem
+                // classification. Otherwise the next idle wave treats the
+                // checkpoint as a full source capture and may immediately
+                // evict the useful branch frontier it just published.
+                found->stemmed = found->stemmed || durable.stemmed;
+                found->selected_tokens = durable.selected_token_count;
+                const bool prepared = durable.stemmed
+                    ? context->cache->prepare_vbr_stem_publication_metadata(
+                        found->slot->prompt,
+                        int64_t(durable.selected_token_count),
+                        selected_identity.execution_identity,
+                        selected_identity.adapter_config_identity,
+                        found->slot->id, found->publication)
+                    : context->cache->prepare_vbr_publication_metadata(
+                        found->slot->prompt,
+                        selected_identity.execution_identity,
+                        selected_identity.adapter_config_identity,
+                        found->slot->id, found->publication);
+                if (!prepared) {
+                    return false;
+                }
+            }
+            return session->continue_capture();
+        };
+        admission.admit = [](
+                void * opaque,
+                const server_vbr_projected_capture_admission::quote & quote)
+                noexcept {
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
+            // Planning can include controller settlement, projection and
+            // recurrent sizing. The store now holds the exact transfer-
+            // staging and durable claims plus the persistent ring operation
+            // while this final queue check runs, so capture cannot begin
+            // behind queued work or a competing transfer. Later arrivals
+            // cancel between bounded recurrent writes or attention chunks.
+            if (!context || !context->cache || !context->candidates ||
+                !context->admitted ||
+                !context->capacity || !session ||
+                !session->continue_capture()) {
+                return false;
+            }
+            // Refresh owns a separate in-place transaction. Do not partition
+            // one physical quote between refresh and fresh publication in
+            // this first bounded capacity-claim slice.
+            if (context->has_refresh) {
+                return !context->has_fresh &&
+                    session->continue_capture();
+            }
+            context->admitted->clear();
+            for (const auto & durable : quote.durable) {
+                server_prompt_cache_vbr_publication_metadata * found =
+                    nullptr;
+                for (auto & candidate : *context->candidates) {
+                    if (!candidate.refresh &&
+                        candidate.manifest_id == durable.manifest_id) {
+                        if (found) {
+                            return false;
+                        }
+                        found = &candidate.publication;
+                    }
+                }
+                if (!found) {
+                    return false;
+                }
+                if (std::find(
+                        context->admitted->begin(),
+                        context->admitted->end(), found) !=
+                    context->admitted->end()) {
+                    return false;
+                }
+                context->admitted->push_back(found);
+            }
+            if (context->admitted->empty()) {
+                return false;
+            }
+            if (!context->cache->prepare_vbr_publication_capacity(
+                    context->admitted->data(), context->admitted->size(),
+                    quote.projected_host_resident_bytes,
+                    *context->capacity, &context->capacity_status)) {
+                context->capacity_refused = true;
+                if (context->capacity_status ==
+                        server_prompt_cache_vbr_capacity_status::
+                            pressure_batch_unsupported) {
+                    std::array<uint64_t,
+                        VBR_PROJECTED_CAPTURE_MAX_MANIFESTS> ranked = {};
+                    std::array<uint64_t,
+                        VBR_PROJECTED_CAPTURE_MAX_MANIFESTS> admitted = {};
+                    size_t ranked_count = 0;
+                    size_t admitted_count = 0;
+                    for (const auto & candidate : *context->candidates) {
+                        if (ranked_count < ranked.size()) {
+                            ranked[ranked_count++] = candidate.manifest_id;
+                        }
+                    }
+                    for (const auto & durable : quote.durable) {
+                        if (admitted_count < admitted.size()) {
+                            admitted[admitted_count++] = durable.manifest_id;
+                        }
+                    }
+                    context->capacity_retry_manifest_id =
+                        vbr_idle_capacity_retry_manifest(
+                            ranked.data(), ranked_count,
+                            admitted.data(), admitted_count);
+                }
+                return false;
+            }
+            if (!session->continue_capture()) {
+                *context->capacity = {};
+                return false;
+            }
+            return true;
+        };
+        admission.continue_capture = [](void * opaque) noexcept {
+            auto * context = static_cast<idle_admission_context *>(opaque);
+            auto * session = context ? context->session : nullptr;
+            return session && session->continue_capture();
+        };
+        const bool projected_ok =
+            vbr_artifact_store->capture_projected_host_batch(
+                *memory, std::move(manifests), runway,
+                captured, &admission, &diagnostics);
+        if (params_base.cache_debug) {
+            SRV_INF(
+                "VBR_CAPTURE_TRACE event=projected_complete ok=%d "
+                "manifests=%zu status=%s phase=%s frontier=%u "
+                "requested_tokens=%" PRIu64 " selected_tokens=%" PRIu64
+                " union_cells=%" PRIu64 " planned=%" PRIu64
+                " companion=%" PRIu64 " survey_cells=%" PRIu64
+                " survey_calls=%u recaptures=%u size_passes=%u "
+                "projections=%u transfers=%u ring_acquires=%u "
+                "capacity=%u duration_ms=%.3f\n",
+                int(projected_ok), candidates.size(),
+                vbr_explicit_capture_status_name(
+                    diagnostics.capture_status),
+                vbr_explicit_capture_phase_name(
+                    diagnostics.capture_phase),
+                unsigned(diagnostics.frontier_status),
+                diagnostics.requested_frontier_tokens,
+                diagnostics.selected_frontier_tokens,
+                diagnostics.union_cells,
+                diagnostics.planned_packed_bytes,
+                diagnostics.companion_d2h_bytes,
+                diagnostics.frontier_survey_cells,
+                diagnostics.frontier_survey_calls,
+                diagnostics.frontier_recapture_calls,
+                diagnostics.size_pass_calls,
+                diagnostics.projection_calls,
+                diagnostics.unit_transfer_calls,
+                diagnostics.ring_operation_acquires,
+                unsigned(admission_state.capacity_status),
+                (ggml_time_us() - started)/1000.0);
+        }
+        if (!projected_ok) {
+            SRV_DBG(
+                "VBR_IDLE_CAPTURE refused status=%s phase=%s planned=%" PRIu64
+                " duration_ms=%.3f\n",
+                vbr_explicit_capture_status_name(
+                    diagnostics.capture_status),
+                vbr_explicit_capture_phase_name(
+                    diagnostics.capture_phase),
+                diagnostics.planned_packed_bytes,
+                (ggml_time_us() - started)/1000.0);
+            const bool terminal =
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::unsupported_layout ||
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::not_armed;
+            const bool aggregate_over_cap =
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::accounting_failed &&
+                diagnostics.planned_packed_bytes > runway;
+            const bool incoming_over_host_cap =
+                admission_state.capacity_status ==
+                    server_prompt_cache_vbr_capacity_status::
+                        incoming_exceeds_hard_limit;
+            const bool stem_permanently_unavailable =
+                diagnostics.frontier_status ==
+                    vbr_projected_capture_frontier_status::
+                        stem_below_minimum ||
+                (diagnostics.frontier_status ==
+                     vbr_projected_capture_frontier_status::stem_unsupported &&
+                 (diagnostics.capture_status ==
+                      vbr_explicit_capture_status::unsupported_layout ||
+                  diagnostics.capture_status ==
+                      vbr_explicit_capture_status::identity_unavailable ||
+                  diagnostics.capture_status ==
+                      vbr_explicit_capture_status::
+                          required_companion_unavailable));
+            const bool witnessable_admission_refusal =
+                candidates.size() == 1 &&
+                admission_state.capacity_refused &&
+                diagnostics.capture_status ==
+                    vbr_explicit_capture_status::admission_refused &&
+                diagnostics.capture_phase ==
+                    vbr_explicit_capture_phase::reservation_preparation;
+            // Prepared prompt/retention metadata owns provisional accounting
+            // operations. Roll it back before sampling the refusal currency,
+            // otherwise its later destructor would make our own witness stale
+            // and reopen the identical candidate on the next idle tick.
+            if (witnessable_admission_refusal) {
+                admitted_publications.clear();
+                capacity_claim = {};
+                for (auto & candidate : candidates) {
+                    candidate.publication = {};
+                }
+            }
+            const int64_t retry_after_ms = ggml_time_ms() + 5000;
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                const auto & candidate = candidates[i];
+                candidate.slot->vbr_idle_capture_attempt_identity =
+                    candidate.attempt_identity;
+                const bool refusal_witnessed =
+                    witnessable_admission_refusal &&
+                    vbr_record_idle_admission_refusal(
+                        *candidate.slot, candidate.attempt_identity);
+                const bool begin_stem_retry = !candidate.refresh &&
+                    !candidate.stem_requested && candidates.size() == 1 &&
+                    (aggregate_over_cap || incoming_over_host_cap) &&
+                    !requires_coordinated_tree_clear &&
+                    !candidate.slot->prompt.tokens.has_media();
+                if (begin_stem_retry || candidate.stem_requested) {
+                    candidate.slot->vbr_idle_stem_source_identity =
+                        candidate.full_source_identity;
+                    candidate.slot->vbr_idle_stem_source_valid = false;
+                    candidate.slot->vbr_idle_stem_host_artifact = {};
+                    candidate.slot->vbr_idle_stem_retry =
+                        !stem_permanently_unavailable;
+                    candidate.slot->vbr_idle_stem_coverage_tokens =
+                        diagnostics.selected_frontier_tokens;
+                }
+                // Aggregate admission is not a property of any one frontier.
+                // Reopen one row immediately and cool down its siblings so
+                // the next idle tick isolates it. A singleton overflow also
+                // remains transient: dynamic retiering can reduce its packed
+                // representation without changing the semantic frontier.
+                candidate.slot->vbr_idle_capture_terminal =
+                    terminal ||
+                    (candidate.stem_requested &&
+                     stem_permanently_unavailable);
+                const bool retry_immediately = vbr_idle_retry_immediately(
+                    terminal, aggregate_over_cap,
+                    admission_state.capacity_status,
+                    candidates.size(),
+                    candidate.manifest_id ==
+                        diagnostics.first_available_manifest_id,
+                    candidate.manifest_id ==
+                        admission_state.capacity_retry_manifest_id);
+                candidate.slot->vbr_idle_capture_retry_after_ms =
+                    begin_stem_retry ? 0 :
+                    candidate.slot->vbr_idle_capture_terminal ? 0 :
+                    refusal_witnessed ? 0 :
+                    retry_immediately ? 0 : retry_after_ms;
+                candidate.slot->vbr_idle_capture_isolated_retry =
+                    !candidate.slot->vbr_idle_capture_terminal &&
+                    candidates.size() > 1 && !retry_immediately &&
+                    (aggregate_over_cap ||
+                     admission_state.capacity_status ==
+                        server_prompt_cache_vbr_capacity_status::
+                            pressure_batch_unsupported);
+                if (retry_immediately || begin_stem_retry) {
+                    queue_tasks.request_idle_maintenance();
+                }
+            }
+            return 0;
+        }
+        }
+
+        if (has_fresh_candidate &&
+            !capacity_claim.requires_publication_revalidation() &&
+            !prompt_cache->consume_vbr_publication_capacity(
+                capacity_claim)) {
+            const int64_t retry_after_ms = ggml_time_ms() + 5000;
+            for (auto & candidate : candidates) {
+                if (!candidate.refresh && candidate.slot) {
+                    candidate.slot->vbr_idle_capture_attempt_identity =
+                        candidate.attempt_identity;
+                    candidate.slot->vbr_idle_capture_terminal = false;
+                    candidate.slot->vbr_idle_capture_retry_after_ms =
+                        retry_after_ms;
+                    candidate.slot->vbr_idle_capture_isolated_retry = false;
+                }
+            }
+            return displaced_existing;
+        }
+
+        size_t published_count = 0;
+        size_t refreshed_count = 0;
+        size_t displaced_count = 0;
+        const auto representation_after =
+            memory->vbr_representation_identity();
+        for (auto & row : captured) {
+            if (!capture_session.continue_capture()) {
+                break;
+            }
+            if (!row.payload ||
+                (row.status !=
+                     vbr_projected_manifest_publish_status::published &&
+                 row.status !=
+                     vbr_projected_manifest_publish_status::adopted)) {
+                const auto failed = std::find_if(
+                    candidates.begin(), candidates.end(),
+                    [&](const candidate & value) {
+                        return value.manifest_id == row.manifest_id;
+                    });
+                if (failed != candidates.end()) {
+                    failed->slot->vbr_idle_capture_attempt_identity =
+                        failed->attempt_identity;
+                    // Dependency availability includes live recurrent/source
+                    // currency and can recover without a semantic frontier
+                    // change. Keep it on the bounded transient cooldown.
+                    failed->slot->vbr_idle_capture_terminal = false;
+                    failed->slot->vbr_idle_capture_retry_after_ms =
+                        ggml_time_ms() + 5000;
+                    failed->slot->vbr_idle_capture_isolated_retry = false;
+                }
+                continue;
+            }
+            const auto found = std::find_if(
+                candidates.begin(), candidates.end(),
+                [&](const candidate & value) {
+                    return value.manifest_id == row.manifest_id;
+                });
+            if (found == candidates.end() || !found->slot ||
+                found->slot->is_processing() ||
+                found->slot->state != SLOT_STATE_IDLE) {
+                continue;
+            }
+            auto & source = *found->slot;
+            const bool representation_stable =
+                representation_after.tier_epoch == found->tier_epoch &&
+                representation_after.tier_epoch_swa ==
+                    found->tier_epoch_swa;
+            const auto adapter_key =
+                row.payload->package().manifest().identity.
+                    adapter_config_identity;
+            std::array<uint8_t, 32> publication_token_identity = {};
+            if (!source.prompt.tokens.retention_token_digest(
+                    publication_token_identity)) {
+                continue;
+            }
+            const auto publication_identity =
+                vbr_idle_publication_identity(
+                    publication_token_identity,
+                    found->tier_epoch, found->tier_epoch_swa);
+            if (found->refresh) {
+                const auto refresh = prompt_cache->refresh_vbr_compact(
+                    source.prompt, std::move(row.payload),
+                    frontier_execution_identity, adapter_key, source.id);
+                if (refresh ==
+                        server_prompt_cache_vbr_refresh_status::
+                            updated_with_anchor ||
+                    refresh ==
+                        server_prompt_cache_vbr_refresh_status::
+                            updated_compact_only ||
+                    refresh ==
+                        server_prompt_cache_vbr_refresh_status::unchanged) {
+                    source.vbr_idle_capture_published_identity =
+                        publication_identity;
+                    source.vbr_idle_capture_representation_valid =
+                        representation_stable;
+                    source.vbr_idle_capture_attempt_identity =
+                        found->attempt_identity;
+                    source.vbr_idle_capture_terminal = true;
+                    source.vbr_idle_capture_retry_after_ms = 0;
+                    source.vbr_idle_capture_isolated_retry = false;
+                    if (refresh !=
+                            server_prompt_cache_vbr_refresh_status::unchanged) {
+                        ++refreshed_count;
+                    }
+                    // Refresh publication never clears its live source. A
+                    // later idle/pressure wave observes the now-current
+                    // durable frontier and owns any displacement decision.
+                    continue;
+                }
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = false;
+                source.vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                source.vbr_idle_capture_isolated_retry = false;
+                continue;
+            }
+            server_prompt_cache::iterator published_host =
+                prompt_cache->states.end();
+            if (!found->publication.ready() ||
+                !prompt_cache->publish_vbr(
+                    found->publication,
+                    server_prompt_cache_payload::from_vbr(
+                        std::move(row.payload)),
+                    source.cache_family,
+                    !source.task || !source.task->is_child(),
+                    &published_host,
+                    capacity_claim.requires_publication_revalidation()
+                        ? &capacity_claim : nullptr)) {
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = false;
+                source.vbr_idle_capture_retry_after_ms =
+                    ggml_time_ms() + 5000;
+                source.vbr_idle_capture_isolated_retry = false;
+                continue;
+            }
+            ++published_count;
+            if (found->stemmed) {
+                // A stem is an independently sealed, non-consuming host
+                // frontier. It cannot certify or clear the longer live
+                // source; remember only enough to suppress duplicate work
+                // while that exact host stem remains present.
+                source.vbr_idle_stem_source_identity =
+                    found->full_source_identity;
+                source.vbr_idle_stem_coverage_tokens =
+                    found->selected_tokens;
+                source.vbr_idle_stem_host_artifact =
+                    prompt_cache->vbr_host_artifact_id(published_host);
+                if (source.vbr_idle_stem_host_artifact.v == 0) {
+                    source.vbr_idle_stem_source_valid = false;
+                    source.vbr_idle_stem_retry = true;
+                    source.vbr_idle_capture_terminal = false;
+                    source.vbr_idle_capture_retry_after_ms =
+                        ggml_time_ms() + 5000;
+                    source.vbr_idle_capture_isolated_retry = false;
+                    continue;
+                }
+                source.vbr_idle_stem_source_valid = true;
+                source.vbr_idle_stem_retry = false;
+                source.vbr_idle_capture_attempt_identity =
+                    found->attempt_identity;
+                source.vbr_idle_capture_terminal = true;
+                source.vbr_idle_capture_retry_after_ms = 0;
+                source.vbr_idle_capture_isolated_retry = false;
+                if (source.vbr_reuse_capture_frontier ==
+                        found->selected_tokens) {
+                    source.vbr_reuse_capture_frontier = 0;
+                }
+                continue;
+            }
+            source.vbr_idle_stem_retry = false;
+            source.vbr_idle_stem_source_valid = false;
+            source.vbr_idle_stem_host_artifact = {};
+            source.vbr_idle_capture_published_identity =
+                publication_identity;
+            source.vbr_idle_capture_representation_valid =
+                representation_stable;
+            source.vbr_idle_capture_attempt_identity =
+                found->attempt_identity;
+            source.vbr_idle_capture_terminal = true;
+            source.vbr_idle_capture_retry_after_ms = 0;
+            source.vbr_idle_capture_isolated_retry = false;
+
+            // Publication is durable, but it is not authority to destroy a
+            // different live frontier. Re-derive the complete semantic key
+            // immediately before the canonical clear and repeat every live
+            // protection check that can change while capture was in flight.
+            // A refusal intentionally retains both the host artifact and the
+            // live source; a later pressure wave may reconsider the latter.
+            vbr_artifact_identity_block current_identity;
+            std::array<uint8_t, 32> current_token_identity = {};
+            server_vbr_artifact_capture_status identity_status;
+            const bool source_unchanged =
+                build_capture_identity_fields(
+                    source, current_identity, identity_status) &&
+                source.prompt.tokens.retention_token_digest(
+                    current_token_identity) &&
+                vbr_idle_capture_attempt_digest(
+                    current_identity,
+                    current_token_identity,
+                    found->tier_epoch,
+                    found->tier_epoch_swa) ==
+                    found->attempt_identity && representation_stable;
+            if (!source_unchanged || source.is_processing() ||
+                source.state != SLOT_STATE_IDLE ||
+                automatic_vbr_cache_support(
+                    source.prompt.tokens, source.lora,
+                    source.can_speculate()) !=
+                    server_vbr_prompt_cache_support_status::supported ||
+                source.hard_lease_blocks_live_prefix() ||
+                !capture_session.continue_capture() ||
+                queue_tasks.has_deferred_for_slot(source.id) ||
+                !prompt_cache->contains_vbr_frontier(
+                    source.prompt, frontier_execution_identity,
+                    adapter_key)) {
+                continue;
+            }
+            if (!requires_coordinated_tree_clear &&
+                may_displace_live_source) {
+                if (!source.prompt_clear_after_vbr_publication()) {
+                    continue;
+                }
+                ++displaced_count;
+            }
+        }
+
+        // Spend any remaining per-wave operation budget on the coldest
+        // already-durable live aliases only after the selected capture batch
+        // has completed. This preserves the source geometry of hotter rows
+        // throughout projection and D2H.
+        displace_existing_sources();
+
+        // An oversized multi-frontier batch is isolated to one manifest so
+        // the bounded staging ring is never overcommitted. After that
+        // singleton publishes, release exactly one cooled sibling for the
+        // next idle maintenance pass. This drains a saturated slot set one
+        // bounded transfer at a time without imposing the generic five-second
+        // transient-failure backoff between successful captures.
+        if (candidates.size() == 1 &&
+            published_count + refreshed_count != 0) {
+            for (auto & pending : slots) {
+                if (!vbr_idle_release_isolated_retry(
+                        candidates.size(), published_count + refreshed_count,
+                        pending.vbr_idle_capture_isolated_retry,
+                        pending.vbr_idle_capture_terminal,
+                        pending.state == SLOT_STATE_IDLE,
+                        pending.is_processing())) {
+                    continue;
+                }
+                pending.vbr_idle_capture_isolated_retry = false;
+                pending.vbr_idle_capture_retry_after_ms = 0;
+                queue_tasks.request_idle_maintenance();
+                break;
+            }
+        }
+
+        if (requires_coordinated_tree_clear &&
+            may_displace_live_source) {
+            std::vector<server_slot *> reclaim;
+            bool all_durable = true;
+            try {
+                reclaim.reserve(slots.size());
+                size_t query_count = 0;
+                for (auto & live : slots) {
+                    if (live.prompt.n_tokens() == 0) {
+                        continue;
+                    }
+                    const auto admission = live.observe_full_slot(
+                        server_cache_destruction_class::slot_drop,
+                        server_cache_destruction_reason::idle_reclaim);
+                    const bool safe = !live.is_processing() &&
+                        live.state == SLOT_STATE_IDLE &&
+                        automatic_vbr_cache_support(
+                            live.prompt.tokens, live.lora,
+                            live.can_speculate()) ==
+                            server_vbr_prompt_cache_support_status::supported &&
+                        !live.hard_lease_blocks_live_prefix() &&
+                        !queue_tasks.has_deferred_for_slot(live.id) &&
+                        admission.verdict !=
+                            server_cache_destruction_verdict::
+                                would_refuse_hard_leased &&
+                        admission.verdict !=
+                            server_cache_destruction_verdict::unavailable;
+                    if (!safe) {
+                        all_durable = false;
+                        break;
+                    }
+                    if (query_count >= vbr_idle_frontier_queries.size()) {
+                        all_durable = false;
+                        break;
+                    }
+                    auto & query = vbr_idle_frontier_queries[query_count++];
+                    query.slot_id = live.id;
+                    query.prompt = &live.prompt;
+                    server_vbr_artifact_capture_status identity_status;
+                    if (!build_capture_identity_fields(
+                            live, query.identity, identity_status)) {
+                        all_durable = false;
+                        break;
+                    }
+                    query.expected_stem_artifact = {};
+                    query.durable = false;
+                    query.stem_durable = false;
+                    reclaim.push_back(&live);
+                }
+                if (all_durable && query_count != reclaim.size()) {
+                    all_durable = false;
+                }
+                if (all_durable && query_count != 0) {
+                    all_durable = prompt_cache->mark_vbr_frontiers(
+                        vbr_idle_frontier_queries.data(), query_count);
+                }
+                if (all_durable) {
+                    for (size_t i = 0; i < query_count; ++i) {
+                        if (!vbr_idle_frontier_queries[i].durable) {
+                            all_durable = false;
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {
+                all_durable = false;
+            }
+            if (all_durable && !reclaim.empty() &&
+                capture_session.continue_capture()) {
+                // No per-sequence erase can empty the payload-complete SWA
+                // child. The scheduler has authenticated every resident
+                // sequence above, so clear the shared tree once and then
+                // consume each already-admitted live alias without another
+                // fallible operation in between.
+                llama_memory_clear(memory, false);
+                // Publish an immediately importable empty frontier. Without
+                // this settle, the next idle tick eventually shrinks the VBR
+                // watermarks, but a request arriving first sees the old
+                // mapped frontier as target_not_empty and cold-prefills.
+                llama_memory_breathe(memory);
+                for (auto * live : reclaim) {
+                    const bool cleared =
+                        live->prompt_clear_after_vbr_publication();
+                    GGML_ASSERT(cleared);
+                    if (cleared) {
+                        ++displaced_count;
+                    }
+                }
+            }
+        }
+
+        SRV_INF(
+            "VBR_IDLE_CAPTURE manifests=%zu published=%zu refreshed=%zu displaced=%zu "
+            "union_cells=%" PRIu64 " planned=%" PRIu64
+            " transfers=%u duration_ms=%.3f\n",
+            candidates.size(), published_count, refreshed_count,
+            displaced_existing + displaced_count,
+            diagnostics.union_cells, diagnostics.planned_packed_bytes,
+            diagnostics.unit_transfer_calls,
+            (ggml_time_us() - started)/1000.0);
+        return published_count;
+        } catch (...) {
+            return 0;
+        }
+    }
+
     // fork 9l-d2c: cache-control authority (fork server-context.cpp 3642-3648).
     // Lazily constructed by its scheduler-only cache-control task; the fork's
     // destroy() closes it before prompt_cache because host proofs point into
