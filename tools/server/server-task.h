@@ -1234,6 +1234,15 @@ struct server_prompt_cache_vbr_replacement_diagnostics {
     uint64_t recovery_raw_token_comparisons = 0;
 };
 
+// fork 9l-d4b6o (fork server-task.h 1102-1109)
+inline void server_prompt_cache_apply_family(
+        server_prompt_cache_state & state,
+        common_cache_family_binding binding,
+        bool automatic_main_family) noexcept {
+    state.cache_family = binding;
+    state.main_family = common_cache_family_main_family(
+        binding, automatic_main_family);
+}
 
 // fork 9l-c: server_prompt_retention_publish_exact_prefix decl (fork server-task.h 1335-1340)
 bool server_prompt_retention_publish_exact_prefix(
@@ -1495,6 +1504,18 @@ struct server_prompt_cache {
         std::string adapter_config_key,
         int32_t source_slot,
         server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+
+    // fork 9l-d4b6o (fork server-task.h 1454-1463)
+    // Attach the sealed catalog payload and enter the ordinary cache-capacity
+    // publication terminal. All node/token/prefix allocations were completed
+    // by prepare; a refusal still preserves the live source.
+    bool publish_vbr(
+        server_prompt_cache_vbr_publication_metadata & prepared,
+        server_prompt_cache_payload payload,
+        common_cache_family_binding family,
+        bool automatic_main_family,
+        iterator * published = nullptr,
+        server_prompt_cache_vbr_capacity_claim * capacity = nullptr) noexcept;
 
     // fork 9l-d4b5a (fork server-task.h 1475-1476)
     bool consume_vbr_publication_capacity(

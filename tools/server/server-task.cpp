@@ -3638,6 +3638,133 @@ bool server_prompt_cache::prepare_vbr_publication_metadata_impl(
     return true;
 }
 
+// fork 9l-d4b6o: server_prompt_cache::publish_vbr (fork server-task.cpp 4141-4264)
+
+bool server_prompt_cache::publish_vbr(
+        server_prompt_cache_vbr_publication_metadata & prepared,
+        server_prompt_cache_payload payload,
+        common_cache_family_binding family,
+        bool automatic_main_family,
+        iterator * published,
+        server_prompt_cache_vbr_capacity_claim * capacity) noexcept {
+    if (published) {
+        *published = states.end();
+    }
+    if (!prepared.ready() || prepared.cache_ != this ||
+        payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
+        !payload.publishable()) {
+        return false;
+    }
+    auto & staged = prepared.entry_.front();
+    const auto source_prefix_matches = [&]() noexcept {
+        if (!prepared.stem_) {
+            return true;
+        }
+        try {
+            if (!prepared.source_ ||
+                prepared.source_->sequence_epoch !=
+                    prepared.source_sequence_epoch_ ||
+                staged.prompt.sequence_epoch !=
+                    prepared.source_sequence_epoch_ ||
+                prepared.coverage_tokens_ > uint64_t(INT64_MAX) ||
+                prepared.source_->n_tokens() < 0 ||
+                uint64_t(prepared.source_->n_tokens()) <
+                    prepared.coverage_tokens_ ||
+                staged.prompt.n_tokens() < 0 ||
+                uint64_t(staged.prompt.n_tokens()) !=
+                    prepared.coverage_tokens_ ||
+                !server_prompt_cache_vbr_frontier_matches(
+                    staged.prompt, payload,
+                    staged.vbr_execution_identity,
+                    staged.adapter_config_key)) {
+                return false;
+            }
+            std::array<uint8_t, 32> live_digest = {};
+            std::array<uint8_t, 32> staged_digest = {};
+            return prepared.source_->tokens.retention_token_prefix_digest(
+                       size_t(prepared.coverage_tokens_), live_digest) &&
+                   staged.prompt.tokens.retention_token_prefix_digest(
+                       size_t(prepared.coverage_tokens_), staged_digest) &&
+                   live_digest == prepared.source_prefix_digest_ &&
+                   staged_digest == prepared.source_prefix_digest_ &&
+                   prepared.source_->tokens.get_common_prefix(
+                       staged.prompt.tokens) == prepared.coverage_tokens_;
+        } catch (...) {
+            return false;
+        }
+    };
+    if (!source_prefix_matches()) {
+        return false;
+    }
+    server_prompt_cache_vbr_pressure_citation required_victims;
+    if (capacity) {
+        if (!capacity->ready() || capacity->cache_ != this ||
+            capacity->scheduler_owner_ != std::this_thread::get_id()) {
+            return false;
+        }
+        if (capacity->victim_count_ != 0) {
+            const auto compact = payload.vbr_compact_owner();
+            if (prepared.destination_artifact_ !=
+                    capacity->destination_artifact_ ||
+                prepared.entry_.front().prompt.n_tokens() < 0 ||
+                size_t(prepared.entry_.front().prompt.n_tokens()) !=
+                    capacity->incoming_tokens_ ||
+                !compact || compact->resident_bytes() >
+                    capacity->incoming_compact_bytes_) {
+                capacity->clear();
+                return false;
+            }
+            for (size_t i = 0; i < capacity->victim_count_; ++i) {
+                if (!server_prompt_cache_revalidate_vbr_victim(
+                        *this, capacity->victims_[i],
+                        capacity->victim_artifacts_[i])) {
+                    capacity->clear();
+                    return false;
+                }
+            }
+            required_victims.artifacts = capacity->victim_artifacts_;
+            required_victims.count = capacity->victim_count_;
+        }
+        capacity->clear();
+    }
+    const auto source_key =
+        server_retention_instance_key::for_slot(prepared.source_slot_);
+    const auto destination_key =
+        server_retention_instance_key::for_host_entry(&staged);
+    if (!retention_obs ||
+        retention_obs->artifact_id(source_key) !=
+            prepared.source_artifact_ ||
+        retention_obs->artifact_id(destination_key) !=
+            prepared.destination_artifact_) {
+        return false;
+    }
+    staged.payload = std::move(payload);
+    server_prompt_cache_apply_family(
+        staged, family, automatic_main_family);
+    const auto * source = prepared.source_;
+    const int32_t source_slot = prepared.source_slot_;
+    const int64_t source_vbr_coverage_tokens = prepared.stem_
+        ? int64_t(prepared.coverage_tokens_) : -1;
+    std::list<server_prompt_cache_state> entry;
+    entry.splice(entry.end(), prepared.entry_);
+    prepared.clear();
+    try {
+        if (publish_impl(
+                std::move(entry), source, source_slot, published, true,
+                required_victims, source_vbr_coverage_tokens)) {
+            return true;
+        }
+    } catch (...) {
+    }
+    if (retention_obs) {
+        retention_obs->retire(destination_key);
+    }
+    if (published) {
+        *published = states.end();
+    }
+    return false;
+}
+
 // fork 9l-d4b5a: vbr_retention_source_available (fork server-task.cpp 7272-7277)
 bool server_prompt_cache::vbr_retention_source_available(
         int32_t source_slot) const noexcept {
