@@ -1428,6 +1428,17 @@ struct server_prompt_cache {
     // fork 9l-d4b6a (fork server-task.h 1413-1414)
     llama_cache_acct_artifact_id vbr_host_artifact_id(
         const_iterator host) const noexcept;
+    // fork 9l-d4b6b (fork server-task.h 1416-1425)
+    // Replace one exact logical node's compact representation in place. A
+    // lower-quality recapture preserves the prior best owner as an optional
+    // anchor when its independent budget fits. No unrelated cache victim is
+    // selected by this bounded refresh transaction.
+    server_prompt_cache_vbr_refresh_status refresh_vbr_compact(
+        const server_prompt & source_prompt,
+        server_prompt_cache_vbr_owner incoming,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        int32_t source_slot) noexcept;
 
     bool prepare_vbr_restore(
         const server_tokens & request_tokens,

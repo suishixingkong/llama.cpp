@@ -4387,6 +4387,166 @@ static bool server_prompt_cache_plan_vbr_pressure(
     return true;
 }
 
+// fork 9l-d4b6b: server_prompt_cache::refresh_vbr_compact (fork server-task.cpp 2847-3004)
+server_prompt_cache_vbr_refresh_status
+server_prompt_cache::refresh_vbr_compact(
+        const server_prompt & source_prompt,
+        server_prompt_cache_vbr_owner incoming,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key,
+        int32_t source_slot) noexcept {
+    using status = server_prompt_cache_vbr_refresh_status;
+    if (!incoming || !acct || !retention_obs || source_slot < 0 ||
+        execution_identity.empty() || adapter_config_key.empty() ||
+        !incoming->accounted_by(acct) || !incoming->retirement_owned() ||
+        !vbr_retention_source_available(source_slot)) {
+        return status::invalid;
+    }
+    try {
+        const auto probe = server_prompt_cache_payload::from_vbr(incoming);
+        if (!probe.valid() || !server_prompt_cache_vbr_frontier_matches(
+                source_prompt, probe, execution_identity,
+                adapter_config_key)) {
+            return status::invalid;
+        }
+
+        iterator target = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact ||
+                it->adapter_config_key != adapter_config_key ||
+                it->vbr_execution_identity != execution_identity ||
+                !server_prompt_cache_vbr_frontier_matches(
+                    source_prompt, it->payload, execution_identity,
+                    adapter_config_key)) {
+                continue;
+            }
+            if (target != states.end()) {
+                return status::ambiguous;
+            }
+            target = it;
+        }
+        if (target == states.end()) {
+            return status::not_found;
+        }
+        if (target->recovery_pins != 0) {
+            return status::busy;
+        }
+
+        const auto * old_variants = target->payload.vbr_variants();
+        if (!old_variants || !old_variants->compact_current()) {
+            return status::invalid;
+        }
+        if (incoming.get() == old_variants->compact_current().get() ||
+            incoming.get() == old_variants->quality_anchor().get()) {
+            return status::unchanged;
+        }
+        const bool had_anchor = bool(old_variants->quality_anchor());
+        const auto * old_compact = old_variants->compact_current().get();
+        server_prompt_cache_payload replacement;
+        bool unchanged = false;
+        if (!target->payload.prepare_vbr_refresh(
+                std::move(incoming), replacement,
+                quality_anchor_budget_enabled, unchanged)) {
+            return unchanged ? status::unchanged : status::internal_error;
+        }
+
+        struct budget_result {
+            bool measured = false;
+            bool compact_fits = false;
+            bool anchor_fits = false;
+        };
+        const auto measure = [&](const server_prompt_cache_payload & value) {
+            budget_result result;
+            std::vector<const server_prompt_cache_payload *> payloads;
+            std::vector<const server_prompt_cache_state *> fixed_states;
+            payloads.reserve(states.size());
+            fixed_states.reserve(states.size());
+            for (const auto & state : states) {
+                if (&state == &*target) {
+                    payloads.push_back(&value);
+                } else if (state.payload.kind() ==
+                        server_prompt_cache_payload_kind::vbr_artifact) {
+                    payloads.push_back(&state.payload);
+                } else {
+                    fixed_states.push_back(&state);
+                }
+            }
+            server_prompt_cache_vbr_budget_summary vbr;
+            size_t fixed_bytes = 0;
+            if (!server_prompt_cache_payload::summarize_vbr_budgets(
+                    payloads, vbr) ||
+                !server_prompt_cache_measure_fixed_states(
+                    fixed_states, acct, fixed_bytes) ||
+                vbr.compact_resident_bytes > SIZE_MAX - fixed_bytes) {
+                return result;
+            }
+            const size_t compact_bytes = fixed_bytes +
+                size_t(vbr.compact_resident_bytes);
+            result.measured = true;
+            result.compact_fits = fits_bytes(compact_bytes);
+            result.anchor_fits = !value.vbr_has_quality_anchor() ||
+                (quality_anchor_budget_enabled &&
+                 vbr.anchor_resident_bytes <= limit_anchor_size);
+            return result;
+        };
+
+        const server_prompt_cache_vbr_payload * retired_owner = nullptr;
+        if (had_anchor) {
+            retired_owner = old_compact;
+        } else if (!replacement.vbr_has_quality_anchor()) {
+            retired_owner = old_compact;
+        }
+        const auto budget = measure(replacement);
+        if (!budget.measured || !budget.compact_fits) {
+            return status::budget_refused;
+        }
+        if (!budget.anchor_fits) {
+            if (had_anchor) {
+                return status::budget_refused;
+            }
+            auto compact = replacement.vbr_compact_owner();
+            replacement = server_prompt_cache_payload::from_vbr(
+                std::move(compact));
+            retired_owner = old_compact;
+            if (!replacement.valid()) {
+                return status::budget_refused;
+            }
+        }
+
+        vbr_artifact_prepared_retire prepared;
+        bool physical_retire = false;
+        const uint64_t serial = acct->serial();
+        if (retired_owner &&
+            !target->payload.vbr_logical_erase_only()) {
+            std::vector<const vbr_artifact_package_view *> retiring_packages {
+                &retired_owner->package(),
+            };
+            if (!retiring_packages.front()->prepare_owned_retire(
+                    retiring_packages, serial, prepared)) {
+                return status::accounting_unavailable;
+            }
+            physical_retire = true;
+        }
+        if (acct->serial() != serial) {
+            return status::accounting_unavailable;
+        }
+
+        target->payload.swap_vbr_storage(replacement);
+        replacement.reset_vbr_storage();
+        if (physical_retire) {
+            const auto retired = prepared.commit();
+            GGML_ASSERT(retired !=
+                        vbr_artifact_prepared_retire_status::unavailable);
+        }
+        return target->payload.vbr_has_quality_anchor()
+            ? status::updated_with_anchor
+            : status::updated_compact_only;
+    } catch (...) {
+        return status::internal_error;
+    }
+}
+
 void server_prompt_cache::release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
     if (candidate.cache_ != this) {
