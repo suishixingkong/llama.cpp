@@ -2758,6 +2758,45 @@ static server_cache_destruction_admission server_prompt_cache_observe_drop(
     return server_cache_retention_admit(cache.destruction_obs, request);
 }
 
+// fork 9l-d4b6g: server_prompt_cache_observe_drop_pair (fork server-task.cpp 4324-4360)
+static server_cache_destruction_admission
+server_prompt_cache_observe_drop_pair(
+        server_prompt_cache & cache,
+        const server_prompt_cache_state & first,
+        const server_prompt_cache_state & second,
+        server_cache_destruction_reason reason,
+        const llama_cache_acct_release_set_preview & preview) noexcept {
+    if (!cache.destruction_obs) {
+        return {};
+    }
+    server_cache_destruction_request request;
+    request.cls = server_cache_destruction_class::host_artifact_drop;
+    request.reason = reason;
+    for (const auto * state : { &first, &second }) {
+        request.add_target(
+            server_cache_destruction_target_kind::host_artifact, -1,
+            cache.retention_obs ? cache.retention_obs->artifact_id(
+                server_retention_instance_key::for_host_entry(state))
+                : llama_cache_acct_artifact_id {});
+    }
+    for (const auto & row : preview.yield_rows) {
+        for (const auto measure : {
+                llama_cache_acct_measure::logical_payload,
+                llama_cache_acct_measure::resident_allocated }) {
+            server_cache_destruction_yield value;
+            value.category = row.category;
+            value.measure = measure;
+            value.domain_known = true;
+            value.domain = row.domain;
+            value.value = llama_cache_acct_value::measured(
+                measure == llama_cache_acct_measure::logical_payload
+                    ? row.logical_payload : row.resident_allocated);
+            request.add_yield(value);
+        }
+    }
+    return server_cache_retention_admit(cache.destruction_obs, request);
+}
+
 // fork 9l-d4b6d: the retirement manifest (fork server-task.cpp 4362-4419)
 struct server_prompt_cache_retirement_manifest {
     server_retention_instance_key host;
@@ -4364,6 +4403,26 @@ host_trade_retention_capacity_projection project_host_trade_retention_capacity(
     return result;
 }
 
+// fork 9l-d4b6g: observe_host_trade_refusal (fork server-task.cpp 5626-5643)
+void observe_host_trade_refusal(
+        server_prompt_cache & cache,
+        uint64_t admission_sequence,
+        common_cache_plan_destruction_reason reason,
+        const host_trade_ranking * ranking = nullptr) noexcept {
+    common_cache_plan_destruction_receipt receipt;
+    receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::
+            different_host_source_consumption);
+    receipt.state = common_cache_plan_destruction_state::refused;
+    receipt.reason = reason;
+    receipt.admission_sequence = admission_sequence;
+    receipt.payload_kind = ranking
+        ? ranking->payload_kind
+        : common_cache_plan_payload_kind::unavailable;
+    server_prompt_cache_observe_host_destruction(
+        cache, receipt, true, 0, ranking);
+}
+
 } // namespace
 
 // fork 9l-d4b5c: the VBR pressure planner (fork server-task.cpp 5647-5674, 5676-5926)
@@ -5583,6 +5642,95 @@ void commit_certified_host_destruction(
     certified.pin = {};
 }
 } // namespace
+
+// fork 9l-d4b6g: server_prompt_cache::destroy_vbr_pair (fork server-task.cpp 7036-7122)
+bool server_prompt_cache::destroy_vbr_pair(
+        iterator first,
+        iterator second,
+        server_cache_destruction_reason reason,
+        bool first_soft_leased,
+        bool second_soft_leased,
+        uint64_t & released_bytes,
+        size_t & released_tokens) {
+    released_bytes = 0;
+    released_tokens = 0;
+    if (!acct || first == states.end() || second == states.end() ||
+        first == second || first->recovery_pins != 0 ||
+        second->recovery_pins != 0 ||
+        first->payload.kind() !=
+            server_prompt_cache_payload_kind::vbr_artifact ||
+        second->payload.kind() !=
+            server_prompt_cache_payload_kind::vbr_artifact ||
+        first->payload.vbr_has_quality_anchor() ||
+        second->payload.vbr_has_quality_anchor() ||
+        !first->payload.vbr_retirement_exclusive() ||
+        !second->payload.vbr_retirement_exclusive() ||
+        first->prompt.n_tokens() < 0 || second->prompt.n_tokens() < 0) {
+        return false;
+    }
+
+    server_prompt_cache_retirement_manifest retirements[2];
+    std::vector<const server_prompt_cache_payload *> payloads;
+    try {
+        payloads.reserve(2);
+        payloads.push_back(&first->payload);
+        payloads.push_back(&second->payload);
+    } catch (...) {
+        return false;
+    }
+    vbr_artifact_prepared_retire prepared;
+    uint64_t bytes = 0;
+    const size_t first_tokens = size_t(first->prompt.n_tokens());
+    const size_t second_tokens = size_t(second->prompt.n_tokens());
+    if (second_tokens > SIZE_MAX - first_tokens ||
+        !server_prompt_cache_capture_retirement(
+            *this, first, retirements[0]) ||
+        !server_prompt_cache_capture_retirement(
+            *this, second, retirements[1]) ||
+        server_fault("vbr_prompt_cache_pair_prepare_fail") ||
+        !server_prompt_cache_payload::prepare_vbr_retire_union(
+            payloads, acct->serial(), prepared) ||
+        !vbr_release_resident_bytes(prepared, bytes) ||
+        bytes > SIZE_MAX ||
+        acct->serial() != prepared.preview().accounting_serial) {
+        return false;
+    }
+
+    const auto admission = server_prompt_cache_observe_drop_pair(
+        *this, *first, *second, reason, prepared.preview());
+    const bool first_main_family = first->main_family;
+    const bool second_main_family = second->main_family;
+    if (destruction_obs) {
+        destruction_obs->host_trade_attempted += 2;
+    }
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+    server_prompt_cache_destroy_entry_impl(*this, first);
+    server_prompt_cache_destroy_entry_impl(*this, second);
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    const auto status = prepared.commit();
+    GGML_ASSERT(status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+    server_prompt_cache_retire_manifest(*this, retirements[0]);
+    server_prompt_cache_retire_manifest(*this, retirements[1]);
+    if (destruction_obs) {
+        const uint64_t sequences[] = { admission.sequence };
+        destruction_obs->note_host_trade_executed(
+            admission.sequence,
+            status == vbr_artifact_prepared_retire_status::retired
+                ? bytes : 0,
+            first_main_family, first_soft_leased);
+        destruction_obs->note_host_trade_executed(
+            admission.sequence, 0,
+            second_main_family, second_soft_leased);
+        destruction_obs->note_prepared_release_batch(
+            sequences, 1, status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+    }
+    released_bytes = status == vbr_artifact_prepared_retire_status::retired
+        ? bytes : UINT64_MAX;
+    released_tokens = first_tokens + second_tokens;
+    return true;
+}
 
 // fork 9l-d4b6f: server_prompt_cache::destroy_entry_impl (fork server-task.cpp 7124-7225)
 server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(

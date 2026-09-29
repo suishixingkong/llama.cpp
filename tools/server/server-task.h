@@ -1289,6 +1289,16 @@ struct server_prompt_cache {
             iterator it,
             server_cache_destruction_reason reason);
 
+    // fork 9l-d4b6g (fork server-task.h 1771-1778)
+    bool destroy_vbr_pair(
+        iterator first,
+        iterator second,
+        server_cache_destruction_reason reason,
+        bool first_soft_leased,
+        bool second_soft_leased,
+        uint64_t & released_bytes,
+        size_t & released_tokens);
+
     // ---------------------------------------------------------------------
     // group C tip: the only part of the server_prompt_cache rewrite that the
     // cache-plan observation face actually calls. Everything else in that
