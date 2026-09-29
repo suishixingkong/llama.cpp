@@ -5643,6 +5643,156 @@ void commit_certified_host_destruction(
 }
 } // namespace
 
+// fork 9l-d4b6h: server_prompt_cache::refuse_incoming_under_pressure (fork server-task.cpp 6749-6771)
+void server_prompt_cache::refuse_incoming_under_pressure(
+        iterator incoming,
+        server_cache_destruction_reason reason) {
+    if (incoming == states.end()) {
+        return;
+    }
+    if (incoming->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        vbr_artifact_prepared_retire prepared;
+        const bool alias_only =
+            incoming->payload.vbr_logical_erase_only();
+        if (!acct ||
+            (!alias_only && !incoming->payload.prepare_vbr_retire(
+                acct->serial(), prepared)) ||
+            !destroy_retention_capacity_entry(
+                incoming, reason,
+                alias_only ? nullptr : &prepared)) {
+            destroy_entry(incoming, reason);
+        }
+    } else {
+        destroy_entry(incoming, reason);
+    }
+}
+
+// fork 9l-d4b6h: server_prompt_cache::destroy_retention_capacity_entry (fork server-task.cpp 6912-7034)
+bool server_prompt_cache::destroy_retention_capacity_entry(
+        iterator it,
+        server_cache_destruction_reason reason,
+        vbr_artifact_prepared_retire * vbr_retire,
+        uint64_t * released_bytes,
+        size_t * released_tokens) {
+    if (released_bytes) {
+        *released_bytes = 0;
+    }
+    if (released_tokens) {
+        *released_tokens = 0;
+    }
+    if (!acct || it == states.end()) {
+        return false;
+    }
+
+    if (it->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        uint64_t bytes = 0;
+        server_prompt_cache_retirement_manifest retirement;
+        const bool alias_only = vbr_retire == nullptr &&
+            it->payload.vbr_logical_erase_only();
+        if ((!alias_only &&
+             (!vbr_retire ||
+              !vbr_release_resident_bytes(*vbr_retire, bytes))) ||
+            bytes > SIZE_MAX ||
+            !server_prompt_cache_capture_retirement(
+                *this, it, retirement)) {
+            return false;
+        }
+        const size_t tokens = size_t(it->prompt.n_tokens());
+        const auto admission =
+            server_prompt_cache_observe_drop(*this, *it, reason);
+        if (!alias_only && acct->serial() !=
+                vbr_retire->preview().accounting_serial) {
+            return false;
+        }
+
+        const std::thread::id scheduler_owner = std::this_thread::get_id();
+        server_prompt_cache_destroy_entry_impl(*this, it);
+        GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+        const auto status = alias_only
+            ? vbr_artifact_prepared_retire_status::retired
+            : vbr_retire->commit();
+        // Once the logical owner is gone, commit owns an unconditional
+        // current-serial cleanup fallback. `unavailable` would therefore be
+        // an internal invariant violation, never a reason to touch a second
+        // cache victim after this iterator was erased.
+        GGML_ASSERT(status !=
+                    vbr_artifact_prepared_retire_status::unavailable);
+        server_prompt_cache_retire_manifest(*this, retirement);
+        if (destruction_obs && !alias_only) {
+            destruction_obs->note_prepared_release(
+                admission.sequence, status !=
+                    vbr_artifact_prepared_retire_status::unavailable);
+        }
+        if (released_bytes) {
+            *released_bytes = alias_only || status !=
+                    vbr_artifact_prepared_retire_status::retired
+                ? UINT64_MAX : bytes;
+        }
+        if (released_tokens) {
+            *released_tokens = tokens;
+        }
+        return true;
+    }
+
+    if (!publish_authority) {
+        return false;
+    }
+
+    server_prompt_cache_retirement_manifest retirement;
+    if (!server_prompt_cache_capture_retirement(*this, it, retirement)) {
+        return false;
+    }
+    std::vector<llama_cache_acct_op_id> ops;
+    try {
+        const auto & release_ops = it->release_ops();
+        ops.reserve(release_ops.size());
+        for (const auto op : release_ops) {
+            if (!op) {
+                return false;
+            }
+            ops.push_back(op);
+        }
+    } catch (...) {
+        return false;
+    }
+
+    const uint64_t serial = acct->serial();
+    auto prepared = llama_cache_prepare_release_set(*acct, ops, serial);
+    if (!prepared.ready()) {
+        return false;
+    }
+    uint64_t exact_bytes = 0;
+    if (!vbr_release_resident_bytes(prepared.preview(), exact_bytes)) {
+        return false;
+    }
+    const auto admission =
+        server_prompt_cache_observe_drop(*this, *it, reason);
+    if (acct->serial() != prepared.accounting_serial()) {
+        return false;
+    }
+
+    const size_t tokens = size_t(it->prompt.n_tokens());
+    const std::thread::id scheduler_owner = std::this_thread::get_id();
+    server_prompt_cache_destroy_entry_impl(*this, it);
+    GGML_ASSERT(scheduler_owner == std::this_thread::get_id());
+    const auto release_status = prepared.commit();
+    GGML_ASSERT(release_status ==
+                llama_cache_conditional_release_status::released);
+    server_prompt_cache_retire_manifest(*this, retirement);
+    if (destruction_obs) {
+        destruction_obs->note_prepared_release(admission.sequence, true);
+    }
+    if (released_bytes) {
+        *released_bytes = exact_bytes;
+    }
+    if (released_tokens) {
+        *released_tokens = tokens;
+    }
+    return true;
+}
+
 // fork 9l-d4b6g: server_prompt_cache::destroy_vbr_pair (fork server-task.cpp 7036-7122)
 bool server_prompt_cache::destroy_vbr_pair(
         iterator first,

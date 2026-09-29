@@ -1289,6 +1289,19 @@ struct server_prompt_cache {
             iterator it,
             server_cache_destruction_reason reason);
 
+    // fork 9l-d4b6h (fork server-task.h 1762-1764)
+    void refuse_incoming_under_pressure(
+        iterator incoming,
+        server_cache_destruction_reason reason);
+
+    // fork 9l-d4b6h (fork server-task.h 1765-1770)
+    bool destroy_retention_capacity_entry(
+        iterator it,
+        server_cache_destruction_reason reason,
+        vbr_artifact_prepared_retire * vbr_retire = nullptr,
+        uint64_t * released_bytes = nullptr,
+        size_t * released_tokens = nullptr);
+
     // fork 9l-d4b6g (fork server-task.h 1771-1778)
     bool destroy_vbr_pair(
         iterator first,
