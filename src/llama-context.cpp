@@ -5006,6 +5006,15 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     mem->clear(data);
 }
 
+// fork 9l-d4b6s: llama_memory_breathe (fork src/llama-context.cpp 8315-8321)
+void llama_memory_breathe(llama_memory_t mem) {
+    if (!mem) {
+        return;
+    }
+
+    mem->breathe();
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,

@@ -47,6 +47,11 @@ public:
 
     bool get_can_shift() const override;
 
+    // fork 9l-d4b6s: breathe() override (fork src/llama-kv-cache-dsa.h 53-55)
+    // no VBR params are threaded to the children today, so this is a no-op — kept for
+    // coverage symmetry with get_vbr_epoch should that ever change
+    void breathe() override { kv_mla->breathe(); kv_lid->breathe(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

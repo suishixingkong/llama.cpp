@@ -120,6 +120,11 @@ public:
 
     bool get_can_shift() const override;
 
+    // fork 9l-d4b6s: breathe() override (fork src/llama-kv-cache-dsv4.h 126-128)
+    // VBR params are threaded to all four children (footprint-weighted split in the ctor),
+    // so each child's controller gets its breathe tick
+    void breathe() override { kv_raw->breathe(); kv_csa->breathe(); kv_hca->breathe(); kv_lid->breathe(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
