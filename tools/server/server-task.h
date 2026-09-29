@@ -1412,6 +1412,19 @@ struct server_prompt_cache {
             int32_t source_slot) const noexcept;
 
 
+    // fork 9l-d4b5d (fork server-task.h 1464-1474)
+    // Cite one complete conservative fresh-capture batch at the exact
+    // pre-D2H scheduler checkpoint. Pressure is limited to one incoming row
+    // and at most two canonical victims. A pressure citation is consumed only by the
+    // matching publication terminal; ordinary publication still owns the
+    // eviction and refuses if its first victim no longer matches.
+    bool prepare_vbr_publication_capacity(
+        server_prompt_cache_vbr_publication_metadata * const * prepared,
+        size_t prepared_count,
+        uint64_t incoming_compact_bytes,
+        server_prompt_cache_vbr_capacity_claim & claim,
+        server_prompt_cache_vbr_capacity_status * status = nullptr) noexcept;
+
     bool prepare_vbr_restore(
         const server_tokens & request_tokens,
         const std::string & execution_identity,
