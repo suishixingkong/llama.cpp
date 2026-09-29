@@ -5643,6 +5643,416 @@ void commit_certified_host_destruction(
 }
 } // namespace
 
+// fork 9l-d4b6i: server_prompt_cache::observe_retention_pressure_choice (fork server-task.cpp 6042-6449)
+void server_prompt_cache::observe_retention_pressure_choice(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        iterator incumbent,
+        bool competition_wave_valid) noexcept {
+    if (!retention_obs) {
+        return;
+    }
+    const auto increment = [](uint64_t & value) noexcept {
+        if (value != UINT64_MAX) {
+            value++;
+        }
+    };
+    increment(retention_shadow.choices);
+    auto & event = retention_shadow.last;
+    event = {};
+    event.reason = reason;
+    event.competition_epoch = retention_obs->competition_epoch_value();
+
+    const auto unavailable = [&]() noexcept {
+        increment(retention_shadow.unavailable);
+        if (debug_observability) {
+            SRV_INF(
+                "CACHE_RETENTION_SHADOW status=unavailable reason=%u "
+                "epoch=%" PRIu64 " candidates=%" PRIu64 "\n",
+                unsigned(reason), event.competition_epoch,
+                event.candidate_count);
+        }
+    };
+
+    struct fill_context {
+        server_prompt_cache_shadow_row * rows = nullptr;
+        size_t size = 0;
+    };
+    const auto fill_value = [](void * opaque,
+            const server_retention_value_snapshot & value) noexcept {
+        auto & context = *static_cast<fill_context *>(opaque);
+        if (context.size == SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+            return false;
+        }
+        context.rows[context.size++] = {
+            value.artifact_id,
+            value.instance_key,
+            value.kind,
+            value.stamp,
+            value.lineage,
+            value.external_shared_coverage_tokens,
+            0,
+            false,
+            false,
+        };
+        return true;
+    };
+
+    // Lifecycle shadow uses the same immutable catalog, evaluated leases and
+    // serial-bound accounting release preview as the certified authority. It
+    // remains counterfactual: the already-selected lifecycle victim is the
+    // incumbent and no projection result can authorize mutation during observation.
+    if (publish_authority) {
+        if (!competition_wave_valid || !retention_shadow_rows || !acct ||
+            !lease_obs || !lease_execution_identity ||
+            reason != server_cache_destruction_reason::host_capacity ||
+            states.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES ||
+            incumbent == states.end()) {
+            unavailable();
+            return;
+        }
+        try {
+            fill_context fill { retention_shadow_rows.get(), 0 };
+            const auto inventory = retention_obs->value_snapshots(
+                &fill, fill_value);
+            if (inventory.status !=
+                    server_retention_value_snapshot_status::complete ||
+                inventory.size != fill.size || fill.size == 0) {
+                unavailable();
+                return;
+            }
+            auto * begin = retention_shadow_rows.get();
+            auto * end = begin + fill.size;
+            std::sort(begin, end, [](const auto & a, const auto & b) {
+                return a.artifact_id.v < b.artifact_id.v;
+            });
+            const auto find_artifact = [&](llama_cache_acct_artifact_id id) {
+                const auto found = std::lower_bound(
+                    begin, end, id.v, [](const auto & row, uint64_t value) {
+                        return row.artifact_id.v < value;
+                    });
+                return found != end && found->artifact_id == id ? found : end;
+            };
+
+            std::vector<server_cache_yield_candidate> candidates;
+            candidates.reserve(fill.size);
+            for (auto * row = begin; row != end; ++row) {
+                server_retention_candidate catalog;
+                if (!retention_obs->candidate_for_instance(
+                        row->instance_key, catalog) ||
+                    catalog.artifact_id != row->artifact_id ||
+                    catalog.record.kind != row->kind ||
+                    catalog.record.stamp.stable_id != row->stamp.stable_id ||
+                    catalog.record.stamp.lineage_id !=
+                        row->stamp.lineage_id ||
+                    catalog.lineage != row->lineage) {
+                    unavailable();
+                    return;
+                }
+                server_cache_yield_candidate candidate;
+                candidate.artifact_id = catalog.artifact_id;
+                candidate.record = catalog.record;
+                candidate.lineage = catalog.lineage;
+                candidate.availability =
+                    server_retention_candidate_availability::
+                        in_flight_mutation;
+                candidate.lease = {
+                    server_cache_lease_eval_state::known,
+                    server_cache_lease_class::none,
+                    server_cache_lease_eligibility::eligible,
+                };
+                candidate.identity_known = true;
+                candidate.external_shared_coverage_tokens =
+                    row->external_shared_coverage_tokens;
+                candidates.push_back(std::move(candidate));
+            }
+
+            uint64_t n_candidates = 0;
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                server_cache_destruction_artifact artifact;
+                if (!build_host_destruction_artifact(*this, *it, artifact)) {
+                    unavailable();
+                    return;
+                }
+                auto candidate = std::move(artifact.candidate);
+                auto * row = find_artifact(candidate.artifact_id);
+                if (row == end || row->kind !=
+                        common_retention_artifact_kind::host_entry ||
+                    row->backing_known) {
+                    unavailable();
+                    return;
+                }
+                row->backing_known = true;
+                candidate.external_shared_coverage_tokens =
+                    row->external_shared_coverage_tokens;
+                if (it == incoming || it->recovery_pins != 0) {
+                    candidate.availability =
+                        server_retention_candidate_availability::
+                            in_flight_mutation;
+                }
+                if (candidate.availability ==
+                        server_retention_candidate_availability::available &&
+                    candidate.lease.eligibility ==
+                        server_cache_lease_eligibility::eligible &&
+                    !server_cache_lease_is_hard(candidate.lease) &&
+                    !candidate.release_ops.empty()) {
+                    n_candidates++;
+                }
+                candidates[size_t(row - begin)] = std::move(candidate);
+            }
+            for (const auto * row = begin; row != end; ++row) {
+                if (row->kind == common_retention_artifact_kind::host_entry &&
+                    !row->backing_known) {
+                    unavailable();
+                    return;
+                }
+            }
+            event.candidate_count = n_candidates;
+            event.incumbent_artifact = host_entry_artifact_id(
+                *this, *incumbent);
+            if (!event.incumbent_artifact.v) {
+                unavailable();
+                return;
+            }
+
+            const uint64_t accounting_serial = acct->serial();
+            const auto host_domain =
+                llama_cache_acct_resource_domain::non_device(
+                    llama_cache_acct_residency::pageable_host);
+            const auto projection = server_retention_shadow_project(
+                candidates,
+                event.competition_epoch,
+                host_domain,
+                accounting_serial,
+                [this](const std::vector<llama_cache_acct_op_id> & ops,
+                       uint64_t serial,
+                       llama_cache_acct_release_set_preview & out) {
+                    return acct->preview_release_set(ops, serial, out);
+                });
+            if (!projection.complete || projection.alternatives.empty() ||
+                projection.alternatives.front().artifact_ids.size() != 1) {
+                unavailable();
+                return;
+            }
+            const auto & alternative = projection.alternatives.front();
+            event.proposed_artifact = alternative.artifact_ids.front();
+            event.proposed_lineage = alternative.lineage_id;
+            event.proposed_pool = alternative.pool;
+            event.proposed_lost_work = alternative.lost_work_units;
+            event.proposed_resource = alternative.value.marginal_resource;
+            event.status = server_prompt_cache_shadow_status::complete;
+            event.agrees =
+                event.incumbent_artifact == event.proposed_artifact;
+            increment(retention_shadow.complete);
+            increment(event.agrees
+                ? retention_shadow.agreements
+                : retention_shadow.disagreements);
+            if (debug_observability) {
+                SRV_INF(
+                    "CACHE_RETENTION_SHADOW status=complete reason=%u "
+                    "epoch=%" PRIu64 " candidates=%" PRIu64
+                    " incumbent=%" PRIu64 " proposed=%" PRIu64
+                    " agrees=%s lost_work=%" PRIu64
+                    " resource=%" PRIu64 "\n",
+                    unsigned(reason), event.competition_epoch,
+                    event.candidate_count, event.incumbent_artifact.v,
+                    event.proposed_artifact.v,
+                    event.agrees ? "true" : "false",
+                    event.proposed_lost_work, event.proposed_resource);
+            }
+        } catch (...) {
+            unavailable();
+        }
+        return;
+    }
+
+    // The lifecycle route returned above after lowering its evaluated lease
+    // and accounting evidence. This branch observes only the ordinary
+    // fixed-cache FIFO route; never mix the two evidence shapes.
+    if (!competition_wave_valid ||
+        !retention_shadow_rows || incumbent == states.end() ||
+        states.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+        unavailable();
+        return;
+    }
+
+    fill_context fill { retention_shadow_rows.get(), 0 };
+    const auto inventory = retention_obs->value_snapshots(
+        &fill, fill_value);
+    if (inventory.status !=
+            server_retention_value_snapshot_status::complete ||
+        inventory.size != fill.size) {
+        unavailable();
+        return;
+    }
+    const size_t n_rows = fill.size;
+    if (n_rows == 0) {
+        unavailable();
+        return;
+    }
+
+    auto * begin = retention_shadow_rows.get();
+    auto * end = begin + n_rows;
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return a.artifact_id.v < b.artifact_id.v;
+    });
+    const auto find_artifact = [&](llama_cache_acct_artifact_id id) {
+        const auto found = std::lower_bound(
+            begin, end, id.v, [](const auto & row, uint64_t value) {
+                return row.artifact_id.v < value;
+            });
+        return found != end && found->artifact_id == id ? found : end;
+    };
+    uint64_t n_candidates = 0;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const auto artifact = retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&*it));
+        auto * row = find_artifact(artifact);
+        const uint64_t resource =
+            reason == server_cache_destruction_reason::host_token_limit
+                ? uint64_t(it->prompt.n_tokens())
+                : uint64_t(it->size());
+        if (!artifact.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known || resource == 0) {
+            unavailable();
+            return;
+        }
+        row->backing_known = true;
+        row->resource = resource;
+        row->releasable = it != incoming && it->recovery_pins == 0;
+        if (row->releasable) {
+            n_candidates++;
+        }
+    }
+    for (const auto * row = begin; row != end; ++row) {
+        if (row->kind == common_retention_artifact_kind::host_entry &&
+            !row->backing_known) {
+            unavailable();
+            return;
+        }
+    }
+    event.candidate_count = n_candidates;
+    const auto incumbent_artifact = retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*incumbent));
+    const auto * incumbent_row = find_artifact(incumbent_artifact);
+    if (!incumbent_artifact.v || incumbent_row == end ||
+        incumbent_row->kind != common_retention_artifact_kind::host_entry ||
+        !incumbent_row->backing_known || !incumbent_row->releasable) {
+        unavailable();
+        return;
+    }
+    event.incumbent_artifact = incumbent_artifact;
+    event.incumbent_lineage = incumbent_row->lineage.lineage_id;
+
+    std::sort(begin, end, [](const auto & a, const auto & b) {
+        return std::tie(
+                   a.stamp.pool, a.stamp.lineage_id,
+                   a.stamp.coverage_tokens, a.stamp.recency_ordinal,
+                   a.artifact_id.v) <
+               std::tie(
+                   b.stamp.pool, b.stamp.lineage_id,
+                   b.stamp.coverage_tokens, b.stamp.recency_ordinal,
+                   b.artifact_id.v);
+    });
+
+    bool have_proposed = false;
+    common_retention_shadow_value proposed_value;
+    for (size_t first = 0; first < n_rows;) {
+        size_t last = first + 1;
+        while (last < n_rows &&
+               begin[last].stamp.pool == begin[first].stamp.pool &&
+               begin[last].stamp.lineage_id ==
+                   begin[first].stamp.lineage_id) {
+            if (begin[last].lineage != begin[first].lineage) {
+                unavailable();
+                return;
+            }
+            last++;
+        }
+
+        uint64_t maximum = 0;
+        uint64_t second = 0;
+        size_t n_maximum = 0;
+        for (size_t i = first; i < last; ++i) {
+            const uint64_t coverage = begin[i].stamp.coverage_tokens;
+            if (coverage > maximum) {
+                second = maximum;
+                maximum = coverage;
+                n_maximum = 1;
+            } else if (coverage == maximum) {
+                n_maximum++;
+            } else if (coverage > second) {
+                second = coverage;
+            }
+        }
+
+        for (size_t i = first; i < last; ++i) {
+            if (!begin[i].releasable) {
+                continue;
+            }
+            server_retention_singleton_quote quote;
+            if (!server_retention_quote_singleton(
+                    begin[i].stamp, begin[i].lineage,
+                    maximum, second, uint32_t(n_maximum),
+                    begin[i].external_shared_coverage_tokens,
+                    begin[i].resource, event.competition_epoch,
+                    {}, quote)) {
+                unavailable();
+                return;
+            }
+            const bool lower = !have_proposed ||
+                common_retention_shadow_compare(
+                    quote.value, proposed_value) < 0;
+            const bool tied = have_proposed &&
+                common_retention_shadow_compare(
+                    quote.value, proposed_value) == 0;
+            if (lower || (tied &&
+                    std::tie(begin[i].stamp.pool,
+                             begin[i].stamp.lineage_id,
+                             begin[i].artifact_id.v) <
+                    std::tie(event.proposed_pool,
+                             event.proposed_lineage,
+                             event.proposed_artifact.v))) {
+                have_proposed = true;
+                proposed_value = quote.value;
+                event.proposed_artifact = begin[i].artifact_id;
+                event.proposed_lineage = begin[i].stamp.lineage_id;
+                event.proposed_pool = begin[i].stamp.pool;
+                event.proposed_lost_work = quote.lost_work_units;
+                event.proposed_resource = begin[i].resource;
+            }
+        }
+        first = last;
+    }
+
+    if (!have_proposed) {
+        unavailable();
+        return;
+    }
+    event.status = server_prompt_cache_shadow_status::complete;
+    event.agrees = event.incumbent_artifact == event.proposed_artifact;
+    increment(retention_shadow.complete);
+    if (event.agrees) {
+        increment(retention_shadow.agreements);
+    } else {
+        increment(retention_shadow.disagreements);
+    }
+    if (debug_observability) {
+        SRV_INF(
+            "CACHE_RETENTION_SHADOW status=complete reason=%u "
+            "epoch=%" PRIu64 " candidates=%" PRIu64
+            " incumbent=%" PRIu64 " proposed=%" PRIu64
+            " agrees=%s lost_work=%" PRIu64
+            " resource=%" PRIu64 "\n",
+            unsigned(reason), event.competition_epoch,
+            event.candidate_count, event.incumbent_artifact.v,
+            event.proposed_artifact.v,
+            event.agrees ? "true" : "false",
+            event.proposed_lost_work, event.proposed_resource);
+    }
+}
+
 // fork 9l-d4b6h: server_prompt_cache::refuse_incoming_under_pressure (fork server-task.cpp 6749-6771)
 void server_prompt_cache::refuse_incoming_under_pressure(
         iterator incoming,

@@ -1312,6 +1312,13 @@ struct server_prompt_cache {
         uint64_t & released_bytes,
         size_t & released_tokens);
 
+    // fork 9l-d4b6i (fork server-task.h 1786-1790)
+    void observe_retention_pressure_choice(
+            server_cache_destruction_reason reason,
+            iterator incoming,
+            iterator incumbent,
+            bool competition_wave_valid) noexcept;
+
     // ---------------------------------------------------------------------
     // group C tip: the only part of the server_prompt_cache rewrite that the
     // cache-plan observation face actually calls. Everything else in that
