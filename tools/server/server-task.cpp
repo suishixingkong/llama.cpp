@@ -3677,6 +3677,97 @@ bool server_prompt_cache::payload_bytes(
     return true;
 }
 
+// fork 9l-d4b6m: server_prompt_cache::payload_leaves + acct_charge_entry (fork server-task.cpp 3690-3778)
+bool server_prompt_cache::payload_leaves(
+        server_prompt_cache_state & st,
+        std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept {
+    leaves = {{
+        {
+            llama_cache_acct_category::full_snapshot_payload,
+            0,
+        },
+        {
+            llama_cache_acct_category::checkpoint_state_payload,
+            0,
+        },
+        {
+            llama_cache_acct_category::typed_accelerator_payload,
+            0,
+        },
+    }};
+    uint64_t snapshot_bytes = 0;
+    uint64_t checkpoint_bytes = 0;
+    uint64_t accelerator_bytes = 0;
+    if (!payload_bytes(
+            st, snapshot_bytes, checkpoint_bytes, accelerator_bytes)) {
+        return false;
+    }
+    leaves[0].bytes = snapshot_bytes;
+    leaves[1].bytes = checkpoint_bytes;
+    leaves[2].bytes = accelerator_bytes;
+    return true;
+}
+
+// Shadow-accounting producer: one transaction per charged leaf category of a published
+// entry, at the publication boundary (the splice into `states`), released when the entry leaves
+// `states` on any path. Aggregate entry size is a provider grouping and is NEVER charged — the
+// leaves below are mutually exclusive so their sum cannot double-count. The fill-failure abort
+// mapping (stage() → abort) lands with F's real artifact transaction. The ledger is
+// non-throwing by contract, so no accounting failure can escape into the shipped cache path;
+// the `acct_unavailable` fault seam proves that invariance in the gate.
+void server_prompt_cache::acct_charge_entry(server_prompt_cache_state & st) {
+    if (!acct || st.payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        // Sealed VBR allocations were already admitted and charged by their
+        // catalog transaction. The logical cache node owns a borrow, not a
+        // second physical allocation.
+        return;
+    }
+    const auto domain = llama_cache_acct_resource_domain::non_device(
+        llama_cache_acct_residency::pageable_host);
+
+    // checked sums: an overflowing observation latches the leaf unavailable instead of
+    // charging a fabricated value (the shipped path is untouched either way)
+    std::array<server_prompt_cache_payload_leaf, 3> leaves;
+    const bool sums_ok = payload_leaves(st, leaves);
+
+    if (!sums_ok || server_fault("acct_unavailable")) { // Shipped-path invariance seam.
+        for (const auto & leaf : leaves) {
+            server_cache_acct_mark_shadow_unavailable(
+                *acct, leaf.category, domain,
+                llama_cache_acct_producer::host_cache);
+        }
+        return;
+    }
+
+    try {
+        st.acct_ops.clear();
+        st.acct_ops.reserve(leaves.size());
+        for (const auto & leaf : leaves) {
+            const auto op = server_cache_acct_charge_shadow(
+                *acct, leaf.category, domain,
+                llama_cache_acct_producer::host_cache, {},
+                leaf.bytes, leaf.bytes);
+            if (!op) {
+                for (const auto committed : st.acct_ops) {
+                    (void) acct->release(committed);
+                }
+                st.acct_ops.clear();
+                st.accounting_complete = false;
+                return;
+            }
+            st.acct_ops.push_back(op);
+        }
+        st.accounting_complete = true;
+    } catch (...) {
+        for (const auto committed : st.acct_ops) {
+            (void) acct->release(committed);
+        }
+        st.acct_ops.clear();
+        st.accounting_complete = false;
+    }
+}
+
 // fork 9l-d4b5b: host destruction / host-trade layer (fork server-task.cpp 4587-5645, anonymous namespace)
 namespace {
 bool build_host_retention_artifact_uninspected(

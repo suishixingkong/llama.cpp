@@ -800,8 +800,15 @@ struct server_prompt_cache_shadow_artifact_slot {
 
 // fork server-task.h:1111 -- forward declaration so publish_authority can be
 // spelled as a pointer member (the fork declares it just before its own payload
-// leaf struct, which this tree does not carry).
+// leaf struct).
 struct server_cache_authority;
+
+// fork 9l-d4b6m (fork server-task.h 1113-1117)
+struct server_prompt_cache_payload_leaf {
+    llama_cache_acct_category category =
+        llama_cache_acct_category::full_snapshot_payload;
+    uint64_t bytes = 0;
+};
 
 struct server_prompt_cache_shadow_lineage_slot {
     uint64_t lineage_id = 0;
@@ -1620,12 +1627,19 @@ struct server_prompt_cache {
             const server_prompt_cache_state & victim,
             const server_prompt_cache_state & survivor) noexcept;
 
+    // fork 9l-d4b6m (fork server-task.h 1718)
+    void acct_charge_entry(server_prompt_cache_state & st);
+
     // fork 9l-d4b5b (fork server-task.h 1721-1725)
     static bool payload_bytes(
             const server_prompt_cache_state & st,
             uint64_t & snapshot_bytes,
             uint64_t & checkpoint_bytes,
             uint64_t & accelerator_bytes) noexcept;
+    // fork 9l-d4b6m (fork server-task.h 1726-1728)
+    static bool payload_leaves(
+            server_prompt_cache_state & st,
+            std::array<server_prompt_cache_payload_leaf, 3> & leaves) noexcept;
     bool enable_retention_shadow() noexcept;
 
     server_prompt_cache_shadow_snapshot retention_shadow_snapshot() const noexcept {
