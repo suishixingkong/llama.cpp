@@ -1506,6 +1506,12 @@ struct server_prompt_cache {
     bool retention_capacity_authority = false;
 
 // fork 9l-d3c2: shadow workspace allocator + snapshot accessor (fork server-task.h 1730-1734)
+    // fork 9l-d4b5b (fork server-task.h 1721-1725)
+    static bool payload_bytes(
+            const server_prompt_cache_state & st,
+            uint64_t & snapshot_bytes,
+            uint64_t & checkpoint_bytes,
+            uint64_t & accelerator_bytes) noexcept;
     bool enable_retention_shadow() noexcept;
 
     server_prompt_cache_shadow_snapshot retention_shadow_snapshot() const noexcept {

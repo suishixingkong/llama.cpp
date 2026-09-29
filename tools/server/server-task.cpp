@@ -3297,6 +3297,637 @@ bool server_prompt_cache::vbr_retention_source_available(
             server_retention_instance_key::for_slot(source_slot));
 }
 
+// fork 9l-d4b5b: server_prompt_cache::payload_bytes (fork server-task.cpp 3660-3688)
+bool server_prompt_cache::payload_bytes(
+        const server_prompt_cache_state & st,
+        uint64_t & snapshot_bytes,
+        uint64_t & checkpoint_bytes,
+        uint64_t & accelerator_bytes) noexcept {
+    snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
+    const auto * fixed = st.payload.fixed_state();
+    if (!fixed) {
+        return false;
+    }
+    snapshot_bytes    = uint64_t(fixed->size());
+    const auto add_checked = [](uint64_t & acc, size_t value) {
+        if (uint64_t(value) > std::numeric_limits<uint64_t>::max() - acc) {
+            return false;
+        }
+        acc += uint64_t(value);
+        return true;
+    };
+    for (const auto & ckpt : st.prompt.checkpoints) {
+        if (!add_checked(checkpoint_bytes, ckpt.data_tgt.size()) ||
+            !add_checked(checkpoint_bytes, ckpt.data_dft.size()) ||
+            !add_checked(accelerator_bytes, ckpt.data_qsa.size()) ||
+            !add_checked(accelerator_bytes, ckpt.accel.size())) {
+            snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
+            return false;
+        }
+    }
+    return true;
+}
+
+// fork 9l-d4b5b: host destruction / host-trade layer (fork server-task.cpp 4587-5645, anonymous namespace)
+namespace {
+bool build_host_retention_artifact_uninspected(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out,
+        server_cache_lease_identity & identity) noexcept {
+    out = {};
+    identity = {};
+    try {
+        if (!cache.retention_obs || !cache.lease_obs ||
+            !cache.lease_execution_identity) {
+            return false;
+        }
+        server_retention_candidate catalog;
+        const auto key = server_retention_instance_key::for_host_entry(&state);
+        if (!cache.retention_obs->candidate_for_instance(key, catalog) ||
+            catalog.artifact_id.v == 0 ||
+            catalog.record.kind != common_retention_artifact_kind::host_entry) {
+            return false;
+        }
+        if (!server_cache_lease_build_identity(
+                *cache.lease_execution_identity,
+                state.adapter_config_key,
+                state.prompt.tokens,
+                state.prompt.n_tokens(),
+                identity)) {
+            return false;
+        }
+        out.candidate.artifact_id = catalog.artifact_id;
+        out.candidate.record = catalog.record;
+        out.candidate.lineage = catalog.lineage;
+        out.candidate.availability = catalog.avail;
+        out.candidate.identity_known = true;
+        out.kind = common_retention_artifact_kind::host_entry;
+        out.host_source_id = state.cache_plan_source_id;
+        out.pool = catalog.record.stamp.pool;
+        out.mandatory_anchor = catalog.record.stamp.mandatory_anchor;
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+bool build_host_retention_artifact(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out) noexcept {
+    server_cache_lease_identity identity;
+    if (!build_host_retention_artifact_uninspected(
+            cache, state, out, identity)) {
+        return false;
+    }
+    out.candidate.lease = cache.lease_obs->inspect(
+        out.candidate.artifact_id, identity);
+    return true;
+}
+bool build_host_destruction_artifact(
+        server_prompt_cache & cache,
+        server_prompt_cache_state & state,
+        server_cache_destruction_artifact & out) noexcept {
+    if (!state.accounting_complete ||
+        !build_host_retention_artifact(cache, state, out)) {
+        return false;
+    }
+    try {
+        out.candidate.release_ops.reserve(state.release_ops().size());
+        for (const auto op : state.release_ops()) {
+            if (!op) {
+                out = {};
+                return false;
+            }
+            out.candidate.release_ops.push_back(op);
+        }
+        return true;
+    } catch (...) {
+        out = {};
+        return false;
+    }
+}
+struct host_trade_ranking {
+    uint32_t ordinal = 0;
+    int32_t source_id = -1;
+    llama_cache_acct_artifact_id artifact_id;
+    common_cache_family_role family_role = common_cache_family_role::_count;
+    common_cache_plan_payload_kind payload_kind =
+        common_cache_plan_payload_kind::unavailable;
+};
+struct host_trade_candidate {
+    server_prompt_cache::iterator victim;
+    host_trade_ranking ranking;
+    uint64_t marginal_resident_bytes = 0;
+    std::vector<llama_cache_acct_op_id> release_ops;
+    bool marginal_resident_known = false;
+    bool lease_known = false;
+    bool soft_leased = false;
+    bool hard_leased = false;
+    bool mandatory_anchor = false;
+    bool vbr = false;
+    bool vbr_logical_alias = false;
+    bool retirement_ready = false;
+};
+bool vbr_release_resident_bytes(
+        const llama_cache_acct_release_set_preview & preview,
+        uint64_t & bytes) noexcept {
+    bytes = 0;
+    if (preview.accounting_serial == 0) {
+        return false;
+    }
+    for (const auto & row : preview.rows) {
+        if (row.resident_allocated > UINT64_MAX - bytes) {
+            bytes = 0;
+            return false;
+        }
+        bytes += row.resident_allocated;
+    }
+    return true;
+}
+bool vbr_release_resident_bytes(
+        const vbr_artifact_prepared_retire & prepared,
+        uint64_t & bytes) noexcept {
+    return prepared.ready() &&
+           vbr_release_resident_bytes(prepared.preview(), bytes);
+}
+uint64_t server_prompt_cache_shadow_hash(uint64_t value) noexcept {
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+bool inspect_host_candidate(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator victim,
+        uint32_t ordinal,
+        server_cache_destruction_reason reason,
+        host_trade_candidate & out,
+        bool preview_vbr = true,
+        const server_cache_destruction_artifact * prepared_artifact = nullptr) noexcept {
+    out = {};
+    out.victim = victim;
+    out.ranking.ordinal = ordinal;
+    out.ranking.source_id = victim->cache_plan_source_id;
+    out.ranking.family_role = victim->cache_family.declared()
+        ? victim->cache_family.role : common_cache_family_role::_count;
+    try {
+        server_cache_destruction_artifact local_artifact;
+        out.vbr = victim->payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact;
+        out.ranking.payload_kind =
+            server_cache_plan_payload_kind(victim->payload.kind());
+        if (!prepared_artifact && !(out.vbr
+                ? build_host_retention_artifact(cache, *victim, local_artifact)
+                : build_host_destruction_artifact(cache, *victim, local_artifact))) {
+            return false;
+        }
+        const auto & artifact = prepared_artifact
+            ? *prepared_artifact : local_artifact;
+        out.ranking.artifact_id = artifact.candidate.artifact_id;
+        out.mandatory_anchor = artifact.mandatory_anchor;
+        if (artifact.candidate.lease.state !=
+                server_cache_lease_eval_state::known) {
+            return false;
+        }
+        out.lease_known = true;
+        out.soft_leased = artifact.candidate.lease.cls ==
+            server_cache_lease_class::soft;
+        out.hard_leased = server_cache_lease_is_hard(
+            artifact.candidate.lease);
+        if (out.vbr) {
+            out.vbr_logical_alias =
+                victim->payload.vbr_logical_erase_only();
+            if (out.vbr_logical_alias && !out.hard_leased) {
+                out.retirement_ready = true;
+                return true;
+            }
+            // Ordinary pressure owns only compact-current entries. A quality
+            // anchor has a separate byte pool and parent-value competition;
+            // it must never be hidden in compact victim bytes.
+            if (out.hard_leased || !cache.acct ||
+                victim->payload.vbr_has_quality_anchor()) {
+                return false;
+            }
+            if (!victim->payload.vbr_retirement_exclusive()) {
+                return false;
+            }
+            if (preview_vbr && reason ==
+                    server_cache_destruction_reason::host_capacity) {
+                llama_cache_acct_release_set_preview preview;
+                if (!victim->payload.preview_vbr_retire(
+                        cache.acct->serial(), preview) ||
+                    !vbr_release_resident_bytes(
+                        preview, out.marginal_resident_bytes)) {
+                    return false;
+                }
+                out.marginal_resident_known = true;
+            }
+            out.retirement_ready = true;
+            // VBR payloads use typed restore authority. They enter the
+            // avoided-prefill retention projection below.
+            return true;
+        }
+        if (reason == server_cache_destruction_reason::host_capacity) {
+            out.release_ops = artifact.candidate.release_ops;
+            // Retain a complete diagnostic proposal until the inventory-wide
+            // one-lock marginal preview below replaces it with exact physical
+            // release evidence. Unknown evidence never authorizes retention-capacity eviction.
+            uint64_t snapshot_bytes = 0;
+            uint64_t checkpoint_bytes = 0;
+            uint64_t accelerator_bytes = 0;
+            if (!server_prompt_cache::payload_bytes(
+                    *victim, snapshot_bytes, checkpoint_bytes,
+                    accelerator_bytes) ||
+                checkpoint_bytes > UINT64_MAX - snapshot_bytes ||
+                accelerator_bytes > UINT64_MAX - snapshot_bytes -
+                    checkpoint_bytes) {
+                return false;
+            }
+            out.marginal_resident_bytes = snapshot_bytes +
+                checkpoint_bytes + accelerator_bytes;
+        }
+        out.retirement_ready = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+bool populate_vbr_host_trade_marginals(
+        server_prompt_cache & cache,
+        std::vector<host_trade_candidate> & candidates) noexcept {
+    try {
+        std::vector<const server_prompt_cache_payload *> payloads;
+        std::vector<size_t> indices;
+        payloads.reserve(candidates.size());
+        indices.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto & candidate = candidates[i];
+            if (!candidate.vbr || !candidate.retirement_ready ||
+                candidate.vbr_logical_alias || candidate.hard_leased ||
+                candidate.mandatory_anchor) {
+                continue;
+            }
+            payloads.push_back(&candidate.victim->payload);
+            indices.push_back(i);
+        }
+        if (payloads.empty()) {
+            return true;
+        }
+        std::vector<vbr_artifact_retire_resident_preview> marginals;
+        if (!cache.acct ||
+            !server_prompt_cache_payload::preview_vbr_retire_resident_batch(
+                payloads, cache.acct->serial(), marginals) ||
+            marginals.size() != indices.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto & candidate = candidates[indices[i]];
+            candidate.marginal_resident_bytes = marginals[i].resident;
+            candidate.marginal_resident_known = marginals[i].known;
+            if (!marginals[i].known) {
+                candidate.retirement_ready = false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+bool populate_vbr_host_trade_marginals_conditioned(
+        server_prompt_cache & cache,
+        std::vector<host_trade_candidate> & candidates,
+        const host_trade_candidate & baseline) noexcept {
+    try {
+        std::vector<const server_prompt_cache_payload *> payloads;
+        std::vector<size_t> indices;
+        payloads.reserve(candidates.size());
+        indices.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto & candidate = candidates[i];
+            if (&candidate == &baseline || !candidate.vbr ||
+                !candidate.retirement_ready ||
+                candidate.vbr_logical_alias || candidate.hard_leased ||
+                candidate.mandatory_anchor) {
+                continue;
+            }
+            payloads.push_back(&candidate.victim->payload);
+            indices.push_back(i);
+        }
+        if (payloads.empty()) {
+            return false;
+        }
+        std::vector<vbr_artifact_retire_resident_preview> marginals;
+        if (!cache.acct ||
+            !server_prompt_cache_payload::
+                preview_vbr_retire_resident_conditioned_batch(
+                    &baseline.victim->payload, payloads,
+                    cache.acct->serial(), marginals) ||
+            marginals.size() != indices.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto & candidate = candidates[indices[i]];
+            candidate.marginal_resident_bytes = marginals[i].resident;
+            candidate.marginal_resident_known = marginals[i].known;
+            if (!marginals[i].known) {
+                candidate.retirement_ready = false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+struct host_trade_retention_capacity_projection {
+    bool complete = false;
+    bool release_evidence_complete = true;
+    uint64_t candidate_count = 0;
+    llama_cache_acct_artifact_id artifact;
+    uint64_t lineage_id = 0;
+    common_retention_pool pool = common_retention_pool::attention;
+    uint64_t lost_work = 0;
+    uint64_t resource = 0;
+};
+
+// Allocation-free singleton projection for the synchronous retention-capacity authority.
+// Fixed checkpoint planes may be shared by host/live aliases, so each fixed
+// candidate carries the exact ledger marginal computed during inventory
+// construction. A zero singleton yield is not executable here and remains on
+// the legacy floor. The broader counterfactual projector retains compound
+host_trade_retention_capacity_projection project_host_trade_retention_capacity(
+        server_prompt_cache & cache,
+        server_cache_destruction_reason reason,
+        server_prompt_cache::iterator incoming,
+        const std::vector<host_trade_candidate> & candidates,
+        server_prompt_cache_shadow_row * rows,
+        server_prompt_cache_shadow_artifact_slot * artifacts,
+        server_prompt_cache_shadow_lineage_slot * lineages,
+        llama_cache_acct_artifact_id ignored_artifact = {},
+        llama_cache_acct_artifact_id excluded_artifact = {}) noexcept {
+    host_trade_retention_capacity_projection result;
+    if (!rows || !artifacts || !lineages || !cache.retention_obs || !cache.acct ||
+        candidates.size() > SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES) {
+        return result;
+    }
+
+    static_assert((SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY &
+                   (SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY - 1)) == 0);
+    constexpr size_t index_mask =
+        SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY - 1;
+    std::fill_n(artifacts, SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY,
+        server_prompt_cache_shadow_artifact_slot {});
+    std::fill_n(lineages, SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY,
+        server_prompt_cache_shadow_lineage_slot {});
+
+    struct fill_context {
+        server_prompt_cache_shadow_row * rows = nullptr;
+        server_prompt_cache_shadow_artifact_slot * artifacts = nullptr;
+        server_prompt_cache_shadow_lineage_slot * lineages = nullptr;
+        size_t size = 0;
+        size_t observed = 0;
+        llama_cache_acct_artifact_id excluded;
+    } fill { rows, artifacts, lineages, 0, 0, excluded_artifact };
+    const auto fill_value = [](void * opaque,
+            const server_retention_value_snapshot & value) noexcept {
+        auto & context = *static_cast<fill_context *>(opaque);
+        context.observed++;
+        if (value.artifact_id == context.excluded) {
+            return true;
+        }
+        if (context.size == SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES ||
+            !value.artifact_id.v || !value.stamp.lineage_id) {
+            return false;
+        }
+        context.rows[context.size] = {
+            value.artifact_id,
+            value.instance_key,
+            value.kind,
+            value.stamp,
+            value.lineage,
+            value.external_shared_coverage_tokens,
+            0,
+            false,
+            false,
+        };
+
+        constexpr size_t mask =
+            SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY - 1;
+        size_t artifact_slot = size_t(server_prompt_cache_shadow_hash(
+            value.artifact_id.v)) & mask;
+        size_t probes = 0;
+        while (context.artifacts[artifact_slot].artifact_id &&
+               probes++ < SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY) {
+            if (context.artifacts[artifact_slot].artifact_id ==
+                    value.artifact_id.v) {
+                return false;
+            }
+            artifact_slot = (artifact_slot + 1) & mask;
+        }
+        if (context.artifacts[artifact_slot].artifact_id) {
+            return false;
+        }
+        context.artifacts[artifact_slot] = {
+            value.artifact_id.v, uint32_t(context.size) };
+
+        const uint64_t lineage_key = value.stamp.lineage_id ^
+            (uint64_t(uint8_t(value.stamp.pool)) << 56);
+        size_t lineage_slot = size_t(server_prompt_cache_shadow_hash(
+            lineage_key)) & mask;
+        probes = 0;
+        while (context.lineages[lineage_slot].lineage_id &&
+               probes++ < SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY) {
+            if (context.lineages[lineage_slot].lineage_id ==
+                    value.stamp.lineage_id &&
+                context.lineages[lineage_slot].pool == value.stamp.pool) {
+                break;
+            }
+            lineage_slot = (lineage_slot + 1) & mask;
+        }
+        auto & lineage = context.lineages[lineage_slot];
+        if (lineage.lineage_id &&
+            (lineage.lineage_id != value.stamp.lineage_id ||
+             lineage.pool != value.stamp.pool)) {
+            return false;
+        }
+        if (!lineage.lineage_id) {
+            lineage.lineage_id = value.stamp.lineage_id;
+            lineage.pool = value.stamp.pool;
+        }
+        const uint64_t coverage = value.stamp.coverage_tokens;
+        if (coverage > lineage.maximum_coverage) {
+            lineage.second_coverage = lineage.maximum_coverage;
+            lineage.maximum_coverage = coverage;
+            lineage.maximum_count = 1;
+        } else if (coverage == lineage.maximum_coverage) {
+            lineage.maximum_count++;
+        } else {
+            lineage.second_coverage = std::max(
+                lineage.second_coverage, coverage);
+        }
+        context.size++;
+        return true;
+    };
+    const auto inventory = cache.retention_obs->value_snapshots(
+        &fill, fill_value, excluded_artifact);
+    if (inventory.status !=
+            server_retention_value_snapshot_status::complete ||
+        inventory.size != fill.observed || fill.size == 0) {
+        return result;
+    }
+
+    auto * begin = rows;
+    auto * end = rows + fill.size;
+    const auto find_artifact = [&](llama_cache_acct_artifact_id id) {
+        if (!id.v) {
+            return end;
+        }
+        size_t slot = size_t(server_prompt_cache_shadow_hash(id.v)) &
+            index_mask;
+        size_t probes = 0;
+        while (artifacts[slot].artifact_id &&
+               probes++ < SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY) {
+            if (artifacts[slot].artifact_id == id.v) {
+                return begin + artifacts[slot].row_index;
+            }
+            slot = (slot + 1) & index_mask;
+        }
+        return end;
+    };
+
+    // The inspected inventory already covers every ordinary physical host
+    // entry. Join those artifacts directly instead of repeating a sidecar
+    // association lookup for every state. Incoming publications and
+    // recovery-pinned entries are deliberately absent from that inventory;
+    // join only those exceptional retained providers afterward.
+    for (const auto & candidate : candidates) {
+        if (candidate.ranking.artifact_id == excluded_artifact) {
+            continue;
+        }
+        if (reason == server_cache_destruction_reason::host_capacity &&
+            !candidate.vbr && !candidate.marginal_resident_known) {
+            result.release_evidence_complete = false;
+        }
+        auto * row = find_artifact(candidate.ranking.artifact_id);
+        if (!candidate.ranking.artifact_id.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known || row->releasable ||
+            !candidate.lease_known) {
+            return {};
+        }
+        row->backing_known = true;
+        row->releasable = !candidate.hard_leased &&
+            candidate.retirement_ready &&
+            candidate.victim != incoming &&
+            candidate.victim->recovery_pins == 0;
+        if (!row->releasable) {
+            continue;
+        }
+        result.candidate_count++;
+        if (reason == server_cache_destruction_reason::host_token_limit) {
+            row->resource = candidate.victim->prompt.n_tokens();
+        } else if (candidate.vbr) {
+            row->resource = candidate.marginal_resident_bytes;
+        } else {
+            row->resource = candidate.marginal_resident_bytes;
+        }
+    }
+    for (auto state = cache.states.begin(); state != cache.states.end();
+            ++state) {
+        if (state != incoming && state->recovery_pins == 0) {
+            continue;
+        }
+        const auto artifact = cache.retention_obs->artifact_id(
+            server_retention_instance_key::for_host_entry(&*state));
+        auto * row = find_artifact(artifact);
+        if (!artifact.v || row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known) {
+            return {};
+        }
+        row->backing_known = true;
+    }
+    if (ignored_artifact.v) {
+        auto * row = find_artifact(ignored_artifact);
+        if (row == end ||
+            row->kind != common_retention_artifact_kind::host_entry ||
+            row->backing_known) {
+            return {};
+        }
+        row->backing_known = true;
+    }
+    for (const auto * row = begin; row != end; ++row) {
+        if (row->kind == common_retention_artifact_kind::host_entry &&
+            !row->backing_known) {
+            return {};
+        }
+    }
+
+    const auto find_lineage = [&](common_retention_pool pool,
+                                  uint64_t lineage_id) {
+        if (!lineage_id) {
+            return static_cast<server_prompt_cache_shadow_lineage_slot *>(nullptr);
+        }
+        const uint64_t key = lineage_id ^
+            (uint64_t(uint8_t(pool)) << 56);
+        size_t slot = size_t(server_prompt_cache_shadow_hash(key)) &
+            index_mask;
+        size_t probes = 0;
+        while (lineages[slot].lineage_id &&
+               probes++ < SERVER_PROMPT_CACHE_SHADOW_INDEX_CAPACITY) {
+            if (lineages[slot].lineage_id == lineage_id &&
+                lineages[slot].pool == pool) {
+                return &lineages[slot];
+            }
+            slot = (slot + 1) & index_mask;
+        }
+        return static_cast<server_prompt_cache_shadow_lineage_slot *>(nullptr);
+    };
+
+    bool have_best = false;
+    common_retention_shadow_value best;
+    const uint64_t competition_epoch =
+        cache.retention_obs->competition_epoch_value();
+    for (const auto * row = begin; row != end; ++row) {
+        if (!row->releasable || row->resource == 0) {
+            continue;
+        }
+        auto * lineage = find_lineage(
+            row->stamp.pool, row->stamp.lineage_id);
+        GGML_ASSERT(lineage != nullptr);
+        server_retention_singleton_quote quote;
+        if (!server_retention_quote_singleton(
+                row->stamp, row->lineage,
+                lineage->maximum_coverage, lineage->second_coverage,
+                lineage->maximum_count,
+                row->external_shared_coverage_tokens,
+                row->resource, competition_epoch, {}, quote)) {
+            return {};
+        }
+        const int comparison = have_best
+            ? common_retention_shadow_compare(quote.value, best) : -1;
+        if (!have_best || comparison < 0 || (comparison == 0 &&
+                std::tie(row->stamp.pool, row->stamp.lineage_id,
+                         row->artifact_id.v) <
+                std::tie(result.pool, result.lineage_id,
+                         result.artifact.v))) {
+            have_best = true;
+            best = quote.value;
+            result.artifact = row->artifact_id;
+            result.lineage_id = row->stamp.lineage_id;
+            result.pool = row->stamp.pool;
+            result.lost_work = quote.lost_work_units;
+            result.resource = row->resource;
+        }
+    }
+    result.complete = have_best;
+    return result;
+}
+
+} // namespace
+
 void server_prompt_cache::release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
     if (candidate.cache_ != this) {
