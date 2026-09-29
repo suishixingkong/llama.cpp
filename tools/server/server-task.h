@@ -1408,6 +1408,10 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_capacity_claim & claim) noexcept;
 
     // fork 9l-d4b5a (fork server-task.h 1598-1599)
+    // fork 9l-d4b6c (fork server-task.h 1595-1597)
+    bool retention_sources_available(
+            const server_prompt & source_prompt,
+            int32_t source_slot) const noexcept;
     bool vbr_retention_source_available(
             int32_t source_slot) const noexcept;
 
@@ -1534,6 +1538,11 @@ struct server_prompt_cache {
     bool retention_capacity_authority = false;
 
 // fork 9l-d3c2: shadow workspace allocator + snapshot accessor (fork server-task.h 1730-1734)
+    // fork 9l-d4b6c (fork server-task.h 1683-1685)
+    static bool exactly_redundant(
+            const server_prompt_cache_state & victim,
+            const server_prompt_cache_state & survivor) noexcept;
+
     // fork 9l-d4b5b (fork server-task.h 1721-1725)
     static bool payload_bytes(
             const server_prompt_cache_state & st,

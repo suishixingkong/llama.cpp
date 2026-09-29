@@ -4547,6 +4547,93 @@ server_prompt_cache::refresh_vbr_compact(
     }
 }
 
+// fork 9l-d4b6c: checkpoint_payload_equal (fork server-task.cpp 4589-4605)
+namespace {
+bool checkpoint_payload_equal(
+        const common_prompt_checkpoint & a,
+        const common_prompt_checkpoint & b) noexcept {
+    return a.n_tokens == b.n_tokens &&
+           a.id_task == b.id_task &&
+           a.pos_min == b.pos_min &&
+           a.pos_max == b.pos_max &&
+           a.checkpoint_epoch == b.checkpoint_epoch &&
+           a.checkpoint_epoch_swa == b.checkpoint_epoch_swa &&
+           a.computation_frontier == b.computation_frontier &&
+           a.data_tgt == b.data_tgt &&
+           a.data_dft == b.data_dft &&
+           a.data_qsa == b.data_qsa &&
+           a.data_dft_full_sequence == b.data_dft_full_sequence &&
+           a.accel.ring == b.accel.ring &&
+           a.accel.spec == b.accel.spec;
+}
+
+} // namespace
+
+// fork 9l-d4b6c: server_prompt_cache::exactly_redundant (fork server-task.cpp 5999-6040)
+bool server_prompt_cache::exactly_redundant(
+        const server_prompt_cache_state & victim,
+        const server_prompt_cache_state & survivor) noexcept {
+    try {
+        const bool vbr = victim.payload.kind() ==
+            server_prompt_cache_payload_kind::vbr_artifact;
+        if (&victim == &survivor ||
+            victim.payload.kind() != survivor.payload.kind() ||
+            victim.adapter_config_key != survivor.adapter_config_key ||
+            victim.vbr_execution_identity !=
+                survivor.vbr_execution_identity ||
+            (vbr && !victim.payload.same_storage(survivor.payload)) ||
+            victim.prompt.sequence_epoch != survivor.prompt.sequence_epoch ||
+            victim.prompt.n_tokens() > survivor.prompt.n_tokens() ||
+            victim.prompt.tokens.get_common_prefix(survivor.prompt.tokens) !=
+                size_t(victim.prompt.n_tokens()) ||
+            (!vbr && !victim.payload.same_storage(survivor.payload)) ||
+            victim.prompt.checkpoints.size() !=
+                survivor.prompt.checkpoints.size()) {
+            return false;
+        }
+        std::string victim_media;
+        std::string survivor_media;
+        if (!victim.prompt.tokens.media_content_identity(
+                victim.prompt.n_tokens(), victim_media) ||
+            !survivor.prompt.tokens.media_content_identity(
+                victim.prompt.n_tokens(), survivor_media) ||
+            victim_media != survivor_media) {
+            return false;
+        }
+        auto a = victim.prompt.checkpoints.begin();
+        auto b = survivor.prompt.checkpoints.begin();
+        for (; a != victim.prompt.checkpoints.end(); ++a, ++b) {
+            if (!checkpoint_payload_equal(*a, *b)) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// fork 9l-d4b6c: server_prompt_cache::retention_sources_available (fork server-task.cpp 7252-7270)
+bool server_prompt_cache::retention_sources_available(
+        const server_prompt & source_prompt,
+        int32_t source_slot) const noexcept {
+    if (!retention_obs || source_slot < 0) {
+        return true;
+    }
+    if (!retention_obs->clone_source_available(
+            server_retention_instance_key::for_slot(source_slot))) {
+        return false;
+    }
+    for (const auto & checkpoint : source_prompt.checkpoints) {
+        if (!retention_obs->clone_source_available(
+                server_retention_instance_key::for_checkpoint(
+                    source_slot, &checkpoint))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void server_prompt_cache::release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept {
     if (candidate.cache_ != this) {
