@@ -9268,6 +9268,24 @@ private:
                 *found, current_attempt, accounting_serial,
                 retention_epoch, lease);
     }
+
+// fork 9l-d4b6r: vbr_idle_retry_immediately (fork server-context.cpp 11589-11603)
+    static bool vbr_idle_retry_immediately(
+            bool terminal,
+            bool aggregate_over_cap,
+            server_prompt_cache_vbr_capacity_status capacity_status,
+            size_t candidate_count,
+            bool transfer_retry_candidate,
+            bool capacity_retry_candidate) noexcept {
+        const bool transfer_retry = aggregate_over_cap &&
+            transfer_retry_candidate;
+        const bool capacity_retry =
+            capacity_status == server_prompt_cache_vbr_capacity_status::
+                pressure_batch_unsupported && capacity_retry_candidate;
+        return !terminal && candidate_count > 1 &&
+            (transfer_retry || capacity_retry);
+    }
+
     static bool vbr_idle_release_isolated_retry(
             size_t candidate_count,
             size_t successful_captures,
@@ -9463,6 +9481,15 @@ private:
                     conservative_growth_cells_per_second()
                 : 0;
         return input;
+    }
+
+// fork 9l-d4b6r: vbr_capture_reserved_cells (fork server-context.cpp 12173-12179)
+    uint32_t vbr_capture_reserved_cells() const noexcept {
+        if (!vbr_idle_exact_capture || !vbr_idle_exact_capture->readiness) {
+            return 0;
+        }
+        return uint32_t(std::min<uint64_t>(
+            vbr_idle_exact_capture->readiness.device_cells, UINT32_MAX));
     }
 
     // fork 9l-d2c: cache-control authority (fork server-context.cpp 3642-3648).
