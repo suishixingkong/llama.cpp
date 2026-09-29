@@ -1032,6 +1032,66 @@ struct server_slot {
         }
     }
 
+    // fork 9l-d4b6w: server_slot::capture_frontier_logits + capture_synchronized_frontier_logits
+    // (fork server-context.cpp 1911-1967)
+    bool capture_frontier_logits(
+            int32_t output_index, bool synchronize) noexcept {
+        try {
+            if (synchronize) {
+                llama_synchronize(ctx_tgt);
+            }
+            const int32_t n_vocab = llama_vocab_n_tokens(
+                llama_model_get_vocab(llama_get_model(ctx_tgt)));
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            const llama_pos live_pos_max = memory
+                ? memory->seq_pos_max(id) : -1;
+            const llama_pos token_pos_next = prompt.tokens.pos_next();
+            if (n_vocab <= 0 || prompt.n_tokens() <= 0 ||
+                prompt.tokens.has_media() || live_pos_max < 0 ||
+                live_pos_max + 1 != token_pos_next) {
+                return false;
+            }
+            // The public getter may prefer a backend-sampled/top-k row whose
+            // valid prefix is smaller than n_vocab.  Persistent frontier
+            // authority must always copy the full raw pre-sampler row.
+            if (ctx_tgt->get_sampled_logits_ith(output_index) != nullptr) {
+                SLT_DBG(*this, "%s",
+                    "frontier logits unavailable: backend-sampled row is not raw authority\n");
+                return false;
+            }
+            const float * logits = ctx_tgt->get_logits_ith(output_index);
+            if (!logits) {
+                SLT_DBG(*this,
+                        "frontier logits unavailable: vocab=%d raw=%d prompt=%d media=%d\n",
+                        n_vocab, logits != nullptr,
+                        prompt.n_tokens(), prompt.tokens.has_media());
+                return false;
+            }
+            std::array<uint8_t, 32> digest = {};
+            if (!prompt.tokens.retention_token_digest(digest)) {
+                return false;
+            }
+            std::vector<float> captured((size_t(n_vocab)));
+            std::memcpy(captured.data(), logits,
+                        captured.size()*sizeof(float));
+            if (!std::all_of(captured.begin(), captured.end(),
+                    [](float value) { return std::isfinite(value); })) {
+                return false;
+            }
+            frontier_logits.install(
+                std::move(captured), digest, prompt.sequence_epoch);
+            return true;
+        } catch (...) {
+            frontier_logits.clear();
+            return false;
+        }
+    }
+
+    bool capture_synchronized_frontier_logits(
+            int32_t output_index) noexcept {
+        return capture_frontier_logits(output_index, false);
+    }
+
     void bind_frontier_logits_to_prompt() noexcept {
         if (frontier_logits.values.empty()) {
             return;
@@ -7573,6 +7633,74 @@ private:
         }
 
         return true;
+    }
+
+    // fork 9l-d4b6w: capture_vbr_swa_prompt_frontier (fork server-context.cpp 18695-18760)
+    bool capture_vbr_swa_prompt_frontier(
+            server_slot & slot, int32_t output_index) noexcept {
+        if (!params_base.vbr_prompt_cache || !prompt_cache ||
+            !vbr_artifact_store || n_swa <= 0 || ctx_dft ||
+            slot.can_speculate() || vbr_idle_exact_capture ||
+            slot.state != SLOT_STATE_DONE_PROMPT || !slot.is_processing() ||
+            slot.prompt.n_tokens() <
+                int64_t(SERVER_PROMPT_CACHE_MIN_RETENTION_REUSE_TOKENS)) {
+            return false;
+        }
+
+        // Bind the terminal row before the capture so an exact host hit can
+        // sample immediately without re-running the final prompt token.  A
+        // missing row only removes that shortcut; it must not invalidate an
+        // otherwise complete prompt-frontier artifact. Successful output
+        // decode synchronized the target immediately before this call.
+        (void) slot.capture_synchronized_frontier_logits(output_index);
+
+        // Normal live-slot retention publication happens at release(), after
+        // generation.  Prompt-boundary sealing deliberately precedes that
+        // terminal, so publish the same immutable lineage source early.  The
+        // later release refresh is idempotent and remains the general owner.
+        if (!prompt_cache->vbr_retention_source_available(slot.id)) {
+            if (!slot.retention_obs || !slot.task || slot.task->is_child()) {
+                return false;
+            }
+            (void) ensure_frontier_sequence_epoch(slot.prompt);
+            const auto live_key =
+                server_retention_instance_key::for_slot(slot.id);
+            const std::string adapter_identity =
+                lora_config_identity(slot.lora);
+            server_cache_lease_identity identity;
+            const bool identity_known = slot.lease_obs &&
+                slot.lease_execution_identity &&
+                server_cache_lease_build_identity(
+                    *slot.lease_execution_identity, adapter_identity,
+                    slot.prompt.tokens, slot.prompt.n_tokens(), identity);
+            const bool published = slot.retention_obs->publish(
+                live_key, slot.retention_pool,
+                slot.task->params.message_spans,
+                !slot.task->params.message_spans.spans.empty(),
+                uint64_t(slot.prompt.n_tokens()),
+                uint64_t(slot.prompt.n_tokens()), true,
+                identity_known ? &identity : nullptr,
+                nullptr, nullptr,
+                slot.retention_destination.valid()
+                    ? &slot.retention_destination : nullptr);
+            if (!published ||
+                !server_prompt_retention_publish_exact_prefix(
+                    *slot.retention_obs, live_key, slot.prompt,
+                    adapter_identity, slot.prompt.n_tokens())) {
+                slot.retention_obs->retire(live_key);
+                return false;
+            }
+        }
+
+        vbr_prompt_boundary_capture_slot = slot.id;
+        auto capture = queue_tasks.try_begin_prompt_boundary_capture();
+        if (capture) {
+            (void) publish_idle_vbr_batch(capture, true);
+        }
+        vbr_prompt_boundary_capture_slot = -1;
+
+        return vbr_idle_exact_capture &&
+            vbr_idle_exact_capture->candidate.active_prompt_frontier;
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
