@@ -7737,6 +7737,8 @@ private:
                 return;
             }
 
+            // fork 9l-d4b6x: wait_for_prompt_capture declaration (fork server-context.cpp 18830)
+            bool wait_for_prompt_capture = false;
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 const bool snapshot_prev = params_base.checkpoint_recurrent_prev &&
                         params_base.n_ctx_checkpoints > 0 && spec == nullptr &&
@@ -7769,6 +7771,10 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // fork 9l-d4b6x: wait_for_prompt_capture assignment (fork server-context.cpp 18861-18862)
+                wait_for_prompt_capture = capture_vbr_swa_prompt_frontier(
+                    slot, slot.i_batch-off);
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -7820,12 +7826,32 @@ private:
             }
 
             if (!process_token(result, slot)) {
+                // fork 9l-d4b6x: hold the slot for the prompt-frontier capture (fork server-context.cpp 18994-19003)
+                if (wait_for_prompt_capture && vbr_idle_exact_capture) {
+                    // The sampled stop token is not decoded into KV, but the
+                    // prompt-frontier worker still owns this slot as its live
+                    // source. Cancel and drain it before release tears that
+                    // source down. A later idle publication can retry the
+                    // same stable frontier if it remains useful.
+                    slot.state = SLOT_STATE_WAIT_VBR_CAPTURE;
+                    vbr_idle_exact_capture->session.cancel();
+                    (void) finish_idle_exact_vbr_capture(false);
+                }
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
 
                 return;
+            }
+
+            // fork 9l-d4b6x: hold the slot at the immutable prompt frontier (fork server-context.cpp 19023-19029)
+            if (wait_for_prompt_capture) {
+                // The first token is already sampled and delivered, but has
+                // not been decoded into KV yet. Hold only this source slot at
+                // the immutable prompt frontier; scheduler maintenance will
+                // publish or abandon the capture and re-arm generation.
+                slot.state = SLOT_STATE_WAIT_VBR_CAPTURE;
             }
 
             slot.print_timings_tg();
