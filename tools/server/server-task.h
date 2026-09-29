@@ -1589,6 +1589,13 @@ struct server_prompt_cache {
         common_cache_family_binding & destination_family,
         int32_t id_slot) noexcept;
 
+    // fork 9l-d4b6p (fork server-task.h 1600-1604)
+    bool publish(
+            std::list<server_prompt_cache_state> entry,
+            const server_prompt * source_prompt = nullptr,
+            int32_t source_slot = -1,
+            iterator * published = nullptr);
+
     void release_vbr_restore(
         server_prompt_cache_vbr_restore_candidate & candidate) noexcept;
     friend class server_prompt_cache_vbr_restore_candidate;

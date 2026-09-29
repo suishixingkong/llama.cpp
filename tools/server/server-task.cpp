@@ -7052,6 +7052,17 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     return next;
 }
 
+// fork 9l-d4b6p: server_prompt_cache::publish (fork server-task.cpp 7279-7286)
+
+bool server_prompt_cache::publish(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot,
+        iterator * published) {
+    return publish_impl(
+        std::move(entry), source_prompt, source_slot, published, false, {});
+}
+
 // fork 9l-d4b6n: the detached-entry publisher (fork server-task.cpp 7288-7735)
 bool server_prompt_cache::publish_impl(
         std::list<server_prompt_cache_state> entry,
