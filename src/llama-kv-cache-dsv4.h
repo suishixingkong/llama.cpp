@@ -120,6 +120,10 @@ public:
 
     bool get_can_shift() const override;
 
+    // fork 9l-d4b6t: can_seq_rm_partial() override (fork src/llama-kv-cache-dsv4.h 123-124)
+    // Compressed caches support only state-dependent suffix removals, not arbitrary ranges.
+    bool can_seq_rm_partial() const override { return false; }
+
     // fork 9l-d4b6s: breathe() override (fork src/llama-kv-cache-dsv4.h 126-128)
     // VBR params are threaded to all four children (footprint-weighted split in the ctor),
     // so each child's controller gets its breathe tick

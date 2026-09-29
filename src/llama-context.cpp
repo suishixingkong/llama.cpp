@@ -5015,6 +5015,11 @@ void llama_memory_breathe(llama_memory_t mem) {
     mem->breathe();
 }
 
+// fork 9l-d4b6t: llama_memory_can_seq_rm_partial (fork src/llama-context.cpp 8323-8325)
+bool llama_memory_can_seq_rm_partial(llama_memory_t mem) {
+    return mem && mem->can_seq_rm_partial();
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,

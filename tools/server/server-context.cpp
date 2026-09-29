@@ -163,6 +163,9 @@ enum slot_state {
     SLOT_STATE_STARTED,    // after assigning a task and about to process prompt
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
+    // fork 9l-d4b6t: SLOT_STATE_WAIT_VBR_CAPTURE (fork server-context.cpp 1249)
+    SLOT_STATE_WAIT_VBR_CAPTURE,
+
     SLOT_STATE_GENERATING,
 };
 

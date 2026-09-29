@@ -47,6 +47,11 @@ public:
 
     bool get_can_shift() const override;
 
+    // fork 9l-d4b6t: can_seq_rm_partial() override (fork src/llama-kv-cache-dsa.h 49-51)
+    bool can_seq_rm_partial() const override {
+        return kv_mla->can_seq_rm_partial() && kv_lid->can_seq_rm_partial();
+    }
+
     // fork 9l-d4b6s: breathe() override (fork src/llama-kv-cache-dsa.h 53-55)
     // no VBR params are threaded to the children today, so this is a no-op — kept for
     // coverage symmetry with get_vbr_epoch should that ever change

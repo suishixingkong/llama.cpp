@@ -789,6 +789,11 @@ extern "C" {
     // that calls llama_decode. No-op for memory types with nothing to do.
     LLAMA_API void llama_memory_breathe(llama_memory_t mem);
 
+    // fork 9l-d4b6t: llama_memory_can_seq_rm_partial (fork include/llama.h 847-849)
+    // Returns whether arbitrary token ranges can be removed without discarding the whole sequence.
+    // This is a non-mutating capability query.
+    LLAMA_API bool llama_memory_can_seq_rm_partial(llama_memory_t mem);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
