@@ -6925,6 +6925,456 @@ server_prompt_cache::iterator server_prompt_cache::destroy_entry_impl(
     return next;
 }
 
+// fork 9l-d4b6n: the detached-entry publisher (fork server-task.cpp 7288-7735)
+bool server_prompt_cache::publish_impl(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot,
+        iterator * published,
+        bool vbr_retention_prepared,
+        server_prompt_cache_vbr_pressure_citation required_victims,
+        int64_t source_vbr_coverage_tokens) {
+    if (published) {
+        *published = states.end();
+    }
+    // stage() produces exactly one detached node. Enforce that transaction
+    // shape here as well: admission/accounting below bind one logical host
+    // entry, so accepting a longer list would let later nodes bypass both.
+    if (entry.size() != 1 || !entry.front().payload.publishable()) {
+        return false;
+    }
+    auto & staged = entry.front();
+    const bool is_vbr = staged.payload.kind() ==
+        server_prompt_cache_payload_kind::vbr_artifact;
+    const auto source_matches_staged_vbr = [&]() noexcept {
+        if (!source_prompt) {
+            return false;
+        }
+        if (source_vbr_coverage_tokens < 0) {
+            return server_prompt_cache_vbr_frontier_matches(
+                *source_prompt, staged.payload,
+                staged.vbr_execution_identity,
+                staged.adapter_config_key);
+        }
+        try {
+            return staged.prompt.n_tokens() == source_vbr_coverage_tokens &&
+                   source_prompt->n_tokens() >= source_vbr_coverage_tokens &&
+                   source_prompt->sequence_epoch ==
+                       staged.prompt.sequence_epoch &&
+                   source_prompt->tokens.get_common_prefix(
+                       staged.prompt.tokens) ==
+                       size_t(source_vbr_coverage_tokens);
+        } catch (...) {
+            return false;
+        }
+    };
+
+    // A sealed VBR capability is already charged in the cache's canonical
+    // ledger. Borrowed/manual views remain publishable only when they fit
+    // without pressure; cache-owned views may enter the canonical pressure
+    // transaction, whose prepared retirement quote supplies exact marginal
+    // physical bytes.
+    if (is_vbr) {
+        if (!server_prompt_cache_vbr_frontier_matches(
+                staged.prompt, staged.payload,
+                staged.vbr_execution_identity,
+                staged.adapter_config_key) ||
+            !source_matches_staged_vbr() ||
+            !acct || !staged.payload.accounted_by(acct) ||
+            !retention_obs || source_slot < 0 ||
+            !retention_obs->prefix_tracking_enabled() ||
+            !retention_obs->prefix_tracking_available() ||
+            !staged.prompt.checkpoints.empty() ||
+            !retention_obs->clone_source_available(
+                server_retention_instance_key::for_slot(source_slot))) {
+            return false;
+        }
+        const uint64_t staged_anchor =
+            staged.payload.vbr_anchor_resident_bytes();
+        if (staged_anchor > staged.size()) {
+            return false;
+        }
+        const size_t staged_compact =
+            staged.size() - size_t(staged_anchor);
+        const size_t staged_budget_bytes = quality_anchor_budget_enabled
+            ? staged_compact : staged.size();
+        if (!fits_bytes(staged_budget_bytes) ||
+            (limit_size == 0 && limit_tokens > 0 &&
+             size_t(staged.prompt.n_tokens()) > limit_tokens)) {
+            return false;
+        }
+        size_t total_bytes = staged_budget_bytes;
+        size_t total_anchor_bytes = quality_anchor_budget_enabled
+            ? size_t(staged_anchor) : 0;
+        size_t fixed_bytes = 0;
+        size_t total_tokens = size_t(staged.prompt.n_tokens());
+        std::vector<const server_prompt_cache_payload *> payloads;
+        std::vector<const server_prompt_cache_state *> fixed_states;
+        for (const auto & state : states) {
+            // An unpinned exact alias is replaced later in this same
+            // scheduler transaction. Excluding it makes republication
+            // idempotent at an exact byte/token limit; a pinned alias remains
+            // a separate logical node and keeps its token charge.
+            if (state.recovery_pins == 0 &&
+                exactly_redundant(state, staged)) {
+                continue;
+            }
+            if (size_t(state.prompt.n_tokens()) > SIZE_MAX - total_tokens) {
+                return false;
+            }
+            total_tokens += size_t(state.prompt.n_tokens());
+            if (!quality_anchor_budget_enabled) {
+                if (state.size() > SIZE_MAX - total_bytes) {
+                    return false;
+                }
+                total_bytes += state.size();
+            } else {
+                const uint64_t anchor = state.payload.kind() ==
+                        server_prompt_cache_payload_kind::vbr_artifact
+                    ? state.payload.vbr_anchor_resident_bytes() : 0;
+                const size_t state_bytes = state.size();
+                if (anchor > state_bytes ||
+                    size_t(anchor) > SIZE_MAX - total_anchor_bytes ||
+                    state_bytes - size_t(anchor) >
+                        SIZE_MAX - total_bytes) {
+                    return false;
+                }
+                total_anchor_bytes += size_t(anchor);
+                total_bytes += state_bytes - size_t(anchor);
+            }
+        }
+        const bool anchor_exact_needed = quality_anchor_budget_enabled &&
+            (!fits_bytes(total_bytes) ||
+             total_anchor_bytes > limit_anchor_size);
+        if (anchor_exact_needed) {
+            try {
+                payloads.reserve(states.size() + 1);
+                fixed_states.reserve(states.size());
+                payloads.push_back(&staged.payload);
+                for (const auto & state : states) {
+                    if (state.recovery_pins == 0 &&
+                        exactly_redundant(state, staged)) {
+                        continue;
+                    }
+                    if (state.payload.kind() ==
+                            server_prompt_cache_payload_kind::vbr_artifact) {
+                        payloads.push_back(&state.payload);
+                    } else {
+                        fixed_states.push_back(&state);
+                    }
+                }
+            } catch (...) {
+                return false;
+            }
+            server_prompt_cache_vbr_budget_summary budgets;
+            if (!server_prompt_cache_payload::summarize_vbr_budgets(
+                    payloads, budgets) ||
+                !server_prompt_cache_measure_fixed_states(
+                    fixed_states, acct, fixed_bytes) ||
+                budgets.compact_resident_bytes > SIZE_MAX - fixed_bytes) {
+                return false;
+            }
+            total_bytes = fixed_bytes +
+                size_t(budgets.compact_resident_bytes);
+            total_anchor_bytes = size_t(budgets.anchor_resident_bytes);
+        } else if (!fits_bytes(total_bytes) && acct) {
+            try {
+                payloads.reserve(states.size() + 1);
+                fixed_states.clear();
+                fixed_states.reserve(states.size());
+                payloads.push_back(&staged.payload);
+                fixed_bytes = 0;
+                for (const auto & state : states) {
+                    if (state.recovery_pins == 0 &&
+                        exactly_redundant(state, staged)) {
+                        continue;
+                    }
+                    if (state.payload.kind() ==
+                            server_prompt_cache_payload_kind::vbr_artifact) {
+                        payloads.push_back(&state.payload);
+                    } else {
+                        fixed_states.push_back(&state);
+                    }
+                }
+                server_prompt_cache_vbr_budget_summary budgets;
+                if (server_prompt_cache_payload::summarize_vbr_budgets(
+                        payloads, budgets) &&
+                    server_prompt_cache_measure_fixed_states(
+                        fixed_states, acct, fixed_bytes) &&
+                    budgets.compact_resident_bytes <=
+                        SIZE_MAX - fixed_bytes &&
+                    budgets.anchor_resident_bytes <=
+                        SIZE_MAX - fixed_bytes -
+                        size_t(budgets.compact_resident_bytes)) {
+                    total_bytes = fixed_bytes +
+                        size_t(budgets.compact_resident_bytes) +
+                        size_t(budgets.anchor_resident_bytes);
+                }
+            } catch (...) {
+                // Keep the conservative allocation-free upper bound.
+            }
+        }
+        const size_t effective_token_limit = effective_host_token_limit(total_bytes, total_tokens);
+        const bool requires_pressure =
+            !fits_bytes(total_bytes) ||
+            (limit_tokens > 0 && total_tokens > effective_token_limit);
+        if (requires_pressure &&
+            !staged.payload.vbr_retirement_exclusive() &&
+            !staged.payload.vbr_logical_erase_only()) {
+            return false;
+        }
+    }
+
+    // A host save is one compound payload: the host entry plus every copied
+    // checkpoint. Validate all lineage sources before the payload admission
+    // and allocation-free list splice below. A restored/trimmed ring can
+    // legitimately reach this seam with a checkpoint whose optional sidecar
+    // publication was refused; that makes this save a local soft miss, not a
+    // reason to poison the complete retention/accounting catalog. The bound
+    // is the configured checkpoint-ring size (default 32), and this runs only
+    // on the host-save path.
+    if (!is_vbr && retention_obs && source_prompt && source_slot >= 0) {
+        if (source_prompt->checkpoints.size() !=
+                entry.front().prompt.checkpoints.size() ||
+            !retention_sources_available(*source_prompt, source_slot)) {
+            return false;
+        }
+    }
+
+    bool fixed_retention_prepared = false;
+    const auto retire_fixed_preparation = [&]() noexcept {
+        if (!retention_obs) {
+            return;
+        }
+        retention_obs->retire(
+            server_retention_instance_key::for_host_entry(&staged));
+        for (auto & checkpoint : staged.prompt.checkpoints) {
+            retention_obs->retire(
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint));
+        }
+    };
+    if (!is_vbr && publish_authority && retention_obs &&
+        source_prompt && source_slot >= 0) {
+        const auto source_key =
+            server_retention_instance_key::for_slot(source_slot);
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged);
+        fixed_retention_prepared = retention_obs->clone(
+            source_key, destination_key) &&
+            server_prompt_retention_publish_exact_prefix(
+                *retention_obs, destination_key, staged.prompt,
+                staged.adapter_config_key, staged.prompt.n_tokens());
+        auto source_checkpoint = source_prompt->checkpoints.begin();
+        auto host_checkpoint = staged.prompt.checkpoints.begin();
+        for (; fixed_retention_prepared &&
+               source_checkpoint != source_prompt->checkpoints.end() &&
+               host_checkpoint != staged.prompt.checkpoints.end();
+               ++source_checkpoint, ++host_checkpoint) {
+            fixed_retention_prepared = retention_obs->clone(
+                server_retention_instance_key::for_checkpoint(
+                    source_slot, &*source_checkpoint),
+                server_retention_instance_key::for_checkpoint(
+                    -1, &*host_checkpoint));
+        }
+        if (!fixed_retention_prepared) {
+            retire_fixed_preparation();
+            return false;
+        }
+    }
+
+    // Publication-authority boundary: the detached entry is complete, but no shipped cache state has
+    // changed yet. Refusal drops only this detached node; the live slot remains the sole copy.
+    // The callback commits all accounting leaves before returning true, and states.splice below
+    // is allocation-free/noexcept, so accounting can never lag a published entry.
+    if (!is_vbr && publish_authority &&
+        !publish_authority->admit_host_entry(entry.front())) {
+        retire_fixed_preparation();
+        return false;
+    }
+
+    // The detached list node has its final stable address before splice.
+    // Prepare the logical lineage/prefix first so every fallible VBR metadata
+    // operation precedes the allocation-free cache publication. On refusal,
+    // retire the provisional destination; the live source and sealed catalog
+    // capability remain valid. The shared prefix index may separately latch
+    // unavailable under its canonical fail-closed contract.
+    if (is_vbr && !vbr_retention_prepared) {
+        const auto source_key =
+            server_retention_instance_key::for_slot(source_slot);
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged);
+        const bool cloned = retention_obs->clone(
+            source_key, destination_key);
+        const bool indexed = cloned &&
+            !server_fault("vbr_prompt_cache_prefix_fail") &&
+            server_prompt_retention_publish_exact_prefix(
+                *retention_obs, destination_key, staged.prompt,
+                staged.adapter_config_key, staged.prompt.n_tokens());
+        if (!indexed) {
+            // A real prefix-index insertion failure deliberately makes the
+            // shared policy evidence unavailable (the sidecar's canonical
+            // fail-closed terminal). Either way, no logical cache node is
+            // published and this provisional association is retired.
+            retention_obs->retire(destination_key);
+            return false;
+        }
+        const server_cache_lease_subject source {
+            retention_obs->artifact_id(source_key),
+            common_retention_artifact_kind::live_slot,
+            source_slot,
+        };
+        const server_cache_lease_subject destination {
+            retention_obs->artifact_id(destination_key),
+            common_retention_artifact_kind::host_entry,
+            -1,
+        };
+        server_prompt_cache_mirror_lease(
+            *this, true, &source, destination, staged.prompt,
+            staged.adapter_config_key, staged.prompt.n_tokens());
+    } else if (is_vbr) {
+        // The move-only metadata capability installed this exact association
+        // and prefix before D2H. Its detached std::list node retains the same
+        // address through this by-value move and the final splice.
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&staged);
+        if (!retention_obs ||
+            retention_obs->artifact_id(destination_key).v == 0) {
+            return false;
+        }
+    }
+
+    // Splice the pre-allocated node in FIRST (no allocation, no throw) so the new entry is durably
+    // linked before any potentially-throwing comparison below. Then remove cached prompts of the
+    // same adapter identity fully contained in the new (larger) prompt: a contained entry
+    // under a different adapter config is a distinct valid state and is kept. If a comparison throws
+    // (OOM) mid-loop, the new entry is already safely in `states`; at worst a few obsolete entries
+    // remain (benign, FIFO-evicted later) -- never a lost node or partial corruption.
+    states.splice(states.end(), entry);
+    const auto self = std::prev(states.end());
+
+    if (acct && !publish_authority) {
+        acct_charge_entry(*self);
+    }
+    if (!is_vbr && retention_obs && source_prompt && source_slot >= 0) {
+        const auto source_key =
+            server_retention_instance_key::for_slot(source_slot);
+        const auto destination_key =
+            server_retention_instance_key::for_host_entry(&*self);
+        if (!fixed_retention_prepared) {
+            (void) server_prompt_cache_mirror_artifact_clone(
+                *this,
+                source_key, common_retention_artifact_kind::live_slot,
+                source_slot,
+                destination_key, common_retention_artifact_kind::host_entry,
+                -1,
+                self->prompt, self->adapter_config_key,
+                self->prompt.n_tokens());
+        } else {
+            const server_cache_lease_subject source_subject {
+                retention_obs->artifact_id(source_key),
+                common_retention_artifact_kind::live_slot,
+                source_slot,
+            };
+            const server_cache_lease_subject destination_subject {
+                retention_obs->artifact_id(destination_key),
+                common_retention_artifact_kind::host_entry,
+                -1,
+            };
+            server_prompt_cache_mirror_lease(
+                *this, true, &source_subject, destination_subject,
+                self->prompt, self->adapter_config_key,
+                self->prompt.n_tokens());
+        }
+        auto source_checkpoint = source_prompt->checkpoints.begin();
+        auto host_checkpoint = self->prompt.checkpoints.begin();
+        for (; source_checkpoint != source_prompt->checkpoints.end() &&
+               host_checkpoint != self->prompt.checkpoints.end();
+               ++source_checkpoint, ++host_checkpoint) {
+            const auto source_checkpoint_key =
+                server_retention_instance_key::for_checkpoint(
+                    source_slot, &*source_checkpoint);
+            const auto host_checkpoint_key =
+                server_retention_instance_key::for_checkpoint(
+                    -1, &*host_checkpoint);
+            if (!fixed_retention_prepared) {
+                (void) server_prompt_cache_mirror_artifact_clone(
+                    *this,
+                    source_checkpoint_key,
+                    common_retention_artifact_kind::checkpoint,
+                    source_slot,
+                    host_checkpoint_key,
+                    common_retention_artifact_kind::checkpoint,
+                    -1,
+                    self->prompt, self->adapter_config_key,
+                    host_checkpoint->n_tokens);
+            } else {
+                const server_cache_lease_subject source_subject {
+                    retention_obs->artifact_id(source_checkpoint_key),
+                    common_retention_artifact_kind::checkpoint,
+                    source_slot,
+                };
+                const server_cache_lease_subject destination_subject {
+                    retention_obs->artifact_id(host_checkpoint_key),
+                    common_retention_artifact_kind::checkpoint,
+                    -1,
+                };
+                server_prompt_cache_mirror_lease(
+                    *this, true, &source_subject, destination_subject,
+                    self->prompt, self->adapter_config_key,
+                    host_checkpoint->n_tokens);
+            }
+        }
+    }
+
+    for (auto it = states.begin(); it != states.end();) {
+        if (it != self && it->adapter_config_key == self->adapter_config_key) {
+            int len = -1;
+            bool obsolete = false;
+            if (is_vbr) {
+                // Immutable owner identity rejects distinct VBR packages in
+                // O(1) before exactly_redundant examines their long prefix.
+                obsolete = exactly_redundant(*it, *self);
+                if (obsolete) {
+                    len = it->prompt.n_tokens();
+                }
+            } else if (it->payload.fixed_state_restorable()) {
+                len = it->prompt.tokens.get_common_prefix(self->prompt.tokens);
+                obsolete = len == (int) it->prompt.tokens.size();
+            }
+            if (obsolete) {
+                // A recovery citation outlives its destruction commit
+                // through the dependent B execution. Dedup is another victim
+                // enumerator: it must leave the cited physical host node in
+                // place rather than reaching the raw eraser's invariant
+                // assert while that non-policy pin is live.
+                if (it->recovery_pins != 0) {
+                    ++it;
+                    continue;
+                }
+                SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+                it = destroy_entry_impl(
+                    it, server_cache_destruction_reason::host_dedup,
+                    self);
+                continue;
+            }
+        }
+        ++it;
+    }
+
+    // enforce the cache limits through the single canonical eviction primitive. The entry's bytes
+    // are already committed, so a local make-room loop would prevent no memory spike and, being
+    // size-only, would skip the token limit. update() enforces both and evicts oldest-first,
+    // preserving the just-added entry.
+    if (!update_impl(self, required_victims)) {
+        return false;
+    }
+    if (published) {
+        *published = self;
+    }
+    return true;
+}
+
 // fork 9l-d1: occupied-replacement push side (fork server-task.cpp 7941-8261)
 bool server_prompt_cache::prepare_vbr_occupied_replacement(
         server_prompt_cache_vbr_restore_candidate && incoming,

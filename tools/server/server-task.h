@@ -1424,6 +1424,15 @@ struct server_prompt_cache {
         std::string adapter_config_key,
         int32_t source_slot,
         server_prompt_cache_vbr_publication_metadata & prepared) noexcept;
+    // fork 9l-d4b6n (fork server-task.h 1663-1670)
+    bool publish_impl(
+        std::list<server_prompt_cache_state> entry,
+        const server_prompt * source_prompt,
+        int32_t source_slot,
+        iterator * published,
+        bool vbr_retention_prepared,
+        server_prompt_cache_vbr_pressure_citation required_victims = {},
+        int64_t source_vbr_coverage_tokens = -1);
 
     // fork server-task.h:1391-1397  (7 lines)
     // Exact immutable VBR-frontier presence query. This alone is not a clear
