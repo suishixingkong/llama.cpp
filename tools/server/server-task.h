@@ -1333,6 +1333,12 @@ struct server_prompt_cache {
         uint64_t & released_bytes,
         size_t & released_tokens);
 
+    // fork 9l-d4b6k (fork server-task.h 1782-1785)
+    bool enforce_quality_anchor_budget(
+        iterator incoming,
+        uint64_t competition_epoch,
+        size_t & anchor_bytes);
+
     // fork 9l-d4b6i (fork server-task.h 1786-1790)
     void observe_retention_pressure_choice(
             server_cache_destruction_reason reason,
@@ -1382,6 +1388,9 @@ struct server_prompt_cache {
     uint64_t debug_destruction_emissions = 0;
     uint64_t debug_recovery_pin_exclusions = 0;
     uint64_t debug_host_pressure_floor_outcomes = 0;
+    // fork 9l-d4b6k (fork server-task.h 1707-1708)
+    uint64_t quality_anchor_retires = 0;
+    uint64_t quality_anchor_refusals = 0;
     llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
     // fork 9l-d4b6j (fork server-task.h 1710)
     bool host_trade_substrate_warned = false;

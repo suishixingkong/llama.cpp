@@ -7316,3 +7316,284 @@ bool server_prompt_cache::commit_vbr_restore(
     candidate.clear();
     return true;
 }
+
+// fork 9l-d4b6k: server_prompt_cache::enforce_quality_anchor_budget (fork server-task.cpp 8699-8977)
+bool server_prompt_cache::enforce_quality_anchor_budget(
+        iterator incoming,
+        uint64_t competition_epoch,
+        size_t & anchor_bytes) {
+    static_assert(SERVER_PROMPT_CACHE_VBR_ANCHOR_MAX_CANDIDATES ==
+        SERVER_RETENTION_MAX_CANDIDATES);
+    if (anchor_bytes <= limit_anchor_size) {
+        return true;
+    }
+    // An anchor is optional acceleration state. If complete parent-value
+    // evidence is unavailable during publication, discard only the incoming
+    // anchor and preserve its already-published compact checkpoint. This is
+    // also the no-ranking fast terminal for a zero anchor budget.
+    const auto discard_incoming_anchor = [&]() noexcept {
+        if (incoming == states.end() ||
+            !incoming->payload.vbr_has_quality_anchor()) {
+            return false;
+        }
+        server_prompt_cache_payload compact;
+        if (!incoming->payload.prepare_vbr_compact_only(compact)) {
+            return false;
+        }
+        if (!acct) {
+            return false;
+        }
+        std::vector<const server_prompt_cache_payload *> selected;
+        try {
+            selected.push_back(&incoming->payload);
+        } catch (...) {
+            return false;
+        }
+        std::vector<vbr_artifact_prepared_retire> prepared_retires;
+        if (!server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+                selected, acct->serial(), prepared_retires)) {
+            return false;
+        }
+        incoming->payload = std::move(compact);
+        for (auto & prepared : prepared_retires) {
+            const auto status = prepared.commit();
+            GGML_ASSERT(status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+        }
+        quality_anchor_retires++;
+        const auto measured = server_prompt_cache_measure_budgets(states, acct);
+        if (!measured.exact) {
+            return false;
+        }
+        anchor_bytes = measured.anchor;
+        return true;
+    };
+    const auto refuse_or_discard_incoming = [&]() noexcept {
+        if (discard_incoming_anchor() &&
+            anchor_bytes <= limit_anchor_size) {
+            return true;
+        }
+        quality_anchor_refusals++;
+        return false;
+    };
+    if (!publish_authority || !acct || !retention_obs || !lease_obs ||
+        !lease_execution_identity || competition_epoch == 0) {
+        return refuse_or_discard_incoming();
+    }
+
+    struct anchor_binding {
+        llama_cache_acct_artifact_id artifact;
+        iterator state;
+    };
+    try {
+        std::vector<server_live_retention_candidate> rows(
+            SERVER_RETENTION_MAX_CANDIDATES);
+        struct fill_context {
+            server_live_retention_candidate * rows = nullptr;
+            size_t capacity = 0;
+            size_t size = 0;
+        } fill { rows.data(), rows.size(), 0 };
+        const auto visitor = [](void * opaque,
+                const server_retention_value_snapshot & value) noexcept {
+            auto & context = *static_cast<fill_context *>(opaque);
+            if (context.size == context.capacity ||
+                context.size > size_t(INT32_MAX)) {
+                return false;
+            }
+            auto & row = context.rows[context.size];
+            row.slot_id = int32_t(context.size);
+            row.artifact_id = value.artifact_id;
+            row.stamp = value.stamp;
+            row.lineage = value.lineage;
+            row.external_shared_coverage_tokens =
+                value.external_shared_coverage_tokens;
+            row.present = true;
+            row.eligible = false;
+            context.size++;
+            return true;
+        };
+        const auto inventory = retention_obs->value_snapshots(
+            &fill, visitor);
+        if (inventory.status !=
+                server_retention_value_snapshot_status::complete ||
+            inventory.size != fill.size || fill.size == 0) {
+            return refuse_or_discard_incoming();
+        }
+        rows.resize(fill.size);
+
+        std::vector<std::pair<uint64_t, size_t>> row_index;
+        row_index.reserve(rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) {
+            row_index.push_back({ rows[i].artifact_id.v, i });
+        }
+        std::sort(row_index.begin(), row_index.end());
+        if (std::adjacent_find(
+                row_index.begin(), row_index.end(),
+                [](const auto & a, const auto & b) {
+                    return a.first == b.first;
+                }) != row_index.end()) {
+            return refuse_or_discard_incoming();
+        }
+
+        lease_obs->lifecycle_point();
+        std::vector<anchor_binding> bindings;
+        bindings.reserve(states.size());
+        bool have_anchor_binding = false;
+        uint32_t ordinal = 0;
+        for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
+            if (it->payload.kind() !=
+                    server_prompt_cache_payload_kind::vbr_artifact) {
+                continue;
+            }
+            host_trade_candidate candidate;
+            (void) inspect_host_candidate(
+                *this, it, ordinal,
+                server_cache_destruction_reason::host_capacity,
+                candidate);
+            const auto found = std::lower_bound(
+                row_index.begin(), row_index.end(),
+                std::pair<uint64_t, size_t> {
+                    candidate.ranking.artifact_id.v, 0 });
+            if (!candidate.ranking.artifact_id.v ||
+                found == row_index.end() ||
+                found->first != candidate.ranking.artifact_id.v ||
+                !candidate.lease_known) {
+                return refuse_or_discard_incoming();
+            }
+            auto & row = rows[found->second];
+            if (row.eligible) {
+                return refuse_or_discard_incoming();
+            }
+            if (it->payload.vbr_has_quality_anchor()) {
+                row.eligible =
+                    it->payload.vbr_anchor_resident_bytes() != 0 &&
+                    !candidate.hard_leased && !candidate.mandatory_anchor &&
+                    it->recovery_pins == 0;
+                have_anchor_binding = true;
+            }
+            bindings.push_back({ candidate.ranking.artifact_id, it });
+        }
+        if (!have_anchor_binding || !server_live_retention_prepare(
+                rows.data(), rows.size(), competition_epoch)) {
+            return refuse_or_discard_incoming();
+        }
+        std::vector<server_anchor_parent_rank> parent_values;
+        if (!server_anchor_parent_values_prepared(
+                rows.data(), rows.size(), competition_epoch, parent_values)) {
+            return refuse_or_discard_incoming();
+        }
+        std::sort(bindings.begin(), bindings.end(), [](const auto & a,
+                                                       const auto & b) {
+            return a.artifact.v < b.artifact.v;
+        });
+        std::sort(parent_values.begin(), parent_values.end(), [](const auto & a,
+                                                                 const auto & b) {
+            return a.artifact_id.v < b.artifact_id.v;
+        });
+
+        std::vector<server_prompt_cache_vbr_anchor_plan_candidate>
+            plan_candidates;
+        plan_candidates.reserve(bindings.size());
+        for (const auto & binding : bindings) {
+            const auto ranked = std::lower_bound(
+                parent_values.begin(), parent_values.end(), binding.artifact.v,
+                [](const auto & value, uint64_t artifact) {
+                    return value.artifact_id.v < artifact;
+                });
+            server_prompt_cache_vbr_anchor_plan_candidate candidate;
+            candidate.payload = &binding.state->payload;
+            candidate.artifact_id = binding.artifact;
+            candidate.eligible = ranked != parent_values.end() &&
+                ranked->artifact_id == binding.artifact;
+            if (candidate.eligible) {
+                candidate.parent_value_q = ranked->parent_value.lost_value_q;
+                candidate.recency_ordinal =
+                    ranked->parent_value.recency_ordinal;
+                candidate.pool = uint8_t(ranked->pool);
+                candidate.lineage_id = ranked->lineage_id;
+            }
+            plan_candidates.push_back(candidate);
+        }
+        std::vector<llama_cache_acct_artifact_id> selected;
+        if (!server_prompt_cache_plan_vbr_anchor_releases(
+                plan_candidates, anchor_bytes, limit_anchor_size,
+                selected)) {
+            return refuse_or_discard_incoming();
+        }
+
+        struct anchor_terminal {
+            iterator state;
+            server_prompt_cache_payload compact;
+        };
+        std::vector<anchor_terminal> terminals;
+        terminals.reserve(selected.size());
+        for (const auto artifact : selected) {
+            const auto binding = std::lower_bound(
+                bindings.begin(), bindings.end(), artifact.v,
+                [](const auto & value, uint64_t id) {
+                    return value.artifact.v < id;
+                });
+            if (binding == bindings.end() ||
+                binding->artifact != artifact ||
+                binding->state == states.end() ||
+                !binding->state->payload.vbr_has_quality_anchor() ||
+                binding->state->recovery_pins != 0) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            host_trade_candidate current;
+            (void) inspect_host_candidate(
+                *this, binding->state, 0,
+                server_cache_destruction_reason::host_capacity,
+                current);
+            if (!current.lease_known || current.hard_leased ||
+                current.mandatory_anchor ||
+                current.ranking.artifact_id != artifact) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            anchor_terminal terminal;
+            terminal.state = binding->state;
+            if (!binding->state->payload.prepare_vbr_compact_only(
+                    terminal.compact)) {
+                terminals.clear();
+                return refuse_or_discard_incoming();
+            }
+            terminals.push_back(std::move(terminal));
+        }
+        std::vector<const server_prompt_cache_payload *> selected_payloads;
+        selected_payloads.reserve(terminals.size());
+        for (const auto & terminal : terminals) {
+            selected_payloads.push_back(&terminal.state->payload);
+        }
+        std::vector<vbr_artifact_prepared_retire> prepared_retires;
+        if (server_fault("vbr_anchor_prepare_fail") ||
+            !server_prompt_cache_payload::prepare_vbr_anchor_retire_batch(
+                selected_payloads, acct->serial(), prepared_retires)) {
+            terminals.clear();
+            return refuse_or_discard_incoming();
+        }
+        // Every allocation, lease, replacement, and last-owner retirement
+        // capability is ready before the first node changes variant.
+        for (auto & terminal : terminals) {
+            terminal.state->payload = std::move(terminal.compact);
+            quality_anchor_retires++;
+        }
+        for (auto & prepared : prepared_retires) {
+            const auto status = prepared.commit();
+            GGML_ASSERT(status !=
+                vbr_artifact_prepared_retire_status::unavailable);
+        }
+        const auto measured = server_prompt_cache_measure_budgets(states, acct);
+        if (!measured.exact) {
+            return refuse_or_discard_incoming();
+        }
+        anchor_bytes = measured.anchor;
+        if (anchor_bytes > limit_anchor_size) {
+            return refuse_or_discard_incoming();
+        }
+        return true;
+    } catch (...) {
+        return refuse_or_discard_incoming();
+    }
+}
