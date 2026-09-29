@@ -9300,6 +9300,97 @@ private:
         return 0;
     }
 
+    // fork 9l-d4b6a (fork server-context.cpp 11460-11506, 11508-11548): the idle-admission-refusal recorder
+    static bool vbr_store_idle_admission_refusal(
+            std::vector<server_vbr_idle_refusal_witness> & refusals,
+            size_t refusal_limit,
+            const server_vbr_idle_refusal_witness & witness,
+            const server_cache_lease_retry_witness & current_lease) noexcept {
+        if (!witness.valid || refusal_limit == 0) {
+            return false;
+        }
+        auto existing = std::lower_bound(
+            refusals.begin(), refusals.end(), witness.attempt_identity,
+            [](const server_vbr_idle_refusal_witness & value,
+               const std::array<uint8_t, 32> & attempt) {
+                return value.attempt_identity < attempt;
+            });
+        if (existing != refusals.end() &&
+            existing->attempt_identity == witness.attempt_identity) {
+            *existing = witness;
+            return true;
+        }
+        if (refusals.size() >= refusal_limit) {
+            existing = std::find_if(
+                refusals.begin(), refusals.end(),
+                [&](const server_vbr_idle_refusal_witness & value) {
+                    return !vbr_idle_admission_refusal_suppressed(
+                        value, value.attempt_identity,
+                        witness.accounting_serial,
+                        witness.retention_epoch, current_lease);
+                });
+            if (existing == refusals.end()) {
+                existing = refusals.begin();
+            }
+            *existing = witness;
+            std::sort(
+                refusals.begin(), refusals.end(),
+                [](const server_vbr_idle_refusal_witness & a,
+                   const server_vbr_idle_refusal_witness & b) {
+                    return a.attempt_identity < b.attempt_identity;
+                });
+            return true;
+        }
+        try {
+            refusals.insert(existing, witness);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    bool vbr_record_idle_admission_refusal(
+            server_slot & slot,
+            const std::array<uint8_t, 32> & attempt) noexcept {
+        auto * retention = live_retention_owner();
+        if (!cache_authority || !retention) {
+            slot.vbr_idle_admission_refusals.clear();
+            return false;
+        }
+        server_vbr_idle_refusal_witness witness;
+        witness.attempt_identity = attempt;
+        witness.accounting_serial = cache_authority->ledger.serial();
+        witness.retention_epoch = retention->competition_epoch_value();
+        witness.lease_tracked = slot.lease_obs != nullptr;
+        if (witness.lease_tracked) {
+            const auto lease = slot.lease_obs->retry_witness(true);
+            if (!lease.available) {
+                slot.vbr_idle_admission_refusals.clear();
+                return false;
+            }
+            witness.lease_event_ordinal = lease.event_ordinal;
+            witness.lease_next_expiry_ns = lease.next_expiry_ns;
+        }
+        witness.valid = witness.accounting_serial != 0 &&
+            witness.retention_epoch != 0;
+        if (!witness.valid) {
+            return false;
+        }
+
+        // The checkpoint ring is itself bounded. Keep enough witnesses for
+        // every currently sealed frontier plus the full-source/stem attempt,
+        // while preferentially recycling evidence made stale by a currency
+        // change.
+        const size_t refusal_limit = std::max<size_t>(
+            2, slot.prompt.checkpoints.size() + 2);
+        const auto current_lease = slot.lease_obs
+            ? slot.lease_obs->retry_witness(false)
+            : server_cache_lease_retry_witness {};
+        return vbr_store_idle_admission_refusal(
+            slot.vbr_idle_admission_refusals, refusal_limit,
+            witness, current_lease);
+    }
+
     // fork 9l-d4b4 (fork server-context.cpp 12100-12171)
     server_vbr_capture_readiness_input vbr_capture_readiness_input_for(
             const server_slot & source,

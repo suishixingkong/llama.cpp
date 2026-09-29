@@ -3284,6 +3284,18 @@ bool server_prompt_cache::prepare_vbr_publication_capacity(
     return true;
 }
 
+// fork 9l-d4b6a: server_prompt_cache::vbr_host_artifact_id (fork server-task.cpp 2769-2778)
+llama_cache_acct_artifact_id server_prompt_cache::vbr_host_artifact_id(
+        const_iterator host) const noexcept {
+    if (!retention_obs || host == states.cend() ||
+        host->payload.kind() !=
+            server_prompt_cache_payload_kind::vbr_artifact) {
+        return {};
+    }
+    return retention_obs->artifact_id(
+        server_retention_instance_key::for_host_entry(&*host));
+}
+
 // fork 9l-d4b5a: consume_vbr_publication_capacity (fork server-task.cpp 2276-2285)
 bool server_prompt_cache::consume_vbr_publication_capacity(
         server_prompt_cache_vbr_capacity_claim & claim) noexcept {

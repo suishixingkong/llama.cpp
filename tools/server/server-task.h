@@ -1425,6 +1425,10 @@ struct server_prompt_cache {
         server_prompt_cache_vbr_capacity_claim & claim,
         server_prompt_cache_vbr_capacity_status * status = nullptr) noexcept;
 
+    // fork 9l-d4b6a (fork server-task.h 1413-1414)
+    llama_cache_acct_artifact_id vbr_host_artifact_id(
+        const_iterator host) const noexcept;
+
     bool prepare_vbr_restore(
         const server_tokens & request_tokens,
         const std::string & execution_identity,
