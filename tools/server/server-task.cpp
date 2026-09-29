@@ -2699,6 +2699,66 @@ bool server_prompt_cache::mark_vbr_frontiers(
     }
 }
 
+// fork 9l-d4b6d: the retirement manifest (fork server-task.cpp 4362-4419)
+struct server_prompt_cache_retirement_manifest {
+    server_retention_instance_key host;
+    std::vector<server_retention_instance_key> checkpoints;
+};
+
+static bool server_prompt_cache_capture_retirement(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it,
+        server_prompt_cache_retirement_manifest & manifest) noexcept {
+    try {
+        manifest = {};
+        if (!cache.retention_obs) {
+            return true;
+        }
+        manifest.host =
+            server_retention_instance_key::for_host_entry(&*it);
+        manifest.checkpoints.reserve(it->prompt.checkpoints.size());
+        for (auto & checkpoint : it->prompt.checkpoints) {
+            manifest.checkpoints.push_back(
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint));
+        }
+        return true;
+    } catch (...) {
+        manifest = {};
+        return false;
+    }
+}
+
+static void server_prompt_cache_retire_manifest(
+        server_prompt_cache & cache,
+        const server_prompt_cache_retirement_manifest & manifest) noexcept {
+    if (!cache.retention_obs) {
+        return;
+    }
+    cache.retention_obs->retire(manifest.host);
+    for (const auto & checkpoint : manifest.checkpoints) {
+        cache.retention_obs->retire(checkpoint);
+    }
+}
+
+static void server_prompt_cache_retire_entry(
+        server_prompt_cache & cache,
+        server_prompt_cache::iterator it) noexcept {
+    // Retention retirement is a post-capability finalizer on authoritative
+    // paths because it releases the sidecar provenance op. The legacy wrapper
+    // invokes it at its historical pre-erase position.
+    if (!cache.retention_obs) {
+        return;
+    }
+    cache.retention_obs->retire(
+        server_retention_instance_key::for_host_entry(&*it));
+    for (auto & checkpoint : it->prompt.checkpoints) {
+        cache.retention_obs->retire(
+            server_retention_instance_key::for_checkpoint(
+                -1, &checkpoint));
+    }
+}
+
 void server_cache_checkpoint_ring_changed(
         server_cache_checkpoint_authority_context & context) noexcept {
     context.attempts.ring_changed();
@@ -3593,6 +3653,134 @@ struct host_trade_ranking {
     common_cache_plan_payload_kind payload_kind =
         common_cache_plan_payload_kind::unavailable;
 };
+// fork 9l-d4b6d: host-destruction observation (fork server-task.cpp 4762-4887)
+struct host_destruction_certification {
+    bool ready = false;
+    server_cache_prepared_release_capability capability;
+    server_cache_recovery_pin pin;
+    common_cache_plan_destruction_quote quote;
+    server_prompt_cache_retirement_manifest retirement;
+    uint64_t projected_bytes = 0;
+};
+
+void server_prompt_cache_observe_host_destruction(
+        server_prompt_cache & cache,
+        const common_cache_plan_destruction_receipt & receipt,
+        bool observe_classification,
+        uint64_t projected_bytes,
+        const host_trade_ranking * ranking = nullptr) noexcept {
+    cache.publish_authority->observe_host_destruction(
+        receipt, observe_classification);
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        const json unavailable = common_cache_acct_known_name(
+            llama_cache_acct_known::unavailable);
+        json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
+            receipt, projected_bytes));
+        payload["rank_ordinal"] = ranking
+            ? json(ranking->ordinal) : unavailable;
+        payload["victim_source_id"] = ranking && ranking->source_id >= 0
+            ? json(ranking->source_id) : unavailable;
+        payload["victim_artifact_id"] = ranking &&
+                ranking->artifact_id.v != 0
+            ? json(ranking->artifact_id.v) : unavailable;
+        payload["declared_family_role"] = ranking &&
+                ranking->family_role < common_cache_family_role::_count
+            ? json(ranking->family_role == common_cache_family_role::main
+                ? "main" : ranking->family_role ==
+                    common_cache_family_role::branch
+                    ? "branch" : "background")
+            : json(nullptr);
+        payload["legacy_fallbacks"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_legacy_fallbacks : uint64_t(0);
+        payload["retention_capacity_executed"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_retention_capacity_executed : uint64_t(0);
+        payload["publication_skips"] = cache.destruction_obs
+            ? cache.destruction_obs->host_trade_publication_skips : uint64_t(0);
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb maintenance or destruction.
+    }
+}
+
+llama_cache_acct_artifact_id host_entry_artifact_id(
+        const server_prompt_cache & cache,
+        const server_prompt_cache_state & state) noexcept {
+    return cache.retention_obs
+        ? cache.retention_obs->artifact_id(
+              server_retention_instance_key::for_host_entry(&state))
+        : llama_cache_acct_artifact_id {};
+}
+
+void emit_recovery_pin_excluded(
+        server_prompt_cache & cache,
+        const server_prompt_cache_state & state) noexcept {
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        const auto artifact = host_entry_artifact_id(cache, state);
+        common_cache_plan_destruction_receipt receipt;
+        receipt.payload_kind =
+            server_cache_plan_payload_kind(state.payload.kind());
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+        json payload = server_json_from_ordered(
+            server_cache_destruction_receipt_json(receipt, 0));
+        payload["evidence_event"] = "recovery_pin_excluded";
+        payload["recovery_pin_excluded"] = {
+            { "artifact_id", artifact.v },
+            { "source_id", state.cache_plan_source_id },
+            { "pin_count", state.recovery_pins },
+        };
+        payload["floor_outcome"] = "pending";
+        cache.debug_recovery_pin_exclusions++;
+        cache.debug_last_recovery_pin_excluded = artifact;
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb victim selection or pressure.
+    }
+}
+
+void emit_host_pressure_floor_outcome(
+        server_prompt_cache & cache,
+        const char * outcome,
+        llama_cache_acct_artifact_id victim_artifact,
+        int32_t victim_source_id) noexcept {
+    if (!cache.debug_observability) {
+        return;
+    }
+    try {
+        common_cache_plan_destruction_receipt receipt;
+        receipt.effects = common_cache_plan_destruction_effect_bit(
+            common_cache_plan_destruction_effect::
+                different_host_source_consumption);
+        json payload = server_json_from_ordered(
+            server_cache_destruction_receipt_json(receipt, 0));
+        payload["evidence_event"] = "floor_outcome";
+        payload["recovery_pin_excluded"] = nullptr;
+        payload["floor_outcome"] = outcome;
+        payload["floor_victim_artifact_id"] = victim_artifact.v != 0
+            ? json(victim_artifact.v)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+        payload["floor_victim_source_id"] = victim_source_id >= 0
+            ? json(victim_source_id)
+            : json(common_cache_acct_known_name(
+                  llama_cache_acct_known::unavailable));
+        cache.debug_host_pressure_floor_outcomes++;
+        cache.debug_destruction_emissions++;
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n", payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb the already-chosen terminal.
+    }
+}
+
 struct host_trade_candidate {
     server_prompt_cache::iterator victim;
     host_trade_ranking ranking;

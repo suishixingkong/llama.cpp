@@ -1322,6 +1322,11 @@ struct server_prompt_cache {
 // fork 9l-d1: debug observability members (fork server-task.h 1701, 1703)
     bool debug_observability = false;
     uint64_t debug_lifecycle_emissions = 0;
+    // fork 9l-d4b6d (fork server-task.h 1704-1706, 1709)
+    uint64_t debug_destruction_emissions = 0;
+    uint64_t debug_recovery_pin_exclusions = 0;
+    uint64_t debug_host_pressure_floor_outcomes = 0;
+    llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
     // fork server-task.h:1651 (the fork marks this private; this struct has no access specifiers)
     // Reused by the scheduler-owned durability classifier. Durable stems
     // accumulate across capture waves, so this arena follows the full host
