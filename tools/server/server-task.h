@@ -1333,6 +1333,11 @@ struct server_prompt_cache {
         uint64_t & released_bytes,
         size_t & released_tokens);
 
+    // fork 9l-d4b6l (fork server-task.h 1779-1781)
+    bool update_impl(
+        iterator incoming,
+        server_prompt_cache_vbr_pressure_citation required_victims = {});
+
     // fork 9l-d4b6k (fork server-task.h 1782-1785)
     bool enforce_quality_anchor_budget(
         iterator incoming,

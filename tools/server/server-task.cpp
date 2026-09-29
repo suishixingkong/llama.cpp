@@ -7597,3 +7597,289 @@ bool server_prompt_cache::enforce_quality_anchor_budget(
         return refuse_or_discard_incoming();
     }
 }
+
+// fork 9l-d4b6l: server_prompt_cache::update_impl (fork server-task.cpp 8979-9262)
+bool server_prompt_cache::update_impl(
+        iterator incoming,
+        server_prompt_cache_vbr_pressure_citation required_victims) {
+    if (limit_size == 0 && limit_tokens == 0 &&
+        !quality_anchor_budget_enabled) {
+        return true;
+    }
+    bool pressure_wave_started = false;
+    bool competition_wave_valid = true;
+    bool retention_shadow_observed = false;
+    size_t cache_bytes = 0;
+    size_t cache_tokens = 0;
+    size_t anchor_bytes = 0;
+    const auto measure_cache = [&]() noexcept {
+        cache_bytes = 0;
+        cache_tokens = 0;
+        anchor_bytes = 0;
+        bool has_vbr = false;
+        for (const auto & state : states) {
+            const bool vbr = state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact;
+            has_vbr |= vbr;
+            if (vbr && quality_anchor_budget_enabled) {
+                const uint64_t anchor =
+                    state.payload.vbr_anchor_resident_bytes();
+                const size_t total = state.size();
+                if (anchor > total || anchor > SIZE_MAX - anchor_bytes) {
+                    cache_bytes = SIZE_MAX;
+                    anchor_bytes = SIZE_MAX;
+                } else {
+                    cache_bytes += total - size_t(anchor);
+                    anchor_bytes += size_t(anchor);
+                }
+            } else {
+                cache_bytes += state.size();
+            }
+            cache_tokens += state.prompt.n_tokens();
+        }
+
+        // The per-entry sum is an allocation-free upper bound. Exact union
+        // work is needed only close enough to a byte boundary that shared VBR
+        // allocations or fixed checkpoint planes can change the decision.
+        const bool pressure_plausible =
+            !fits_bytes(cache_bytes) ||
+            (quality_anchor_budget_enabled &&
+             anchor_bytes > limit_anchor_size);
+        if (!pressure_plausible) {
+            return;
+        }
+        bool has_shared_fixed_plane = false;
+        if (!has_vbr) {
+            for (const auto & state : states) {
+                for (const auto & checkpoint : state.prompt.checkpoints) {
+                    has_shared_fixed_plane |=
+                        checkpoint.data_tgt.storage_use_count() > 1 ||
+                        checkpoint.data_dft.storage_use_count() > 1 ||
+                        checkpoint.data_qsa.storage_use_count() > 1 ||
+                        checkpoint.accel.ring.storage_use_count() > 1 ||
+                        checkpoint.accel.spec.storage_use_count() > 1;
+                }
+            }
+        }
+        if (!has_vbr && !has_shared_fixed_plane) {
+            return;
+        }
+        const auto measured = server_prompt_cache_measure_budgets(states, acct);
+        if (measured.exact) {
+            cache_bytes = measured.compact;
+            anchor_bytes = quality_anchor_budget_enabled
+                ? measured.anchor : 0;
+            if (!quality_anchor_budget_enabled) {
+                cache_bytes += measured.anchor;
+            }
+        }
+    };
+    measure_cache();
+    const auto begin_pressure_wave = [&]() noexcept {
+        if (pressure_wave_started) {
+            return;
+        }
+        pressure_wave_started = true;
+        if (!retention_obs) {
+            return;
+        }
+        if (retention_shadow.pressure_waves != UINT64_MAX) {
+            retention_shadow.pressure_waves++;
+        }
+        competition_wave_valid =
+            retention_obs->begin_competition_wave();
+    };
+    if (quality_anchor_budget_enabled &&
+        anchor_bytes > limit_anchor_size) {
+        begin_pressure_wave();
+        SRV_WRN(
+            " - quality-anchor limit reached (size = %.3f MiB, cap = %.3f MiB)\n",
+            anchor_bytes / (1024.0 * 1024.0),
+            limit_anchor_size / (1024.0 * 1024.0));
+        if (!enforce_quality_anchor_budget(
+                incoming,
+                retention_obs ? retention_obs->competition_epoch_value() : 0,
+                anchor_bytes)) {
+            if (incoming != states.end()) {
+                if (destruction_obs) {
+                    destruction_obs->note_host_trade_publication_skip();
+                }
+                if (publish_authority) {
+                    const uint64_t sequence =
+                        ++publish_authority->destruction_quote_sequence;
+                    observe_host_trade_refusal(
+                        *this, sequence,
+                        common_cache_plan_destruction_reason::
+                            capacity_refused);
+                }
+                refuse_incoming_under_pressure(
+                    incoming,
+                    server_cache_destruction_reason::host_capacity);
+            }
+            return false;
+        }
+        measure_cache();
+    }
+    if (limit_size > 0) {
+        while (!states.empty() && !fits_bytes(cache_bytes)) {
+            begin_pressure_wave();
+            SRV_WRN(" - cache size limit reached (size = %.3f MiB)\n",
+                    cache_bytes / (1024.0 * 1024.0));
+
+            const bool observe_shadow = !retention_shadow_observed;
+            uint64_t released_bytes = 0;
+            size_t released_tokens = 0;
+            if (required_victims.count == 2) {
+                const auto incoming_artifact = incoming != states.end() &&
+                        retention_obs
+                    ? retention_obs->artifact_id(
+                        server_retention_instance_key::for_host_entry(
+                            &*incoming))
+                    : llama_cache_acct_artifact_id {};
+                server_prompt_cache_vbr_pressure_plan current;
+                const bool planned = incoming_artifact.v != 0 &&
+                    server_prompt_cache_plan_vbr_pressure(
+                        *this, cache_bytes, cache_tokens, 2, false,
+                        current,
+                        retention_shadow_rows.get(),
+                        retention_shadow_artifacts.get(),
+                        retention_shadow_lineages.get(),
+                        incoming_artifact);
+                bool matches = planned && current.count != 0 &&
+                    current.count <= required_victims.count;
+                for (size_t i = 0; matches && i < current.count; ++i) {
+                    matches = current.artifacts[i] ==
+                        required_victims.artifacts[i];
+                }
+                if (!matches) {
+                    refuse_incoming_under_pressure(
+                        incoming,
+                        server_cache_destruction_reason::host_capacity);
+                    return false;
+                }
+                if (current.count == 1) {
+                    required_victims.count = 1;
+                } else {
+                    const auto first = std::find_if(
+                        states.begin(), states.end(), [&](const auto & value) {
+                            return &value == current.victims[0];
+                        });
+                    const auto second = std::find_if(
+                        states.begin(), states.end(), [&](const auto & value) {
+                            return &value == current.victims[1];
+                        });
+                    if (first == states.end() || second == states.end()) {
+                        refuse_incoming_under_pressure(
+                            incoming,
+                            server_cache_destruction_reason::host_capacity);
+                        return false;
+                    }
+                    if (observe_shadow) {
+                        observe_retention_pressure_choice(
+                            server_cache_destruction_reason::host_capacity,
+                            incoming, first,
+                            competition_wave_valid);
+                    }
+                    if (!destroy_vbr_pair(
+                            first, second,
+                            server_cache_destruction_reason::host_capacity,
+                            current.soft_leased[0],
+                            current.soft_leased[1],
+                            released_bytes, released_tokens)) {
+                        refuse_incoming_under_pressure(
+                            incoming,
+                            server_cache_destruction_reason::host_capacity);
+                        return false;
+                    }
+                    if (destruction_obs) {
+                        destruction_obs->host_trade_retention_capacity_executed += 2;
+                    }
+                    required_victims = {};
+                    retention_shadow_observed |= observe_shadow;
+                    if (released_bytes == UINT64_MAX ||
+                        released_bytes > cache_bytes ||
+                        released_tokens > cache_tokens) {
+                        measure_cache();
+                    } else {
+                        cache_bytes -= size_t(released_bytes);
+                        cache_tokens -= released_tokens;
+                    }
+                    continue;
+                }
+            }
+            if (!evict_front_under_pressure(
+                    server_cache_destruction_reason::host_capacity,
+                    incoming, competition_wave_valid, observe_shadow,
+                    released_bytes, released_tokens,
+                    required_victims.count == 1
+                        ? required_victims.artifacts[0]
+                        : llama_cache_acct_artifact_id {})) {
+                return false;
+            }
+            required_victims = {};
+            retention_shadow_observed |= observe_shadow;
+            if (released_bytes == UINT64_MAX ||
+                released_bytes > cache_bytes ||
+                released_tokens > cache_tokens) {
+                measure_cache();
+            } else {
+                cache_bytes -= size_t(released_bytes);
+                cache_tokens -= released_tokens;
+            }
+        }
+    }
+
+    // average size per token
+    // Dynamically increase the token limit if the measured physical payload
+    // fits in the byte limit. Publication preflight uses this exact helper.
+    const size_t limit_tokens_cur = effective_host_token_limit(cache_bytes, cache_tokens);
+
+    if (limit_tokens > 0) {
+        while (!states.empty() && cache_tokens > limit_tokens_cur) {
+            begin_pressure_wave();
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur,
+                    cache_bytes / (1024.0 * 1024.0));
+
+            const bool observe_shadow = !retention_shadow_observed;
+            uint64_t released_bytes = 0;
+            size_t released_tokens = 0;
+            if (required_victims.count > 1) {
+                refuse_incoming_under_pressure(
+                    incoming,
+                    server_cache_destruction_reason::host_token_limit);
+                return false;
+            }
+            if (!evict_front_under_pressure(
+                    server_cache_destruction_reason::host_token_limit,
+                    incoming, competition_wave_valid, observe_shadow,
+                    released_bytes, released_tokens,
+                    required_victims.count == 1
+                        ? required_victims.artifacts[0]
+                        : llama_cache_acct_artifact_id {})) {
+                return false;
+            }
+            required_victims = {};
+            retention_shadow_observed |= observe_shadow;
+            if (released_bytes == UINT64_MAX ||
+                released_bytes > cache_bytes ||
+                released_tokens > cache_tokens) {
+                measure_cache();
+            } else {
+                cache_bytes -= size_t(released_bytes);
+                cache_tokens -= released_tokens;
+            }
+        }
+    }
+
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+            states.size(), cache_bytes / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0), limit_tokens,
+            limit_tokens_cur);
+
+    for (const auto & state : states) {
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+    }
+    return true;
+}
