@@ -6053,6 +6053,305 @@ void server_prompt_cache::observe_retention_pressure_choice(
     }
 }
 
+// fork 9l-d4b6j: server_prompt_cache::destroy_retention_host_entry + evict_front_under_pressure (fork server-task.cpp 6451-6747, 6773-6910)
+bool server_prompt_cache::destroy_retention_host_entry(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        iterator & legacy_floor,
+        common_cache_plan_destruction_reason & floor_reason,
+        bool & recovery_pin_excluded,
+        bool competition_wave_valid,
+        bool & observe_retention_shadow,
+        uint64_t & released_bytes,
+        size_t & released_tokens,
+        llama_cache_acct_artifact_id required_victim) {
+    released_bytes = 0;
+    released_tokens = 0;
+    legacy_floor = states.end();
+    floor_reason = common_cache_plan_destruction_reason::capacity_refused;
+    recovery_pin_excluded = false;
+    if (!publish_authority ||
+        (reason != server_cache_destruction_reason::host_capacity &&
+         reason != server_cache_destruction_reason::host_token_limit)) {
+        return false;
+    }
+    if (!acct || !retention_obs || !lease_obs || !lease_execution_identity) {
+        floor_reason = common_cache_plan_destruction_reason::lease_unavailable;
+        if (destruction_obs) {
+            destruction_obs->note_host_trade_substrate_fault();
+            destruction_obs->host_trade_legacy_fallbacks++;
+        }
+        if (!host_trade_substrate_warned) {
+            host_trade_substrate_warned = true;
+            SRV_WRN("%s\n",
+                    "host retention policy unavailable: lifecycle lease/accounting substrate is incomplete");
+        }
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it == incoming) {
+                continue;
+            }
+            // Without the complete lease/accounting substrate, retention
+            // authority may not retire a VBR capability. Keep it as
+            // durable retained coverage instead of bypassing a potentially
+            // hard lease through the fixed-state terminal.
+            if (!it->payload.fixed_state_restorable()) {
+                continue;
+            }
+            if (it->recovery_pins != 0) {
+                recovery_pin_excluded = true;
+                emit_recovery_pin_excluded(*this, *it);
+                continue;
+            }
+            legacy_floor = it;
+            break;
+        }
+        const uint64_t sequence =
+            ++publish_authority->destruction_quote_sequence;
+        observe_host_trade_refusal(*this, sequence, floor_reason);
+        return false;
+    }
+
+    // Expire leases before inspecting each immutable host artifact. Hard
+    // leases remain ineligible; if retention evidence is incomplete, use the
+    // oldest eligible entry so the configured capacity remains a real bound.
+    lease_obs->lifecycle_point();
+    std::vector<host_trade_candidate> candidates;
+    try {
+        candidates.reserve(states.size());
+        uint32_t ordinal = 0;
+        for (auto it = states.begin(); it != states.end(); ++it, ++ordinal) {
+            if (it == incoming) {
+                continue;
+            }
+            if (it->recovery_pins != 0) {
+                recovery_pin_excluded = true;
+                emit_recovery_pin_excluded(*this, *it);
+                continue;
+            }
+            host_trade_candidate candidate;
+            (void) inspect_host_candidate(
+                *this, it, ordinal, reason, candidate, false);
+            if (candidate.hard_leased) {
+                const uint64_t quote_sequence =
+                    ++publish_authority->destruction_quote_sequence;
+                observe_host_trade_refusal(
+                    *this,
+                    quote_sequence,
+                    common_cache_plan_destruction_reason::hard_lease_blocked,
+                    &candidate.ranking);
+                if (destruction_obs) {
+                    destruction_obs->note_host_trade_veto();
+                }
+            }
+            candidates.push_back(std::move(candidate));
+        }
+        if (reason == server_cache_destruction_reason::host_capacity &&
+            !populate_vbr_host_trade_marginals(*this, candidates)) {
+            if (destruction_obs) {
+                destruction_obs->host_trade_legacy_fallbacks++;
+            }
+            return false;
+        }
+        if (reason == server_cache_destruction_reason::host_capacity) {
+            std::vector<llama_cache_acct_release_set_view> fixed_sets;
+            std::vector<size_t> fixed_indices;
+            fixed_sets.reserve(candidates.size());
+            fixed_indices.reserve(candidates.size());
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                auto & candidate = candidates[i];
+                if (candidate.vbr || candidate.release_ops.empty()) {
+                    continue;
+                }
+                fixed_sets.push_back({
+                    candidate.release_ops.data(),
+                    candidate.release_ops.size(),
+                });
+                fixed_indices.push_back(i);
+            }
+            std::vector<uint64_t> marginals;
+            if (!fixed_sets.empty() &&
+                acct->preview_release_set_resident_batch(
+                    fixed_sets, acct->serial(), marginals) &&
+                marginals.size() == fixed_indices.size()) {
+                for (size_t i = 0; i < fixed_indices.size(); ++i) {
+                    auto & candidate = candidates[fixed_indices[i]];
+                    candidate.marginal_resident_bytes = marginals[i];
+                    candidate.marginal_resident_known = true;
+                }
+            }
+        }
+    } catch (...) {
+        if (destruction_obs) {
+            destruction_obs->host_trade_legacy_fallbacks++;
+        }
+        return false;
+    }
+
+    // Exact shared-owner aliases are zero-value logical cleanup, not a
+    // positive-byte retention-capacity alternative. Execute the first lawful alias before
+    // retention selection; the outer pressure loop then remeasures the
+    // now-exclusive survivor. This preserves pins,
+    // hard leases, and incoming protection while ensuring redundant aliases
+    // cannot mask a more valuable unique entry.
+    const auto alias = std::find_if(
+        candidates.begin(), candidates.end(), [](const auto & candidate) {
+            return candidate.vbr_logical_alias && candidate.lease_known &&
+                   !candidate.hard_leased &&
+                   candidate.victim->recovery_pins == 0;
+        });
+    if (alias != candidates.end()) {
+        if (required_victim.v &&
+            alias->ranking.artifact_id != required_victim) {
+            return false;
+        }
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, alias->victim, competition_wave_valid);
+        }
+        SRV_WRN(
+            " - removing redundant VBR host alias source_id=%d\n",
+            alias->victim->cache_plan_source_id);
+        return destroy_retention_capacity_entry(
+            alias->victim, reason, nullptr,
+            &released_bytes, &released_tokens);
+    }
+
+    for (const auto & candidate : candidates) {
+        if (candidate.lease_known && !candidate.hard_leased &&
+            candidate.retirement_ready &&
+            candidate.victim->recovery_pins == 0) {
+            legacy_floor = candidate.victim;
+            break;
+        }
+    }
+    if (legacy_floor == states.end() && std::any_of(
+            candidates.begin(), candidates.end(), [](const auto & candidate) {
+                return candidate.hard_leased;
+            })) {
+        floor_reason =
+            common_cache_plan_destruction_reason::hard_lease_blocked;
+    }
+
+    // Retention capacity replaces only the lawful lifecycle fallback. Host capacity uses
+    // exact resident payload bytes; token pressure uses exact prompt tokens.
+    // Hard leases, pins, and incoming publication retain precedence.
+    // Reproject on every victim;
+    // record only the first decision in a multi-removal competition wave.
+    if (retention_capacity_authority &&
+        (reason == server_cache_destruction_reason::host_capacity ||
+         reason == server_cache_destruction_reason::host_token_limit) &&
+        legacy_floor != states.end()) {
+        const auto projection = competition_wave_valid
+            ? project_host_trade_retention_capacity(
+                  *this, reason, incoming, candidates,
+                  retention_shadow_rows.get(),
+                  retention_shadow_artifacts.get(),
+                  retention_shadow_lineages.get())
+            : host_trade_retention_capacity_projection {};
+        const auto proposed = projection.artifact;
+        if (observe_retention_shadow) {
+            const auto increment = [](uint64_t & value) noexcept {
+                if (value != UINT64_MAX) {
+                    value++;
+                }
+            };
+            increment(retention_shadow.choices);
+            auto & event = retention_shadow.last;
+            event = {};
+            event.reason = reason;
+            event.competition_epoch =
+                retention_obs->competition_epoch_value();
+            event.candidate_count = projection.candidate_count;
+            event.incumbent_artifact = host_entry_artifact_id(
+                *this, *legacy_floor);
+            if (projection.complete && proposed.v != 0 &&
+                event.incumbent_artifact.v != 0) {
+                event.proposed_artifact = proposed;
+                event.proposed_lineage = projection.lineage_id;
+                event.proposed_pool = projection.pool;
+                event.proposed_lost_work = projection.lost_work;
+                event.proposed_resource = projection.resource;
+                event.status = server_prompt_cache_shadow_status::complete;
+                event.agrees = event.incumbent_artifact == proposed;
+                increment(retention_shadow.complete);
+                increment(event.agrees
+                    ? retention_shadow.agreements
+                    : retention_shadow.disagreements);
+                if (debug_observability) {
+                    SRV_INF(
+                        "CACHE_RETENTION_SHADOW status=complete reason=%u "
+                        "epoch=%" PRIu64 " candidates=%" PRIu64
+                        " incumbent=%" PRIu64 " proposed=%" PRIu64
+                        " agrees=%s lost_work=%" PRIu64
+                        " resource=%" PRIu64 "\n",
+                        unsigned(reason), event.competition_epoch,
+                        event.candidate_count,
+                        event.incumbent_artifact.v,
+                        event.proposed_artifact.v,
+                        event.agrees ? "true" : "false",
+                        event.proposed_lost_work,
+                        event.proposed_resource);
+                }
+            } else {
+                increment(retention_shadow.unavailable);
+                if (debug_observability) {
+                    SRV_INF(
+                        "CACHE_RETENTION_SHADOW status=unavailable "
+                        "reason=%u epoch=%" PRIu64
+                        " candidates=%" PRIu64 "\n",
+                        unsigned(reason), event.competition_epoch,
+                        event.candidate_count);
+                }
+            }
+        }
+        observe_retention_shadow = false;
+        if (projection.release_evidence_complete && proposed.v != 0) {
+            const auto selected = std::find_if(
+                candidates.begin(), candidates.end(), [&](const auto & value) {
+                    return value.ranking.artifact_id == proposed &&
+                        value.lease_known && !value.hard_leased &&
+                        value.victim != incoming &&
+                        value.victim->recovery_pins == 0;
+            });
+            if (selected != candidates.end()) {
+                if (required_victim.v &&
+                    selected->ranking.artifact_id != required_victim) {
+                    return false;
+                }
+                const int32_t source_id =
+                    selected->victim->cache_plan_source_id;
+                const size_t victim_bytes = selected->victim->size();
+                vbr_artifact_prepared_retire selected_retire;
+                vbr_artifact_prepared_retire * selected_retire_ptr = nullptr;
+                if (selected->vbr && !selected->vbr_logical_alias) {
+                    if (!acct ||
+                        !selected->victim->payload.prepare_vbr_retire(
+                            acct->serial(), selected_retire)) {
+                        return false;
+                    }
+                    selected_retire_ptr = &selected_retire;
+                }
+                if (destroy_retention_capacity_entry(
+                        selected->victim, reason,
+                        selected_retire_ptr,
+                        &released_bytes, &released_tokens)) {
+                    if (destruction_obs) {
+                        destruction_obs->host_trade_retention_capacity_executed++;
+                    }
+                    SRV_WRN(
+                        " - removing retention-capacity host entry source_id=%d (size = %.3f MiB)\n",
+                        source_id, victim_bytes / (1024.0 * 1024.0));
+                    return true;
+                }
+            }
+        }
+    }
+    if (destruction_obs) {
+        destruction_obs->host_trade_legacy_fallbacks++;
+    }
+    return false;
+}
+
 // fork 9l-d4b6h: server_prompt_cache::refuse_incoming_under_pressure (fork server-task.cpp 6749-6771)
 void server_prompt_cache::refuse_incoming_under_pressure(
         iterator incoming,
@@ -6076,6 +6375,145 @@ void server_prompt_cache::refuse_incoming_under_pressure(
     } else {
         destroy_entry(incoming, reason);
     }
+}
+
+bool server_prompt_cache::evict_front_under_pressure(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        bool competition_wave_valid,
+        bool observe_retention_shadow,
+        uint64_t & released_bytes,
+        size_t & released_tokens,
+        llama_cache_acct_artifact_id required_victim) {
+    released_bytes = 0;
+    released_tokens = 0;
+    GGML_ASSERT(!states.empty());
+    iterator legacy_floor = states.end();
+    common_cache_plan_destruction_reason floor_reason =
+        common_cache_plan_destruction_reason::capacity_refused;
+    bool recovery_pin_excluded = false;
+    if (destroy_retention_host_entry(
+            reason, incoming, legacy_floor, floor_reason,
+            recovery_pin_excluded, competition_wave_valid,
+            observe_retention_shadow, released_bytes,
+            released_tokens, required_victim)) {
+        return true;
+    }
+
+    if (required_victim.v) {
+        floor_reason =
+            common_cache_plan_destruction_reason::capacity_refused;
+        legacy_floor = states.end();
+    }
+
+    // Lifecycle-off is the byte-identical historical FIFO floor. Once
+    // lifecycle authority exists, the floor skips recovery pins and admits
+    // only entries whose inspected lease is known non-hard.
+    if (!publish_authority) {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it != incoming && it->recovery_pins == 0 &&
+                it->payload.vbr_logical_erase_only()) {
+                legacy_floor = it;
+                break;
+            }
+        }
+        if (legacy_floor == states.end()) {
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                // Fixed state retains its historical FIFO order. An owned
+                // VBR node may join that floor only with an exact catalog
+                // retirement capability.
+                if (it == incoming || it->recovery_pins != 0) {
+                    continue;
+                }
+                if (it->payload.fixed_state_restorable()) {
+                    legacy_floor = it;
+                    break;
+                }
+                vbr_artifact_prepared_retire prepared;
+                if (acct && !it->payload.vbr_has_quality_anchor() &&
+                    it->payload.prepare_vbr_retire(
+                        acct->serial(), prepared)) {
+                    legacy_floor = it;
+                    break;
+                }
+            }
+        }
+    }
+    if (legacy_floor != states.end()) {
+        const auto floor_artifact = host_entry_artifact_id(
+            *this, *legacy_floor);
+        const int32_t floor_source_id = legacy_floor->cache_plan_source_id;
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, legacy_floor, competition_wave_valid);
+        }
+        SRV_WRN(
+            " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
+            legacy_floor->cache_plan_source_id,
+            legacy_floor->size() / (1024.0 * 1024.0));
+        bool floor_evicted = false;
+        if (legacy_floor->payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact) {
+            vbr_artifact_prepared_retire prepared;
+            const bool alias_only =
+                legacy_floor->payload.vbr_logical_erase_only();
+            floor_evicted = acct &&
+                (alias_only ||
+                 legacy_floor->payload.prepare_vbr_retire(
+                     acct->serial(), prepared)) &&
+                destroy_retention_capacity_entry(
+                    legacy_floor, reason,
+                    alias_only ? nullptr : &prepared,
+                    &released_bytes, &released_tokens);
+        } else {
+            if (publish_authority && acct) {
+                floor_evicted = destroy_retention_capacity_entry(
+                    legacy_floor, reason, nullptr,
+                    &released_bytes, &released_tokens);
+            } else {
+                released_bytes = legacy_floor->size();
+                released_tokens =
+                    size_t(legacy_floor->prompt.n_tokens());
+                destroy_entry(legacy_floor, reason);
+                floor_evicted = true;
+            }
+        }
+        if (!floor_evicted) {
+            // The VBR quote became unavailable before mutation. Preserve the
+            // incumbent and execute the ordinary incoming-refusal terminal.
+        } else {
+            if (recovery_pin_excluded) {
+                emit_host_pressure_floor_outcome(
+                    *this, "legacy_evicted", floor_artifact, floor_source_id);
+            }
+            return true;
+        }
+    }
+
+    // Hard leases are proof-backed guarantees. If no unpinned, known-nonhard
+    // retained entry exists, publication—not an existing protected entry—is
+    // the refused operation. Public maintenance without an incoming save
+    // simply leaves the configured pressure visible for a later retry.
+    if (destruction_obs && incoming != states.end()) {
+        destruction_obs->note_host_trade_publication_skip();
+    }
+    if (publish_authority) {
+        const uint64_t sequence =
+            ++publish_authority->destruction_quote_sequence;
+        observe_host_trade_refusal(*this, sequence, floor_reason);
+    }
+    if (incoming != states.end()) {
+        if (observe_retention_shadow) {
+            observe_retention_pressure_choice(
+                reason, incoming, incoming, competition_wave_valid);
+        }
+        refuse_incoming_under_pressure(incoming, reason);
+    }
+    if (recovery_pin_excluded) {
+        emit_host_pressure_floor_outcome(
+            *this, "publication_skipped", {}, -1);
+    }
+    return false;
 }
 
 // fork 9l-d4b6h: server_prompt_cache::destroy_retention_capacity_entry (fork server-task.cpp 6912-7034)

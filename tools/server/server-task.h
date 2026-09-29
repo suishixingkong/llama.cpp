@@ -1289,6 +1289,27 @@ struct server_prompt_cache {
             iterator it,
             server_cache_destruction_reason reason);
 
+    // fork 9l-d4b6j (fork server-task.h 1743-1761)
+    bool destroy_retention_host_entry(
+            server_cache_destruction_reason reason,
+            iterator incoming,
+            iterator & legacy_floor,
+            common_cache_plan_destruction_reason & floor_reason,
+            bool & recovery_pin_excluded,
+            bool competition_wave_valid,
+            bool & observe_retention_shadow,
+            uint64_t & released_bytes,
+            size_t & released_tokens,
+            llama_cache_acct_artifact_id required_victim = {});
+    bool evict_front_under_pressure(
+        server_cache_destruction_reason reason,
+        iterator incoming,
+        bool competition_wave_valid,
+            bool observe_retention_shadow,
+            uint64_t & released_bytes,
+            size_t & released_tokens,
+            llama_cache_acct_artifact_id required_victim = {});
+
     // fork 9l-d4b6h (fork server-task.h 1762-1764)
     void refuse_incoming_under_pressure(
         iterator incoming,
@@ -1362,6 +1383,8 @@ struct server_prompt_cache {
     uint64_t debug_recovery_pin_exclusions = 0;
     uint64_t debug_host_pressure_floor_outcomes = 0;
     llama_cache_acct_artifact_id debug_last_recovery_pin_excluded;
+    // fork 9l-d4b6j (fork server-task.h 1710)
+    bool host_trade_substrate_warned = false;
     // fork server-task.h:1651 (the fork marks this private; this struct has no access specifiers)
     // Reused by the scheduler-owned durability classifier. Durable stems
     // accumulate across capture waves, so this arena follows the full host
