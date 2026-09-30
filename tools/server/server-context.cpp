@@ -63,6 +63,11 @@ static json server_json_from_ordered(nlohmann::ordered_json value) {
     return json::parse(value.dump());
 }
 
+// fork 9l-d4b7e: the inverse helper (fork server-context.cpp 81-83)
+static nlohmann::ordered_json server_ordered_from_json(const json & value) {
+    return nlohmann::ordered_json::parse(value.dump());
+}
+
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -1724,6 +1729,33 @@ server_vbr_occupied_quarantine_reset_for_test() {
 
 static bool server_vbr_dynamic_active(const common_params & params) {
     return params.vbr_dynamic();
+}
+
+// fork 9l-d4b7e: the per-credential VBR tenant key (fork server-context.cpp 823-847)
+static std::string server_cache_capture_tenant_key(
+        const server_http_req & req) {
+    std::string credential =
+        req.get_header_value("Authorization");
+    if (credential.empty()) {
+        credential = req.get_header_value("X-Api-Key");
+    }
+    if (credential.empty()) {
+        credential = "authenticated-local";
+    }
+    llama_sha256_writer writer;
+    static constexpr char domain_label[] =
+        "buun.vbr.server-tenant/v1";
+    writer.string(domain_label, sizeof(domain_label) - 1);
+    writer.string(credential.data(), credential.size());
+    const auto digest = writer.finish();
+    static constexpr char HEX[] = "0123456789abcdef";
+    std::string output;
+    output.reserve(32);
+    for (size_t i = 0; i < 16; ++i) {
+        output.push_back(HEX[digest[i] >> 4]);
+        output.push_back(HEX[digest[i] & 0x0f]);
+    }
+    return output;
 }
 
 // A flip is deliberately per-boot: persisting migration confidence across a
@@ -15077,6 +15109,191 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    // fork 9l-d4b7e: the cache-control HTTP handler (fork server-context.cpp
+    // 21964-22143).  One handler serves every path in SERVER_CACHE_CONTROL_ROUTES;
+    // server.cpp registers it once per route.  The fork's post_cache_plan
+    // (21853-21962) is not ported and belongs here, above this one.
+    this->post_cache_control = [this](const server_http_req & req) {
+        auto res = create_response();
+        res->headers["Cache-Control"] = "no-store";
+
+        server_cache_control_operation operation =
+            server_cache_control_operation::_count;
+        GGML_ASSERT(params.cache_control_api &&
+                    server_cache_control_operation_for_path(req.path, operation));
+
+        auto request = std::make_shared<server_cache_control_request>();
+        server_task task = server_task::cache_control_task(operation);
+        task.id = res->rd.get_new_id();
+
+        const auto typed_status = [&](server_cache_control_status status,
+                                      int http_status = 200) {
+            server_cache_control_result result;
+            result.status = status;
+            const auto body = server_json_from_ordered(
+                server_cache_control_json(operation, result));
+            if (http_status == 400) {
+                res->status = 400;
+                res->data = safe_json_to_str(body);
+            } else {
+                res->ok(body);
+            }
+        };
+        const auto parse_selector = [&](const json & value,
+                                        server_cache_control_selector & selector,
+                                        server_task::cache_control_semantic_selector & semantic) {
+            if (!value.is_object() || !value.contains("kind") ||
+                !value.at("kind").is_string()) {
+                return false;
+            }
+            const std::string kind = value.at("kind").get<std::string>();
+            if (!server_cache_control_parse_subject_kind(kind, selector.kind)) {
+                return false;
+            }
+            // Authorize the complete shape before prompt tokenization. No
+            // rejected field may consume tokenizer/model work on the worker.
+            for (const auto & field : value.items()) {
+                if (!server_cache_control_selector_field_allowed(
+                        selector.kind, field.key())) {
+                    return false;
+                }
+            }
+            if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+                if (!value.contains("slot_id") ||
+                    !value.at("slot_id").is_number_integer()) {
+                    return false;
+                }
+                const int64_t slot_id = value.at("slot_id").get<int64_t>();
+                if (slot_id < std::numeric_limits<int32_t>::min() ||
+                    slot_id > std::numeric_limits<int32_t>::max()) {
+                    return false;
+                }
+                semantic.slot_id = int32_t(slot_id);
+            } else if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+                if (!value.contains("prompt")) {
+                    return false;
+                }
+                auto inputs = tokenize_input_prompts(
+                    ctx_server.vocab, ctx_server.mctx,
+                    value.at("prompt"), true, true, ctx_server.init_opt);
+                if (inputs.size() != 1) {
+                    return false;
+                }
+                if (value.contains("lora")) {
+                    if (!value.at("lora").is_array()) {
+                        return false;
+                    }
+                    semantic.lora = parse_lora_request(value.at("lora"));
+                }
+                if (value.contains("message_delimiters") &&
+                    !value.at("message_delimiters").is_array()) {
+                    return false;
+                }
+                semantic.tokens = std::make_shared<const server_tokens>(
+                    std::move(inputs.front()));
+            } else if (selector.kind == server_cache_control_subject_kind::vbr_reference) {
+                if (!value.contains("reference") ||
+                    !value.at("reference").is_string()) {
+                    return false;
+                }
+                selector.reference = value.at("reference").get<std::string>();
+                selector.tenant_key = server_cache_capture_tenant_key(req);
+            }
+            return true;
+        };
+
+        try {
+            if (!req.files.empty()) {
+                throw std::runtime_error("cache-control routes do not accept multipart files");
+            }
+            const json body = json::parse(req.body);
+            const auto prepared = server_cache_control_prepare_request(
+                operation, server_ordered_from_json(body), *request);
+            if (prepared != server_cache_control_status::ok) {
+                typed_status(prepared, 400);
+                return res;
+            }
+            bool valid = false;
+            switch (operation) {
+                case server_cache_control_operation::holder_create:
+                case server_cache_control_operation::holder_reattach:
+                case server_cache_control_operation::holder_close:
+                case server_cache_control_operation::family_register:
+                case server_cache_control_operation::family_bind:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::lease_acquire: {
+                    valid = true;
+                    if (valid) {
+                        valid = parse_selector(
+                            body.at("subject"), request->subject,
+                            task.cache_control_subject);
+                    }
+                    if (valid && body.contains("fallback")) {
+                        valid = parse_selector(
+                            body.at("fallback"), request->fallback,
+                            task.cache_control_fallback);
+                    } else if (valid && request->requested_class ==
+                            server_cache_lease_class::hard) {
+                        valid = false;
+                    } else if (valid) {
+                        request->fallback.kind =
+                            server_cache_control_subject_kind::_count;
+                    }
+                    if (valid) {
+                        valid = !request->allow_soft_fallback ||
+                            request->requested_class ==
+                                server_cache_lease_class::hard;
+                    }
+                } break;
+                case server_cache_control_operation::lease_inspect:
+                case server_cache_control_operation::lease_release:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::lease_renew:
+                    valid = true;
+                    request->fallback.kind =
+                        server_cache_control_subject_kind::_count;
+                    if (valid && body.contains("fallback")) {
+                        valid = parse_selector(
+                            body.at("fallback"), request->fallback,
+                            task.cache_control_fallback);
+                    }
+                    break;
+                case server_cache_control_operation::events:
+                    valid = true;
+                    break;
+                case server_cache_control_operation::_count:
+                    valid = false;
+                    break;
+            }
+            if (!valid) {
+                typed_status(server_cache_control_status::invalid_request, 400);
+                return res;
+            }
+            task.cache_control = std::move(request);
+            res->rd.post_task(std::move(task));
+        } catch (const std::exception &) {
+            typed_status(server_cache_control_status::invalid_request, 400);
+            return res;
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * controlled = dynamic_cast<
+            server_task_result_cache_control *>(result.get());
+        GGML_ASSERT(controlled != nullptr);
+        res->ok(controlled->to_json());
         return res;
     };
 

@@ -206,6 +206,10 @@ struct server_routes {
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
+    // fork 9l-d4b7e: the cache-control control surface (fork server-context.h 375).
+    // The fork also has post_cache_plan at 374, which belongs to
+    // --cache-plan-preflight (not carried here); it goes above this line.
+    server_http_context::handler_t post_cache_control;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;

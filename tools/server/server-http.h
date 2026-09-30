@@ -62,6 +62,33 @@ struct server_http_req {
         }
         return def;
     }
+
+    // fork 9l-d4b7e: case-insensitive header lookup on the lowered request
+    // (fork server-http.h 77-100).
+    // Header field names are case-insensitive (RFC 9110). Keep this behavior
+    // aligned with httplib::Request::get_header_value after the request is
+    // lowered into the server-owned map.
+    std::string get_header_value(const std::string & key) const {
+        const auto ascii_lower = [](unsigned char c) {
+            return c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c;
+        };
+        for (const auto & [name, value] : headers) {
+            if (name.size() != key.size()) {
+                continue;
+            }
+            bool equal = true;
+            for (size_t i = 0; i < name.size(); ++i) {
+                if (ascii_lower(name[i]) != ascii_lower(key[i])) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) {
+                return value;
+            }
+        }
+        return {};
+    }
 };
 
 struct server_http_context {

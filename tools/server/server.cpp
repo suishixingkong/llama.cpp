@@ -142,6 +142,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // is resolved later, after the cache is actually constructed.
     params.cache_lifecycle = server_cache_lifecycle_default(
         params.cache_lifecycle, false, params.cache_control_api);
+
+    // fork 9l-d4b7e: the exposure gate for the control surface (fork server.cpp 153-159)
+    if (params.cache_control_api &&
+        (is_router_server ||
+         !server_cache_plan_preflight_exposure_allowed(
+             params.hostname, params.api_keys.size()))) {
+        SRV_ERR("%s", "--cache-control-api requires a single-model, trusted-local, single-principal server\n");
+        return 1;
+    }
+
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
 
@@ -290,6 +300,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // fork 9l-d4b7e: the cache-control routes (fork server.cpp 310-315).
+    // The fork's POST /cache/plan (309) belongs to --cache-plan-preflight
+    // and goes above this block when it lands.
+    if (params.cache_control_api) {
+        for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
+            ctx_http.post(std::string(route.path),
+                          ex_wrapper(routes.post_cache_control));
+        }
+    }
+
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h
