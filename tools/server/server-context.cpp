@@ -7838,6 +7838,18 @@ private:
                     (void) finish_idle_exact_vbr_capture(false);
                 }
                 // release slot because of stop condition
+                // fork 9l-d4b6y: frontier-logits release capture (fork server-context.cpp 19005-19015)
+                if (params_base.vbr_prompt_cache ||
+                    !params_base.slot_save_path.empty()) {
+                    (void) ensure_frontier_sequence_epoch(slot.prompt);
+                    const bool frontier_logits_retained =
+                        slot.capture_synchronized_frontier_logits(tok_idx);
+                    SLT_DBG(slot,
+                            "frontier logits capture at output %d: %s\n",
+                            tok_idx,
+                            frontier_logits_retained
+                                ? "retained" : "unavailable");
+                }
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
