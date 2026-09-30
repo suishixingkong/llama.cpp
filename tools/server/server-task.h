@@ -1422,6 +1422,23 @@ struct server_prompt_cache {
     // fork server-task.h:1379
     int32_t cache_plan_next_source_id = 0;
 
+    // fork 9l-d4b7b: acquire_durable_recovery declarations (fork server-task.h 1551-1565)
+    // Resolve the exact durable host state used by prompt_save's durability
+    // predicate and pin its three-payload accounting source. recovery source calls this
+    // after the same-flow save and before preparing live-slot destruction.
+    bool acquire_durable_recovery(
+            const server_tokens & tokens,
+            const std::string & adapter_config_key,
+            llama_cache_acct_artifact_id & artifact,
+            std::vector<llama_cache_acct_op_id> & ops,
+            server_cache_recovery_pin & pin) noexcept;
+
+    bool acquire_durable_recovery(
+            iterator state,
+            llama_cache_acct_artifact_id & artifact,
+            std::vector<llama_cache_acct_op_id> & ops,
+            server_cache_recovery_pin & pin) noexcept;
+
     // fork server-task.h:1567 / server-task.cpp:2418
     void cache_plan_begin_inventory() noexcept;
     bool cache_plan_get_source_id(
@@ -1719,6 +1736,14 @@ struct server_prompt_cache {
         return retention_shadow;
     }
 
+    // fork 9l-d4b7b: find_state_exact (fork server-task.h 1736-1742)
+private:
+    iterator find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) noexcept;
+    const_iterator find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const noexcept;
     // fork 9l-d4b6f (fork server-task.h 1791-1794)
     iterator destroy_entry_impl(
             iterator it,
@@ -1734,6 +1759,15 @@ struct server_prompt_cache {
     server_prompt_cache_shadow_snapshot retention_shadow;
 
 };
+
+    // fork 9l-d4b7b: host fallback proof declaration (fork server-task.h 1804-1810)
+// Proof adapter over the same list-node recovery counter consulted by
+// every host victim selector and by the raw eraser assertion. The semantic
+// selector is resolved against the current list before the pin is acquired.
+server_cache_durable_fallback_proof
+server_prompt_cache_host_fallback_proof(
+    server_prompt_cache & cache,
+    const server_cache_control_selector & selector) noexcept;
 
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {

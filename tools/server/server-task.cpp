@@ -1,6 +1,7 @@
 #include "server-task.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-authority.h"
+#include "server-cache-retention-proof.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1839,6 +1840,30 @@ bool server_prompt_cache::enable_retention_shadow() noexcept {
     retention_shadow_artifacts = std::move(artifacts);
     retention_shadow_lineages = std::move(lineages);
     return true;
+}
+
+// fork 9l-d4b7b: server_prompt_cache::find_state_exact (fork server-task.cpp 2389-2410)
+server_prompt_cache::iterator server_prompt_cache::find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) noexcept {
+    return std::find_if(states.begin(), states.end(), [&](const auto & state) {
+        // Identity-scoped: token equality under another adapter is not a
+        // durable copy. Equal length closes the recurrent/hybrid prefix hole.
+        // contains() is the existing durable-recovery predicate used before
+        // a live slot may be cleared. VBR artifacts use their separate typed
+        // restore/recovery authority and are intentionally excluded here.
+        return state.payload.fixed_state_restorable() &&
+               state.adapter_config_key == adapter_config_key &&
+               state.prompt.tokens.size() == tokens.size() &&
+               state.prompt.tokens.get_common_prefix(tokens) == tokens.size();
+    });
+}
+
+server_prompt_cache::const_iterator server_prompt_cache::find_state_exact(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const noexcept {
+    return const_cast<server_prompt_cache *>(this)->find_state_exact(
+        tokens, adapter_config_key);
 }
 
 //
@@ -5609,6 +5634,78 @@ server_cache_recovery_pin acquire_host_recovery_pin(
         state.recovery_pins--;
     }
     return pin;
+}
+
+// fork 9l-d4b7b: acquire_durable_recovery + host fallback proof (fork server-task.cpp 5928-5997)
+bool server_prompt_cache::acquire_durable_recovery(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key,
+        llama_cache_acct_artifact_id & artifact,
+        std::vector<llama_cache_acct_op_id> & ops,
+        server_cache_recovery_pin & pin) noexcept {
+    return acquire_durable_recovery(
+        find_state_exact(tokens, adapter_config_key), artifact, ops, pin);
+}
+
+bool server_prompt_cache::acquire_durable_recovery(
+        iterator state,
+        llama_cache_acct_artifact_id & artifact,
+        std::vector<llama_cache_acct_op_id> & ops,
+        server_cache_recovery_pin & pin) noexcept {
+    artifact = {};
+    ops.clear();
+    pin = {};
+    try {
+        if (state == states.end()) {
+            return false;
+        }
+        std::vector<llama_cache_acct_artifact_id> artifacts;
+        if (!build_host_recovery_source(
+                *this, *state, artifacts, ops) || artifacts.size() != 1) {
+            return false;
+        }
+        artifact = artifacts.front();
+        pin = acquire_host_recovery_pin(
+            *state, std::move(artifacts), ops);
+        if (!pin.valid() || !pin.binds_exact(artifact, ops)) {
+            artifact = {};
+            ops.clear();
+            pin = {};
+            return false;
+        }
+        return true;
+    } catch (...) {
+        artifact = {};
+        ops.clear();
+        pin = {};
+    }
+    return false;
+}
+
+server_cache_durable_fallback_proof
+server_prompt_cache_host_fallback_proof(
+        server_prompt_cache & cache,
+        const server_cache_control_selector & selector) noexcept {
+    if (selector.kind != server_cache_control_subject_kind::host_snapshot ||
+        selector.retention_key.kind !=
+            common_retention_artifact_kind::host_entry) {
+        return {};
+    }
+    auto state = std::find_if(
+        cache.states.begin(), cache.states.end(), [&](const auto & value) {
+            return &value == reinterpret_cast<const server_prompt_cache_state *>(
+                selector.retention_key.instance);
+        });
+    if (state == cache.states.end()) {
+        return {};
+    }
+    llama_cache_acct_artifact_id artifact;
+    std::vector<llama_cache_acct_op_id> ops;
+    server_cache_recovery_pin pin;
+    if (!cache.acquire_durable_recovery(state, artifact, ops, pin)) {
+        return {};
+    }
+    return server_cache_retention_fallback_proof(std::move(pin));
 }
 
 // fork 9l-d4b6e: certify_host_destruction + commit_certified_host_destruction (fork server-task.cpp 4889-5106)
