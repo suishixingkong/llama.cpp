@@ -248,8 +248,9 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     // fork 9l-d4b7f: the slots capture route handler (fork server-context.h 412).
-    // handle_slots_import (fork 413) belongs to the CACHE_IMPORT slice and goes here.
     std::unique_ptr<server_res_generator> handle_slots_capture(const server_http_req & req, int id_slot);
+    // fork 9l-d4b7g: the slots import route handler (fork server-context.h 413).
+    std::unique_ptr<server_res_generator> handle_slots_import(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
 
