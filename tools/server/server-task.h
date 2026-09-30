@@ -58,6 +58,20 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    // fork 9l-d4b7a: cache-control task types (fork server-task.h 56-68)
+    SERVER_TASK_TYPE_CACHE_CAPTURE,
+    SERVER_TASK_TYPE_CACHE_IMPORT,
+    SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT,
+    SERVER_TASK_TYPE_CACHE_HOLDER_CREATE,
+    SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE,
+    SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH,
+    SERVER_TASK_TYPE_CACHE_FAMILY_REGISTER,
+    SERVER_TASK_TYPE_CACHE_FAMILY_BIND,
+    SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE,
+    SERVER_TASK_TYPE_CACHE_LEASE_INSPECT,
+    SERVER_TASK_TYPE_CACHE_LEASE_RENEW,
+    SERVER_TASK_TYPE_CACHE_LEASE_RELEASE,
+    SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -211,6 +225,11 @@ struct server_task {
     };
     slot_action slot_action;
 
+    // fork 9l-d4b7a: cache-control control task (fork server-task.h 233-235)
+    // Scheduler-internal control task. The wire layer is the only unit allowed to
+    // construct this from HTTP; until then production has no caller.
+    std::shared_ptr<const server_cache_control_request> cache_control;
+
     // fork 9l-d4b6z: cache-control semantic selector (fork server-task.h 237-243)
     // Wire selectors carry semantic inputs only. The scheduler resolves
     // these into exact retention keys before invoking the cache-control authority.
@@ -229,6 +248,14 @@ struct server_task {
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
+
+    // fork 9l-d4b7a: cache-control task constructor (fork server-task.h 255-260)
+    static server_task cache_control_task(
+            server_cache_control_operation operation) {
+        GGML_ASSERT(operation < server_cache_control_operation::_count);
+        return server_task(static_cast<server_task_type>(
+            SERVER_TASK_TYPE_CACHE_HOLDER_CREATE + int(operation)));
+    }
 
     int32_t n_tokens() const {
         return tokens.size();
