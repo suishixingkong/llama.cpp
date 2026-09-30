@@ -211,6 +211,15 @@ struct server_task {
     };
     slot_action slot_action;
 
+    // fork 9l-d4b6z: cache-control semantic selector (fork server-task.h 237-243)
+    // Wire selectors carry semantic inputs only. The scheduler resolves
+    // these into exact retention keys before invoking the cache-control authority.
+    struct cache_control_semantic_selector {
+        int32_t slot_id = -1;
+        std::shared_ptr<const server_tokens> tokens;
+        std::map<int, float> lora;
+    } cache_control_subject, cache_control_fallback;
+
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
 

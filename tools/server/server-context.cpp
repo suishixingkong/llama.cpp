@@ -9169,6 +9169,118 @@ private:
         }
     }
 
+    // fork 9l-d4b6z: cache-control refresh members (fork server-context.cpp 11182-11292)
+    bool cache_control_refresh_prompt(
+            const server_prompt & prompt,
+            const std::string & adapter_identity,
+            server_cache_lease_identity & identity,
+            server_cache_lease_frontier & frontier) noexcept {
+        const int64_t tokens = prompt.n_tokens();
+        if (!server_cache_lease_build_identity(
+                frontier_execution_identity, adapter_identity,
+                prompt.tokens, tokens, identity)) {
+            return false;
+        }
+        frontier = {
+            prompt.sequence_epoch, uint64_t(tokens), tokens,
+        };
+        return frontier.valid();
+    }
+
+    bool cache_control_refresh_subject(
+            const server_cache_control_selector & selector,
+            server_cache_lease_identity & identity,
+            server_cache_lease_frontier & frontier) noexcept {
+        if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+            const auto slot = std::find_if(
+                slots.begin(), slots.end(), [&](const server_slot & value) {
+                    return value.id == selector.retention_key.owner_slot;
+                });
+            if (slot == slots.end()) {
+                return false;
+            }
+            return cache_control_refresh_prompt(
+                slot->prompt, lora_config_identity(slot->lora),
+                identity, frontier);
+        }
+        if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+            if (!prompt_cache) {
+                return false;
+            }
+            const auto * wanted =
+                reinterpret_cast<const server_prompt_cache_state *>(
+                    selector.retention_key.instance);
+            const auto state = std::find_if(
+                prompt_cache->states.begin(), prompt_cache->states.end(),
+                [&](const server_prompt_cache_state & value) {
+                    return &value == wanted;
+                });
+            if (state == prompt_cache->states.end()) {
+                return false;
+            }
+            return cache_control_refresh_prompt(
+                state->prompt, state->adapter_config_key,
+                identity, frontier);
+        }
+        return false;
+    }
+
+    server_cache_control_status cache_control_resolve_semantic_selector(
+            server_cache_control_selector & selector,
+            const server_task::cache_control_semantic_selector & semantic) noexcept {
+        if (selector.kind == server_cache_control_subject_kind::vbr_reference ||
+            selector.kind == server_cache_control_subject_kind::live_checkpoint) {
+            return server_cache_control_status::ok;
+        }
+        if (selector.kind == server_cache_control_subject_kind::live_prefix) {
+            const auto slot = std::find_if(
+                slots.begin(), slots.end(), [&](const server_slot & value) {
+                    return value.id == semantic.slot_id;
+                });
+            if (slot == slots.end() || slot->prompt.n_tokens() == 0) {
+                return server_cache_control_status::not_found;
+            }
+            if (slot->is_processing()) {
+                return server_cache_control_status::subject_busy;
+            }
+            selector.retention_key =
+                server_retention_instance_key::for_slot(slot->id);
+            return cache_control_refresh_prompt(
+                slot->prompt, lora_config_identity(slot->lora),
+                selector.identity, selector.frontier)
+                    ? server_cache_control_status::ok
+                    : server_cache_control_status::identity_unavailable;
+        }
+        if (selector.kind == server_cache_control_subject_kind::host_snapshot) {
+            if (!prompt_cache || !semantic.tokens) {
+                return server_cache_control_status::not_found;
+            }
+            const auto requested_lora = semantic.lora.empty()
+                ? params_base.lora_adapters
+                : construct_lora_list(semantic.lora);
+            const std::string adapter_identity =
+                lora_config_identity(requested_lora);
+            const auto state = std::find_if(
+                prompt_cache->states.begin(), prompt_cache->states.end(),
+                [&](const server_prompt_cache_state & value) {
+                    return value.adapter_config_key == adapter_identity &&
+                        value.prompt.tokens.size() == semantic.tokens->size() &&
+                        value.prompt.tokens.get_common_prefix(*semantic.tokens) ==
+                            semantic.tokens->size();
+                });
+            if (state == prompt_cache->states.end()) {
+                return server_cache_control_status::not_found;
+            }
+            selector.retention_key =
+                server_retention_instance_key::for_host_entry(&*state);
+            return cache_control_refresh_prompt(
+                state->prompt, state->adapter_config_key,
+                selector.identity, selector.frontier)
+                    ? server_cache_control_status::ok
+                    : server_cache_control_status::identity_unavailable;
+        }
+        return server_cache_control_status::not_supported;
+    }
 
     // ---- group A file-local types (verbatim from the fork) ----
 
