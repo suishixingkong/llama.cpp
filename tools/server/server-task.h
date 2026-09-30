@@ -225,6 +225,23 @@ struct server_task {
     };
     slot_action slot_action;
 
+    // fork 9l-d4b7f: the cache-capture / cache-import task actions (fork server-task.h 219-231).
+    // `cache_capture` is consumed by the CACHE_CAPTURE case landed here; `cache_import`
+    // is inert data until the CACHE_IMPORT case (fork server-context.cpp 15049-15282) lands.
+    // used by SERVER_TASK_TYPE_CACHE_CAPTURE / SERVER_TASK_TYPE_CACHE_IMPORT
+    struct cache_capture_action {
+        int id_slot = -1;
+        std::string tenant_key;
+    };
+    cache_capture_action cache_capture;
+
+    struct cache_import_action {
+        int id_slot = -1;
+        std::string tenant_key;
+        std::string reference;
+    };
+    cache_import_action cache_import;
+
     // fork 9l-d4b7a: cache-control control task (fork server-task.h 233-235)
     // Scheduler-internal control task. The wire layer is the only unit allowed to
     // construct this from HTTP; until then production has no caller.

@@ -5731,6 +5731,187 @@ private:
                     }
                     queue_results.send(std::move(res));
                 } break;
+            // fork 9l-d4b7f: CACHE_CAPTURE (fork server-context.cpp 14870-15048).
+            // CACHE_IMPORT (fork 15049-15282) sits between this and SLOT_RESTORE.
+            case SERVER_TASK_TYPE_CACHE_CAPTURE:
+                {
+                    auto send_capture = [&](server_vbr_artifact_capture_status status) {
+                        auto res =
+                            std::make_unique<server_task_result_cache_capture>();
+                        res->id = task.id;
+                        res->id_slot = task.cache_capture.id_slot;
+                        res->status = status;
+                        queue_results.send(std::move(res));
+                    };
+
+                    // The route remains present so gated configurations return
+                    // a typed result, but no slot/model inspection occurs when
+                    // the full lifecycle+armed construction gate did not pass.
+                    if (!vbr_artifact_store) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::unsupported);
+                        break;
+                    }
+                    try {
+                    assert_scheduler_thread(
+                        vbr_capture_scheduler_thread,
+                        "VBR artifact work must run on scheduler thread");
+
+                    server_slot * slot =
+                        get_slot_by_id(task.cache_capture.id_slot);
+                    if (slot == nullptr) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::invalid_slot);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG(
+                            "requested capture slot is processing; defer task, id_task = %d\n",
+                            task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (slot->state != SLOT_STATE_IDLE ||
+                        slot->prompt.n_tokens() <= 0) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::stale_frontier);
+                        break;
+                    }
+
+                    vbr_explicit_capture_request request;
+                    server_vbr_artifact_capture_status request_status;
+                    if (!build_capture_request(
+                            *slot, request, request_status)) {
+                        send_capture(request_status);
+                        break;
+                    }
+
+                    if (!cache_plan_observe_live_memory(false)) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::unavailable);
+                        break;
+                    }
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE begin task=%d slot=%d controllers=%u\n",
+                        task.id, slot->id,
+                        vbr_artifact_store->attention_children());
+                    const int64_t started = ggml_time_us();
+                    const auto captured = vbr_artifact_store->capture(
+                        *llama_get_memory(ctx_tgt), std::move(request),
+                        task.cache_capture.tenant_key);
+                    const auto & capture_totals =
+                        vbr_artifact_store->counters();
+                    const double duration_ms =
+                        (ggml_time_us() - started)/1000.0;
+                    SRV_INF(
+                        "VBR_ARTIFACT_CAPTURE end task=%d slot=%d status=%s "
+                        "library_status=%s phase=%s inner_status=%s "
+                        "generation_failure=%s size_failure=%s "
+                        "reservation_group=%s prepare_status=%s "
+                        "admission_status=%s failed_leaf=%zu "
+                        "consistency=%s units=%u payload=%" PRIu64
+                        " stash=%" PRIu64 " companion=%" PRIu64
+                        " chunks=%" PRIu64 " backpressure=%" PRIu64
+                        " events=%" PRIu64 " sync_fallbacks=%" PRIu64
+                        " dedup=%d duration_ms=%.3f"
+                        " total_requested=%" PRIu64
+                        " total_published=%" PRIu64
+                        " total_refused=%" PRIu64
+                        " total_unavailable=%" PRIu64
+                        " total_internal=%" PRIu64
+                        " total_payload=%" PRIu64
+                        " total_stash=%" PRIu64
+                        " total_companion=%" PRIu64
+                        " pinned_bytes=%" PRIu64
+                        " total_chunks=%" PRIu64
+                        " total_events=%" PRIu64
+                        " total_sync_fallbacks=%" PRIu64
+                        " total_backpressure=%" PRIu64
+                        " total_dedup_hits=%" PRIu64
+                        " total_dedup_misses=%" PRIu64
+                        " staging_overlap_refusals=%" PRIu64 "\n",
+                        task.id, slot->id,
+                        server_vbr_artifact_capture_status_name(
+                            captured.status),
+                        vbr_explicit_capture_status_name(
+                            captured.library_status),
+                        vbr_explicit_capture_phase_name(
+                            captured.phase),
+                        vbr_capture_stream_status_name(
+                            captured.inner_stream_status),
+                        vbr_explicit_generation_failure_name(
+                            captured.generation_failure),
+                        vbr_explicit_size_failure_name(
+                            captured.size_failure),
+                        vbr_capture_reservation_group_name(
+                            captured.begin_diagnostics.
+                                reservation_group),
+                        llama_cache_prepare_status_name(
+                            captured.begin_diagnostics.
+                                prepare_status),
+                        llama_cache_admission_status_name(
+                            captured.begin_diagnostics.
+                                admission_status),
+                        captured.begin_diagnostics.failed_leaf,
+                        captured.status ==
+                                server_vbr_artifact_capture_status::ok
+                            ? "capture_exact" : "unavailable",
+                        captured.units, captured.payload_bytes,
+                        captured.stash_bytes,
+                        captured.companion_bytes, captured.chunks,
+                        captured.backpressure_waits,
+                        captured.event_completions,
+                        captured.synchronous_fallbacks,
+                        captured.dedup, duration_ms,
+                        capture_totals.requested,
+                        capture_totals.exact_published,
+                        capture_totals.refused,
+                        capture_totals.unavailable,
+                        capture_totals.internal_error,
+                        capture_totals.payload_bytes,
+                        capture_totals.stash_bytes,
+                        capture_totals.companion_bytes,
+                        capture_totals.pinned_bytes,
+                        capture_totals.chunks,
+                        capture_totals.event_completions,
+                        capture_totals.synchronous_fallbacks,
+                        capture_totals.backpressure_waits,
+                        capture_totals.dedup_hits,
+                        capture_totals.dedup_misses,
+                        capture_totals.staging_overlap_refusals);
+
+                    auto res =
+                        std::make_unique<server_task_result_cache_capture>();
+                    res->id = task.id;
+                    res->id_slot = slot->id;
+                    res->status = captured.status;
+                    if (captured.status ==
+                            server_vbr_artifact_capture_status::ok) {
+                        res->consistency =
+                            server_cache_capture_consistency::capture_exact;
+                    }
+                    res->reference = captured.reference;
+                    res->controllers = captured.controllers;
+                    res->units = captured.units;
+                    res->companions = captured.companions;
+                    res->payload_bytes = captured.payload_bytes;
+                    res->stash_bytes = captured.stash_bytes;
+                    res->companion_bytes = captured.companion_bytes;
+                    res->chunks = captured.chunks;
+                    res->backpressure_waits =
+                        captured.backpressure_waits;
+                    res->event_completions =
+                        captured.event_completions;
+                    res->synchronous_fallbacks =
+                        captured.synchronous_fallbacks;
+                    res->dedup = captured.dedup;
+                    queue_results.send(std::move(res));
+                    } catch (...) {
+                        send_capture(
+                            server_vbr_artifact_capture_status::
+                                internal_error);
+                    }
+                } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -12164,6 +12345,10 @@ private:
     // nothing"). The declaration exists so that the launch prologue's family
     // resolution is verbatim (fork 10280-10290).
     std::unique_ptr<server_cache_control_authority> cache_control_authority;
+    // fork 9l-d4b7f: the VBR capture scheduler pin (fork server-context.cpp 3649).
+    // The fork has NO assignment site for it anywhere: the first
+    // assert_scheduler_thread() call pins it.
+    std::thread::id vbr_capture_scheduler_thread;
     // ---------------------------------------------------------------------
     // group A: cache-plan observation face + the retention wave it calls.
     // Bodies verbatim from the fork; the fork coordinates are on each header
@@ -15079,13 +15264,13 @@ void server_routes::init_routes() {
         return res;
     };
 
+        // fork 9l-d4b7f: post_slots in the fork's own order (fork server-context.cpp
+    // 21809-21851).  FORK-DIFF: the --slot-save-path gate moved from the top of the
+    // lambda to below capture/erase, so `action=erase` is now reachable without the
+    // flag (the fork's own comment further down explains why) and `capture` is never
+    // gated; `save`/`restore` stay behind the gate.
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-
         std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
@@ -15098,14 +15283,29 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "capture") {
+            return handle_slots_capture(req, id_slot);
+        }
+        // fork 9l-d4b7f: the import branch (fork server-context.cpp 21826-21828) and
+        // handle_slots_import belong to the CACHE_IMPORT slice; they sit here.
+        // Erase does no state-file IO (prompt clear + seq_rm only), so it is
+        // NOT gated on --slot-save-path. Dynamic VBR clears slot_save_path at
+        // startup (legacy state files cannot carry tier-typed KV), and import
+        // REQUIRES an explicit erase to produce its empty target — keeping
+        // erase behind the path gate made import's precondition unreachable
+        // on exactly the servers that support import.
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -15816,6 +16016,38 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     }
 
     res->ok(result->to_json());
+    return res;
+}
+
+// fork 9l-d4b7f: handle_slots_capture (fork server-context.cpp 22692-22720).
+// handle_slots_import (fork 22722-22761) sits between this and handle_slots_restore.
+std::unique_ptr<server_res_generator> server_routes::handle_slots_capture(
+        const server_http_req & req,
+        int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_CACHE_CAPTURE);
+        task.id = rd.get_new_id();
+        task.cache_capture.id_slot = id_slot;
+        task.cache_capture.tenant_key =
+            server_cache_capture_tenant_key(req);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    auto * captured =
+        dynamic_cast<server_task_result_cache_capture *>(result.get());
+    GGML_ASSERT(captured != nullptr);
+    res->ok(captured->to_json());
     return res;
 }
 
