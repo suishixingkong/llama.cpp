@@ -8125,6 +8125,17 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // fork 9l-d4b7i: the decode() hard-seal rewrite (fork server-context.cpp 18455-18693).
+    //  Five fork features are fused in that body.  This port takes three:
+    //    speculative single-yield terminal / VBR hard seal / VBR capture-readiness growth.
+    //  Two are deliberately left out:
+    //    - diffusion cycle accounting (t_verify_total / cycle_has_output): the whole
+    //      cycle family is absent here and post_cycle is not in the VBR queue;
+    //    - DFlash flush (common_speculative_flush_prefill): DFlash is not ported here.
+    //  Upstream-only lines the fork dropped are restored: is_prompt / homogeneous_phase /
+    //  decode_phase + llama_set_decode_phase, and the raw `model_dft` pointer.
+    //  The recurrent copy_state_to bool is not taken: this tree uses the newer
+    //  mem.seq_rm/mem.seq_cp implementation, which cannot fail.
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -8151,6 +8162,9 @@ private:
             }
         }
 
+        // Ensure causal attention is on for prompt eval (diffusion draft toggles it off)
+        llama_set_causal_attn(ctx_tgt, true);
+
         bool has_output = false;
         bool is_prompt = batch.tokens[off].is_prompt;
         bool homogeneous_phase = true;
@@ -8159,23 +8173,90 @@ private:
             homogeneous_phase &=
                 batch.tokens[i].is_prompt == is_prompt;
         }
+
         const enum llama_decode_phase decode_phase =
             !homogeneous_phase ? LLAMA_DECODE_PHASE_AUTOMATIC :
             is_prompt ? LLAMA_DECODE_PHASE_PROMPT :
                         LLAMA_DECODE_PHASE_GENERATION;
 
-        // yield to the queue, so we can still handle metrics tasks while decoding
-        // note: the sync is done here too, so that the wait is also covered by the yield
+        // Keep target verification and the dependent speculative update inside
+        // one queue yield. Re-arming the worker between these two operations
+        // adds a second mutex/wake/condition rendezvous to every speculative
+        // ubatch even when no task is queued.
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
+        bool speculative_ok = true;
+        std::exception_ptr speculative_exception;
+        const int64_t t_verify_start = ggml_time_us();
+        int64_t t_verify_elapsed = 0;
+        const std::exception_ptr yield_exception =
+            queue_tasks.yield_to_queue_capture_exception([&]() {
             llama_set_decode_phase(ctx_tgt, decode_phase);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
-        });
 
+            t_verify_elapsed = ggml_time_us() - t_verify_start;
+
+            if (ret == 0 && spec) {
+                try {
+                    speculative_ok = common_speculative_process(
+                        spec.get(), batch_view);
+                } catch (...) {
+                    // Preserve the existing decode accounting/error terminal:
+                    // queue cleanup completes here, then the speculative
+                    // exception is rethrown at its former publication point.
+                    speculative_exception = std::current_exception();
+                }
+            }
+            }, speculative_exception);
+        SRV_DBG("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
+                batch_view.n_tokens, t_verify_elapsed / 1e3,
+                t_verify_elapsed / 1e3 / std::max(1, batch_view.n_tokens));
+
+        if (vbr_capture_readiness_estimator && t_verify_elapsed > 0 &&
+            batch_view.n_tokens > 0) {
+            vbr_capture_readiness_estimator->observe_growth(
+                uint64_t(batch_view.n_tokens), uint64_t(t_verify_elapsed));
+        }
+
+        auto * memory = llama_get_memory(ctx_tgt);
+        std::vector<vbr_hard_seal_subject> hard_seal_evidence;
+        memory->vbr_hard_seal_evidence_take(hard_seal_evidence);
+        if (params_base.cache_debug) {
+            for (const auto & step : hard_seal_evidence) {
+                const json payload = {
+                    {"evidence_event", "sealed_step"},
+                    {"order_ordinal", step.order_ordinal},
+                    {"layer", step.il},
+                    {"side", step.is_v ? "v" : "k"},
+                };
+                SRV_INF("CACHE_VBR_HARD_SEAL %s\n", payload.dump().c_str());
+            }
+        }
+        const bool hard_seal_terminal =
+            memory->vbr_hard_seal_blocked_take(ret != 0);
+        const auto decode_terminal = server_speculative_decode_terminal_resolve(
+            ret, hard_seal_terminal, n_batch == 1,
+            yield_exception != nullptr, speculative_ok);
         if (ret != 0) {
+            if (decode_terminal ==
+                    server_speculative_decode_terminal::preserve_hard_seal) {
+                constexpr const char * refusal = "hard_lease_blocked";
+                SRV_WRN("VBR pressure refused at the hard-lease seal; completing the in-flight request with %s\n",
+                        refusal);
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, refusal, ERROR_TYPE_HARD_LEASE_BLOCKED);
+                        // prepare() failed before committing this batch. Keep
+                        // the proven live prefix and its lease intact; unlike
+                        // an ordinary cache-placement failure this must never
+                        // clear an idle leased slot or retry forever.
+                        slot.release();
+                    }
+                }
+                throw std::runtime_error(refusal);
+            }
             {
                 std::string err;
 
@@ -8196,7 +8277,9 @@ private:
 
                 // TODO: handle ret == 2 (abort) when we start aborting
 
-                if (!err.empty()) {
+                if (decode_terminal ==
+                        server_speculative_decode_terminal::ordinary_ret_error) {
+                    GGML_ASSERT(!err.empty());
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
@@ -8206,7 +8289,8 @@ private:
 
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
+                            slot.mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
                         }
                     }
 
@@ -8216,6 +8300,8 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
+            GGML_ASSERT(decode_terminal ==
+                server_speculative_decode_terminal::retry);
             if (!try_clear_idle_slots()) {
                 n_batch /= 2;
             }
@@ -8231,20 +8317,20 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
+        if (decode_terminal ==
+                server_speculative_decode_terminal::reset_committed_then_throw) {
+            // Target verification has already committed this batch, including
+            // draft tokens tentatively appended to each live prompt. Never let
+            // a queue/speculative failure publish that suffix as reusable state.
+            server_reset_processing_slots_after_committed_failure(slots);
 
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
+            if (yield_exception) {
+                std::rethrow_exception(yield_exception);
             }
-        }
 
+            SRV_ERR("%s", "failed to process speculative batch\n");
+            throw std::runtime_error("failed to process speculative batch");
+        }
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
