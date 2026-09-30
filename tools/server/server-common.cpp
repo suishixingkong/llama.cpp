@@ -73,6 +73,11 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        // fork 9l-d4b7h: the hard-lease refusal mapping (fork server-common.cpp 74-77).
+        case ERROR_TYPE_HARD_LEASE_BLOCKED:
+            type_str = "hard_lease_blocked";
+            code = 503;
+            break;
     }
     return json {
         {"code", code},

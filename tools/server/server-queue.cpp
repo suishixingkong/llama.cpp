@@ -422,6 +422,19 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 }
 
+// fork 9l-d4b7h: server_queue::yield_to_queue_capture_exception (fork server-queue.cpp 503-513).
+std::exception_ptr server_queue::yield_to_queue_capture_exception(
+        std::function<void()> && work,
+        const std::exception_ptr & delayed_work_exception) noexcept {
+    try {
+        yield_to_queue(std::move(work));
+    } catch (...) {
+        return delayed_work_exception ? delayed_work_exception : std::current_exception();
+    }
+
+    return delayed_work_exception;
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();

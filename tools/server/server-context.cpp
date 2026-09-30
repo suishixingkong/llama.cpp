@@ -1797,6 +1797,20 @@ static uint64_t server_frontier_ratchet_min_agreements() {
     return (uint64_t) parsed;
 }
 
+// fork 9l-d4b7h: server_reset_processing_slots_after_committed_failure
+// (fork server-context.cpp 3094-3102).  Lands ahead of the decode() rewrite:
+// both of its callers (the decode() body and the *_for_test layer) are still
+// unported, so it is defined-but-uncalled until those land.
+static void server_reset_processing_slots_after_committed_failure(
+        std::vector<server_slot> & slots) {
+    for (auto & slot : slots) {
+        if (slot.is_processing()) {
+            slot.mandatory_recovery_reset(
+                server_cache_destruction_reason::restore_failure);
+        }
+    }
+}
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue

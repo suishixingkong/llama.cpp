@@ -66,6 +66,8 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    // fork 9l-d4b7h: the hard-lease refusal type (fork server-common.h 69).
+    ERROR_TYPE_HARD_LEASE_BLOCKED, // custom error
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

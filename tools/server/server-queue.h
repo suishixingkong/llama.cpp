@@ -172,6 +172,16 @@ public:
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
 
+    // fork 9l-d4b7h: server_queue::yield_to_queue_capture_exception (fork server-queue.h 172-178).
+    // Variant for work that must publish failure at a later transaction
+    // boundary. It completes queue cleanup and returns the selected exception
+    // instead of throwing it. A delayed work exception takes precedence over a
+    // concurrent queue-callback exception, matching yield_to_queue().
+    std::exception_ptr yield_to_queue_capture_exception(
+        std::function<void()> && work,
+        const std::exception_ptr & delayed_work_exception) noexcept;
+
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
