@@ -680,6 +680,15 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // fork 9l-d4b7d: the semantic-family digest API (fork llama.h 721-727)
+    // Stable semantic-family compatibility policy for portable sequence
+    // state. This is deliberately NOT a model-weight identity: it excludes
+    // tensor values, quantization, model names, paths, and timestamps while
+    // binding effective state-producing structure and tokenizer semantics.
+    LLAMA_API bool llama_model_semantic_family_digest(
+            const struct llama_model * model,
+            uint8_t digest[32]);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);

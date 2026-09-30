@@ -257,6 +257,21 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    // fork 9l-d4b7d: the rest of the DFlash hparams group.  Declarations
+    // only -- the port has no DFlash backend, so nothing here sets them and
+    // they hold the fork's declaration defaults.  They must exist because
+    // llama_model_semantic_family_digest() binds them unconditionally: writing
+    // zeros by hand instead would change the digest for every model, and
+    // dflash_n_target_features defaults to 25600, not 0.  In the fork these sit
+    // at llama-hparams.h 222-230, next to situ_linear_beta.
+    uint32_t dflash_mask_token_id     = 0;
+    uint32_t dflash_n_target_features = 25600;
+    uint32_t dflash_n_target_layers   = 0;
+    uint32_t dflash_target_layer_ids[8] = {};
+    uint32_t dflash2_conv_kernel_size = 0;
+    uint32_t dflash2_conv_group_size  = 0;
+    uint32_t dflash2_selector_rank     = 0;
+    uint32_t dflash2_selector_top_k    = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
