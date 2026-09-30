@@ -5541,6 +5541,164 @@ private:
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
+            // fork 9l-d4b7c: the cache-task dispatch -- plan preflight and
+            // the cache-control group (fork server-context.cpp 14717-14869).
+            // The fork's other two cache cases (CACHE_CAPTURE 14870-15048
+            // and CACHE_IMPORT 15049-15282) are not ported yet; when they
+            // land they belong here, before SLOT_RESTORE, in fork order.
+            case SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT:
+                {
+                    auto res = std::make_unique<
+                        server_task_result_cache_plan_preflight>();
+                    res->id = task.id;
+                    try {
+                        res->view = cache_plan_preflight(task);
+                    } catch (...) {
+                        res->view.status =
+                            server_cache_plan_preflight_status::internal_fault;
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CACHE_HOLDER_CREATE:
+            case SERVER_TASK_TYPE_CACHE_HOLDER_CLOSE:
+            case SERVER_TASK_TYPE_CACHE_HOLDER_REATTACH:
+            case SERVER_TASK_TYPE_CACHE_FAMILY_REGISTER:
+            case SERVER_TASK_TYPE_CACHE_FAMILY_BIND:
+            case SERVER_TASK_TYPE_CACHE_LEASE_ACQUIRE:
+            case SERVER_TASK_TYPE_CACHE_LEASE_INSPECT:
+            case SERVER_TASK_TYPE_CACHE_LEASE_RENEW:
+            case SERVER_TASK_TYPE_CACHE_LEASE_RELEASE:
+            case SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS:
+                {
+                    auto res = std::make_unique<server_task_result_cache_control>();
+                    res->id = task.id;
+                    static_assert(
+                        SERVER_TASK_TYPE_CACHE_CONTROL_EVENTS -
+                                SERVER_TASK_TYPE_CACHE_HOLDER_CREATE + 1 ==
+                            int(server_cache_control_operation::_count));
+                    const auto operation = static_cast<
+                        server_cache_control_operation>(
+                            task.type - SERVER_TASK_TYPE_CACHE_HOLDER_CREATE);
+                    res->operation = operation;
+                    const auto precheck = server_cache_control_task_precheck(
+                        task.cache_control != nullptr,
+                        params_base.cache_lifecycle,
+                        cache_authority != nullptr);
+                    if (precheck != server_cache_control_status::ok) {
+                        res->result.status = precheck;
+                    } else {
+                        try {
+                            if (!cache_control_authority) {
+                                server_cache_control_config config;
+                                config.leases = &cache_authority->leases;
+                                config.retention = &cache_authority->retention;
+                                config.artifacts = vbr_artifact_store.get();
+                                config.refresh_context = this;
+                                config.refresh_subject = [](void * context,
+                                    const server_cache_control_selector & selector,
+                                    server_cache_lease_identity & identity,
+                                    server_cache_lease_frontier & frontier) noexcept {
+                                    return static_cast<server_context_impl *>(context)
+                                        ->cache_control_refresh_subject(
+                                            selector, identity, frontier);
+                                };
+                                config.host_proof_context = prompt_cache.get();
+                                config.acquire_host_proof = [](void * context,
+                                    const server_cache_control_selector & selector) noexcept {
+                                    auto * cache = static_cast<server_prompt_cache *>(context);
+                                    return cache
+                                        ? server_prompt_cache_host_fallback_proof(
+                                            *cache, selector)
+                                        : server_cache_durable_fallback_proof{};
+                                };
+                                config.selector_evidence_context = prompt_cache.get();
+                                config.selector_evidence = [](void *,
+                                    const server_cache_control_selector & selector,
+                                    uint64_t & bytes, bool & shared) noexcept {
+                                    bytes = 0;
+                                    shared = false;
+                                    if (selector.kind !=
+                                            server_cache_control_subject_kind::host_snapshot ||
+                                        selector.retention_key.kind !=
+                                            common_retention_artifact_kind::host_entry ||
+                                        selector.retention_key.instance == 0) {
+                                        return false;
+                                    }
+                                    const auto * state = reinterpret_cast<
+                                        const server_prompt_cache_state *>(
+                                            selector.retention_key.instance);
+                                    bytes = state->size();
+                                    shared = state->recovery_pins > 1;
+                                    return true;
+                                };
+                                cache_control_authority = std::make_unique<
+                                    server_cache_control_authority>(config);
+                            }
+                            server_cache_control_request request =
+                                *task.cache_control;
+                            server_cache_control_status selector_status =
+                                server_cache_control_status::ok;
+                            if (operation ==
+                                    server_cache_control_operation::lease_acquire) {
+                                if (selector_status ==
+                                        server_cache_control_status::ok) {
+                                    selector_status =
+                                        cache_control_resolve_semantic_selector(
+                                            request.subject,
+                                            task.cache_control_subject);
+                                }
+                                if (selector_status ==
+                                        server_cache_control_status::ok &&
+                                    request.requested_class ==
+                                        server_cache_lease_class::hard) {
+                                    selector_status =
+                                        cache_control_resolve_semantic_selector(
+                                            request.fallback,
+                                            task.cache_control_fallback);
+                                    if (selector_status !=
+                                            server_cache_control_status::ok &&
+                                        request.allow_soft_fallback) {
+                                        // Keep the unresolved exact selector:
+                                        // the authority remains the sole policy
+                                        // point for an explicitly authorized
+                                        // hard->soft downgrade and reports the
+                                        // effective class.
+                                        selector_status =
+                                            server_cache_control_status::ok;
+                                    } else if (selector_status ==
+                                            server_cache_control_status::not_found) {
+                                        selector_status =
+                                            server_cache_control_status::fallback_unavailable;
+                                    }
+                                }
+                            } else if (operation ==
+                                    server_cache_control_operation::lease_renew &&
+                                request.fallback.kind <
+                                    server_cache_control_subject_kind::_count) {
+                                selector_status =
+                                    cache_control_resolve_semantic_selector(
+                                        request.fallback,
+                                        task.cache_control_fallback);
+                                if (selector_status ==
+                                        server_cache_control_status::not_found) {
+                                    selector_status =
+                                        server_cache_control_status::fallback_unavailable;
+                                }
+                            }
+                            if (selector_status !=
+                                    server_cache_control_status::ok) {
+                                res->result.status = selector_status;
+                            } else {
+                                res->result = cache_control_authority->execute(
+                                    operation, request);
+                            }
+                        } catch (...) {
+                            res->result.status =
+                                server_cache_control_status::internal_fault;
+                        }
+                    }
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
                     const int id_slot = task.slot_action.id_slot;
