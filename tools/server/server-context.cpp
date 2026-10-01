@@ -733,6 +733,82 @@ server_slot_frontier_logits_status server_slot_envelope_token_binding_status(
     return server_slot_frontier_logits_status::loaded;
 }
 
+// fork 9l-d4b7l: the frontier-logits prepare status + geometry (fork
+// server-context.cpp 683-753).  Free functions, so they must precede
+// server_context_impl -- prepare_slot_frontier_logits_for_save (a member of
+// that class) calls server_slot_frontier_geometry_classify.
+enum class server_slot_frontier_prepare_status {
+    captured_existing,
+    aligned_without_logits,
+    completed_tail,
+    media_unsupported,
+    frontier_gap,
+    decode_rolled_back,
+    decode_partially_committed,
+    capture_failed,
+};
+
+const char * server_slot_frontier_prepare_status_name(
+        server_slot_frontier_prepare_status status) noexcept {
+    switch (status) {
+        case server_slot_frontier_prepare_status::captured_existing:
+            return "captured_existing";
+        case server_slot_frontier_prepare_status::aligned_without_logits:
+            return "aligned_without_logits";
+        case server_slot_frontier_prepare_status::completed_tail:
+            return "completed_tail";
+        case server_slot_frontier_prepare_status::media_unsupported:
+            return "media_unsupported";
+        case server_slot_frontier_prepare_status::frontier_gap:
+            return "frontier_gap";
+        case server_slot_frontier_prepare_status::decode_rolled_back:
+            return "decode_rolled_back";
+        case server_slot_frontier_prepare_status::decode_partially_committed:
+            return "decode_partially_committed";
+        case server_slot_frontier_prepare_status::capture_failed:
+            return "capture_failed";
+    }
+    return "unknown";
+}
+
+bool server_slot_frontier_prepare_requires_reset(
+        server_slot_frontier_prepare_status status,
+        bool physically_aligned) noexcept {
+    return status == server_slot_frontier_prepare_status::decode_partially_committed ||
+        status == server_slot_frontier_prepare_status::frontier_gap ||
+        (status == server_slot_frontier_prepare_status::capture_failed &&
+         !physically_aligned);
+}
+
+enum class server_slot_frontier_geometry {
+    aligned_with_logits,
+    aligned_without_logits,
+    one_behind,
+    unsafe_gap,
+};
+
+server_slot_frontier_geometry server_slot_frontier_geometry_classify(
+        bool memory_available,
+        bool prompt_nonempty,
+        llama_pos live_pos_max,
+        llama_pos last_position,
+        llama_pos next_position,
+        bool logits_match) noexcept {
+    if (!memory_available || !prompt_nonempty) {
+        return server_slot_frontier_geometry::unsafe_gap;
+    }
+    if (live_pos_max + 1 == next_position) {
+        return logits_match
+            ? server_slot_frontier_geometry::aligned_with_logits
+            : server_slot_frontier_geometry::aligned_without_logits;
+    }
+    if (live_pos_max >= 0 && last_position == live_pos_max + 1 &&
+            next_position == last_position + 1) {
+        return server_slot_frontier_geometry::one_behind;
+    }
+    return server_slot_frontier_geometry::unsafe_gap;
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -9370,6 +9446,109 @@ private:
             GGML_ASSERT(frontier_next_sequence_epoch != 0);
         }
         return prompt.sequence_epoch;
+    }
+
+    // fork 9l-d4b7l: the SLOT_SAVE frontier-logits prepare helpers (fork
+    // server-context.cpp 4594-4690).  slot_frontier_is_physically_aligned is
+    // the read-only geometry probe; prepare_slot_frontier_logits_for_save may
+    // finish one already-published tail token in the target so the frontier
+    // can be captured at all.  Fork order, and the fork keeps them next to
+    // ensure_frontier_sequence_epoch() -- which is exactly where they land.
+    bool slot_frontier_is_physically_aligned(
+            const server_slot & slot) const noexcept {
+        try {
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            return memory && !slot.prompt.tokens.empty() &&
+                memory->seq_pos_max(slot.id) + 1 ==
+                    slot.prompt.tokens.pos_next();
+        } catch (...) {
+            return false;
+        }
+    }
+
+    server_slot_frontier_prepare_status
+    prepare_slot_frontier_logits_for_save(server_slot & slot) noexcept {
+        bool target_decode_committed = false;
+        bool target_decode_started = false;
+        try {
+            if (slot.prompt.tokens.has_media()) {
+                return server_slot_frontier_prepare_status::media_unsupported;
+            }
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            if (!memory || slot.prompt.tokens.empty()) {
+                return server_slot_frontier_prepare_status::frontier_gap;
+            }
+            const llama_pos live_pos_max = memory->seq_pos_max(slot.id);
+            const llama_pos last_position = slot.prompt.tokens.pos_next(
+                int64_t(slot.prompt.tokens.size()) - 1);
+            const llama_pos next_position = slot.prompt.tokens.pos_next();
+            switch (server_slot_frontier_geometry_classify(
+                    true, true,
+                    live_pos_max, last_position, next_position,
+                    slot.frontier_logits_matches())) {
+                case server_slot_frontier_geometry::aligned_with_logits:
+                    return server_slot_frontier_prepare_status::captured_existing;
+                case server_slot_frontier_geometry::aligned_without_logits:
+                    return server_slot_frontier_prepare_status::aligned_without_logits;
+                case server_slot_frontier_geometry::unsafe_gap:
+                    return server_slot_frontier_prepare_status::frontier_gap;
+                case server_slot_frontier_geometry::one_behind:
+                    break;
+            }
+
+            // Any older row describes the pre-tail frontier.  Clear it before
+            // the fallible completion so a post-decode capture refusal can
+            // only produce a cold companion-free save.
+            slot.frontier_logits.clear();
+
+            // Slot actions run on the scheduler between decode cycles.  Finish
+            // exactly the already-published, one-token-behind ledger frontier
+            // in the target only; this is explicit slot-save work and never
+            // touches the ordinary request path or its timing counters.
+            struct batch_guard {
+                llama_batch value = llama_batch_init(1, 0, 1);
+                ~batch_guard() { llama_batch_free(value); }
+            } tail;
+            common_batch_add(
+                tail.value,
+                slot.prompt.tokens[slot.prompt.tokens.size() - 1],
+                last_position, { slot.id }, true);
+            // 9l-d4b7l: the fork arms its DFlash tape right here (a DFlash
+            // feature, not VBR -- this tree has neither the speculative type
+            // nor the recording mechanism), so the tail decode below runs
+            // unarmed, exactly as it does on every other path here.
+            target_decode_started = true;
+            const int decode_result =
+                server_fault("slot_frontier_logits_decode_partial") ? 2 :
+                server_fault("slot_frontier_logits_decode_fail") ? -1 :
+                llama_decode(ctx_tgt, tail.value);
+            if (decode_result != 0) {
+                return decode_result == 1 || decode_result == -1
+                    ? server_slot_frontier_prepare_status::decode_rolled_back
+                    : server_slot_frontier_prepare_status::decode_partially_committed;
+            }
+            llama_synchronize(ctx_tgt);
+            target_decode_committed = true;
+
+            // The target is now one token newer than every speculative side
+            // carrier.  Reuse the canonical transition so MTP carry, DFlash
+            // rings, and draft KV cannot claim the completed frontier.
+            common_speculative_sequence_transition(
+                slot.get_spec(), slot.id,
+                common_speculative_sequence_event::
+                    target_restored_without_draft);
+            (void) ensure_frontier_sequence_epoch(slot.prompt);
+            if (!slot.capture_synchronized_frontier_logits(0)) {
+                return server_slot_frontier_prepare_status::capture_failed;
+            }
+            return server_slot_frontier_prepare_status::completed_tail;
+        } catch (...) {
+            return target_decode_committed
+                ? server_slot_frontier_prepare_status::capture_failed
+                : target_decode_started
+                    ? server_slot_frontier_prepare_status::decode_partially_committed
+                    : server_slot_frontier_prepare_status::decode_rolled_back;
+        }
     }
 
     bool build_capture_identity_fields(
