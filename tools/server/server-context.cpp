@@ -1058,6 +1058,21 @@ static void server_cache_mandatory_recovery_reset_impl(
     common_context_seq_rm(ctx, seq_id, p0, p1);
 }
 
+// fork 9l-d4b7t (fork server-context.cpp 1466-1472).  The third member of the
+// closed-physical-seam family, and the one that carries a VBR distinction the
+// upstream tree does not have: a DURABLE removal tells the retention layer the
+// state is gone, while a TRANSIENT removal says "this storage is being
+// reconfigured, do not count it as a durability event".  A rejected speculative
+// suffix is the second kind -- the prefix is still valid, only the unverified
+// tail is being taken back.
+static bool server_cache_transient_seq_rm_impl(
+        llama_memory_t mem,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return llama_memory_seq_rm_transient(mem, seq_id, p0, p1);
+}
+
 // fork 9l-d4b7s: outcome of an attempt to save a slot's state to the host prompt
 // cache (fork server-context.cpp 1407-1417).  A live slot may be cleared without
 // losing state only when its state is now durable in the cache (published OR
@@ -9909,7 +9924,31 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            // fork 9l-d4b7t: the no-backup rollback (fork server-context.cpp
+            // 19302-19314).  The fork reaches this body as the `else` of its
+            // per-slot draft-backup branch, which this tree does not carry, so the
+            // guard is unconditional here; what matters is the PRIMITIVE.  The
+            // ancestor bfdc32183 had exactly `slot.mem.seq_rm(slot.id,
+            // slot.prompt.tokens.pos_next(), -1)` on this line -- a DURABLE
+            // removal, which is wrong: taking back a rejected speculative suffix
+            // is a transient reconfiguration, and a durable removal is visible to
+            // the retention layer as state loss.  `common_memory::seq_rm` also
+            // aborts on failure; the fork instead recovers, because accepted-token
+            // bookkeeping must not advance over an untrimmed rejected suffix.
+            if (!server_cache_transient_seq_rm_impl(
+                    llama_get_memory(ctx_tgt), slot.id,
+                    slot.prompt.tokens.pos_next(), -1)) {
+                // RS contexts own their rollback snapshot internally, so this is the
+                // only target-state rollback operation on the no-backup path. Refusal
+                // cannot be ignored: accepted-token bookkeeping would otherwise advance
+                // over an untrimmed rejected suffix.
+                SLT_ERR(slot, "%s\n", "failed to roll back rejected speculative suffix; resetting slot");
+                send_error(slot, "Compute error rolling back speculative tokens");
+                slot.release();
+                slot.mandatory_recovery_reset(
+                    server_cache_destruction_reason::restore_failure);
+                return;
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
