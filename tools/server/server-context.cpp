@@ -2792,6 +2792,12 @@ struct server_context_impl {
     // grants access to nothing reachable, and any guard that treated "the family
     // symbol is closed" as "a capability arrived" would be wrong.
     friend struct server_swa_window_selection_test;
+    // fork 9l-d4b7z: the friendship this oracle needs (fork
+    // server-context.cpp 3415-3416), landed in the same commit as its
+    // definition -- a friend for a function this tree cannot define would
+    // be a capability the tree does not have.
+    friend server_rejected_prompt_preservation_result
+        server_rejected_prompt_preservation_for_test();
 
     // fork 9l-d4b7u: the friendship the test oracle needs (fork server-context.cpp
     // 3413-3422).  Without it the oracle cannot reach the private statics it
@@ -17424,6 +17430,92 @@ server_vbr_retention_wiring_for_test() {
         authority_metadata, nullptr, authority_plan);
     result.authority_prefix_tracking_enabled =
         authority_metadata.prefix_tracking_enabled();
+    return result;
+}
+
+// fork 9l-d4b7z: server_rejected_prompt_preservation_for_test (fork server-context.cpp 21075-21158)
+server_rejected_prompt_preservation_result
+server_rejected_prompt_preservation_for_test() {
+    server_rejected_prompt_preservation_result result;
+    server_context_impl context;
+    context.sleeping = true;
+
+    server_retention_sidecar_store retention;
+    context.slots.emplace_back();
+    auto & slot = context.slots.front();
+    slot.id = 0;
+    slot.n_ctx = 8;
+    slot.prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6 }, false);
+    slot.prompt.sequence_epoch = 1;
+    slot.prompt.checkpoints.emplace_back();
+    slot.prompt.checkpoints.back().n_tokens = 4;
+    slot.retention_obs = &retention;
+
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, 6);
+    const auto live_key = server_retention_instance_key::for_slot(slot.id);
+    const auto checkpoint_key = server_retention_instance_key::for_checkpoint(
+        slot.id, &slot.prompt.checkpoints.front());
+    if (!retention.publish(
+            live_key, common_retention_pool::attention, spans,
+            true, 6, 6, true) ||
+        !retention.publish(
+            checkpoint_key, common_retention_pool::attention, spans,
+            true, 6, 4, true, nullptr, nullptr, &live_key)) {
+        return result;
+    }
+    const auto live_artifact = retention.artifact_id(live_key);
+    const auto checkpoint_artifact = retention.artifact_id(checkpoint_key);
+
+    const llama_tokens prompt_before = slot.prompt.tokens.get_tokens();
+    const size_t checkpoints_before = slot.prompt.checkpoints.size();
+    const server_context_impl::slot_prompt_admission_geometry geometry {
+        true, 4,
+    };
+    context.prompt_admission_geometry_for_test = &geometry;
+
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = 77;
+    task.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, false);
+    context.queue_results.add_waiting_task_id(task.id);
+    context.process_single_task(std::move(task), false);
+
+    auto response = context.queue_results.recv(77);
+    const auto * error = dynamic_cast<const server_task_result_error *>(
+        response.get());
+    result.rejected = error &&
+        error->err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+    result.error_geometry_valid = error &&
+        error->n_prompt_tokens == 9 && error->n_ctx == 8;
+
+    server_task parent(SERVER_TASK_TYPE_COMPLETION);
+    parent.id = 78;
+    parent.tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7 }, false);
+    parent.add_child(parent.id, 79);
+    parent.child_tasks.front().tokens = server_tokens(
+        llama_tokens { 1, 2, 3, 4, 5, 6, 7, 8 }, false);
+    context.queue_results.add_waiting_task_id(79);
+    context.process_single_task(std::move(parent), false);
+    auto child_response = context.queue_results.recv(79);
+    const auto * child_error =
+        dynamic_cast<const server_task_result_error *>(child_response.get());
+    result.oversized_child_rejected = child_error &&
+        child_error->err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE &&
+        child_error->n_prompt_tokens == 8 && child_error->n_ctx == 8;
+    result.selection_skipped =
+        context.prompt_selection_calls_for_test == 0;
+
+    result.prompt_preserved =
+        slot.prompt.tokens.get_tokens() == prompt_before;
+    result.checkpoints_preserved =
+        slot.prompt.checkpoints.size() == checkpoints_before &&
+        slot.prompt.checkpoints.front().n_tokens == 4;
+    result.retention_preserved =
+        retention.artifact_id(live_key) == live_artifact &&
+        retention.artifact_id(checkpoint_key) == checkpoint_artifact;
     return result;
 }
 

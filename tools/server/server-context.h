@@ -44,6 +44,20 @@ server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
 
 // fork 9l-d4b7u: the VBR reclaim-policy test oracle (fork server-context.h 189-209)
+// fork 9l-d4b7z: server_rejected_prompt_preservation_result (fork server-context.h 144-155)
+struct server_rejected_prompt_preservation_result {
+    bool rejected = false;
+    bool prompt_preserved = false;
+    bool checkpoints_preserved = false;
+    bool retention_preserved = false;
+    bool error_geometry_valid = false;
+    bool oversized_child_rejected = false;
+    bool selection_skipped = false;
+};
+
+server_rejected_prompt_preservation_result
+server_rejected_prompt_preservation_for_test();
+
 struct server_vbr_reclaim_policy_result {
     bool learned_kept_hot = false;
     bool learned_removed_cold = false;
