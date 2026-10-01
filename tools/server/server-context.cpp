@@ -1576,11 +1576,60 @@ struct server_slot {
         return res;
     }
 
-    void copy_state_to(server_slot & other) const {
+    // fork 9l-d4b7r: server_slot::copy_state_to (fork server-context.cpp
+    // 3058-3091).  Two things change, and neither is cosmetic:
+    //
+    //   1. IT RETURNS BOOL.  The copy is transactional: a recurrent
+    //      companion with no free cell cannot clone, and the caller must
+    //      not run the child on empty state.  This tree used to swallow
+    //      exactly that failure -- llama_memory_hybrid_iswa::seq_cp() is
+    //      `(void) try_seq_cp(...)`.  See the corrected marker on decode().
+    //
+    //   2. THE DROP IS VBR-OBSERVED.  The child's live range is admitted
+    //      through observe_live_range_drop(child_release, true) BEFORE the
+    //      physical drop, and the draft companion is dropped explicitly.
+    //      An unobserved seq_rm is invisible to the retention layer, which
+    //      is what the old mem.seq_rm() here was.
+    //
+    // Two deliberate deviations, both pinned by test_9l_d4b7r_guards.py:
+    //   a) the fork calls the public llama_memory_try_seq_cp() wrapper.
+    //      This tree has no such wrapper and does not need one:
+    //      llama_memory_i already exposes the identical operation as the
+    //      public virtual try_seq_cp() (src/llama-memory.h), reachable here
+    //      through src/llama-context.h, and llama_get_memory() returns the
+    //      very object the wrapper would forward to.  Adding a function to
+    //      include/llama.h costs a 170-TU rebuild for one call site, so the
+    //      wrapper's body -- including its null check -- is inlined at the
+    //      two copy sites instead.  Same semantics, one TU.
+    //   b) the ON_DEVICE checkpoint filter is upstream-only.  The fork has
+    //      no `data_tgt_on_device` at all (0 occurrences tree-wide), so the
+    //      fork's silence here is absence, not deletion.
+    // Returns false if the state copy could not be performed (for example, the recurrent pool has no
+    // free cell for the child) -- the caller must not run the child on empty state
+    bool copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        other.observe_live_range_drop(
+            server_cache_destruction_reason::child_release, true);
+        ::server_cache_live_range_drop_impl(ctx_tgt, other.id, -1, -1);
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        if (!mem_tgt || !mem_tgt->try_seq_cp(id, other.id, -1, -1)) {
+            return false;
+        }
+
+        if (ctx_dft) {
+            ::server_cache_live_range_drop_impl(ctx_dft, other.id, -1, -1);
+            llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+            if (!mem_dft || !mem_dft->try_seq_cp(id, other.id, -1, -1)) {
+                return false;
+            }
+        }
+
+        common_speculative_sequence_transition(
+            other.get_spec(), other.id,
+            ctx_dft
+                ? common_speculative_sequence_event::draft_image_restored
+                : common_speculative_sequence_event::target_restored_without_draft);
 
         other.i_batch = i_batch;
 
@@ -1593,7 +1642,9 @@ struct server_slot {
         other.prompt.checkpoints.remove_if([](const common_prompt_checkpoint & ckpt) {
             return ckpt.data_tgt_on_device;
         });
+        other.cache_family = cache_family;
         other.init_sampler();
+        return true;
     }
     // --- computation-frontier and speculative accessors (slice 7d part 3b) ---
 
@@ -9173,8 +9224,13 @@ private:
     //    - DFlash flush (common_speculative_flush_prefill): DFlash is not ported here.
     //  Upstream-only lines the fork dropped are restored: is_prompt / homogeneous_phase /
     //  decode_phase + llama_set_decode_phase, and the raw `model_dft` pointer.
-    //  The recurrent copy_state_to bool is not taken: this tree uses the newer
-    //  mem.seq_rm/mem.seq_cp implementation, which cannot fail.
+    //  The recurrent copy_state_to bool IS taken as of 9l-d4b7r.  The two
+    //  lines this replaced claimed mem.seq_cp "cannot fail"; that was wrong
+    //  -- llama_memory_hybrid_iswa::seq_cp() is `(void) try_seq_cp(...)`, so
+    //  it swallows a failed clone and lets the child run on empty state.
+    //  copy_state_to() now reports the failure and its call site fails the
+    //  child.  A justification that turns out to be false is a correction,
+    //  not a deletion: it stays here so nobody re-derives it.
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -9389,7 +9445,20 @@ private:
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
-                    slot.copy_state_to(*child);
+                    // fork 9l-d4b7r: the fork refuses to run a child on state
+                    // that was never copied (fork server-context.cpp 18677-18686).
+                    // This is the other half of taking the bool: without it the
+                    // bool is write-only and the child still runs empty.
+                    if (!slot.copy_state_to(*child)) {
+                        // the recurrent pool had no free cell to clone into: fail the child rather
+                        // than run it on empty state.
+                        SLT_ERR(*child, "%s\n", "failed to copy parent state to child (recurrent pool full)");
+                        send_error(*child, "Failed to clone parent state to child slot");
+                        child->release();
+                        child->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
+                        continue;
+                    }
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }
