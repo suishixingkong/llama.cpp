@@ -1347,7 +1347,21 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // fork 9l-d4b7s: true if a token-identical entry with the SAME adapter identity is already fully
+    // cached, i.e. the state is durable and the live slot may be safely cleared without saving again
+    // (fork server-task.h 1387-1389).  Identity-scoped: token equality under another adapter is not
+    // a durable copy.
+    bool contains(const server_tokens & tokens, const std::string & adapter_config_key) const;
+
+    // fork 9l-d4b7s (fork server-task.h 1572-1580)
+    // Transactional save is a stage -> fill -> publish sequence. stage() allocates a detached
+    // single-node list WITHOUT touching `states`; any allocation failure there leaves the cache
+    // completely untouched (no eviction, no limit change). The caller fills + validates the state
+    // bytes; publish() then removes now-obsolete entries and splices the completed node in (no
+    // allocation, no throw). A failed fill drops the staged node -- never a poisoned/half-filled
+    // published entry, never an eviction that bought nothing.  This replaces the upstream
+    // `alloc()` (absent from the fork), which evicted before it knew the bytes could be written.
+    std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

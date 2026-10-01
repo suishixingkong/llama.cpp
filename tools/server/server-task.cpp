@@ -1866,6 +1866,13 @@ server_prompt_cache::const_iterator server_prompt_cache::find_state_exact(
         tokens, adapter_config_key);
 }
 
+// fork 9l-d4b7s: server_prompt_cache::contains (fork server-task.cpp 2412-2416)
+bool server_prompt_cache::contains(
+        const server_tokens & tokens,
+        const std::string & adapter_config_key) const {
+    return find_state_exact(tokens, adapter_config_key) != states.end();
+}
+
 //
 // server_prompt_cache
 //
@@ -2279,96 +2286,108 @@ bool server_cache_lease_build_identity(
            out.valid();
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
-        }
-    }
-
-    // Device-backed checkpoints are transient views into llama_context::mem_storage. They cannot
-    // outlive/migrate with a prompt-cache entry. The full sequence state saved below already
-    // contains the recurrent rollback planes, so persist only portable host-backed checkpoints.
-    std::list<common_prompt_checkpoint> portable_checkpoints;
+// fork 9l-d4b7s: server_prompt_cache::stage (fork server-task.cpp 2432-2526).
+// This is the fork's replacement for the upstream `alloc()` this port still had.
+// It posts nothing into `states`: every throwing allocation happens on a detached
+// single-node list, so a save that cannot be completed leaves the cache exactly as
+// it was (no eviction, no limit reduction).  The two pieces of upstream behaviour
+// that `alloc()` folded in -- obsolete-entry removal and limit enforcement -- moved
+// to publish()/publish_impl()/update_impl(), which is why the idle-slot caller in
+// server-context.cpp no longer needs its own `update()`.
+std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, std::string adapter_config_key) {
+    // Calculate the entry's marginal physical bytes before allocating it.
+    // Lifecycle-off retains the historical logical sum. Under authority, a
+    // live checkpoint plane already bound to this ledger is resident and the
+    // host save adds only another reference; unbound aliases within the same
+    // prompt are counted once.
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        if (ckpt.data_tgt_on_device) {
-            continue;
+    if (publish_authority && acct) {
+        try {
+            std::vector<const void *> unbound;
+            unbound.reserve(prompt.checkpoints.size() * 4);
+            const auto add_plane = [&](const common_shared_byte_buffer & plane) {
+                if (plane.empty()) {
+                    return true;
+                }
+                const void * owner = nullptr;
+                uint64_t allocation = 0;
+                if (plane.accounting_binding(owner, allocation)) {
+                    return owner == acct;
+                }
+                const auto identity = plane.storage_identity();
+                if (!identity) {
+                    return false;
+                }
+                if (std::find(unbound.begin(), unbound.end(), identity) !=
+                        unbound.end()) {
+                    return true;
+                }
+                if (plane.size() > SIZE_MAX - checkpoints_size) {
+                    return false;
+                }
+                unbound.push_back(identity);
+                checkpoints_size += plane.size();
+                return true;
+            };
+            for (const auto & ckpt : prompt.checkpoints) {
+                if (!add_plane(ckpt.data_tgt) ||
+                    !add_plane(ckpt.data_dft) ||
+                    !add_plane(ckpt.data_qsa) ||
+                    !add_plane(ckpt.accel.ring) ||
+                    !add_plane(ckpt.accel.spec)) {
+                    return {};
+                }
+            }
+        } catch (...) {
+            return {};
         }
-        checkpoints_size += ckpt.size();
-        portable_checkpoints.push_back(ckpt);
+    } else {
+        for (const auto & ckpt : prompt.checkpoints) {
+            if (ckpt.size() > SIZE_MAX - checkpoints_size) {
+                return {};
+            }
+            checkpoints_size += ckpt.size();
+        }
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    if (state_size_dft > SIZE_MAX - state_size_tgt ||
+        checkpoints_size > SIZE_MAX - state_size_tgt - state_size_dft) {
+        return {};
+    }
+    const size_t state_size_new =
+        state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    // this state can't be cached at all; report failure (the caller keeps the live slot)
+    if (!fits_bytes(state_size_new)) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
+        return {};
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
-    }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
-    // check if we can allocate enough memory for the new state
+    // Allocate the entry as a DETACHED single-node list, entirely outside `states`. Every allocation
+    // that can throw (the list node, the state vectors, the token clone, the checkpoint copy) is
+    // performed here; on any failure we return an empty list and leave the cache completely
+    // untouched: no eviction or limit reduction for a save that did not happen. publish()
+    // then splices this node in without allocating.
+    std::list<server_prompt_cache_state> staged;
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        staged.emplace_back();
+        auto & entry = staged.back();
+        auto * fixed = entry.payload.fixed_state();
+        GGML_ASSERT(fixed != nullptr);
+
+        fixed->main.resize(state_size_tgt);
+        fixed->drft.resize(state_size_dft);
+        entry.prompt.tokens      = prompt.tokens.clone();
+        entry.prompt.checkpoints = prompt.checkpoints;
+        entry.prompt.sequence_epoch = prompt.sequence_epoch;
+        entry.adapter_config_key = std::move(adapter_config_key);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
+        return {};
     }
 
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ std::move(portable_checkpoints),
-        },
-        /*.payload =*/ {},
-    });
-
-    // a default-constructed payload owns an empty fixed-state image; fill it in place
-    auto * fixed = states.back().payload.fixed_state();
-    GGML_ASSERT(fixed != nullptr);
-    fixed->main = std::move(state_data_tgt);
-    fixed->drft = std::move(state_data_dft);
-
-    return &states.back();
+    return staged;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {

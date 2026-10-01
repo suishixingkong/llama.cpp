@@ -1058,6 +1058,21 @@ static void server_cache_mandatory_recovery_reset_impl(
     common_context_seq_rm(ctx, seq_id, p0, p1);
 }
 
+// fork 9l-d4b7s: outcome of an attempt to save a slot's state to the host prompt
+// cache (fork server-context.cpp 1407-1417).  A live slot may be cleared without
+// losing state only when its state is now durable in the cache (published OR
+// already cached under the same identity); a `failed` save must NOT be followed
+// by a clear.
+enum class prompt_save_result {
+    published,       // a new entry was saved to the cache
+    already_durable, // the state was already fully cached under this adapter identity
+    failed,          // could not be cached (empty prompt, zero/short state, over-limit, OOM, short write)
+};
+
+static inline bool prompt_save_durable(prompt_save_result r) {
+    return r == prompt_save_result::published || r == prompt_save_result::already_durable;
+}
+
 struct server_slot {
     int id;
 
@@ -1128,36 +1143,125 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // fork 9l-d4b7s: the transactional durability front half (fork
+    // server-context.cpp 1680-1786).  Two things change relative to the
+    // upstream body this port still had, and neither is cosmetic:
+    //
+    //   1. IT RETURNS prompt_save_result, NOT bool.  `already_durable` is a
+    //      distinct outcome from `published`: a caller may clear the live slot
+    //      on EITHER, but must never clear it on `failed`.
+    //
+    //   2. THE SAVE IS TRANSACTIONAL.  The upstream `alloc()` evicted entries
+    //      and pushed a new node into `states` BEFORE the state bytes were
+    //      written, so an OOM or a short write left a truncated published
+    //      entry.  stage() builds a detached node, the caller validates the
+    //      exact written length, and publish() splices it in only then.
+    prompt_save_result prompt_save(
+            server_prompt_cache & prompt_cache,
+            bool refresh_exact = false,
+            server_prompt_cache::iterator * published = nullptr) const {
+        if (published) {
+            *published = prompt_cache.states.end();
+        }
         if (prompt.tokens.size() == 0) {
-            return false;
+            return prompt_save_result::failed;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        // Everything below allocates (identity key, staged node, token/checkpoint clones). Any OOM
+        // must degrade the save to `failed` (the caller keeps the live slot) rather than escape and
+        // abort the server. stage() is already allocation-neutral internally; this catch also covers
+        // the identity-string construction and the by-value key hand-off.
+        try {
+            const std::string adapter_key = lora_config_identity(lora);
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+            // Ordinary durability accepts an existing identical token key.
+            // recovery source requests a fresh exact three-payload image so recovery of
+            // the displaced live state cannot cite an older checkpoint or
+            // accelerator payload that happens to share those tokens.
+            if (!refresh_exact &&
+                prompt_cache.contains(prompt.tokens, adapter_key)) {
+                return prompt_save_result::already_durable;
+            }
 
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+            // Missing optional retention metadata is a local save miss. Check
+            // it before sizing, allocating, or writing what can be a multi-GiB
+            // host image; publish() repeats the check immediately before its
+            // first mutation.
+            if (!prompt_cache.retention_sources_available(prompt, id)) {
+                SLT_WRN(*this, "%s",
+                        "prompt cache save skipped: retention source incomplete\n");
+                return prompt_save_result::failed;
+            }
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
+            const size_t cur_size_tgt = llama_state_seq_get_size_ext(
+                ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t cur_size_dft = ctx_dft
+                ? llama_state_seq_get_size_ext(
+                    ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                : 0;
+
+            // A zero-size declared state is never a valid snapshot: an empty target would publish
+            // an entry that "restores" as a 0 == 0 false success, and an empty draft alongside a valid
+            // target would restore target-only, leaving the two sides on different states. Require a
+            // non-empty target, and a non-empty draft whenever a draft context exists.
+            if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
+                SLT_WRN(*this, "prompt cache save skipped: zero-size state (target %zu, draft %zu)\n", cur_size_tgt, cur_size_dft);
+                return prompt_save_result::failed;
+            }
+
+            const size_t cur_size = cur_size_tgt + cur_size_dft;
+            SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                    (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+
+            // Stage -> fill -> validate -> publish. Fill the staged node and verify the writer
+            // returned the exact declared length BEFORE publishing; a short write (e.g. a dynamic VBR
+            // state_write refusal after a degrade) aborts the save without touching the cache,
+            // instead of publishing a truncated entry. On any failure the state is not durable.
+            auto staged = prompt_cache.stage(prompt, cur_size_tgt, cur_size_dft, adapter_key);
+            if (staged.empty()) {
+                return prompt_save_result::failed;
+            }
+            auto & entry = staged.front();
+            // An idle save has no active task and therefore keeps the
+            // historical automatic-main default. Checkpoint pricing below is
+            // intentionally the opposite polarity: no request means no
+            // provisional automatic-main claim. A declaration overrides both.
+            server_prompt_cache_apply_family(
+                entry, cache_family, !task || !task->is_child());
+            auto * fixed = entry.payload.fixed_state();
+            GGML_ASSERT(fixed != nullptr);
+
+            size_t n_tgt = llama_state_seq_get_data_ext(
+                ctx_tgt, fixed->main.data(), cur_size_tgt,
+                id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (server_fault("save_short")) { n_tgt = cur_size_tgt > 0 ? cur_size_tgt - 1 : 0; } // Save fault seam.
+            if (n_tgt != cur_size_tgt) {
+                SLT_WRN(*this, "prompt cache save aborted: target state write %zu != %zu bytes\n", n_tgt, cur_size_tgt);
+                return prompt_save_result::failed;
+            }
+
+            if (ctx_dft) {
+                const size_t n_dft = llama_state_seq_get_data_ext(
+                    ctx_dft, fixed->drft.data(), cur_size_dft,
+                    id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n_dft != cur_size_dft) {
+                    SLT_WRN(*this, "prompt cache save aborted: draft state write %zu != %zu bytes\n", n_dft, cur_size_dft);
+                    return prompt_save_result::failed;
+                }
+            }
+
+            if (!prompt_cache.publish(
+                    std::move(staged), &prompt, id, published)) {
+                SLT_WRN(*this, "%s",
+                        "prompt cache save refused at lifecycle admission boundary\n");
+                return prompt_save_result::failed;
+            }
+
+            return prompt_save_result::published;
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(*this, "%s", "prompt cache save aborted: out of memory\n");
+            return prompt_save_result::failed;
         }
-
-        auto * cur_fixed = cur->payload.fixed_state();
-        if (cur_fixed == nullptr) {
-            SLT_WRN(*this, "%s", "prompt cache entry has no fixed state to save into\n");
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur_fixed->main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur_fixed->drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -6260,14 +6364,17 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const prompt_save_result saved = slot.prompt_save(*prompt_cache);
+                                if (saved == prompt_save_result::published) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                // clear the live slot only if its state is now durable in the cache
+                                // A failed save must not destroy the only copy of the state.
+                                if (params_base.kv_unified && prompt_save_durable(saved)) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    slot.prompt_clear(
+                                        server_cache_destruction_reason::idle_reclaim);
                                 }
                             }
                         }
