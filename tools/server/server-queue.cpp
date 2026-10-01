@@ -174,6 +174,8 @@ static bool task_resets_idle_timer(server_task_type type) {
 
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    // fork 9l-d4b8d: a post invalidates any idle capture in flight.
+    cancel_idle_capture_locked();
     GGML_ASSERT(task.id != -1);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
@@ -196,6 +198,10 @@ int server_queue::post(server_task && task, bool front) {
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    // fork 9l-d4b8d: same, but only when something was actually posted.
+    if (!tasks.empty()) {
+        cancel_idle_capture_locked();
+    }
     bool reset_timer = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
@@ -222,6 +228,8 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    // fork 9l-d4b8d: a deferred task is still a task the capture cannot see.
+    cancel_idle_capture_locked();
     QUE_DBG("defer task, id = %d\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
@@ -278,6 +286,10 @@ void server_queue::wait_until_no_sleep() {
 
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    // fork 9l-d4b8d: termination both latches the stop flag and kills the
+    // capture, so a later try_begin_idle_capture() also stays refused.
+    idle_capture_stopped = true;
+    cancel_idle_capture_locked();
     running = false;
     condition_tasks.notify_all();
 }

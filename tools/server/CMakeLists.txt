@@ -156,3 +156,21 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-cache-checkpoint-ring-changed COMMAND test-cache-checkpoint-ring-changed)
     set_property(TEST test-cache-checkpoint-ring-changed PROPERTY LABELS main)
 endif()
+
+# The fork's model-free prompt-cache suite (slice 9l-d4b8d).  5,114 lines, and the
+# reason 9l-d4b8b/9l-d4b8c exist: it constructs a `server_prompt_cache` with NO
+# llama_context and pins each phase of a host restore, of the retention mirror, and
+# of teardown on its own.  It is also the first thing that actually CALLS seven of
+# the nine `*_for_test` oracles in this port -- until now they were landed but
+# inert.  Model-free; runs on CPU.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-server-prompt-cache
+        ${PROJECT_SOURCE_DIR}/tests/test-server-prompt-cache.cpp)
+    target_link_libraries(test-server-prompt-cache PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-server-prompt-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
+    add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
+    set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
+endif()
