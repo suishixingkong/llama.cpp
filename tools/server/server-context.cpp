@@ -243,6 +243,37 @@ bool server_vbr_stem_matches_capture_source(
 }
 
 // fork 9l-d4b7k: the slot-envelope layer (fork server-context.cpp 155-237).
+// fork 9l-d4b8a: server_context_shift_capability (fork server-context.cpp 124-153)
+enum class server_context_shift_capability_status {
+    enabled,
+    request_disabled,
+    target_unsupported,
+    draft_unsupported,
+};
+
+struct server_context_shift_capability {
+    server_context_shift_capability_status status =
+        server_context_shift_capability_status::request_disabled;
+    bool enabled = false;
+    bool shift_draft = false;
+};
+
+server_context_shift_capability server_context_shift_capability_resolve(
+        bool requested,
+        bool target_can_shift,
+        bool draft_present,
+        bool draft_can_shift) noexcept {
+    if (!requested) {
+        return {};
+    }
+    if (!target_can_shift) {
+        return { server_context_shift_capability_status::target_unsupported, false, false };
+    }
+    if (draft_present && !draft_can_shift) {
+        return { server_context_shift_capability_status::draft_unsupported, false, false };
+    }
+    return { server_context_shift_capability_status::enabled, true, draft_present };
+}
 constexpr char SERVER_SLOT_ENVELOPE_MAGIC[8] = {
     'B', 'U', 'U', 'N', 'S', 'L', 'O', 'T',
 };
@@ -2818,6 +2849,11 @@ struct server_context_impl {
     friend server_vbr_slot_selection_result
         server_vbr_slot_selection_for_test(
             server_cache_lease_fallback_provider * lease_fallback);
+    // fork 9l-d4b8a: the LAST friendship of the fork group (fork
+    // server-context.cpp 3422-3423), landed in the same commit as its
+    // definition.
+    friend server_mmproj_lifecycle_test_result
+        server_mmproj_lifecycle_for_test();
 
 public:
     // only use these pointers outside of this class:
@@ -17430,6 +17466,127 @@ server_vbr_retention_wiring_for_test() {
         authority_metadata, nullptr, authority_plan);
     result.authority_prefix_tracking_enabled =
         authority_metadata.prefix_tracking_enabled();
+    return result;
+}
+
+// fork 9l-d4b8a: server_mmproj_lifecycle_for_test (fork server-context.cpp 19986-20096)
+server_mmproj_lifecycle_test_result
+server_mmproj_lifecycle_for_test() {
+    server_mmproj_lifecycle_test_result result;
+
+    // Exercise the same rebinding door used by production restoration. The
+    // opaque addresses are identity sentinels only; neither the rebinder nor
+    // common_memory::init dereferences them.
+    server_context_impl context;
+    context.sleeping = true;
+    context.slots.emplace_back();
+    server_slot & slot = context.slots.front();
+    slot.id = 0;
+    slot.ctx_tgt = reinterpret_cast<llama_context *>(uintptr_t(0x1000));
+    slot.ctx_dft = reinterpret_cast<llama_context *>(uintptr_t(0x2000));
+    // fork 9l-d4b8a: DELIBERATE DEVIATION, and the shape is the one 9l-d4b7x
+    // already recorded.  The fork keeps TWO speculative handles -- an owned
+    // `spec` plus a non-owning `spec_shared` -- and writes the identity sentinel
+    // into spec_shared.  This port carries a single raw pointer to the shared
+    // owner (`spec`; see the FORK-DIFF note on get_spec()), so the sentinel and
+    // the three null checks below all read `spec`.  Copying the fork verbatim
+    // does not compile; dropping the sentinel would leave the rebinding arm
+    // asserting nothing.
+    slot.spec = reinterpret_cast<common_speculative *>(uintptr_t(0x3000));
+    slot.mem.init(slot.ctx_tgt, slot.ctx_dft);
+
+    context.bind_slots_to_draft_context(nullptr, nullptr);
+    result.null_binding_clears_views =
+        slot.ctx_dft == nullptr &&
+        slot.mem.ctx_tgt == slot.ctx_tgt &&
+        slot.mem.ctx_dft == nullptr &&
+        slot.spec == nullptr &&
+        !slot.can_speculate();
+
+    llama_context * replacement =
+        reinterpret_cast<llama_context *>(uintptr_t(0x4000));
+    context.bind_slots_to_draft_context(replacement, nullptr);
+    result.restored_binding_updates_views =
+        slot.ctx_dft == replacement &&
+        slot.mem.ctx_tgt == slot.ctx_tgt &&
+        slot.mem.ctx_dft == replacement &&
+        slot.spec == nullptr;
+
+    // A failed recreation takes the same target-only terminal as a restore
+    // exception: all prior successful views must be revoked together.
+    context.bind_slots_to_draft_context(nullptr, nullptr);
+    result.failed_recreation_stays_null =
+        slot.ctx_dft == nullptr &&
+        slot.mem.ctx_dft == nullptr &&
+        slot.spec == nullptr &&
+        !slot.can_speculate();
+
+    const auto restore_count = [](
+            bool throw_media,
+            bool throw_callback,
+            bool throw_restore) {
+        int count = 0;
+        try {
+            server_mmproj_restore_guard guard([&]() {
+                ++count;
+                if (throw_restore) {
+                    throw std::runtime_error("injected restore failure");
+                }
+            });
+            guard.arm();
+            if (throw_media) {
+                throw std::runtime_error("injected media failure");
+            }
+            if (throw_callback) {
+                throw std::runtime_error("injected callback failure");
+            }
+            guard.restore_now();
+            guard.restore_now();
+        } catch (...) {
+            // The production queue propagates the original work/callback
+            // exception after the guard's destructor restores draft state.
+        }
+        return count;
+    };
+
+    result.normal_restore_once =
+        restore_count(false, false, false) == 1;
+    result.thrown_media_restore_once =
+        restore_count(true, false, false) == 1;
+    result.thrown_callback_restore_once =
+        restore_count(false, true, false) == 1;
+    result.throwing_restore_not_retried =
+        restore_count(false, false, true) == 1;
+
+    const auto simulate_shift = [](
+            const server_context_shift_capability & capability) {
+        std::pair<int, int> calls = { 0, 0 };
+        if (capability.enabled) {
+            ++calls.first;
+            if (capability.shift_draft) {
+                ++calls.second;
+            }
+        }
+        return calls;
+    };
+    const auto incompatible = server_context_shift_capability_resolve(
+        true,  // requested
+        true,  // target can shift
+        true,  // draft present
+        false  // draft cannot shift
+    );
+    const auto incompatible_calls = simulate_shift(incompatible);
+    result.incompatible_draft_disables_shift =
+        !incompatible.enabled &&
+        incompatible.status == server_context_shift_capability_status::draft_unsupported;
+    result.incompatible_draft_not_shifted = incompatible_calls.second == 0;
+
+    const auto compatible = server_context_shift_capability_resolve(
+        true, true, true, true);
+    const auto compatible_calls = simulate_shift(compatible);
+    result.compatible_draft_enables_shift = compatible.enabled;
+    result.compatible_draft_shifted =
+        compatible_calls.first == 1 && compatible_calls.second == 1;
     return result;
 }
 

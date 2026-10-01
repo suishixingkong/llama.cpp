@@ -58,6 +58,27 @@ struct server_rejected_prompt_preservation_result {
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test();
 
+// fork 9l-d4b8a: server_mmproj_lifecycle_test_result (fork server-context.h 157-175)
+struct server_mmproj_lifecycle_test_result {
+    bool null_binding_clears_views = false;
+    bool restored_binding_updates_views = false;
+    bool failed_recreation_stays_null = false;
+    bool normal_restore_once = false;
+    bool thrown_media_restore_once = false;
+    bool thrown_callback_restore_once = false;
+    bool throwing_restore_not_retried = false;
+    bool incompatible_draft_disables_shift = false;
+    bool incompatible_draft_not_shifted = false;
+    bool compatible_draft_enables_shift = false;
+    bool compatible_draft_shifted = false;
+};
+
+// TEST-ONLY model-free exercise of the production slot rebinder and exactly-once
+// restoration guard. It uses opaque pointer identities but never dereferences
+// them, so ownership transitions can be proved without loading a projector.
+server_mmproj_lifecycle_test_result
+server_mmproj_lifecycle_for_test();
+
 struct server_vbr_reclaim_policy_result {
     bool learned_kept_hot = false;
     bool learned_removed_cold = false;
