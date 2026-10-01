@@ -1211,6 +1211,10 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        // fork server-context.cpp:2379 -- a recycled slot must not inherit a
+        // stale authenticated row from the task that owned it before.
+        frontier_logits.pending = false;
+
         spec_is_replay = false;
 
         last_nl_pos    = 0;
@@ -2654,6 +2658,13 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // fork server-context.cpp:15644 (a server_context_impl member there too, among
+    // the DFlash cycle flags this port does not carry).  sample_frontier_logits()
+    // sets it, pre_decode() clears it at the top of the cycle, and the empty-batch
+    // gate in update_slots() reads it: an authenticated frontier hit legitimately
+    // finishes prompt processing without contributing a token to the batch.
+    bool frontier_logits_sampled_cycle = false;
 
     // ---------------------------------------------------------------------
     // group C tip: the server_context_impl handles the cache-plan observation
@@ -5493,6 +5504,131 @@ private:
         }
     }
 
+    // fork 9l-d4b7p: the reader chain of slot.frontier_logits.pending.
+    //  Two new members go in front of send_error because that is where the fork
+    //  keeps them (fork server-context.cpp 10718-10835, immediately after
+    //  populate_token_probs and before send_error).
+
+    void populate_token_probs_from_logits(
+            const server_slot & slot,
+            completion_token_output & result,
+            bool post_sampling,
+            bool special,
+            const std::vector<float> & logits) const {
+        const size_t n_probs_request = slot.task->params.sampling.n_probs;
+        if (post_sampling) {
+            const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+            const size_t n_probs = std::min(cur_p->size, n_probs_request);
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == result.tok) {
+                    result.prob = cur_p->data[i].p;
+                    break;
+                }
+            }
+            result.probs.reserve(n_probs);
+            for (size_t i = 0; i < n_probs && cur_p->data[i].p != 0.0f; ++i) {
+                result.probs.push_back({
+                    cur_p->data[i].id,
+                    common_token_to_piece(ctx_tgt, cur_p->data[i].id, special),
+                    cur_p->data[i].p,
+                });
+            }
+            return;
+        }
+
+        auto cur = get_token_probabilities(
+            logits.data(), logits.size(), n_probs_request);
+        const size_t n_probs = std::min(cur.size(), n_probs_request);
+        for (const auto & item : cur) {
+            if (item.id == result.tok) {
+                result.prob = item.p;
+                break;
+            }
+        }
+        result.probs.reserve(n_probs);
+        for (size_t i = 0; i < n_probs; ++i) {
+            result.probs.push_back({
+                cur[i].id,
+                common_token_to_piece(ctx_tgt, cur[i].id, special),
+                cur[i].p,
+            });
+        }
+    }
+
+    void sample_frontier_logits(server_slot & slot) {
+        GGML_ASSERT(slot.state == SLOT_STATE_DONE_PROMPT);
+        GGML_ASSERT(slot.frontier_logits.pending);
+        GGML_ASSERT(slot.task && slot.task->need_sampling());
+
+        struct release_frontier_logits {
+            server_frontier_logits_state & state;
+            ~release_frontier_logits() { state.clear(); }
+        } release { slot.frontier_logits };
+        slot.frontier_logits.pending = false;
+        slot.state = SLOT_STATE_GENERATING;
+        if (slot.can_speculate()) {
+            // FORK-DIFF: the fork dispatches the per-slot drafter first
+            //   (`if (slot.spec) common_speculative_begin(slot.get_spec(), prompt);`)
+            //   and only then falls back to the shared owner.  That branch is not
+            //   taken here.  In the fork slot.spec is an owned per-slot drafter with
+            //   n_seq = 1, so seq 0 is right for it; in this port slot.spec is a raw
+            //   alias of the shared owner (see get_spec(), which this file already
+            //   documents as the identity), so the fork first branch would be taken
+            //   for EVERY slot and would silently move the sequence id from slot.id
+            //   to 0.  The DFlash three lines above it are dropped with DFlash.
+            common_speculative_begin(
+                spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+        }
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample_from_logits(
+                slot.smpl.get(), slot.frontier_logits.values.data(),
+                slot.frontier_logits.values.size());
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error(
+                "authenticated frontier logits could not be sampled");
+        }
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+        slot.stats.n_gen = 1;
+        slot.stats.set_prompt_last(t_now);
+        slot.stats.update_gen_last();
+        slot.t_print_last = t_now;
+        slot.n_gen_last = 0;
+        cache_plan_finalize(slot);
+
+        completion_token_output result;
+        result.tok = id;
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) !=
+                slot.task->params.sampling.preserved_tokens.end();
+        result.text_to_send = common_token_to_piece(ctx_tgt, id, special);
+        result.prob = 1.0f;
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs_from_logits(
+                slot, result, slot.task->params.post_sampling_probs,
+                params_base.special, slot.frontier_logits.values);
+        }
+
+        frontier_logits_sampled_cycle = true;
+        const bool continue_generation = process_token(result, slot);
+        // The row predicts the token just appended by process_token(). The
+        // scope guard releases its O(vocabulary) storage on every terminal,
+        // including sampler/process exceptions.
+        if (!continue_generation) {
+            slot.print_timings();
+            send_final_response(slot);
+            metrics_on_prediction(slot);
+            slot.release();
+            return;
+        }
+        slot.print_timings_tg();
+    }
+
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
     }
@@ -7008,9 +7144,30 @@ private:
             return;
         }
 
+        // fork: the chunk loop below never runs for an empty batch, so the empty-batch
+        // warn/abort lives here — with the diffusion exemption (diffusion slots contribute
+        // no main-batch tokens; they decode their own batches in post_cycle())
+        if (batch.size() == 0) {
+            const bool has_diff_gen = std::any_of(slots.begin(), slots.end(),
+                [](const server_slot & s) { return s.diff_self_spec && s.state == SLOT_STATE_GENERATING; });
+            if (!has_diff_gen && !frontier_logits_sampled_cycle) {
+                SRV_WRN("%s", "no tokens to decode\n");
+                if (++n_empty_consecutive > 3) {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
+            }
+        } else {
+            n_empty_consecutive = 0;
+        }
+
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
-        if (batch.slot_batched) {
+        // An authenticated frontier hit can consume frontier logits and
+        // finish (for example on EOS) without adding a decode token.  Sampling
+        // releases that slot above, so an empty batch must not dereference the
+        // stale assembly-time task pointer merely to configure a decode that
+        // will not run.
+        if (batch.slot_batched && batch.size() != 0) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
             auto & alora_disabled_id = batch.alora_disabled_id;
@@ -7072,6 +7229,7 @@ private:
     }
 
     void pre_decode() {
+        frontier_logits_sampled_cycle = false;
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -8653,13 +8811,16 @@ private:
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
-                        GGML_ASSERT(batch.size() > 0);
-
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
-
                         slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
+                        if (slot.frontier_logits.pending) {
+                            slot.i_batch = -1;
+                        } else {
+                            GGML_ASSERT(batch.size() > 0);
+
+                            // extract the logits only for the last token
+                            batch.set_output(batch.size() - 1, true);
+                            slot.i_batch = batch.size() - 1;
+                        }
 
                         slot.init_sampler();
                     } else {
@@ -8701,6 +8862,17 @@ private:
                 }
             });
         }
+
+        // An authenticated frontier hit can finish prompt processing without adding a token
+        // to the decode batch. Sample its authenticated terminal row through
+        // the ordinary sampler/token pipeline before speculative post-cycle
+        // work begins.
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_DONE_PROMPT &&
+                slot.frontier_logits.pending) {
+                sample_frontier_logits(slot);
+            }
+        }
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -8722,6 +8894,8 @@ private:
         metrics_pre_decode();
 
         if (batch.size() == 0) {
+            // note: normally unreachable — update_slots() skips decode() for an empty batch and
+            //       handles the empty-batch warn/abort (with the diffusion exemption) itself
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {
