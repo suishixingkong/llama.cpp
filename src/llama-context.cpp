@@ -25,10 +25,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -3958,78 +3962,336 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
+// fork 9l-d4b7m: the sequence-state file envelope layer (fork
+// llama-context.cpp 6483-6807).  ONE ATOMIC PAIR: the writer frames a
+// length+checksum v3 envelope around a temp file it publishes by rename, and
+// the reader validates that envelope through llama_state_seq_file_snapshot
+// before it touches sequence memory.  Both halves land here together -- see
+// the module docstring, and skill 03 section 40.1.
+// Sequence state file v3 (all scalar fields use the host byte order, as does the
+// raw state payload):
+//
+//   offset  size  field
+//        0     4  LLAMA_STATE_SEQ_MAGIC (uint32_t)
+//        4     4  LLAMA_STATE_SEQ_VERSION (uint32_t)
+//        8     8  total file size, including this 24-byte header (uint64_t)
+//       16     8  FNV-1a-64 of every payload byte at offsets [24, total size)
+//       24     4  token count (uint32_t)
+//       28   4*n  tokens (raw llama_token values)
+//     28+4*n  ... sequence state payload written by state_seq_write_data()
+//
+// Versions before v3 are deliberately rejected: they have neither a declared
+// length nor a checksum, so accepting them would reintroduce silent corruption.
+static constexpr size_t LLAMA_STATE_SEQ_FILE_HEADER_SIZE = 24;
 
-    // version checks
-    {
+static uint64_t llama_state_seq_file_checksum(const uint8_t * data, size_t size) {
+    static constexpr uint64_t FNV1A64_OFFSET_BASIS = UINT64_C(14695981039346656037);
+    static constexpr uint64_t FNV1A64_PRIME        = UINT64_C(1099511628211);
+
+    uint64_t hash = FNV1A64_OFFSET_BASIS;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= FNV1A64_PRIME;
+    }
+    return hash;
+}
+
+static FILE * llama_state_seq_open_temp_file(const char * filepath, std::string & temp_path) {
+    static std::atomic<uint64_t> counter{0};
+
+    // "x" makes each candidate an exclusive create. The suffix combines time
+    // and a process-local counter; collisions with other writers are retried.
+    const uint64_t epoch = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+    for (uint64_t attempt = 0; attempt < 100; ++attempt) {
+        const uint64_t suffix = epoch ^ counter.fetch_add(1, std::memory_order_relaxed) ^ attempt;
+        temp_path = std::string(filepath) + ".tmp." + std::to_string(suffix);
+
+        errno = 0;
+        FILE * file = ggml_fopen(temp_path.c_str(), "wbx");
+        if (file != nullptr) {
+            return file;
+        }
+        if (errno != EEXIST) {
+            throw std::runtime_error(format("failed to open temporary sequence state file %s: %s",
+                                            temp_path.c_str(), strerror(errno)));
+        }
+    }
+
+    throw std::runtime_error(format("failed to create a unique temporary sequence state file for %s", filepath));
+}
+
+bool llama_state_seq_file_snapshot::copy_packed_token_bytes(
+        std::vector<uint8_t> & output) const noexcept {
+    output.clear();
+    if (!valid()) {
+        return false;
+    }
+    try {
+        const size_t size = size_t(token_count_)*sizeof(llama_token);
+        output.assign(payload_.begin() + sizeof(uint32_t),
+                      payload_.begin() + sizeof(uint32_t) + size);
+        return true;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
+
+size_t llama_state_seq_file_snapshot::packed_token_size() const noexcept {
+    return valid() ? size_t(token_count_)*sizeof(llama_token) : 0;
+}
+
+uint32_t llama_state_seq_file_snapshot::token_count() const noexcept {
+    return valid() ? token_count_ : 0;
+}
+
+bool llama_state_seq_file_snapshot::valid() const noexcept {
+    return total_size_ >= LLAMA_STATE_SEQ_FILE_HEADER_SIZE &&
+        payload_.size() == total_size_ - LLAMA_STATE_SEQ_FILE_HEADER_SIZE &&
+        payload_.size() >= sizeof(uint32_t) &&
+        uint64_t(token_count_)*sizeof(llama_token) <=
+            payload_.size() - sizeof(uint32_t);
+}
+
+void llama_state_seq_file_snapshot::clear() noexcept {
+    total_size_ = 0;
+    token_count_ = 0;
+    payload_.clear();
+}
+
+bool llama_state_seq_file_snapshot_prepare(
+        const char * filepath,
+        llama_state_seq_file_snapshot & output) noexcept {
+    output.clear();
+    try {
+        llama_file file(filepath, "rb");
+
+        if (file.size() < 2*sizeof(uint32_t)) {
+            LLAMA_LOG_ERROR("%s: sequence state file is too small for magic and version: %zu bytes\n",
+                            __func__, file.size());
+            return false;
+        }
+
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
-
         if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
-            return 0;
+            return false;
         }
+
+        if (file.size() < LLAMA_STATE_SEQ_FILE_HEADER_SIZE) {
+            LLAMA_LOG_ERROR("%s: truncated sequence state file header: %zu < %zu bytes\n",
+                            __func__, file.size(), LLAMA_STATE_SEQ_FILE_HEADER_SIZE);
+            return false;
+        }
+
+        file.read_raw(&output.total_size_, sizeof(output.total_size_));
+        uint64_t payload_checksum = 0;
+        file.read_raw(&payload_checksum, sizeof(payload_checksum));
+
+        if (output.total_size_ != file.size()) {
+            LLAMA_LOG_ERROR("%s: sequence state file length mismatch: declared %" PRIu64 ", actual %zu\n",
+                            __func__, output.total_size_, file.size());
+            output.clear();
+            return false;
+        }
+
+        output.payload_.resize(file.size() - LLAMA_STATE_SEQ_FILE_HEADER_SIZE);
+        file.read_raw(output.payload_.data(), output.payload_.size());
+
+        const uint64_t checksum_actual = llama_state_seq_file_checksum(
+            output.payload_.data(), output.payload_.size());
+        if (payload_checksum != checksum_actual) {
+            LLAMA_LOG_ERROR("%s: sequence state file checksum mismatch: declared %016" PRIx64 ", actual %016" PRIx64 "\n",
+                            __func__, payload_checksum, checksum_actual);
+            output.clear();
+            return false;
+        }
+
+        if (output.payload_.size() < sizeof(uint32_t)) {
+            LLAMA_LOG_ERROR("%s: sequence state payload is too small for token count: %zu bytes\n",
+                            __func__, output.payload_.size());
+            output.clear();
+            return false;
+        }
+
+        memcpy(&output.token_count_, output.payload_.data(), sizeof(output.token_count_));
+        if (!output.valid()) {
+            LLAMA_LOG_ERROR("%s: token data exceeds sequence state payload: %u\n",
+                            __func__, output.token_count_);
+            output.clear();
+            return false;
+        }
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing sequence state file: %s\n", __func__, err.what());
+        output.clear();
+        return false;
+    }
+}
+
+size_t llama_context::state_seq_apply_file_snapshot(
+        llama_seq_id seq_id,
+        const llama_state_seq_file_snapshot & snapshot,
+        llama_token * tokens_out,
+        size_t n_token_capacity,
+        size_t * n_token_count_out) {
+    if (!snapshot.valid()) {
+        LLAMA_LOG_ERROR("%s: invalid prepared sequence state snapshot\n", __func__);
+        return 0;
+    }
+    if (n_token_count_out == nullptr) {
+        LLAMA_LOG_ERROR("%s: token count output pointer is null\n", __func__);
+        return 0;
     }
 
-    // load the prompt
-    {
-        const uint32_t n_token_count = file.read_u32();
-
-        if (tokens_out == nullptr) {
-            const size_t n_token_max = (file.size() - file.tell()) / sizeof(llama_token);
-            if (n_token_count > n_token_max) {
-                LLAMA_LOG_ERROR("%s: token count in sequence state file exceeds the file size! %u > %zu\n", __func__, n_token_count, n_token_max);
-                return 0;
-            }
-
-            *n_token_count_out = n_token_count;
-            return file.tell();
-        }
-
-        if (n_token_count > n_token_capacity) {
-            LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
-            return 0;
-        }
-
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
+    if (tokens_out == nullptr) {
+        *n_token_count_out = snapshot.token_count_;
+        return size_t(snapshot.total_size_);
+    }
+    if (snapshot.token_count_ > n_token_capacity) {
+        LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n",
+                        __func__, snapshot.token_count_, n_token_capacity);
+        return 0;
     }
 
-    // restore the context state
-    {
-        const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+    const size_t tokens_size  = size_t(snapshot.token_count_)*sizeof(llama_token);
+    const size_t state_offset = sizeof(uint32_t) + tokens_size;
+    const size_t state_size   = snapshot.payload_.size() - state_offset;
+
+    // The complete file has now passed length, checksum, and token bounds
+    // validation. state_seq_read_data() has no non-mutating parser, so a
+    // checksum-valid semantic/structural failure is made coherent by clearing
+    // the destination sequence after the read attempt.
+    try {
+        llama_io_read_host io(snapshot.payload_.data() + state_offset, state_size);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
-            return 0;
+        // Architectures without sequence memory legitimately serialize an
+        // empty state after the token envelope. A zero-byte read is valid
+        // only for that exact zero-byte payload; all partial/nonempty reads
+        // still fail the equality check.
+        if (nread != state_size) {
+            throw std::runtime_error(format("sequence state payload length mismatch: expected %zu, read %zu",
+                                            state_size, nread));
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+    } catch (const std::exception & err) {
+        bool cleared_all = false;
+        if (memory != nullptr && !memory->seq_rm(seq_id, -1, -1)) {
+            // Full-sequence removal succeeds for valid sequence IDs in the
+            // built-in memory implementations. Keep a coherent fallback for
+            // other implementations or an invalid destination ID.
+            memory->clear(true);
+            cleared_all = true;
+        }
+        LLAMA_LOG_ERROR("%s: failed to restore sequence state; %s cleared: %s\n",
+                        __func__, cleared_all ? "all sequence memory" : "destination sequence", err.what());
+        return 0;
     }
 
-    return file.tell();
+    if (tokens_size > 0) {
+        memcpy(tokens_out, snapshot.payload_.data() + sizeof(uint32_t),
+               tokens_size);
+    }
+    // Publish caller-visible outputs only after the semantic state restore has
+    // succeeded. A checksum-valid but structurally invalid state must leave
+    // both the token buffer and count untouched.
+    *n_token_count_out = snapshot.token_count_;
+    return size_t(snapshot.total_size_);
+}
+
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_state_seq_file_snapshot snapshot;
+    if (!llama_state_seq_file_snapshot_prepare(filepath, snapshot)) {
+        return 0;
+    }
+    return state_seq_apply_file_snapshot(
+        seq_id, snapshot, tokens_out, n_token_capacity, n_token_count_out);
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(filepath, "wb");
+    if (n_token_count > UINT32_MAX) {
+        throw std::runtime_error(format("too many tokens for sequence state file: %zu", n_token_count));
+    }
+    if (n_token_count > 0 && tokens == nullptr) {
+        throw std::runtime_error("token input buffer is null");
+    }
+    if (n_token_count > (std::numeric_limits<size_t>::max() - sizeof(uint32_t))/sizeof(llama_token)) {
+        throw std::runtime_error("sequence state token data size overflow");
+    }
 
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    llama_io_write_dummy size_io(false);
+    const size_t state_size = state_seq_write_data(size_io, seq_id, 0);
+    const size_t tokens_size = sizeof(llama_token)*n_token_count;
+    if (state_size > std::numeric_limits<size_t>::max() - sizeof(uint32_t) - tokens_size) {
+        throw std::runtime_error("sequence state payload size overflow");
+    }
 
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
+    const size_t payload_size = sizeof(uint32_t) + tokens_size + state_size;
+    if (payload_size > std::numeric_limits<size_t>::max() - LLAMA_STATE_SEQ_FILE_HEADER_SIZE) {
+        throw std::runtime_error("sequence state file size overflow");
+    }
 
-    // save the context state using stream saving
-    llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
+    std::vector<uint8_t> payload(payload_size);
+    const uint32_t n_token_count_u32 = (uint32_t) n_token_count;
+    memcpy(payload.data(), &n_token_count_u32, sizeof(n_token_count_u32));
+    if (tokens_size > 0) {
+        memcpy(payload.data() + sizeof(n_token_count_u32), tokens, tokens_size);
+    }
 
-    const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
+    {
+        llama_io_write_host io(payload.data() + sizeof(uint32_t) + tokens_size, state_size);
+        const size_t nwritten = state_seq_write_data(io, seq_id, 0);
+        if (nwritten != state_size) {
+            throw std::runtime_error(format("sequence state payload size changed while saving: expected %zu, wrote %zu",
+                                            state_size, nwritten));
+        }
+    }
 
-    return res;
+    const uint64_t total_size = (uint64_t) (LLAMA_STATE_SEQ_FILE_HEADER_SIZE + payload.size());
+    const uint64_t checksum   = llama_state_seq_file_checksum(payload.data(), payload.size());
+
+    std::string temp_path;
+    FILE * temp_fp = llama_state_seq_open_temp_file(filepath, temp_path);
+    try {
+        {
+            llama_file file(temp_fp);
+            file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+            file.write_u32(LLAMA_STATE_SEQ_VERSION);
+            file.write_raw(&total_size, sizeof(total_size));
+            file.write_raw(&checksum, sizeof(checksum));
+            file.write_raw(payload.data(), payload.size());
+        }
+
+        if (fflush(temp_fp) != 0) {
+            throw std::runtime_error(format("failed to flush temporary sequence state file %s: %s",
+                                            temp_path.c_str(), strerror(errno)));
+        }
+        if (fclose(temp_fp) != 0) {
+            temp_fp = nullptr;
+            throw std::runtime_error(format("failed to close temporary sequence state file %s: %s",
+                                            temp_path.c_str(), strerror(errno)));
+        }
+        temp_fp = nullptr;
+
+        std::error_code rename_error;
+        std::filesystem::rename(std::filesystem::u8path(temp_path), std::filesystem::u8path(filepath), rename_error);
+        if (rename_error) {
+            throw std::runtime_error(format("failed to publish sequence state file %s: %s",
+                                            filepath, rename_error.message().c_str()));
+        }
+    } catch (...) {
+        if (temp_fp != nullptr) {
+            fclose(temp_fp);
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(std::filesystem::u8path(temp_path), remove_error);
+        throw;
+    }
+
+    // The destination is only replaced after the complete temporary file has
+    // been flushed and closed. No fsync is issued, so this is atomic publication
+    // but does not promise persistence across sudden power loss.
+    return (size_t) total_size;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
