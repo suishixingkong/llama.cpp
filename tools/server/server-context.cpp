@@ -1310,10 +1310,43 @@ struct server_slot {
         }
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens,
+                     const std::string & adapter_config_key,
+                     common_cache_plan_record * obs = nullptr) {
+        // fork 9l-d4b8b (fork server-context.cpp 1788-1822).  No-restore is a
+        // successful identity operation, so the out-value is seeded with the LIVE
+        // lineage; a committed host restore overwrites it with the entry's own
+        // family below.
+        common_cache_family_binding restored_family = cache_family;
+        server_prompt_cache_restore_shape restore_shape =
+            server_prompt_cache_restore_shape::none;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id,
+                                     adapter_config_key, restore_shape, obs,
+                                     &restored_family);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            switch (restore_shape) {
+                case server_prompt_cache_restore_shape::none:
+                    break;
+                case server_prompt_cache_restore_shape::target_only:
+                    common_speculative_sequence_transition(
+                        get_spec(), id,
+                        common_speculative_sequence_event::
+                            target_restored_without_draft);
+                    break;
+                case server_prompt_cache_restore_shape::target_and_draft:
+                    common_speculative_sequence_transition(
+                        get_spec(), id,
+                        common_speculative_sequence_event::draft_image_restored);
+                    break;
+            }
+            // A host image replaces the live frontier wholesale, including its
+            // immutable family provenance.
+            cache_family = restored_family;
+            if (lifecycle_authority) {
+                checkpoint_ring_changed();
+            }
         }
 
         return res;
@@ -4648,7 +4681,13 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // fork 9l-d4b8b: the adapter identity travels with the lookup so
+                // an entry built under another adapter can never be served.  The
+                // slot's own key is the same expression prompt_save() stores under,
+                // which is what makes the comparison meaningful in this port (the
+                // fork derives it from the incoming request instead -- see the
+                // still-open incoming-adapter finding).
+                if (!ret->prompt_load(*prompt_cache, task.tokens, lora_config_identity(ret->lora))) {
                     ret->prompt_clear();
                 }
 

@@ -2390,7 +2390,21 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
     return staged;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key,
+        server_prompt_cache_restore_shape & restore_shape,
+        common_cache_plan_record * rec,
+        common_cache_family_binding * restored_family) {
+    // fork 9l-d4b8b: `none` is the terminal for BOTH "nothing better was
+    // found" and "a restore was attempted and failed short", so the caller
+    // must not read a non-none shape unless this returned true.
+    restore_shape = server_prompt_cache_restore_shape::none;
+    // The fork dispatches on `rec` to an observed / unobserved load_impl.  This port's
+    // load carries no observer, so `rec` is accepted and ignored: taking it keeps the
+    // signature identical to the fork's while the observer stays a separate refactor.
+    (void) rec;
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2400,19 +2414,37 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // find the most similar cached prompt, that would also preserve the most context.
+    // fork 9l-d4b8b: the fork's UNOBSERVED loop, byte-exact except that the
+    // Observed-only declarations and blocks are omitted (this port's load has no
+    // observer).  Two consequences worth naming:
+    //   * VBR nodes are rejected before their long prefix is scanned -- they use the
+    //     typed restore selector, not the fixed-state scan;
+    //   * the historical `f_keep_cur < 0.25f` heuristic is GONE.  It is absent from
+    //     the fork, i.e. its disappearance is a deletion this port had not taken.
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // Keep fixed-state inventory consistent with the diagnostic scan. VBR nodes
+        // use the typed restore selector; reject them before assigning a
+        // bounded fixed source ID or scanning their long prefix here.
+        if (!it->payload.fixed_state_restorable()) {
+            continue;
+        }
+
+        // never serve state built under a different adapter configuration: token LCP alone
+        // would hand adapter A's KV to a base/adapter-B request. Live-slot rebinds are caught at
+        // launch, but a host-cache entry is restored here during prefill, after that check.
+        if (it->adapter_config_key != adapter_config_key) {
+            continue;
+        }
+
+        // Preserve the shipped instantiation: the potentially O(n)
+        // LCP scan occurs only after both O(1) reject guards.
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
 
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
@@ -2431,6 +2463,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             return false;
         }
+
+        bool draft_image_restored = false; // fork 9l-d4b8b: which sides were restored
 
         {
             auto & data = best_fixed->main;
@@ -2461,10 +2495,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
+                draft_image_restored = true;
+
                 data.clear();
                 data.shrink_to_fit();
             }
         }
+
+        // fork 9l-d4b8b: the two outputs, set only after BOTH restores succeeded and
+        // BEFORE the source is consumed.  `restored_family` is the no-restore identity
+        // terminal read against the caller's live lineage seed: an entry whose family
+        // differs from the slot's must replace it, not be silently adopted.
+        if (restored_family) {
+            *restored_family = it_best->cache_family;
+        }
+        restore_shape = draft_image_restored
+            ? server_prompt_cache_restore_shape::target_and_draft
+            : server_prompt_cache_restore_shape::target_only;
 
         prompt = std::move(it_best->prompt);
 

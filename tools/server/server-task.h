@@ -795,6 +795,17 @@ struct server_prompt {
 };
 
 // fork 9l-d3c2: prompt-shadow workspace types (fork server-task.h 1137-1199)
+
+// fork 9l-d4b8b: what a host restore actually restored (fork
+// server-task.h 1131-1135).  Reported by load() so the caller can fire the
+// matching speculative sequence transition, and so "nothing was restored"
+// is distinguishable from "a restore replaced the lineage".
+enum class server_prompt_cache_restore_shape : uint8_t {
+    none = 0,
+    target_only,
+    target_and_draft,
+};
+
 constexpr size_t SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES =
     SERVER_RETENTION_MAX_CANDIDATES;
 
@@ -1363,7 +1374,16 @@ struct server_prompt_cache {
     // `alloc()` (absent from the fork), which evicted before it knew the bytes could be written.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // fork 9l-d4b8b: the three outputs the fork added (fork server-task.h
+    // 1610-1615).  `rec` is the cache-plan observer row and stays nullptr
+    // here -- the observed/unobserved dispatch of load_impl is a separate
+    // refactor and this port's load has no observer.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new,
+              llama_context * ctx_tgt, llama_context * ctx_dft,
+              int32_t id_slot, const std::string & adapter_config_key,
+              server_prompt_cache_restore_shape & restore_shape,
+              common_cache_plan_record * rec = nullptr,
+              common_cache_family_binding * restored_family = nullptr);
 
     void update();
 
