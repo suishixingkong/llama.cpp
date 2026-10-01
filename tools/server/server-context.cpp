@@ -2778,6 +2778,20 @@ static void server_wire_standalone_retention_metadata(
 
 struct server_context_impl {
     friend struct server_context;
+    // fork 9l-d4b7y: the SWA-window friend (fork server-context.cpp 3413).
+    //
+    // ⚠️ This closes the LAST family symbol as a DECLARATION, not as an
+    // implementation, and the difference is the whole point.  The fork NEVER
+    // DEFINES struct server_swa_window_selection_test -- this line is the ONLY
+    // occurrence of that name in the entire fork (verified across tools/, tests/,
+    // src/, common/ and the CMake files).  So it is a dangling forward
+    // declaration: a friend of an incomplete type.  That is legal C++ and it
+    // emits no symbol at all.
+    //
+    // Landing it is therefore byte-fidelity to the fork and nothing more.  It
+    // grants access to nothing reachable, and any guard that treated "the family
+    // symbol is closed" as "a capability arrived" would be wrong.
+    friend struct server_swa_window_selection_test;
 
     // fork 9l-d4b7u: the friendship the test oracle needs (fork server-context.cpp
     // 3413-3422).  Without it the oracle cannot reach the private statics it
