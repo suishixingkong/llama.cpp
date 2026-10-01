@@ -1668,6 +1668,24 @@ struct server_slot {
         return capture_frontier_logits(output_index, false);
     }
 
+    // fork 9l-d4b7q: server_slot::install_frontier_logits (fork
+    // server-context.cpp 1969-1976).  The restore path is its only caller:
+    // it hands over a row the envelope already authenticated, plus the
+    // DESTINATION slot's own epoch -- never the source's (that is what
+    // makes a restored row refusable once the destination is rebound).
+    //
+    // Its READER (sample_frontier_logits, and the empty-batch gate that
+    // lets i_batch = -1 through) landed in 9l-d4b7p.  Landing this member
+    // without that reader is what killed 9l-d4b7n.
+    void install_frontier_logits(
+            std::vector<float> && logits,
+            const std::array<uint8_t, 32> & token_digest,
+            uint64_t destination_sequence_epoch) noexcept {
+        GGML_ASSERT(destination_sequence_epoch != 0 && !logits.empty());
+        frontier_logits.install(
+            std::move(logits), token_digest, destination_sequence_epoch);
+    }
+
     void bind_frontier_logits_to_prompt() noexcept {
         if (frontier_logits.values.empty()) {
             return;
@@ -2094,6 +2112,32 @@ struct server_slot {
         return observe_full_slot(
             server_cache_destruction_class::mandatory_recovery_reset,
             reason);
+    }
+
+    // fork 9l-d4b7q: server_slot::server_cache_mandatory_recovery_reset_impl
+    // (fork server-context.cpp 2122-2140).  Note the deliberate asymmetry with
+    // the file-scope static of the same name above: slot-file restore reaches
+    // this one AFTER the target bytes are already installed, so it clears only
+    // the displaced prompt metadata and draft state and leaves the restored
+    // target sequence intact.
+    // Slot-file restore has already installed target bytes when this cleanup runs. It clears
+    // only the displaced prompt metadata and draft state; the target must remain intact.
+    void server_cache_mandatory_recovery_reset_impl(bool clear_draft) {
+        if (retention_obs) {
+            retention_obs->retire_slot(id);
+        }
+        if (lifecycle_authority && !prompt.checkpoints.empty()) {
+            checkpoint_ring_changed();
+        }
+        prompt.clear();
+        cache_family = {};
+        frontier_logits.clear();
+        if (clear_draft && ctx_dft) {
+            ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
+        }
+        common_speculative_sequence_transition(
+            get_spec(), id,
+            common_speculative_sequence_event::target_replaced);
     }
 
     // fork server-context.cpp:2142
@@ -6269,6 +6313,15 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            // fork 9l-d4b7q: the SLOT_SAVE body (fork server-context.cpp
+            // 14610-14716).  ONE HALF OF AN ATOMIC PAIR -- the other half is
+            // the SLOT_RESTORE body in this same commit.  The fork replaced
+            // both together because they share a wire format: the save now
+            // writes a server_slot_envelope_build payload (tokens + five
+            // digests + optional frontier row) inside the engine's
+            // authenticated file envelope, and the restore is the only
+            // reader that knows how to take it apart.  Landing one half
+            // alone is a regression -- 9l-d4b7l measured it (200 -> 400).
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -6289,9 +6342,49 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    const auto frontier_prepare =
+                        prepare_slot_frontier_logits_for_save(*slot);
+                    SLT_INF(*slot,
+                        "SLOT_FRONTIER_LOGITS event=prepare status=%s tokens=%d\n",
+                        server_slot_frontier_prepare_status_name(
+                            frontier_prepare),
+                        slot->prompt.n_tokens());
+                    if (server_slot_frontier_prepare_requires_reset(
+                            frontier_prepare,
+                            slot_frontier_is_physically_aligned(*slot))) {
+                        slot->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
+                        send_error(task,
+                            "Unable to save slot: terminal frontier alignment failed",
+                            ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    std::vector<char> serialized_tokens;
                     std::vector<char> packed;
+                    std::array<uint8_t, 32> token_digest = {};
+                    bool envelope_has_logits = false;
                     try {
-                        packed = slot->prompt.tokens.serialize();
+                        serialized_tokens = slot->prompt.tokens.serialize();
+                        if (!slot->prompt.tokens.retention_token_digest(
+                                token_digest)) {
+                            throw std::runtime_error(
+                                "Unable to bind slot token identity");
+                        }
+                        envelope_has_logits =
+                            slot->frontier_logits_matches() &&
+                            slot_file_runtime_identity.family_compatible;
+                        const std::vector<float> * logits = envelope_has_logits
+                            ? &slot->frontier_logits.values : nullptr;
+                        if (!server_slot_envelope_build(
+                                serialized_tokens, slot_file_runtime_identity,
+                                lora_config_identity(slot->lora),
+                                uint64_t(slot->prompt.n_tokens()),
+                                int64_t(slot->prompt.tokens.pos_next()),
+                                token_digest, logits, packed)) {
+                            throw std::runtime_error(
+                                "Unable to build authenticated slot envelope");
+                        }
                     } catch (const std::exception & err) {
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
@@ -6305,6 +6398,23 @@ private:
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
+
+                    const server_slot_frontier_logits_status logits_status =
+                        envelope_has_logits
+                        ? server_slot_frontier_logits_status::loaded
+                        : server_slot_frontier_logits_status::not_present;
+                    // New saves are one atomic authenticated file. Remove stale
+                    // optional sidecars from pre-envelope versions only after
+                    // the new primary has committed.
+                    for (const std::string suffix : { ".lora", ".frontier-logits" }) {
+                        std::error_code ignored;
+                        std::filesystem::remove(
+                            std::filesystem::u8path(filepath + suffix), ignored);
+                    }
+                    SLT_INF(*slot,
+                        "SLOT_FRONTIER_LOGITS event=save status=%s tokens=%d\n",
+                        server_slot_frontier_logits_status_name(logits_status),
+                        slot->prompt.n_tokens());
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -6322,8 +6432,9 @@ private:
             // fork 9l-d4b7c: the cache-task dispatch -- plan preflight and
             // the cache-control group (fork server-context.cpp 14717-14869).
             // The fork's other two cache cases (CACHE_CAPTURE 14870-15048
-            // and CACHE_IMPORT 15049-15282) are not ported yet; when they
-            // land they belong here, before SLOT_RESTORE, in fork order.
+            // and CACHE_IMPORT 15049-15282) both landed here, in that fork
+            // order, as 9l-d4b7f and 9l-d4b7g.  The two lines above this
+            // one used to predict them; 9l-d4b7q states them as fact.
             case SERVER_TASK_TYPE_CACHE_PLAN_PREFLIGHT:
                 {
                     auto res = std::make_unique<
@@ -6893,6 +7004,19 @@ private:
                             server_vbr_artifact_import_status::internal_error);
                     }
                 } break;
+            // fork 9l-d4b7q: the SLOT_RESTORE body (fork server-context.cpp
+            // 15283-15510).  The other half of the SAME atomic pair as the
+            // SLOT_SAVE body above.  Note what it does NOT do any more: it
+            // never calls llama_state_seq_load_file.  It authenticates the
+            // file itself (llama_state_seq_file_snapshot_prepare, landed in
+            // 9l-d4b7m), parses the semantic envelope, and applies the
+            // authenticated snapshot -- which is why the engine layer had to
+            // move first, and why the two server bodies cannot move
+            // separately from each other.
+            //
+            // 9l-d4b7n had this body and was withdrawn: the frontier row it
+            // installs is what makes slot.frontier_logits.pending reachable,
+            // and at that time nothing read it.  9l-d4b7p landed the reader.
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -6912,36 +7036,199 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+                    server_slot_frontier_logits_status logits_status =
+                        server_slot_frontier_logits_status::not_present;
+                    std::array<uint8_t, 32> restored_token_digest = {};
 
                     size_t nread = 0;
+                    bool target_load_attempted = false;
                     try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                        const std::string adapter_identity =
+                            lora_config_identity(slot->lora);
+                        llama_state_seq_file_snapshot prepared;
+                        if (!llama_state_seq_file_snapshot_prepare(
+                                filepath.c_str(), prepared)) {
+                            throw std::runtime_error(
+                                "Invalid or unauthenticated slot save file");
                         }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
+                        std::vector<uint8_t> prepared_packed;
+                        if (!prepared.copy_packed_token_bytes(prepared_packed)) {
+                            throw std::runtime_error(
+                                "Unable to copy authenticated slot envelope");
                         }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
+                        auto envelope = server_slot_envelope_parse_bytes(
+                            prepared_packed.data(), prepared_packed.size(),
+                            slot_file_runtime_identity,
+                            adapter_identity,
+                            uint32_t(llama_vocab_n_tokens(
+                                llama_model_get_vocab(model_tgt))));
+                        const bool legacy = envelope.status ==
+                            server_slot_frontier_logits_status::legacy_cold;
+                        if (envelope.status ==
+                                server_slot_frontier_logits_status::model_family_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::adapter_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::format_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::serialized_payload_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::io_error) {
+                            throw std::runtime_error(std::string(
+                                "Slot semantic envelope refused: ") +
+                                server_slot_frontier_logits_status_name(
+                                    envelope.status));
+                        }
+                        if (legacy) {
+                            std::ifstream identity_file(
+                                filepath + ".lora", std::ios::binary);
+                            if (identity_file) {
+                                const std::string saved_identity(
+                                    (std::istreambuf_iterator<char>(identity_file)),
+                                    std::istreambuf_iterator<char>());
+                                if (saved_identity != adapter_identity) {
+                                    throw std::runtime_error(
+                                        "Legacy slot file adapter identity mismatch");
+                                }
+                            } else if (adapter_identity != "0") {
+                                throw std::runtime_error(
+                                    "Legacy slot file has no adapter identity");
+                            }
+                        }
+                        llama_tokens serialized(prepared.token_count());
+                        if (!prepared_packed.empty()) {
+                            std::memcpy(serialized.data(),
+                                prepared_packed.data(), prepared_packed.size());
+                        }
+                        if (!legacy) {
+                            serialized.resize(
+                                envelope.serialized_tokens.size()/sizeof(llama_token));
+                            std::memcpy(serialized.data(),
+                                envelope.serialized_tokens.data(),
+                                envelope.serialized_tokens.size());
+                        }
+                        server_tokens restored = server_tokens::deserialize(
+                            serialized, mctx != nullptr);
                         if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+                            throw std::runtime_error(
+                                "Restored prompt does not fit in the slot context");
                         }
-
                         if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
+                            throw std::runtime_error(
+                                "Invalid tokens in slot save file");
+                        }
+                        if (!restored.retention_token_digest(
+                                restored_token_digest)) {
+                            throw std::runtime_error(
+                                "Unable to authenticate restored token identity");
+                        }
+                        if (!legacy) {
+                            envelope.status =
+                                server_slot_envelope_token_binding_status(
+                                    envelope, restored.size(),
+                                    restored.pos_next(), restored_token_digest);
+                            if (envelope.status !=
+                                    server_slot_frontier_logits_status::loaded) {
+                                // The serialized server_tokens payload and
+                                // primary state remain independently
+                                // authenticated. A stale optional frontier
+                                // binding only removes the hot capability.
+                                std::vector<float>().swap(envelope.logits);
+                            }
                         }
 
-                        slot->prompt.clear();
+                        size_t n_packed = prepared.token_count();
+                        llama_tokens loaded_packed(std::max<size_t>(1, n_packed));
+                        target_load_attempted = true;
+                        ctx_tgt->synchronize();
+                        nread = ctx_tgt->state_seq_apply_file_snapshot(
+                            slot->id, prepared,
+                            loaded_packed.data(), loaded_packed.size(),
+                            &n_packed);
+                        loaded_packed.resize(n_packed);
+                        if (nread == 0 ||
+                            loaded_packed.size()*sizeof(llama_token) !=
+                                prepared_packed.size() ||
+                            (!prepared_packed.empty() &&
+                             std::memcmp(loaded_packed.data(),
+                                prepared_packed.data(),
+                                prepared_packed.size()) != 0)) {
+                            slot->mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
+                            target_load_attempted = false;
+                            throw std::runtime_error(
+                                "Prepared slot state could not be applied");
+                        }
+                        logits_status = envelope.status;
+
+                        if (slot->prompt.sequence_epoch != 0 ||
+                            !slot->prompt.checkpoints.empty()) {
+                            SLT_INF(*slot,
+                                    "FRONTIER_RECORD event=invalidate "
+                                    "reason=slot_file_restore checkpoints=%zu "
+                                    "sequence_epoch=%" PRIu64 "\n",
+                                    slot->prompt.checkpoints.size(),
+                                    slot->prompt.sequence_epoch);
+                        }
+
+                        // The target bytes are installed. Retire the displaced prompt lineage
+                        // and clear only draft state/metadata before publishing the restored
+                        // token+media envelope; do not erase the new target sequence.
+                        slot->observe_mandatory_recovery_reset(
+                            server_cache_destruction_reason::slot_rebind);
+                        slot->server_cache_mandatory_recovery_reset_impl(ctx_dft != nullptr);
                         slot->prompt.tokens = std::move(restored);
+
+                        if (logits_status ==
+                                server_slot_frontier_logits_status::loaded) {
+                            const uint64_t destination_epoch =
+                                ensure_frontier_sequence_epoch(slot->prompt);
+                            slot->install_frontier_logits(
+                                std::move(envelope.logits),
+                                restored_token_digest,
+                                destination_epoch);
+                        }
+
+                        SLT_INF(*slot,
+                            "SLOT_FRONTIER_LOGITS event=restore status=%s hot=%u tokens=%d\n",
+                            server_slot_frontier_logits_status_name(logits_status),
+                            logits_status ==
+                                server_slot_frontier_logits_status::loaded,
+                            slot->prompt.n_tokens());
+
+                        if (slot->retention_obs) {
+                            const common_chat_msg_spans unavailable_spans;
+                            const auto live_key =
+                                server_retention_instance_key::for_slot(slot->id);
+                            const bool published = slot->retention_obs->publish(
+                                live_key,
+                                slot->retention_pool,
+                                unavailable_spans,
+                                false,
+                                uint64_t(slot->prompt.n_tokens()),
+                                uint64_t(slot->prompt.n_tokens()),
+                                true);
+                            if (published &&
+                                slot->retention_obs->prefix_tracking_enabled()) {
+                                (void) server_prompt_retention_publish_exact_prefix(
+                                    *slot->retention_obs, live_key, slot->prompt,
+                                    lora_config_identity(slot->lora),
+                                    slot->prompt.n_tokens());
+                            }
+                        }
+                        target_load_attempted = false;
                     } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        // Parsing and identity failures occur before the
+                        // mutating library load and preserve an occupied
+                        // destination.  Once load begins, any exception is
+                        // conservatively treated as a partial install.
+                        if (target_load_attempted) {
+                            slot->mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
+                        }
+                        send_error(task,
+                            std::string("Unable to restore slot: ") + err.what(),
+                            ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
