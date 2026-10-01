@@ -44,6 +44,25 @@ server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
 
 // fork 9l-d4b7u: the VBR reclaim-policy test oracle (fork server-context.h 189-209)
+// fork 9l-d4b8c: server_cache_family_slot_round_trip_result + oracle decl
+// (fork server-context.h 127-142)
+struct server_cache_family_slot_round_trip_result {
+    bool resolved = false;
+    bool second_resolved = false;
+    bool roles_distinct = false;
+    bool host_roles_distinct = false;
+    bool no_restore_resume = false;
+    bool binding_intact = false;
+    bool host_save_carries = false;
+    bool checkpoint_carries = false;
+};
+
+server_cache_family_slot_round_trip_result
+server_cache_family_slot_round_trip_for_test(
+        server_cache_control_authority & authority,
+        server_cache_control_token binding_token,
+        server_cache_control_token second_binding_token = {});
+
 // fork 9l-d4b7z: server_rejected_prompt_preservation_result (fork server-context.h 144-155)
 struct server_rejected_prompt_preservation_result {
     bool rejected = false;

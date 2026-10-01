@@ -442,6 +442,11 @@ MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 
+// fork 9l-d4b8c: image-chunk factories for model-free tests (fork mtmd.h 448-450)
+// empty-id fail-closed guard in server_tokens::get_common_prefix. caller owns the result
+// (mtmd_input_chunk_free), or hands it to a copying consumer such as server_tokens::push_back.
+MTMD_API mtmd_input_chunk * mtmd_test_create_image_chunk(const char * id, size_t n_tokens);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

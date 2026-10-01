@@ -796,6 +796,19 @@ struct server_prompt {
 
 // fork 9l-d3c2: prompt-shadow workspace types (fork server-task.h 1137-1199)
 
+// fork 9l-d4b8c: move-only staged restore transaction (fork server-task.h 1119-1129)
+// Move-only storage transaction staged before llama_state_seq_set_data_ext().
+// In lifecycle mode it owns an immutable copy of the host prompt/checkpoints;
+// the successful delivery moves this copy into the live slot and retains the
+// source node. In legacy mode it stays empty and commit consumes the source.
+// Move-only is currently derived from server_prompt/server_tokens; preserve
+// that intent explicitly if server_tokens ever becomes copyable.
+struct server_prompt_cache_restore_delivery {
+    server_prompt prompt;
+    common_cache_family_binding cache_family;
+    bool retains_source = false;
+};
+
 // fork 9l-d4b8b: what a host restore actually restored (fork
 // server-task.h 1131-1135).  Reported by load() so the caller can fire the
 // matching speculative sequence transition, and so "nothing was restored"
@@ -958,6 +971,12 @@ struct server_prompt_cache_vbr_frontier_batch_diagnostics {
     uint64_t stem_matches = 0;
 };
 
+
+// fork 9l-d4b8c: retention-capacity live transition (fork server-task.h 1201-1204)
+struct server_prompt_cache_retention_capacity_live_transition {
+    bool lookup_host = false;
+    bool preserve_source = false;
+};
 
 // Match the fork's established useful cache-reuse granularity. Tiny shared
 // prefixes remain valid LCP hits, but cannot earn durable frequency credit or
@@ -1309,6 +1328,35 @@ inline void server_prompt_cache_apply_family(
 }
 
 // fork 9l-c: server_prompt_retention_publish_exact_prefix decl (fork server-task.h 1335-1340)
+// fork 9l-d4b8c: retention-capacity helpers (fork server-task.h 1307-1333)
+inline uint32_t server_prompt_cache_retention_prior_milli(
+        const common_cache_family_binding & family,
+        bool automatic_main) noexcept {
+    return common_cache_family_main_family(family, automatic_main)
+        ? 2000 : 1000;
+}
+
+inline server_prompt_cache_retention_capacity_live_transition
+server_prompt_cache_retention_capacity_live_transition_for(
+        bool enabled,
+        bool completion,
+        bool selection_deferred_busy,
+        size_t live_tokens,
+        size_t retained_prefix,
+        const common_retention_lineage_record * lineage,
+        const common_chat_msg_spans * message_spans = nullptr) noexcept {
+    if (!enabled || !completion || selection_deferred_busy ||
+        live_tokens == 0 || retained_prefix >= live_tokens) {
+        return {};
+    }
+    return {
+        true,
+        server_prompt_cache_retention_reuse_is_useful(
+            retained_prefix, message_spans) &&
+            lineage && lineage->reuse_hits != 0,
+    };
+}
+
 bool server_prompt_retention_publish_exact_prefix(
     server_retention_sidecar_store & retention,
     const server_retention_instance_key & key,
@@ -1385,6 +1433,23 @@ struct server_prompt_cache {
               common_cache_plan_record * rec = nullptr,
               common_cache_family_binding * restored_family = nullptr);
 
+    // fork 9l-d4b8c: two-phase immutable host restore (fork server-task.h 1625-1640).
+    // NOT wired into load() yet -- see slice 9l-d4b8c.
+    // Two-phase immutable host restore. prepare() runs before either
+    // target is touched; commit() is called only after main+draft restore.
+    // Public only so the model-free server cache test can pin the storage
+    // transaction without constructing a llama_context.
+    bool prepare_restore_delivery(
+            iterator source,
+            server_prompt_cache_restore_delivery & delivery) const noexcept;
+    void commit_restore_delivery(
+            iterator source,
+            server_prompt_cache_restore_delivery && delivery,
+            server_prompt & destination,
+            int32_t id_slot,
+            int32_t debug_source_id = -1,
+            uint64_t reused_prefix_tokens = 0,
+            bool continues_lineage = true);
     void update();
 
     // fork 9l-d4b6f (fork server-task.h 1643-1645)
@@ -1757,7 +1822,13 @@ struct server_prompt_cache {
     // fork server-task.h:1712-1715
     ~server_prompt_cache() {
         detach_active_storage_accounting();
+        clear_accounting();
     }
+
+    // fork 9l-d4b8c: teardown accounting (fork server-task.h 1717-1718).
+    // Declared next to the destructor rather than next to acct_charge_entry, because that adjacency is a pinned d4b6m run.
+    void clear_accounting();
+    void acct_release_entry(server_prompt_cache_state & st);
 
 // fork 9l-d3c2: destination gate for the shadow workspace (fork server-task.h 1702)
     bool retention_capacity_authority = false;

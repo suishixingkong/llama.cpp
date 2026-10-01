@@ -17629,6 +17629,95 @@ server_mmproj_lifecycle_for_test() {
     return result;
 }
 
+// fork 9l-d4b8c: the ninth oracle (fork server-context.cpp 3284-3368).  Its result
+// type is anonymous here exactly as in the fork: the trailing return type is
+// written out on the definition.
+server_cache_family_slot_round_trip_result
+server_cache_family_slot_round_trip_for_test(
+        server_cache_control_authority & authority,
+        server_cache_control_token binding_token,
+        server_cache_control_token second_binding_token) {
+    server_cache_family_slot_round_trip_result result;
+    common_cache_family_binding incoming;
+    result.resolved = server_cache_family_resolve_for_launch(
+        &authority, binding_token, incoming) ==
+            server_cache_control_status::ok;
+    if (!result.resolved) {
+        return result;
+    }
+
+    server_slot slot {};
+    slot.id = 0;
+    slot.cache_family = common_cache_family_follow_lineage(
+        {}, incoming, 0, 0);
+    slot.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    slot.prompt.sequence_epoch = 1;
+
+    // The actual slot wrapper seeds the no-restore out parameter with its
+    // current lineage. Drive the real cache selection path with no host rows;
+    // This is the identity terminal that previously returned a default.
+    server_prompt_cache empty_cache(0, 0);
+    common_cache_family_binding restored = slot.cache_family;
+    server_prompt_cache_restore_shape restore_shape =
+        server_prompt_cache_restore_shape::none;
+    const server_tokens resumed(
+        llama_tokens { 1, 2, 3, 4 }, false);
+    result.no_restore_resume = empty_cache.load(
+        slot.prompt, resumed, nullptr, nullptr, slot.id, "", restore_shape,
+        nullptr, &restored);
+    if (result.no_restore_resume) {
+        slot.cache_family = restored;
+    }
+    result.binding_intact = slot.cache_family == incoming;
+
+    auto staged = empty_cache.stage(slot.prompt, 8, 0, "");
+    if (!staged.empty()) {
+        server_prompt_cache_apply_family(
+            staged.front(), slot.cache_family, true);
+        result.host_save_carries =
+            staged.front().cache_family == incoming &&
+            staged.front().main_family ==
+                common_cache_family_main_family(incoming, true);
+    }
+    common_prompt_checkpoint checkpoint;
+    checkpoint.cache_family = slot.cache_family;
+    result.checkpoint_carries = checkpoint.cache_family == incoming;
+
+    if (second_binding_token) {
+        common_cache_family_binding second;
+        result.second_resolved = server_cache_family_resolve_for_launch(
+            &authority, second_binding_token, second) ==
+                server_cache_control_status::ok;
+        result.roles_distinct = result.second_resolved &&
+            incoming.family == second.family && incoming.role != second.role;
+        if (result.roles_distinct) {
+            server_slot second_slot {};
+            second_slot.id = 1;
+            second_slot.cache_family = common_cache_family_follow_lineage(
+                {}, second, 0, 0);
+            second_slot.prompt.tokens = server_tokens(
+                llama_tokens { 5, 6, 7 }, false);
+            second_slot.prompt.sequence_epoch = 2;
+
+            server_prompt_cache two_slot_cache(0, 0);
+            auto first_staged = two_slot_cache.stage(
+                slot.prompt, 8, 0, "family-pair-first");
+            auto second_staged = two_slot_cache.stage(
+                second_slot.prompt, 8, 0, "family-pair-second");
+            if (!first_staged.empty() && !second_staged.empty()) {
+                server_prompt_cache_apply_family(
+                    first_staged.front(), slot.cache_family, true);
+                server_prompt_cache_apply_family(
+                    second_staged.front(), second_slot.cache_family, true);
+                result.host_roles_distinct =
+                    first_staged.front().cache_family == incoming &&
+                    second_staged.front().cache_family == second;
+            }
+        }
+    }
+    return result;
+}
+
 // fork 9l-d4b7z: server_rejected_prompt_preservation_for_test (fork server-context.cpp 21075-21158)
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test() {

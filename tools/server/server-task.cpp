@@ -8131,6 +8131,297 @@ bool server_prompt_cache::commit_vbr_restore(
     return true;
 }
 
+// fork 9l-d4b8c NOTE ON PLACEMENT: these five definitions sit here rather
+// than at the two obvious spots, because both of those open a pinned run:/n//   * immediately before update_impl()'s signature IS inside d4b6l's
+//     fragment -- its marker sits directly above that signature and the
+//     fragment runs to EOF;
+//   * next to acct_charge_entry() splits d4b6m's two-definition fragment.
+// They stay after every dependency they touch (observe_drop, mirror_prefix,
+// mirror_artifact_clone) and still ahead of update_impl.  And load() does
+// NOT call the delivery pair yet -- that remains its own slice.
+// fork 9l-d4b8c: acct_release_entry (fork server-task.cpp 3780-3791)
+void server_prompt_cache::acct_release_entry(server_prompt_cache_state & st) {
+    if (!acct) {
+        return;
+    }
+    for (const auto op : st.release_ops()) {
+        if (op) {
+            acct->release(op);
+        }
+    }
+    st.acct_ops.clear();
+    st.accounting_complete = false;
+}
+
+// fork 9l-d4b8c: clear_accounting (fork server-task.cpp 7230-7250)
+void server_prompt_cache::clear_accounting() {
+    if (!acct && !destruction_obs && !retention_obs) {
+        return;
+    }
+    for (auto & st : states) {
+        server_prompt_cache_observe_drop(
+            *this, st, server_cache_destruction_reason::host_shutdown);
+        if (acct) {
+            acct_release_entry(st);
+        }
+        if (retention_obs) {
+            retention_obs->retire(
+                server_retention_instance_key::for_host_entry(&st));
+            for (auto & checkpoint : st.prompt.checkpoints) {
+                retention_obs->retire(
+                    server_retention_instance_key::for_checkpoint(
+                        -1, &checkpoint));
+            }
+        }
+    }
+}
+
+// fork 9l-d4b8c: mirror_restore_retention (fork server-task.cpp 7758-7925)
+static void server_prompt_cache_mirror_restore_retention(
+        server_prompt_cache & cache,
+        server_prompt_cache_state * source,
+        server_prompt & destination,
+        int32_t id_slot,
+        bool retained_source,
+        bool continues_lineage) {
+    if (!cache.retention_obs) {
+        return;
+    }
+    const auto host_key =
+        server_retention_instance_key::for_host_entry(source);
+    const auto live_key =
+        server_retention_instance_key::for_slot(id_slot);
+    if (continues_lineage) {
+        server_prompt_cache_mirror_artifact_clone(
+            cache,
+            host_key, common_retention_artifact_kind::host_entry, -1,
+            live_key, common_retention_artifact_kind::live_slot, id_slot,
+            destination, source->adapter_config_key,
+            destination.n_tokens());
+    } else {
+        const bool branched = cache.retention_obs->branch(
+            host_key, live_key, nullptr, true);
+        if (branched) {
+            server_prompt_cache_mirror_prefix(
+                cache, live_key, destination,
+                source->adapter_config_key, destination.n_tokens());
+        }
+    }
+    // Selection does not count as reuse. Carry the immutable host source in a
+    // scheduler-consumed transition receipt so successful launch credits it
+    // once before admitting a divergent destination; every unlaunched path
+    // abandons the receipt and provisional branch.
+    (void) cache.retention_obs->prepare_for_launch(host_key, live_key);
+
+    const auto admit_restored_checkpoints = [&]() -> bool {
+        if (!cache.publish_authority || !cache.retention_obs) {
+            return true;
+        }
+        try {
+            std::vector<server_retention_instance_key> keys;
+            std::vector<server_cache_live_checkpoint_admission> batch;
+            keys.reserve(destination.checkpoints.size());
+            batch.reserve(destination.checkpoints.size());
+            size_t checkpoint_ordinal = 0;
+            for (const auto & checkpoint : destination.checkpoints) {
+                const auto key =
+                    server_retention_instance_key::for_checkpoint(
+                        id_slot, &checkpoint);
+                llama_cache_acct_artifact_id artifact;
+                if ((server_fault("restore_checkpoint_artifact_missing") &&
+                     checkpoint_ordinal == 1) ||
+                    !cache.retention_obs->checkpoint_admission_artifact(
+                        key, artifact)) {
+                    return false;
+                }
+                checkpoint_ordinal++;
+                server_cache_live_checkpoint_admission member;
+                member.artifact = artifact;
+                member.checkpoint = &checkpoint;
+                keys.push_back(key);
+                batch.push_back(std::move(member));
+            }
+            if (batch.size() != destination.checkpoints.size()) {
+                return false;
+            }
+            if (batch.empty()) {
+                return destination.checkpoints.empty();
+            }
+            if (!cache.publish_authority->admit_live_checkpoints(batch)) {
+                SRV_WRN(
+                    "restored checkpoint ownership batch admission failed; "
+                    "%zu members remain fail-closed\n", batch.size());
+                return false;
+            }
+            GGML_ASSERT(keys.size() == batch.size());
+            bool attached = true;
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (!cache.retention_obs->attach_release_ops(
+                        keys[i], std::move(batch[i].committed))) {
+                    SRV_WRN("%s\n",
+                        "restored checkpoint ownership attach failed; member remains fail-closed");
+                    attached = false;
+                }
+            }
+            return attached;
+        } catch (...) {
+            SRV_WRN("%s\n",
+                "restored checkpoint ownership batch setup failed; ring remains fail-closed");
+            return false;
+        }
+    };
+
+    const auto discard_unowned_checkpoints = [&]() noexcept {
+        if (cache.retention_obs) {
+            for (const auto & checkpoint : destination.checkpoints) {
+                cache.retention_obs->retire(
+                    server_retention_instance_key::for_checkpoint(
+                        id_slot, &checkpoint));
+            }
+        }
+        destination.checkpoints.clear();
+    };
+
+    if (!retained_source) {
+        // std::list's equal allocator move transfers the original nodes, so
+        // destination checkpoint addresses are the historical host keys.
+        for (const auto & checkpoint : destination.checkpoints) {
+            const auto host_checkpoint =
+                server_retention_instance_key::for_checkpoint(
+                    -1, &checkpoint);
+            const auto live_checkpoint =
+                server_retention_instance_key::for_checkpoint(
+                    id_slot, &checkpoint);
+            const bool rebound = continues_lineage
+                ? cache.retention_obs->rebind(
+                    host_checkpoint, live_checkpoint)
+                : cache.retention_obs->branch(
+                    host_checkpoint, live_checkpoint, &live_key);
+            const auto artifact =
+                cache.retention_obs->artifact_id(live_checkpoint);
+            const server_cache_lease_subject checkpoint_destination {
+                artifact,
+                common_retention_artifact_kind::checkpoint,
+                id_slot,
+            };
+            server_prompt_cache_mirror_lease(
+                cache, rebound, nullptr, checkpoint_destination,
+                destination, source->adapter_config_key,
+                checkpoint.n_tokens);
+        }
+        if (!admit_restored_checkpoints()) {
+            discard_unowned_checkpoints();
+        }
+        return;
+    }
+
+    auto source_checkpoint = source->prompt.checkpoints.begin();
+    auto destination_checkpoint = destination.checkpoints.begin();
+    for (; source_checkpoint != source->prompt.checkpoints.end() &&
+           destination_checkpoint != destination.checkpoints.end();
+           ++source_checkpoint, ++destination_checkpoint) {
+        const auto source_key =
+            server_retention_instance_key::for_checkpoint(
+                -1, &*source_checkpoint);
+        const auto destination_key =
+            server_retention_instance_key::for_checkpoint(
+                id_slot, &*destination_checkpoint);
+        if (continues_lineage) {
+            server_prompt_cache_mirror_artifact_clone(
+                cache,
+                source_key, common_retention_artifact_kind::checkpoint, -1,
+                destination_key, common_retention_artifact_kind::checkpoint,
+                id_slot,
+                destination, source->adapter_config_key,
+                destination_checkpoint->n_tokens);
+        } else {
+            (void) cache.retention_obs->branch(
+                source_key, destination_key, &live_key);
+        }
+    }
+    GGML_ASSERT(source_checkpoint == source->prompt.checkpoints.end());
+    GGML_ASSERT(destination_checkpoint == destination.checkpoints.end());
+    if (!admit_restored_checkpoints()) {
+        discard_unowned_checkpoints();
+    }
+}
+
+// fork 9l-d4b8c: prepare_restore_delivery (fork server-task.cpp 7737-7756)
+bool server_prompt_cache::prepare_restore_delivery(
+        iterator source,
+        server_prompt_cache_restore_delivery & delivery) const noexcept {
+    delivery = {};
+    delivery.cache_family = source->cache_family;
+    if (!publish_authority) {
+        return true;
+    }
+    try {
+        if (server_fault("load_clone_fail")) {
+            return false;
+        }
+        delivery.prompt = source->prompt.clone();
+        delivery.retains_source = true;
+        return true;
+    } catch (...) {
+        delivery = {};
+        return false;
+    }
+}
+
+// fork 9l-d4b8c: commit_restore_delivery (fork server-task.cpp 8421-8471)
+void server_prompt_cache::commit_restore_delivery(
+        iterator source,
+        server_prompt_cache_restore_delivery && delivery,
+        server_prompt & destination,
+        int32_t id_slot,
+        int32_t debug_source_id,
+        uint64_t reused_prefix_tokens,
+        bool continues_lineage) {
+    if (delivery.retains_source) {
+        GGML_ASSERT(publish_authority != nullptr);
+        destination = std::move(delivery.prompt);
+        server_prompt_cache_mirror_restore_retention(
+            *this, &*source, destination, id_slot, true,
+            continues_lineage);
+        if (retention_obs && reused_prefix_tokens == 0) {
+            retention_obs->abandon_prepared_launch(
+                server_retention_instance_key::for_slot(id_slot));
+        }
+        if (destruction_obs) {
+            destruction_obs->note_host_restore(true);
+        }
+        if (debug_observability) {
+            debug_lifecycle_emissions++;
+            SRV_INF(
+                "CACHE_HOST_LIFECYCLE {\"mode\":\"non_consuming\","
+                "\"payload_kind\":\"fixed_state\","
+                "\"source_id\":%d,\"host_entries\":%zu,"
+                "\"host_bytes\":%zu,\"retained_restores\":%" PRIu64 "}\n",
+                debug_source_id, states.size(), size(),
+                destruction_obs
+                    ? destruction_obs->host_restores_retained
+                    : uint64_t(0));
+        }
+        return;
+    }
+
+    // Lifecycle-off is the historical move/rebind/erase terminal verbatim.
+    destination = std::move(source->prompt);
+    server_prompt_cache_mirror_restore_retention(
+        *this, &*source, destination, id_slot, false,
+        continues_lineage);
+    if (retention_obs && reused_prefix_tokens == 0) {
+        retention_obs->abandon_prepared_launch(
+            server_retention_instance_key::for_slot(id_slot));
+    }
+    if (destruction_obs) {
+        destruction_obs->note_host_restore(false);
+    }
+    destroy_entry(
+        source, server_cache_destruction_reason::host_consumed_restore);
+}
+
+
 // fork 9l-d4b6k: server_prompt_cache::enforce_quality_anchor_budget (fork server-task.cpp 8699-8977)
 bool server_prompt_cache::enforce_quality_anchor_budget(
         iterator incoming,
