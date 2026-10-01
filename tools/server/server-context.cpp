@@ -16697,6 +16697,314 @@ server_committed_decode_reset_for_test() {
     return result;
 }
 
+
+// fork 9l-d4b7w: server_slot_frontier_logits_for_test (fork server-context.cpp 20124-20428)
+server_slot_frontier_logits_test_result
+server_slot_frontier_logits_for_test() {
+    server_slot_frontier_logits_test_result result;
+    std::filesystem::path directory;
+    try {
+        directory = std::filesystem::temp_directory_path() /
+            ("buun-slot-frontier-logits-" + random_string());
+        std::filesystem::create_directories(directory);
+        const std::string primary = (directory / "slot.bin").string();
+        common_params identity_params;
+        std::array<uint8_t, 32> model_receipt = {};
+        model_receipt[0] = 1;
+        const auto test_runtime_identity = [&identity_params](
+                const std::array<uint8_t, 32> & receipt,
+                bool valid,
+                server_slot_runtime_geometry geometry = {}) {
+            return server_slot_runtime_identity_from_owner_receipts(
+                receipt, valid, nullptr, identity_params, geometry);
+        };
+        const auto initial_identity =
+            test_runtime_identity(model_receipt, true);
+        identity_params.model.path = "renamed-and-requantized.gguf";
+        const auto nonsemantic_identity =
+            test_runtime_identity(model_receipt, true);
+        result.model_nonsemantic_variation_matches =
+            initial_identity.digest == nonsemantic_identity.digest;
+        const auto unresolved_2048 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    2048, 2048, identity_params, 2048, 0));
+        const auto unresolved_4096 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    4096, 4096, identity_params, 4096, 0));
+        result.unresolved_context_fallback_changes_identity =
+            unresolved_2048.digest != unresolved_4096.digest;
+        identity_params.n_ctx = 8192;
+        identity_params.yarn_orig_ctx = 4096;
+        const auto explicit_from_2048 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    8192, 8192, identity_params, 2048, 0));
+        const auto explicit_from_16384 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    8192, 8192, identity_params, 16384, 32768));
+        result.explicit_context_override_ignores_training_context =
+            explicit_from_2048.digest == explicit_from_16384.digest;
+        identity_params.n_ctx = 0;
+        identity_params.yarn_orig_ctx = 0;
+        identity_params.kv_unified = false;
+        identity_params.n_parallel = 1;
+        const auto one_sequence_geometry = test_runtime_identity(
+            model_receipt, true, { 8192, 8192, 4096 });
+        identity_params.n_parallel = 2;
+        const auto two_sequence_geometry = test_runtime_identity(
+            model_receipt, true, { 8192, 4096, 4096 });
+        result.sequence_geometry_changes_identity =
+            one_sequence_geometry.digest != two_sequence_geometry.digest;
+
+        identity_params.n_parallel = 1;
+        identity_params.n_ctx = 1000;
+        const auto padded_from_1000 = test_runtime_identity(
+            model_receipt, true, { 1024, 1024, 4096 });
+        identity_params.n_ctx = 1024;
+        const auto padded_from_1024 = test_runtime_identity(
+            model_receipt, true, { 1024, 1024, 4096 });
+        result.padding_equivalent_geometry_matches =
+            padded_from_1000.digest == padded_from_1024.digest;
+        identity_params.n_ctx = 0;
+        model_receipt[0] = 2;
+        const auto changed_model_identity =
+            test_runtime_identity(model_receipt, true);
+        result.model_family_mutation_refused =
+            initial_identity.family_compatible && changed_model_identity.family_compatible &&
+            initial_identity.digest != changed_model_identity.digest;
+
+        identity_params.control_vectors.push_back({ 0.5f, "ignored" });
+        identity_params.control_vector_applied_digest_valid = true;
+        identity_params.control_vector_applied_digest[0] = 3;
+        const auto changed_control_identity =
+            test_runtime_identity(model_receipt, true);
+        result.control_content_mutation_refused =
+            changed_model_identity.family_compatible &&
+            changed_control_identity.family_compatible &&
+            changed_model_identity.digest != changed_control_identity.digest;
+
+        identity_params.control_vector_applied_digest_valid = false;
+        const auto missing_family_identity =
+            test_runtime_identity(model_receipt, true);
+        result.missing_family_receipt_disables_hot =
+            !missing_family_identity.family_compatible;
+        server_slot_runtime_identity runtime;
+        runtime.digest[0] = 7;
+        runtime.family_compatible = true;
+        const std::string adapter = "adapter:test";
+        server_tokens tokens(llama_tokens { 1, 2, 3 }, false);
+        const std::vector<char> serialized = tokens.serialize();
+        std::array<uint8_t, 32> token_digest = {};
+        tokens.retention_token_digest(token_digest);
+        const uint64_t token_count = tokens.size();
+        const int64_t next_position = tokens.pos_next();
+        const std::vector<float> logits { -2.5f, 0.0f, 1.25f, 9.0f };
+        std::vector<char> envelope_bytes;
+        if (!server_slot_envelope_build(
+                serialized, runtime, adapter, token_count, next_position,
+                token_digest, &logits, envelope_bytes)) {
+            throw std::runtime_error("slot envelope fixture build failed");
+        }
+        llama_tokens packed(envelope_bytes.size()/sizeof(llama_token));
+        std::memcpy(packed.data(), envelope_bytes.data(), envelope_bytes.size());
+        const auto loaded = server_slot_envelope_parse(
+            packed, runtime, adapter, uint32_t(logits.size()));
+        result.round_trip = loaded.status ==
+                server_slot_frontier_logits_status::loaded &&
+            loaded.logits == logits && loaded.serialized_tokens == serialized;
+
+        auto changed_runtime = runtime;
+        changed_runtime.digest[0] ^= 1;
+        result.runtime_family_mutation_refused =
+            server_slot_envelope_parse(
+                packed, changed_runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::model_family_mismatch;
+        result.adapter_mutation_refused =
+            server_slot_envelope_parse(
+                packed, runtime, adapter + "-changed",
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::adapter_mismatch;
+        result.vocabulary_mutation_refused =
+            server_slot_envelope_parse(
+                packed, runtime, adapter,
+                uint32_t(logits.size() + 1)).status ==
+            server_slot_frontier_logits_status::vocabulary_mismatch;
+
+        result.token_count_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count + 1, next_position, token_digest) ==
+            server_slot_frontier_logits_status::token_count_mismatch;
+        result.next_position_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count, next_position + 1, token_digest) ==
+            server_slot_frontier_logits_status::next_position_mismatch;
+        auto changed_tokens = token_digest;
+        changed_tokens[0] ^= 1;
+        result.token_digest_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count, next_position, changed_tokens) ==
+            server_slot_frontier_logits_status::token_digest_mismatch;
+
+        llama_tokens mutated_logits = packed;
+        reinterpret_cast<uint8_t *>(mutated_logits.data())[
+            SERVER_SLOT_ENVELOPE_HEADER_SIZE + serialized.size()] ^= 1;
+        result.logits_mutation_refused =
+            server_slot_envelope_parse(
+                mutated_logits, runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::logits_digest_mismatch;
+
+        llama_tokens mutated_serialized = packed;
+        reinterpret_cast<uint8_t *>(mutated_serialized.data())[
+            SERVER_SLOT_ENVELOPE_HEADER_SIZE] ^= 1;
+        result.serialized_payload_mutation_refused =
+            server_slot_envelope_parse(
+                mutated_serialized, runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::serialized_payload_mismatch;
+
+        std::vector<float> nonfinite = logits;
+        nonfinite[0] = std::numeric_limits<float>::infinity();
+        std::vector<char> refused;
+        result.nonfinite_logits_refused = !server_slot_envelope_build(
+            serialized, runtime, adapter, token_count, next_position,
+            token_digest, &nonfinite, refused);
+
+        llama_tokens torn = packed;
+        torn.pop_back();
+        result.torn_companion_refused =
+            server_slot_envelope_parse(
+                torn, runtime, adapter, uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::format_mismatch;
+
+        std::vector<char> cold_bytes;
+        server_slot_envelope_build(
+            serialized, runtime, adapter, token_count, next_position,
+            token_digest, nullptr, cold_bytes);
+        llama_tokens cold_packed(cold_bytes.size()/sizeof(llama_token));
+        std::memcpy(cold_packed.data(), cold_bytes.data(), cold_bytes.size());
+        result.missing_companion_is_cold =
+            server_slot_envelope_parse(
+                cold_packed, runtime, adapter, uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::not_present;
+
+        // The outer v3 checksum authenticates the entire semantic envelope.
+        std::vector<uint8_t> primary_bytes(28 + envelope_bytes.size());
+        const uint32_t primary_magic = LLAMA_STATE_SEQ_MAGIC;
+        const uint32_t primary_version = LLAMA_STATE_SEQ_VERSION;
+        const uint64_t primary_size = primary_bytes.size();
+        const uint32_t primary_count = uint32_t(packed.size());
+        std::memcpy(primary_bytes.data(), &primary_magic, 4);
+        std::memcpy(primary_bytes.data() + 4, &primary_version, 4);
+        std::memcpy(primary_bytes.data() + 8, &primary_size, 8);
+        std::memcpy(primary_bytes.data() + 24, &primary_count, 4);
+        std::memcpy(primary_bytes.data() + 28, envelope_bytes.data(),
+                    envelope_bytes.size());
+        uint64_t primary_checksum = server_slot_state_payload_checksum(
+            primary_bytes.data() + 24, primary_bytes.size() - 24);
+        std::memcpy(primary_bytes.data() + 16, &primary_checksum, 8);
+        {
+            std::ofstream file(primary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char *>(primary_bytes.data()),
+                       primary_bytes.size());
+        }
+        primary_bytes.back() ^= 1;
+        {
+            std::ofstream file(primary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char *>(primary_bytes.data()),
+                       primary_bytes.size());
+        }
+        llama_state_seq_file_snapshot ignored_snapshot;
+        result.primary_binding_mutation_refused =
+            !llama_state_seq_file_snapshot_prepare(
+                primary.c_str(), ignored_snapshot);
+
+        server_slot destination;
+        destination.id = 9;
+        destination.prompt.tokens =
+            server_tokens(llama_tokens { 1, 2, 3 }, false);
+        destination.prompt.sequence_epoch = 991;
+        std::vector<float> rebound_logits = logits;
+        destination.install_frontier_logits(
+            std::move(rebound_logits), token_digest,
+            destination.prompt.sequence_epoch);
+        result.destination_epoch_rebound =
+            destination.frontier_logits.sequence_epoch == 991;
+        result.destination_slot_rebound = destination.id == 9;
+        constexpr uint64_t source_process_epoch = 77;
+        result.source_process_epoch_not_reused =
+            destination.frontier_logits.sequence_epoch !=
+                source_process_epoch;
+
+        const auto hot = server_slot_exact_prompt_action_resolve(
+            token_count, true, false, true);
+        result.exact_hit_skips_decode =
+            hot.use_frontier_logits && hot.reusable_tokens == token_count;
+        const auto cold = server_slot_exact_prompt_action_resolve(
+            token_count, true, false, false);
+        result.missing_capability_replays =
+            !cold.use_frontier_logits &&
+            cold.reusable_tokens + 1 == token_count;
+
+        server_slot failed_save;
+        failed_save.prompt.tokens =
+            server_tokens(llama_tokens { 1, 2, 3 }, false);
+        result.rollback_decode_allows_cold_save =
+            !server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::decode_rolled_back, false);
+        result.partial_decode_requires_reset =
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::decode_partially_committed,
+                false);
+        result.aligned_without_logits_allows_cold_save =
+            server_slot_frontier_geometry_classify(
+                true, true, 2, 2, 3, false) ==
+                    server_slot_frontier_geometry::aligned_without_logits &&
+            !server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::aligned_without_logits,
+                true);
+        result.missing_memory_requires_reset =
+            server_slot_frontier_geometry_classify(
+                false, true, -1, 2, 3, false) ==
+                    server_slot_frontier_geometry::unsafe_gap &&
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::frontier_gap, false);
+        result.multi_token_gap_requires_reset =
+            server_slot_frontier_geometry_classify(
+                true, true, 0, 3, 4, false) ==
+                    server_slot_frontier_geometry::unsafe_gap &&
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::frontier_gap, false);
+        result.decode_failure_refuses_publication =
+            result.partial_decode_requires_reset;
+        if (result.decode_failure_refuses_publication) {
+            failed_save.mandatory_recovery_reset(
+                server_cache_destruction_reason::restore_failure);
+        }
+        result.decode_failure_clears_slot =
+            failed_save.prompt.tokens.empty() &&
+            failed_save.frontier_logits.values.empty();
+        server_frontier_logits_state consumed;
+        std::vector<float> large(4096, 1.0f);
+        consumed.install(std::move(large), token_digest, 1);
+        consumed.clear();
+        result.consumed_logits_release_capacity =
+            consumed.values.empty() && consumed.values.capacity() == 0;
+    } catch (...) {
+        // Leave individual booleans false; the focused test reports the exact
+        // missing contract rather than allowing an exception to escape.
+    }
+    if (!directory.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
+    return result;
+}
+
 // fork 9l-d4b7v: server_vbr_retention_wiring_for_test (fork server-context.cpp 20430-20496)
 server_vbr_retention_wiring_result
 server_vbr_retention_wiring_for_test() {

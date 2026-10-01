@@ -79,6 +79,47 @@ server_committed_decode_reset_for_test();
 // fork 9l-d4b7v: server_active_prefix_retention_for_test (fork server-context.h 43-43)
 bool server_active_prefix_retention_for_test();
 
+// fork 9l-d4b7w: server_slot_frontier_logits_test_result (fork server-context.h 45-83)
+struct server_slot_frontier_logits_test_result {
+    bool round_trip = false;
+    bool primary_binding_mutation_refused = false;
+    bool runtime_family_mutation_refused = false;
+    bool model_family_mutation_refused = false;
+    bool model_nonsemantic_variation_matches = false;
+    bool unresolved_context_fallback_changes_identity = false;
+    bool explicit_context_override_ignores_training_context = false;
+    bool sequence_geometry_changes_identity = false;
+    bool padding_equivalent_geometry_matches = false;
+    bool control_content_mutation_refused = false;
+    bool missing_family_receipt_disables_hot = false;
+    bool adapter_mutation_refused = false;
+    bool token_count_mutation_refused = false;
+    bool next_position_mutation_refused = false;
+    bool token_digest_mutation_refused = false;
+    bool vocabulary_mutation_refused = false;
+    bool logits_mutation_refused = false;
+    bool serialized_payload_mutation_refused = false;
+    bool nonfinite_logits_refused = false;
+    bool torn_companion_refused = false;
+    bool missing_companion_is_cold = false;
+    bool destination_slot_rebound = false;
+    bool destination_epoch_rebound = false;
+    bool source_process_epoch_not_reused = false;
+    bool exact_hit_skips_decode = false;
+    bool missing_capability_replays = false;
+    bool decode_failure_refuses_publication = false;
+    bool decode_failure_clears_slot = false;
+    bool rollback_decode_allows_cold_save = false;
+    bool partial_decode_requires_reset = false;
+    bool aligned_without_logits_allows_cold_save = false;
+    bool missing_memory_requires_reset = false;
+    bool multi_token_gap_requires_reset = false;
+    bool consumed_logits_release_capacity = false;
+};
+
+server_slot_frontier_logits_test_result
+server_slot_frontier_logits_for_test();
+
 // fork 9l-d4b7v: server_vbr_retention_wiring_result (fork server-context.h 177-187)
 struct server_vbr_retention_wiring_result {
     bool slot_metadata_wired = false;
