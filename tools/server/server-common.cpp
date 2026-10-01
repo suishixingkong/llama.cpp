@@ -1750,25 +1750,14 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
-    std::vector<llama_token_data> cur;
-
-    const auto * logits = llama_get_logits_ith(ctx, idx);
-    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
-
-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
-
-    cur.resize(n_logits);
-    if (sampled_ids) {
-        for (int i = 0; i < n_logits; i++) {
-            cur[i] = llama_token_data{sampled_ids[i], logits[i], 0.0f};
-        }
-    } else {
-        for (llama_token token_id = 0; token_id < n_logits; token_id++) {
-            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-        }
-    }
-
+// fork 9l-d4b7o: the probability tail, extracted, plus the row-level
+// overload (fork tools/server/server-common.cpp 1755-1814).  The extraction
+// is what makes the two overloads one rule: before it, the row-level
+// version would have been a second copy of the partial_sort + softmax
+// block, and the two could drift.
+static std::vector<llama_token_data> token_probabilities_finish(
+        std::vector<llama_token_data> cur,
+        size_t n_top) {
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
     if (n_top > cur.size()) {
         n_top = cur.size();
@@ -1800,6 +1789,31 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     }
 
     return cur;
+}
+
+std::vector<llama_token_data> get_token_probabilities(const float * logits, size_t n_logits, size_t n_top) {
+    std::vector<llama_token_data> cur(n_logits);
+    for (size_t token_id = 0; token_id < n_logits; token_id++) {
+        cur[token_id] = llama_token_data{llama_token(token_id), logits[token_id], 0.0f};
+    }
+    return token_probabilities_finish(std::move(cur), n_top);
+}
+
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
+    const auto * logits = llama_get_logits_ith(ctx, idx);
+    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
+    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+    std::vector<llama_token_data> cur((size_t(n_logits)));
+    if (sampled_ids) {
+        for (int i = 0; i < n_logits; i++) {
+            cur[size_t(i)] = llama_token_data{sampled_ids[i], logits[i], 0.0f};
+        }
+    } else {
+        for (llama_token token_id = 0; token_id < n_logits; token_id++) {
+            cur[size_t(token_id)] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
+    }
+    return token_probabilities_finish(std::move(cur), n_top);
 }
 
 std::string safe_json_to_str(const json & data) {
