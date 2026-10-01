@@ -66,6 +66,36 @@ struct server_vbr_reclaim_policy_result {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test();
 
+// fork 9l-d4b7x: server_vbr_slot_selection_result (fork server-context.h 211-238)
+struct server_vbr_slot_selection_result {
+    bool learned_selected_cold = false;
+    bool learned_kept_hot = false;
+    bool selection_was_pure = false;
+    bool fixed_learned_selected_cold = false;
+    bool fixed_learned_kept_hot = false;
+    bool fixed_selection_was_pure = false;
+    bool fixed_incomplete_used_lru = false;
+    bool fixed_protected_fallback_was_safe = false;
+    bool fixed_capability_tier_was_preserved = false;
+    bool incomplete_used_lru = false;
+    bool protected_fallback_was_safe = false;
+    bool all_protected_has_no_target = false;
+    bool empty_slot_was_preferred = false;
+    bool capability_tier_was_preserved = false;
+    bool exhausted_tier_used_alternate = false;
+    bool weak_prefix_preserved_empty = false;
+    bool weak_prefix_preserved_hot = false;
+    bool stem_recovery_allows_selection = false;
+    bool stem_recovery_not_proactive = false;
+    bool undurable_filter_makes_progress = false;
+    bool undurable_selection_makes_progress = false;
+    bool full_rebind_clears_stem_authority = false;
+};
+
+server_vbr_slot_selection_result
+server_vbr_slot_selection_for_test(
+    server_cache_lease_fallback_provider * lease_fallback);
+
 // fork 9l-d4b7v: server_committed_decode_reset_test_result (fork server-context.h 34-41)
 struct server_committed_decode_reset_test_result {
     bool processing_prompt_cleared = false;

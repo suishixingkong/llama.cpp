@@ -2791,6 +2791,13 @@ struct server_context_impl {
     // test_9l_d4b7u_guards.py, each with the slice that has to bring it.
     friend server_vbr_reclaim_policy_result
         server_vbr_reclaim_policy_for_test();
+    // fork 9l-d4b7x: the friendship this oracle needs (fork
+    // server-context.cpp 3420-3422), landed in the same commit as its
+    // definition -- a friend for a function this tree cannot define would
+    // be a capability the tree does not have.
+    friend server_vbr_slot_selection_result
+        server_vbr_slot_selection_for_test(
+            server_cache_lease_fallback_provider * lease_fallback);
 
 public:
     // only use these pointers outside of this class:
@@ -16587,6 +16594,338 @@ server_vbr_reclaim_policy_for_test() {
         mixed_host[0] && !mixed_host[2] && !mixed_host[3];
     return result;
 }
+
+// fork 9l-d4b7x: server_vbr_slot_selection_for_test (fork server-context.cpp 20755-21073)
+server_vbr_slot_selection_result
+server_vbr_slot_selection_for_test(
+        server_cache_lease_fallback_provider * lease_fallback) {
+    server_vbr_slot_selection_result result;
+    enum class protection_mode {
+        none,
+        deferred_oldest,
+        hard_oldest,
+        deferred_all,
+        deferred_spec,
+    };
+    struct outcome {
+        bool published = false;
+        int32_t preflight_slot = -1;
+        int32_t actual_slot = -1;
+        bool preflight_pure = false;
+        bool actual_was_pure = false;
+        int32_t home_slot = -1;
+        int32_t weak_prefix_slot = -1;
+        bool reuse_selection_was_pure = false;
+    };
+    const auto run = [lease_fallback](
+            bool complete_evidence,
+            protection_mode protection = protection_mode::none,
+            int32_t empty_slot = -1,
+            bool mixed_capability = false,
+            bool dynamic_vbr = true,
+            bool automatic_vbr_host = false) {
+        server_context_impl context;
+        context.sleeping = true;
+        context.params_base.vbr_prompt_cache = automatic_vbr_host;
+        if (automatic_vbr_host) {
+            context.prompt_cache =
+                std::make_unique<server_prompt_cache>(0, 0);
+        }
+        if (!dynamic_vbr) {
+            context.params_base.vbr_cache_type_k = false;
+            context.params_base.vbr_cache_type_v = false;
+            context.params_base.vbr_budget = "f16";
+        }
+        context.slots.resize(3);
+        for (int32_t i = 0; i < 3; ++i) {
+            auto & slot = context.slots[size_t(i)];
+            slot.id = i;
+            slot.t_last_used = i + 1;
+            if (i != empty_slot) {
+                slot.prompt.tokens = server_tokens(
+                    llama_tokens { 1, 2, llama_token(3 + i) }, false);
+                slot.prompt.sequence_epoch = 1;
+            }
+            if (mixed_capability && i != 0) {
+                // can_speculate() only observes non-nullness in this
+                // model-free door; the sentinel is never dereferenced.
+                //
+                // fork 9l-d4b7x: DELIBERATE DEVIATION, and the only one in this
+                // oracle.  The fork writes `slot.spec_shared` -- its non-owning
+                // handle that sits BESIDE the owned `spec`.  This port carries a
+                // single raw pointer to the shared owner instead (see the
+                // FORK-DIFF note on get_spec() above), so the same non-nullness
+                // sentinel belongs in `spec`.  Copying the fork's line verbatim
+                // does not compile (it is not a member here); dropping the
+                // sentinel instead would leave the mixed-capability arm testing
+                // nothing.
+                slot.spec = reinterpret_cast<common_speculative *>(
+                    uintptr_t(1));
+            }
+        }
+        context.cache_retention_metadata =
+            std::make_unique<server_retention_sidecar_store>();
+        const auto plan = server_retention_owner_plan_for(
+            false, false, false, true, false);
+        server_wire_standalone_retention_metadata(
+            *context.cache_retention_metadata, context.slots, nullptr,
+            common_retention_pool::attention, plan);
+
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, 3);
+        bool published = true;
+        for (int32_t i = 0; i < 3; ++i) {
+            if (i == empty_slot || (!complete_evidence && i == 2)) {
+                continue;
+            }
+            const auto key = server_retention_instance_key::for_slot(i);
+            published = published &&
+                context.cache_retention_metadata->publish(
+                    key, common_retention_pool::attention, spans,
+                    true, 3, 3, true);
+            published = published &&
+                context.cache_retention_metadata->publish_prefix(
+                    key, "vbr-selection-test",
+                    llama_tokens { 1, 2, llama_token(3 + i) });
+            if (!mixed_capability && i == 0) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 2000);
+            } else if (mixed_capability && i == 0) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 1);
+            } else if (mixed_capability && i == 1) {
+                published = published &&
+                    context.cache_retention_metadata->set_lineage_prior(
+                        key, 2000);
+            }
+        }
+
+        server_cache_authority lease_authority;
+        server_cache_lease_table lease_table(nullptr, lease_fallback);
+        const std::string execution_identity = "vbr-selection-test";
+        if (protection == protection_mode::deferred_oldest ||
+            protection == protection_mode::deferred_all ||
+            protection == protection_mode::deferred_spec) {
+            const int32_t first = protection == protection_mode::deferred_spec
+                ? 1 : 0;
+            const int32_t end = protection == protection_mode::deferred_oldest
+                ? 1 : 3;
+            for (int32_t i = first; i < end; ++i) {
+                server_task pinned(SERVER_TASK_TYPE_COMPLETION);
+                pinned.id = 100 + i;
+                pinned.id_slot = i;
+                context.queue_tasks.defer(std::move(pinned));
+            }
+        } else if (protection == protection_mode::hard_oldest) {
+            auto & slot = context.slots[0];
+            slot.lifecycle_authority = &lease_authority;
+            slot.lease_obs = &lease_table;
+            slot.lease_execution_identity = &execution_identity;
+            const auto artifact = context.cache_retention_metadata->artifact_id(
+                server_retention_instance_key::for_slot(slot.id));
+            server_cache_lease_identity identity;
+            published = published && artifact.v != 0 &&
+                server_cache_lease_build_identity(
+                    execution_identity, lora_config_identity(slot.lora),
+                    slot.prompt.tokens, slot.prompt.n_tokens(), identity);
+            if (published) {
+                const auto lease = lease_table.grant_hard_owned(
+                    { artifact, common_retention_artifact_kind::live_slot,
+                        slot.id },
+                    server_cache_lease_scope::from(
+                        server_cache_explicit_lease_scope_id { 1 }),
+                    identity,
+                    server_cache_lease_owner_id { 1 },
+                    { slot.prompt.sequence_epoch,
+                        uint64_t(slot.prompt.n_tokens()),
+                        slot.prompt.n_tokens() },
+                    server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+                published = bool(lease);
+            }
+        }
+
+        context.vbr_retention_candidates.resize(context.slots.size());
+        context.vbr_retention_candidate_by_seq.resize(context.slots.size());
+        context.vbr_retention_seen_by_seq.resize(context.slots.size());
+        context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
+        context.vbr_durable_sources_by_seq.resize(context.slots.size());
+        context.vbr_durable_stems_by_seq.resize(context.slots.size());
+        context.vbr_idle_frontier_queries.resize(context.slots.size());
+        const std::vector<uint32_t> exclusive { 100, 100, 100 };
+        context.vbr_exclusive_cells_for_test = &exclusive;
+
+        server_task fresh(SERVER_TASK_TYPE_COMPLETION);
+        fresh.id = 90;
+        fresh.tokens = server_tokens(llama_tokens { 9, 10 }, false);
+        const uint64_t epoch_before =
+            context.cache_retention_metadata->competition_epoch_value();
+        auto preflight = context.cache_plan_select_before_mutation(
+            fresh, false, true);
+        const uint64_t epoch_after_preflight =
+            context.cache_retention_metadata->competition_epoch_value();
+        auto actual = context.cache_plan_select_before_mutation(
+            fresh, false, false);
+        const uint64_t epoch_after_actual =
+            context.cache_retention_metadata->competition_epoch_value();
+
+        const uint64_t epoch_before_reuse =
+            context.cache_retention_metadata->competition_epoch_value();
+        server_task returning(SERVER_TASK_TYPE_COMPLETION);
+        returning.id = 92;
+        returning.tokens = server_tokens(
+            llama_tokens { 1, 2, 3, 99 }, false);
+        auto home = context.cache_plan_select_before_mutation(
+            returning, false, false);
+        llama_tokens weak_tokens(300, llama_token(99));
+        weak_tokens[0] = 1;
+        weak_tokens[1] = 2;
+        weak_tokens[2] = 3;
+        server_task weak_prefix(SERVER_TASK_TYPE_COMPLETION);
+        weak_prefix.id = 93;
+        weak_prefix.tokens = server_tokens(std::move(weak_tokens), false);
+        auto weak = context.cache_plan_select_before_mutation(
+            weak_prefix, false, false);
+        const uint64_t epoch_after_reuse =
+            context.cache_retention_metadata->competition_epoch_value();
+
+        return outcome {
+            published,
+            preflight.target ? preflight.target->id : -1,
+            actual.target ? actual.target->id : -1,
+            epoch_before == epoch_after_preflight,
+            epoch_after_preflight == epoch_after_actual,
+            home.target ? home.target->id : -1,
+            weak.target ? weak.target->id : -1,
+            epoch_before_reuse == epoch_after_reuse,
+        };
+    };
+
+    const auto learned = run(true);
+    result.learned_selected_cold =
+        learned.published && learned.preflight_slot == 1 &&
+        learned.actual_slot == 1;
+    result.learned_kept_hot =
+        learned.published && learned.actual_slot != 0;
+    result.selection_was_pure =
+        learned.published && learned.preflight_pure &&
+        learned.actual_was_pure;
+    const auto fixed = run(
+        true, protection_mode::none, -1, false, false);
+    result.fixed_learned_selected_cold =
+        fixed.published && fixed.preflight_slot == 1 &&
+        fixed.actual_slot == 1;
+    result.fixed_learned_kept_hot =
+        fixed.published && fixed.actual_slot != 0;
+    result.fixed_selection_was_pure =
+        fixed.published && fixed.preflight_pure &&
+        fixed.actual_was_pure;
+    const auto fixed_incomplete = run(
+        false, protection_mode::none, -1, false, false);
+    result.fixed_incomplete_used_lru =
+        fixed_incomplete.published && fixed_incomplete.actual_slot == 0;
+    const auto fixed_hard = run(
+        false, protection_mode::hard_oldest, -1, false, false);
+    result.fixed_protected_fallback_was_safe =
+        fixed_hard.published && fixed_hard.actual_slot == 1;
+    const auto fixed_mixed = run(
+        true, protection_mode::none, -1, true, false);
+    result.fixed_capability_tier_was_preserved =
+        fixed_mixed.published && fixed_mixed.actual_slot == 2;
+    const auto incomplete = run(false);
+    result.incomplete_used_lru =
+        incomplete.published && incomplete.actual_slot == 0;
+    const auto deferred = run(false, protection_mode::deferred_oldest);
+    const auto hard = run(false, protection_mode::hard_oldest);
+    result.protected_fallback_was_safe =
+        deferred.published && deferred.actual_slot == 1 &&
+        hard.published && hard.actual_slot == 1;
+    const auto all_protected = run(false, protection_mode::deferred_all);
+    result.all_protected_has_no_target =
+        all_protected.published && all_protected.actual_slot == -1;
+    const auto empty = run(true, protection_mode::none, 2);
+    result.empty_slot_was_preferred =
+        empty.published && empty.actual_slot == 2;
+    const auto mixed = run(
+        true, protection_mode::none, -1, true);
+    result.capability_tier_was_preserved =
+        mixed.published && mixed.actual_slot == 2;
+    const auto alternate_resident = run(
+        true, protection_mode::deferred_spec, -1, true);
+    const auto alternate_empty = run(
+        true, protection_mode::deferred_spec, 0, true);
+    result.exhausted_tier_used_alternate =
+        alternate_resident.published &&
+        alternate_resident.actual_slot == 0 &&
+        alternate_empty.published && alternate_empty.actual_slot == 0;
+    const auto automatic_undurable = run(
+        true, protection_mode::none, -1, false, true, true);
+    result.undurable_selection_makes_progress =
+        automatic_undurable.published &&
+        automatic_undurable.actual_slot >= 0;
+    result.weak_prefix_preserved_empty =
+        empty.published && empty.weak_prefix_slot == 2 &&
+        empty.reuse_selection_was_pure;
+    result.weak_prefix_preserved_hot =
+        learned.published && learned.weak_prefix_slot != 0 &&
+        learned.reuse_selection_was_pure;
+
+    // A batch-authenticated durable stem is sufficient only for scheduling
+    // progress. Background reclaim still requires the exact live frontier.
+    server_context_impl stem_context;
+    stem_context.params_base.vbr_prompt_cache = true;
+    stem_context.slots.emplace_back();
+    stem_context.slots.front().id = 0;
+    stem_context.slots.front().prompt.tokens = server_tokens(
+        llama_tokens { 1, 2, 3 }, false);
+    stem_context.vbr_durable_sources_by_seq = { 0 };
+    stem_context.vbr_durable_stems_by_seq = { 1 };
+    const server_context_impl::vbr_live_retention_filter selection_filter {
+        -1, -1, nullptr,
+        server_context_impl::vbr_recovery_requirement::full_or_stem,
+    };
+    const server_context_impl::vbr_live_retention_filter reclaim_filter;
+    result.stem_recovery_allows_selection =
+        stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), selection_filter);
+    result.stem_recovery_not_proactive =
+        !stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), reclaim_filter);
+    const server_context_impl::vbr_live_retention_filter progress_filter {
+        -1, -1, nullptr,
+        server_context_impl::vbr_recovery_requirement::none_for_admission_progress,
+    };
+    result.undurable_filter_makes_progress =
+        stem_context.vbr_idle_reclaim_eligible(
+            stem_context.slots.front(), progress_filter);
+    auto & rebound = stem_context.slots.front();
+    rebound.vbr_idle_capture_attempt_identity[0] = 1;
+    rebound.vbr_idle_capture_terminal = true;
+    rebound.vbr_idle_capture_published_identity[0] = 2;
+    rebound.vbr_idle_capture_representation_valid = true;
+    rebound.vbr_idle_stem_source_identity[0] = 3;
+    rebound.vbr_idle_stem_coverage_tokens = 2;
+    rebound.vbr_idle_stem_host_artifact = { 7 };
+    rebound.vbr_idle_stem_source_valid = true;
+    rebound.vbr_idle_stem_retry = true;
+    rebound.server_cache_slot_drop_impl(false);
+    result.full_rebind_clears_stem_authority =
+        rebound.vbr_idle_capture_attempt_identity ==
+            std::array<uint8_t, 32> {} &&
+        !rebound.vbr_idle_capture_terminal &&
+        rebound.vbr_idle_capture_published_identity ==
+            std::array<uint8_t, 32> {} &&
+        !rebound.vbr_idle_capture_representation_valid &&
+        rebound.vbr_idle_stem_source_identity ==
+            std::array<uint8_t, 32> {} &&
+        rebound.vbr_idle_stem_coverage_tokens == 0 &&
+        rebound.vbr_idle_stem_host_artifact.v == 0 &&
+        !rebound.vbr_idle_stem_source_valid &&
+        !rebound.vbr_idle_stem_retry;
+    return result;
+}
+
 // fork 9l-d4b7v: server_active_prefix_retention_for_test (fork server-context.cpp 19904-19984)
 bool server_active_prefix_retention_for_test() {
     bool passed = true;
