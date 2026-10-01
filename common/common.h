@@ -17,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
@@ -511,6 +512,10 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
+    // fork 9l-d4b7j: carried for the slot-file runtime identity digest (fork
+    // common.h 644).  This tree has no --no-fused-gdn switch and nothing else
+    // sets the field, so it always holds the fork default -- see the slice note.
+    bool no_fused_gdn = false;
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
@@ -548,6 +553,8 @@ struct common_params {
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
+    std::array<uint8_t, 32> control_vector_applied_digest = {};
+    bool control_vector_applied_digest_valid = false;
     bool    offline                    = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
@@ -585,6 +592,9 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    // fork 9l-d4b7j: carried for the slot-file runtime identity digest (fork
+    // common.h 721).  Same reasoning as no_fused_gdn above.
+    bool logits_all        = true;  // see llama_context_params.logits_all
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -1319,6 +1329,8 @@ struct common_control_vector_data {
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
+    std::array<uint8_t, 32> applied_digest = {};
+    bool applied_digest_valid = false;
 };
 
 struct common_control_vector_load_info {

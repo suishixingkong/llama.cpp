@@ -242,6 +242,120 @@ bool server_vbr_stem_matches_capture_source(
     return valid && stem_source == capture_source;
 }
 
+// fork 9l-d4b7j: the slot-file runtime identity (fork server-context.cpp 239-350).
+struct server_slot_runtime_identity {
+    std::array<uint8_t, 32> digest = {};
+    // Capability policy, not weight identity: "exact" slot continuation is
+    // exact only within this semantic-family + runtime configuration contract.
+    bool family_compatible = false;
+};
+
+struct server_slot_runtime_geometry {
+    uint32_t n_ctx = 0;
+    uint32_t n_ctx_seq = 0;
+    uint32_t n_ctx_orig_yarn = 0;
+};
+
+server_slot_runtime_geometry server_slot_runtime_geometry_from_owner(
+        uint32_t actual_n_ctx,
+        uint32_t actual_n_ctx_seq,
+        const common_params & params,
+        uint32_t model_n_ctx_train,
+        uint32_t model_n_ctx_orig_yarn) noexcept {
+    return {
+        actual_n_ctx,
+        actual_n_ctx_seq,
+        params.yarn_orig_ctx != 0 ? uint32_t(params.yarn_orig_ctx) :
+            model_n_ctx_orig_yarn != 0 ? model_n_ctx_orig_yarn :
+                                         model_n_ctx_train,
+    };
+}
+
+server_slot_runtime_identity server_slot_runtime_identity_from_owner_receipts(
+        const std::array<uint8_t, 32> & model_digest,
+        bool model_digest_valid,
+        const llama_model * model,
+        const common_params & params,
+        server_slot_runtime_geometry runtime_geometry) {
+    llama_sha256_writer writer;
+    static constexpr char domain[] =
+        "buun.server.slot-file-runtime-identity/v2";
+    writer.string(domain, sizeof(domain) - 1);
+    const char * commit = llama_commit();
+    writer.string(commit, std::strlen(commit));
+    bool family_compatible = model_digest_valid;
+    writer.u32(family_compatible ? 1u : 0u);
+    writer.bytes(model_digest.data(), model_digest.size());
+    const bool has_mmproj = !params.no_mmproj && !params.mmproj.path.empty();
+    writer.u32(has_mmproj ? 1u : 0u);
+    // The multimodal projector has no semantic-family receipt yet.
+    // Media slot files retain their existing cold semantic restore, but can
+    // never acquire the exact frontier-logits capability from a path hash.
+    if (has_mmproj) {
+        family_compatible = false;
+    }
+    writer.u32(uint32_t(params.control_vectors.size()));
+    if (!params.control_vectors.empty()) {
+        family_compatible = family_compatible &&
+            params.control_vector_applied_digest_valid;
+        writer.bytes(params.control_vector_applied_digest.data(),
+                     params.control_vector_applied_digest.size());
+    }
+    writer.u32(uint32_t(params.control_vector_layer_start));
+    writer.u32(uint32_t(params.control_vector_layer_end));
+    // LoRA authority is intentionally not duplicated here.  The loaded
+    // adapter registry can change through POST /lora-adapters; each envelope
+    // binds the canonical per-slot lora_config_identity(), which already owns
+    // loaded adapter content identity and scale at save/restore time.
+    writer.u32(model ? uint32_t(llama_vocab_n_tokens(
+        llama_model_get_vocab(model))) : 0);
+    const auto write_f32 = [&](float value) {
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        writer.u32(bits);
+    };
+    writer.u32(runtime_geometry.n_ctx);
+    writer.u32(runtime_geometry.n_ctx_seq);
+    writer.u32(uint32_t(params.grp_attn_n));
+    writer.u32(uint32_t(params.grp_attn_w));
+    writer.u32(uint32_t(params.rope_scaling_type));
+    write_f32(params.rope_freq_base);
+    write_f32(params.rope_freq_scale);
+    write_f32(params.yarn_ext_factor);
+    write_f32(params.yarn_attn_factor);
+    write_f32(params.yarn_beta_fast);
+    write_f32(params.yarn_beta_slow);
+    writer.u32(runtime_geometry.n_ctx_orig_yarn);
+    writer.u32(uint32_t(params.cache_type_k));
+    writer.u32(uint32_t(params.cache_type_v));
+    writer.u32(uint32_t(params.flash_attn_type));
+    writer.u32(params.no_fused_gdn ? 1u : 0u);
+    writer.u32(params.swa_full ? 1u : 0u);
+    writer.u32(params.kv_unified ? 1u : 0u);
+    writer.u32(params.logits_all ? 1u : 0u);
+    return { writer.finish(), family_compatible };
+}
+
+server_slot_runtime_identity server_slot_file_runtime_identity_build(
+        const llama_model * model,
+        const llama_context * ctx,
+        const common_params & params) {
+    std::array<uint8_t, 32> model_digest = {};
+    const bool valid = model && llama_model_semantic_family_digest(
+        model, model_digest.data());
+    const uint32_t n_ctx_train = model
+        ? uint32_t(llama_model_n_ctx_train(model)) : 0;
+    const uint32_t n_ctx_orig_yarn = model
+        ? uint32_t(llama_model_n_ctx_orig_yarn(model)) : 0;
+    return server_slot_runtime_identity_from_owner_receipts(
+        model_digest, valid, model, params,
+        server_slot_runtime_geometry_from_owner(
+            ctx ? llama_n_ctx(ctx) : 0,
+            ctx ? llama_n_ctx_seq(ctx) : 0,
+            params, n_ctx_train, n_ctx_orig_yarn));
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -2074,6 +2188,10 @@ private:
     // fork server-context.cpp:3521-3522
     std::array<uint8_t, 32> swa_window_execution_identity {};
     int32_t swa_window_checkpoint_limit = 0;
+    // Stable across server restarts, unlike frontier_execution_identity.  It
+    // exists only when slot-file persistence is enabled and binds the optional
+    // logits companion to the exact model/execution configuration.
+    server_slot_runtime_identity slot_file_runtime_identity;
     uint64_t frontier_next_sequence_epoch = 1;
     // fork server-context.cpp:3528
     uint64_t frontier_ratchet_threshold = 1024;
@@ -2780,6 +2898,15 @@ private:
                 params_base.slot_save_path.clear();
                 SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
             }
+        }
+
+        // Dynamic VBR may have disabled slot files above.  Hash model shards,
+        // controls, and LoRA sources only for an actually reachable slot-file
+        // endpoint; ordinary servers and the disabled path do no file IO.
+        if (!params_base.slot_save_path.empty()) {
+            slot_file_runtime_identity =
+                server_slot_file_runtime_identity_build(
+                    model_tgt, ctx_tgt, params_base);
         }
 
         if (params_base.cache_ram_mib != 0) {

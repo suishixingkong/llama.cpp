@@ -11,6 +11,7 @@
 #include "unicode.h"
 
 #include "../src/llama-ext.h" // staging API: llama_vram_load_begin/end/complete
+#include "../src/llama-sha256.h" // fork 9l-d4b7j: the control-vector applied digest (fork common.cpp 10)
 
 #include <algorithm>
 #include <cinttypes>
@@ -1686,6 +1687,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (err) {
             return res;
         }
+        params.control_vector_applied_digest = cvec.applied_digest;
+        params.control_vector_applied_digest_valid = cvec.applied_digest_valid;
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
@@ -2347,6 +2350,16 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     if (result.n_embd == -1) {
         COM_ERR("%s", "no valid control vector files passed\n");
         result.data.clear();
+    } else {
+        llama_sha256_writer writer;
+        static constexpr char domain[] =
+            "llama.control-vector.applied-data/v1";
+        writer.string(domain, sizeof(domain) - 1);
+        writer.u32(uint32_t(result.n_embd));
+        writer.u64(uint64_t(result.data.size()));
+        writer.bytes(result.data.data(), result.data.size()*sizeof(float));
+        result.applied_digest = writer.finish();
+        result.applied_digest_valid = true;
     }
 
     return result;
