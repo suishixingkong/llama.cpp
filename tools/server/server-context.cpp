@@ -2779,6 +2779,19 @@ static void server_wire_standalone_retention_metadata(
 struct server_context_impl {
     friend struct server_context;
 
+    // fork 9l-d4b7u: the friendship the test oracle needs (fork server-context.cpp
+    // 3413-3422).  Without it the oracle cannot reach the private statics it
+    // drives, and the failure is a C2248 -- i.e. the name is PRESENT and the
+    // closure scanner says the dependency is satisfied, while ACCESS is not.
+    //
+    // The fork groups five friends here (a struct for the SWA-window oracle and
+    // four function friends).  This slice lands ONLY the one whose definition it
+    // also lands: a friend for a function this tree cannot yet define would be a
+    // capability the tree does not have.  The other four are asserted ABSENT by
+    // test_9l_d4b7u_guards.py, each with the slice that has to bring it.
+    friend server_vbr_reclaim_policy_result
+        server_vbr_reclaim_policy_for_test();
+
 public:
     // only use these pointers outside of this class:
     //  - when not in sleeping state
@@ -16316,6 +16329,264 @@ private:
 
 };
 
+// fork 9l-d4b7u: the VBR reclaim-policy test oracle (fork server-context.cpp 20498-20753)
+
+server_vbr_reclaim_policy_result
+server_vbr_reclaim_policy_for_test() {
+    server_vbr_reclaim_policy_result result;
+    {
+        vbr_artifact_identity_block identity {
+            "vbr-attempt-test", "adapter", "media", 1, 3, 3,
+        };
+        const server_tokens first(
+            llama_tokens { 1, 2, 3 }, false);
+        const server_tokens divergent(
+            llama_tokens { 1, 2, 4 }, false);
+        std::array<uint8_t, 32> first_digest = {};
+        std::array<uint8_t, 32> divergent_digest = {};
+        const bool digests_ready =
+            first.retention_token_digest(first_digest) &&
+            divergent.retention_token_digest(divergent_digest);
+        const auto first_attempt =
+            server_context_impl::vbr_idle_capture_attempt_digest(
+                identity, first_digest, 7, 11);
+        const auto divergent_attempt =
+            server_context_impl::vbr_idle_capture_attempt_digest(
+                identity, divergent_digest, 7, 11);
+        result.token_identity_distinguishes_attempt =
+            digests_ready && first_attempt != divergent_attempt;
+        result.successful_attempt_is_state_sealed =
+            digests_ready &&
+            server_context_impl::vbr_idle_capture_attempt_suppressed(
+                first_attempt, first_attempt, true, 0,
+                std::numeric_limits<int64_t>::max()) &&
+            !server_context_impl::vbr_idle_capture_attempt_suppressed(
+                first_attempt, divergent_attempt, true, 0,
+                std::numeric_limits<int64_t>::max()) &&
+            server_context_impl::vbr_idle_capture_attempt_suppressed(
+                first_attempt, first_attempt, false, 100, 99) &&
+            !server_context_impl::vbr_idle_capture_attempt_suppressed(
+                first_attempt, first_attempt, false, 100, 100);
+        result.multi_fresh_pressure_isolated =
+            server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, true) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, false) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                true, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                2, false, true) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::invalid,
+                2, false, false) &&
+            !server_context_impl::vbr_idle_retry_immediately(
+                false, false,
+                server_prompt_cache_vbr_capacity_status::
+                    pressure_batch_unsupported,
+                1, false, true) &&
+            server_context_impl::vbr_idle_retry_immediately(
+                false, true,
+                server_prompt_cache_vbr_capacity_status::invalid,
+                2, true, false) &&
+            [&]() {
+                const uint64_t ranked[] = { 10, 20, 30 };
+                const uint64_t admitted[] = { 20, 30 };
+                return server_context_impl::
+                    vbr_idle_capacity_retry_manifest(
+                        ranked, 3, admitted, 2) == 20;
+            }();
+        result.isolated_capture_drains_without_backoff =
+            server_context_impl::vbr_idle_release_isolated_retry(
+                1, 1, true, false, true, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                2, 1, true, false, true, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                1, 0, true, false, true, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                1, 1, false, false, true, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                1, 1, true, true, true, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                1, 1, true, false, false, false) &&
+            !server_context_impl::vbr_idle_release_isolated_retry(
+                1, 1, true, false, true, true);
+        server_vbr_idle_refusal_witness refusal;
+        refusal.attempt_identity = first_attempt;
+        refusal.accounting_serial = 41;
+        refusal.retention_epoch = 17;
+        refusal.lease_event_ordinal = 9;
+        refusal.lease_next_expiry_ns = 100;
+        refusal.lease_tracked = true;
+        refusal.valid = true;
+        server_cache_lease_retry_witness unchanged_lease;
+        unchanged_lease.event_ordinal = 9;
+        unchanged_lease.now_ns = 99;
+        unchanged_lease.available = true;
+        result.unchanged_admission_refusal_is_suppressed =
+            server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, first_attempt, 41, 17, unchanged_lease);
+        auto third_attempt = divergent_attempt;
+        third_attempt[0] ^= 0x80;
+        auto second_refusal = refusal;
+        second_refusal.attempt_identity = divergent_attempt;
+        std::vector<server_vbr_idle_refusal_witness> checkpoint_refusals;
+        result.checkpoint_admission_refusals_are_independent =
+            server_context_impl::vbr_store_idle_admission_refusal(
+                checkpoint_refusals, 4, refusal, unchanged_lease) &&
+            server_context_impl::vbr_store_idle_admission_refusal(
+                checkpoint_refusals, 4, second_refusal,
+                unchanged_lease) &&
+            checkpoint_refusals.size() == 2 &&
+            server_context_impl::vbr_idle_admission_refusal_suppressed(
+                checkpoint_refusals, first_attempt, 41, 17,
+                unchanged_lease) &&
+            server_context_impl::vbr_idle_admission_refusal_suppressed(
+                checkpoint_refusals, divergent_attempt, 41, 17,
+                unchanged_lease) &&
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                checkpoint_refusals, third_attempt, 41, 17,
+                unchanged_lease);
+        auto changed_lease = unchanged_lease;
+        changed_lease.event_ordinal++;
+        result.admission_refusal_reopens_on_currency_change =
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, divergent_attempt, 41, 17, unchanged_lease) &&
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, first_attempt, 42, 17, unchanged_lease) &&
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, first_attempt, 41, 18, unchanged_lease) &&
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, first_attempt, 41, 17, changed_lease);
+        auto expired_lease = unchanged_lease;
+        expired_lease.now_ns = refusal.lease_next_expiry_ns;
+        result.admission_refusal_reopens_at_lease_expiry =
+            !server_context_impl::vbr_idle_admission_refusal_suppressed(
+                refusal, first_attempt, 41, 17, expired_lease);
+    }
+    const auto run = [](
+            bool complete_evidence, bool zero_yield = false,
+            bool require_durable_vbr = false,
+            bool add_host_alias = false) {
+        server_context_impl context;
+        context.sleeping = true;
+        context.params_base.vbr_prompt_cache = require_durable_vbr;
+        context.slots.resize(3);
+        for (int32_t i = 0; i < 3; ++i) {
+            auto & slot = context.slots[size_t(i)];
+            slot.id = i;
+            slot.t_last_used = i + 1;
+            slot.prompt.tokens = server_tokens(
+                llama_tokens { 1, 2, llama_token(3 + i) }, false);
+            slot.prompt.sequence_epoch = 1;
+        }
+        context.cache_retention_metadata =
+            std::make_unique<server_retention_sidecar_store>();
+        const auto plan = server_retention_owner_plan_for(
+            false, false, false, true, false);
+        server_wire_standalone_retention_metadata(
+            *context.cache_retention_metadata, context.slots, nullptr,
+            common_retention_pool::attention, plan);
+
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, 3);
+        const auto hot = server_retention_instance_key::for_slot(0);
+        const auto cold_a = server_retention_instance_key::for_slot(1);
+        const auto cold_b = server_retention_instance_key::for_slot(2);
+        server_prompt_cache_state host_alias;
+        bool published = context.cache_retention_metadata->publish(
+            hot, common_retention_pool::attention, spans,
+            true, 3, 3, true);
+        published = published &&
+            context.cache_retention_metadata->publish_prefix(
+                hot, "vbr-reclaim-test", llama_tokens { 1, 2, 3 });
+        published = published &&
+            context.cache_retention_metadata->set_lineage_prior(hot, 2000);
+        published = published &&
+            context.cache_retention_metadata->publish(
+                cold_a, common_retention_pool::attention, spans,
+                true, 3, 3, true);
+        published = published &&
+            context.cache_retention_metadata->publish_prefix(
+                cold_a, "vbr-reclaim-test", llama_tokens { 1, 2, 4 });
+        if (complete_evidence) {
+            published = published &&
+                context.cache_retention_metadata->publish(
+                    cold_b, common_retention_pool::attention, spans,
+                    true, 3, 3, true);
+            published = published &&
+                context.cache_retention_metadata->publish_prefix(
+                    cold_b, "vbr-reclaim-test", llama_tokens { 1, 2, 5 });
+        }
+        if (add_host_alias) {
+            const auto host_key =
+                server_retention_instance_key::for_host_entry(&host_alias);
+            published = published &&
+                context.cache_retention_metadata->clone(
+                    cold_a, host_key) &&
+                context.cache_retention_metadata->publish_prefix(
+                    host_key, "vbr-reclaim-test",
+                    llama_tokens { 1, 2, 4 });
+        }
+
+        context.vbr_retention_candidates.resize(context.slots.size());
+        context.vbr_retention_candidate_by_seq.resize(context.slots.size());
+        context.vbr_retention_seen_by_seq.resize(context.slots.size());
+        context.vbr_exclusive_cells_by_seq.resize(context.slots.size());
+        context.vbr_durable_sources_by_seq.resize(context.slots.size());
+        const std::vector<uint32_t> exclusive {
+            zero_yield ? 0u : 100u, 100, 100,
+        };
+        context.vbr_exclusive_cells_for_test = &exclusive;
+        context.vbr_reclaim_initial_cells_for_test = zero_yield ? 200 : 300;
+        context.vbr_reclaim_cells_needed_for_test =
+            zero_yield ? 50 : (complete_evidence ? 150 : 50);
+        if (published) {
+            // The incomplete arm deliberately omits only the except/protected slot. Learned
+            // authority must still fail closed because that live prefix can change the two
+            // represented candidates' marginal lost work.
+            context.vbr_reclaim_before_degrade(
+                complete_evidence ? -1 : 2, 1, "test");
+        }
+        return std::array<bool, 5> {
+            published,
+            context.slots[0].prompt.n_tokens() > 0,
+            context.slots[1].prompt.n_tokens() > 0,
+            context.slots[2].prompt.n_tokens() > 0,
+            context.vbr_pool_state_index_for_test ==
+                ((complete_evidence || zero_yield) ? 3 : 2),
+        };
+    };
+
+    const auto learned = run(true);
+    result.learned_kept_hot = learned[0] && learned[1];
+    result.learned_removed_cold =
+        learned[0] && !learned[2] && !learned[3];
+    result.stopped_at_sufficiency = learned[0] && learned[4];
+    const auto fallback = run(false);
+    result.fallback_removed_oldest =
+        fallback[0] && !fallback[1] && fallback[2] && fallback[3] &&
+        fallback[4];
+    const auto zero_yield = run(true, true);
+    result.zero_yield_fell_back =
+        zero_yield[0] && !zero_yield[1] && !zero_yield[2] &&
+        zero_yield[3] && zero_yield[4];
+    const auto undurable = run(true, false, true);
+    result.automatic_cache_preserved_undurable =
+        undurable[0] && undurable[1] && undurable[2] && undurable[3];
+    const auto mixed_host = run(true, false, false, true);
+    result.mixed_host_kept_hot = mixed_host[0] && mixed_host[1];
+    result.mixed_host_removed_cold =
+        mixed_host[0] && !mixed_host[2] && !mixed_host[3];
+    return result;
+}
 //
 // server_context (public API)
 //

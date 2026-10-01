@@ -43,6 +43,29 @@ struct server_vbr_occupied_quarantine_reset_result {
 server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
 
+// fork 9l-d4b7u: the VBR reclaim-policy test oracle (fork server-context.h 189-209)
+struct server_vbr_reclaim_policy_result {
+    bool learned_kept_hot = false;
+    bool learned_removed_cold = false;
+    bool stopped_at_sufficiency = false;
+    bool fallback_removed_oldest = false;
+    bool zero_yield_fell_back = false;
+    bool automatic_cache_preserved_undurable = false;
+    bool mixed_host_kept_hot = false;
+    bool mixed_host_removed_cold = false;
+    bool token_identity_distinguishes_attempt = false;
+    bool successful_attempt_is_state_sealed = false;
+    bool multi_fresh_pressure_isolated = false;
+    bool isolated_capture_drains_without_backoff = false;
+    bool unchanged_admission_refusal_is_suppressed = false;
+    bool checkpoint_admission_refusals_are_independent = false;
+    bool admission_refusal_reopens_on_currency_change = false;
+    bool admission_refusal_reopens_at_lease_expiry = false;
+};
+
+server_vbr_reclaim_policy_result
+server_vbr_reclaim_policy_for_test();
+
 // Inputs to the empty-slot handoff decision. The scheduler fills these from the
 // live slot table; the predicates below are pure so the policy can be reasoned
 // about (and tested) without a server.
