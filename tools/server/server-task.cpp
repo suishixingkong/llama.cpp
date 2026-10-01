@@ -8422,6 +8422,83 @@ void server_prompt_cache::commit_restore_delivery(
 }
 
 
+// fork 9l-d4b8d: server_cache_checkpoint_capacity_floor (fork server-task.cpp 4494-4563).
+// Declared in server-cache-authority.h since forever but never DEFINED in this
+// tree -- the ported prompt-cache suite is what exposed that: it links against it.
+// One adaptation: the victim parameter is spelled as the nested typedef this
+// tree declares (`server_cache_checkpoint_authority_context::checkpoint_iterator`);
+// the fork uses a free alias `server_cache_checkpoint_iterator`.
+bool server_cache_checkpoint_capacity_floor(
+        server_cache_checkpoint_authority_context & context,
+        int checkpoint_task_id,
+        const common_prompt_checkpoint * seam_heuristic,
+        server_cache_checkpoint_authority_context::checkpoint_iterator & victim,
+        common_cache_plan_destruction_reason & refusal) noexcept {
+    victim = context.checkpoints.end();
+    refusal = context.floor_refusal;
+    if (!context.attempts.begin(
+            server_cache_checkpoint_attempt_lane::capacity_floor)) {
+        return false;
+    }
+    refusal = common_cache_plan_destruction_reason::mandatory_anchor;
+    if (context.leases) {
+        context.leases->lifecycle_point();
+    }
+    std::vector<server_cache_checkpoint_floor_input> inputs;
+    std::vector<server_cache_checkpoint_authority_context::checkpoint_iterator> members;
+    try {
+        inputs.reserve(context.checkpoints.size());
+        members.reserve(context.checkpoints.size());
+        uint32_t ordinal = 0;
+        for (auto it = context.checkpoints.begin();
+             it != context.checkpoints.end(); ++it, ++ordinal) {
+            server_cache_checkpoint_floor_input input;
+            input.ordinal = ordinal;
+            const auto key =
+                server_retention_instance_key::for_checkpoint(context.slot_id, &*it);
+            server_retention_checkpoint_inventory catalog;
+            const bool catalog_found = context.retention &&
+                context.retention->checkpoint_inventory(key, catalog);
+            input.recovery_pinned = catalog_found &&
+                catalog.recovery_pinned;
+            if (it->id_task == checkpoint_task_id ||
+                input.recovery_pinned) {
+                input.protection =
+                    server_cache_checkpoint_protection::mandatory_anchor;
+            } else if (seam_heuristic == &*it) {
+                input.protection =
+                    server_cache_checkpoint_protection::seam_heuristic;
+            }
+            if (catalog_found) {
+                if (catalog.mandatory_anchor) {
+                    input.protection =
+                        server_cache_checkpoint_protection::
+                            mandatory_anchor;
+                }
+                if (catalog.identity_known &&
+                    server_cache_lease_is_hard(catalog.lease)) {
+                    input.protection =
+                        server_cache_checkpoint_protection::hard_lease;
+                }
+            }
+            inputs.push_back(input);
+            members.push_back(it);
+        }
+    } catch (...) {
+        refusal = common_cache_plan_destruction_reason::internal_fault;
+        context.floor_refusal = refusal;
+        return false;
+    }
+    const auto plan = server_cache_plan_checkpoint_capacity_floor(inputs);
+    refusal = plan.reason;
+    context.floor_refusal = refusal;
+    if (!plan.selected || plan.ordinal >= members.size()) {
+        return false;
+    }
+    victim = members[plan.ordinal];
+    return true;
+}
+
 // fork 9l-d4b6k: server_prompt_cache::enforce_quality_anchor_budget (fork server-task.cpp 8699-8977)
 bool server_prompt_cache::enforce_quality_anchor_budget(
         iterator incoming,

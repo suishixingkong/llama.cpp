@@ -1819,16 +1819,16 @@ struct server_prompt_cache {
     // detach hook is reachable from what exists here; the omitted call
     // cleans accounting this tree never creates, so the observable result
     // is unchanged.
-    // fork server-task.h:1712-1715
+        // fork 9l-d4b8c: teardown accounting (fork server-task.h 1717-1718).
+    // Declared next to the destructor rather than next to acct_charge_entry, because that adjacency is a pinned d4b6m run.
+    void clear_accounting();
+    void acct_release_entry(server_prompt_cache_state & st);
+
+// fork server-task.h:1712-1715
     ~server_prompt_cache() {
         detach_active_storage_accounting();
         clear_accounting();
     }
-
-    // fork 9l-d4b8c: teardown accounting (fork server-task.h 1717-1718).
-    // Declared next to the destructor rather than next to acct_charge_entry, because that adjacency is a pinned d4b6m run.
-    void clear_accounting();
-    void acct_release_entry(server_prompt_cache_state & st);
 
 // fork 9l-d3c2: destination gate for the shadow workspace (fork server-task.h 1702)
     bool retention_capacity_authority = false;
