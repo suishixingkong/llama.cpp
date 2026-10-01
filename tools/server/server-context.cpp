@@ -242,6 +242,91 @@ bool server_vbr_stem_matches_capture_source(
     return valid && stem_source == capture_source;
 }
 
+// fork 9l-d4b7k: the slot-envelope layer (fork server-context.cpp 155-237).
+constexpr char SERVER_SLOT_ENVELOPE_MAGIC[8] = {
+    'B', 'U', 'U', 'N', 'S', 'L', 'O', 'T',
+};
+constexpr uint32_t SERVER_SLOT_ENVELOPE_VERSION = 2;
+constexpr size_t SERVER_SLOT_ENVELOPE_HEADER_SIZE = 224;
+constexpr uint32_t SERVER_SLOT_ENVELOPE_HAS_LOGITS = 1u << 0;
+constexpr uint32_t SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND = 1u << 1;
+
+enum class server_slot_frontier_logits_status {
+    loaded,
+    not_present,
+    legacy_cold,
+    io_error,
+    format_mismatch,
+    model_family_mismatch,
+    adapter_mismatch,
+    token_count_mismatch,
+    next_position_mismatch,
+    token_digest_mismatch,
+    vocabulary_mismatch,
+    serialized_payload_mismatch,
+    payload_mismatch,
+    logits_digest_mismatch,
+};
+
+const char * server_slot_frontier_logits_status_name(
+        server_slot_frontier_logits_status status) noexcept {
+    switch (status) {
+        case server_slot_frontier_logits_status::loaded:
+            return "loaded";
+        case server_slot_frontier_logits_status::not_present:
+            return "not_present";
+        case server_slot_frontier_logits_status::legacy_cold:
+            return "legacy_cold";
+        case server_slot_frontier_logits_status::io_error:
+            return "io_error";
+        case server_slot_frontier_logits_status::format_mismatch:
+            return "format_mismatch";
+        case server_slot_frontier_logits_status::model_family_mismatch:
+            return "model_family_mismatch";
+        case server_slot_frontier_logits_status::adapter_mismatch:
+            return "adapter_mismatch";
+        case server_slot_frontier_logits_status::token_count_mismatch:
+            return "token_count_mismatch";
+        case server_slot_frontier_logits_status::next_position_mismatch:
+            return "next_position_mismatch";
+        case server_slot_frontier_logits_status::token_digest_mismatch:
+            return "token_digest_mismatch";
+        case server_slot_frontier_logits_status::vocabulary_mismatch:
+            return "vocabulary_mismatch";
+        case server_slot_frontier_logits_status::serialized_payload_mismatch:
+            return "serialized_payload_mismatch";
+        case server_slot_frontier_logits_status::payload_mismatch:
+            return "payload_mismatch";
+        case server_slot_frontier_logits_status::logits_digest_mismatch:
+            return "logits_digest_mismatch";
+    }
+    return "unknown";
+}
+
+std::array<uint8_t, 32> server_slot_frontier_tagged_digest(
+        const char * domain,
+        const void * data,
+        size_t size) {
+    llama_sha256_writer writer;
+    writer.string(domain, std::strlen(domain));
+    writer.string(data, size);
+    return writer.finish();
+}
+
+std::array<uint8_t, 32> server_slot_frontier_string_digest(
+        const char * domain,
+        const std::string & value) {
+    return server_slot_frontier_tagged_digest(
+        domain, value.data(), value.size());
+}
+
+std::array<uint8_t, 32> server_slot_frontier_logits_digest(
+        const std::vector<float> & logits) {
+    return server_slot_frontier_tagged_digest(
+        "buun.server.slot-frontier-logits/v1",
+        logits.data(), logits.size()*sizeof(float));
+}
+
 // fork 9l-d4b7j: the slot-file runtime identity (fork server-context.cpp 239-350).
 struct server_slot_runtime_identity {
     std::array<uint8_t, 32> digest = {};
@@ -354,6 +439,298 @@ server_slot_runtime_identity server_slot_file_runtime_identity_build(
             ctx ? llama_n_ctx(ctx) : 0,
             ctx ? llama_n_ctx_seq(ctx) : 0,
             params, n_ctx_train, n_ctx_orig_yarn));
+}
+
+// fork 9l-d4b7k: the slot-envelope layer, part 2 (fork server-context.cpp
+// 352-638).  The LE helpers (B1) come first, then the envelope itself (B2),
+// then the token-binding check (B3) -- fork order, and also the only order in
+// which every file-scope free function is defined before its use.
+void server_slot_store_le_u32(std::vector<char> & out, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) {
+        out.push_back(char(uint8_t(value >> (8*i))));
+    }
+}
+
+void server_slot_store_le_u64(std::vector<char> & out, uint64_t value) {
+    for (size_t i = 0; i < 8; ++i) {
+        out.push_back(char(uint8_t(value >> (8*i))));
+    }
+}
+
+bool server_slot_load_le_u32(
+        const char * data, size_t size, size_t & offset,
+        uint32_t & value) noexcept {
+    if (offset + 4 > size) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        value |= uint32_t(uint8_t(data[offset++])) << (8*i);
+    }
+    return true;
+}
+
+bool server_slot_load_le_u64(
+        const char * data, size_t size, size_t & offset,
+        uint64_t & value) noexcept {
+    if (offset + 8 > size) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        value |= uint64_t(uint8_t(data[offset++])) << (8*i);
+    }
+    return true;
+}
+
+void server_slot_state_payload_checksum_update(
+        uint64_t & hash, const uint8_t * data, size_t size) noexcept {
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+}
+
+uint64_t server_slot_state_payload_checksum(
+        const uint8_t * data, size_t size) noexcept {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    server_slot_state_payload_checksum_update(hash, data, size);
+    return hash;
+}
+
+struct server_slot_envelope {
+    server_slot_frontier_logits_status status =
+        server_slot_frontier_logits_status::format_mismatch;
+    std::vector<char> serialized_tokens;
+    std::vector<float> logits;
+    std::array<uint8_t, 32> token_digest = {};
+    uint64_t token_count = 0;
+    int64_t next_position = 0;
+};
+
+bool server_slot_envelope_build(
+        const std::vector<char> & serialized_tokens,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint64_t token_count,
+        int64_t next_position,
+        const std::array<uint8_t, 32> & token_digest,
+        const std::vector<float> * logits,
+        std::vector<char> & output) noexcept {
+    output.clear();
+    try {
+        if (serialized_tokens.empty() || serialized_tokens.size() % 4 != 0 ||
+            serialized_tokens.size() > UINT64_MAX ||
+            (logits && (logits->empty() || logits->size() > UINT32_MAX ||
+                !std::all_of(logits->begin(), logits->end(),
+                    [](float value) { return std::isfinite(value); })))) {
+            return false;
+        }
+        const bool include_logits = logits && runtime_identity.family_compatible;
+        const uint64_t logits_bytes = include_logits
+            ? uint64_t(logits->size())*sizeof(float) : 0;
+        if (serialized_tokens.size() > SIZE_MAX - SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            logits_bytes > SIZE_MAX - SERVER_SLOT_ENVELOPE_HEADER_SIZE -
+                serialized_tokens.size()) {
+            return false;
+        }
+        output.reserve(SERVER_SLOT_ENVELOPE_HEADER_SIZE +
+                       serialized_tokens.size() + size_t(logits_bytes));
+        output.insert(output.end(), std::begin(SERVER_SLOT_ENVELOPE_MAGIC),
+                      std::end(SERVER_SLOT_ENVELOPE_MAGIC));
+        server_slot_store_le_u32(output, SERVER_SLOT_ENVELOPE_VERSION);
+        server_slot_store_le_u32(output,
+                                 uint32_t(SERVER_SLOT_ENVELOPE_HEADER_SIZE));
+        uint32_t flags = runtime_identity.family_compatible
+            ? SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND : 0;
+        if (include_logits) {
+            flags |= SERVER_SLOT_ENVELOPE_HAS_LOGITS;
+        }
+        server_slot_store_le_u32(output, flags);
+        server_slot_store_le_u32(output, 0);
+        server_slot_store_le_u64(output, serialized_tokens.size());
+        server_slot_store_le_u64(output, token_count);
+        server_slot_store_le_u64(output, uint64_t(next_position));
+        server_slot_store_le_u32(output,
+            include_logits ? uint32_t(logits->size()) : 0);
+        server_slot_store_le_u32(output, 0);
+        const auto adapter_digest = server_slot_frontier_string_digest(
+            "buun.server.slot-frontier-adapter/v1", adapter_identity);
+        const auto serialized_digest = server_slot_frontier_tagged_digest(
+            "buun.server.slot-token-envelope/v2", serialized_tokens.data(),
+            serialized_tokens.size());
+        const auto logits_digest = include_logits
+            ? server_slot_frontier_logits_digest(*logits)
+            : std::array<uint8_t, 32> {};
+        for (const auto & digest : { runtime_identity.digest, adapter_digest,
+                token_digest, serialized_digest, logits_digest }) {
+            output.insert(output.end(),
+                          reinterpret_cast<const char *>(digest.data()),
+                          reinterpret_cast<const char *>(digest.data() + digest.size()));
+        }
+        server_slot_store_le_u64(output, logits_bytes);
+        GGML_ASSERT(output.size() == SERVER_SLOT_ENVELOPE_HEADER_SIZE);
+        output.insert(output.end(), serialized_tokens.begin(), serialized_tokens.end());
+        if (include_logits) {
+            const char * begin = reinterpret_cast<const char *>(logits->data());
+            output.insert(output.end(), begin, begin + logits_bytes);
+        }
+        return output.size() % sizeof(llama_token) == 0;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
+
+server_slot_envelope server_slot_envelope_parse_bytes(
+        const void * packed_data,
+        size_t packed_size,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint32_t vocabulary_size) noexcept {
+    server_slot_envelope result;
+    try {
+        const char * data = reinterpret_cast<const char *>(packed_data);
+        const size_t size = packed_size;
+        if (size < sizeof(SERVER_SLOT_ENVELOPE_MAGIC) ||
+            std::memcmp(data, SERVER_SLOT_ENVELOPE_MAGIC,
+                        sizeof(SERVER_SLOT_ENVELOPE_MAGIC)) != 0) {
+            result.status = server_slot_frontier_logits_status::legacy_cold;
+            return result;
+        }
+        size_t offset = sizeof(SERVER_SLOT_ENVELOPE_MAGIC);
+        uint32_t version = 0;
+        uint32_t header_size = 0;
+        uint32_t flags = 0;
+        uint32_t reserved = 0;
+        uint64_t token_bytes = 0;
+        uint64_t next_position = 0;
+        uint32_t saved_vocab = 0;
+        uint32_t reserved2 = 0;
+        if (!server_slot_load_le_u32(data, size, offset, version) ||
+            !server_slot_load_le_u32(data, size, offset, header_size) ||
+            !server_slot_load_le_u32(data, size, offset, flags) ||
+            !server_slot_load_le_u32(data, size, offset, reserved) ||
+            !server_slot_load_le_u64(data, size, offset, token_bytes) ||
+            !server_slot_load_le_u64(data, size, offset, result.token_count) ||
+            !server_slot_load_le_u64(data, size, offset, next_position) ||
+            !server_slot_load_le_u32(data, size, offset, saved_vocab) ||
+            !server_slot_load_le_u32(data, size, offset, reserved2) ||
+            version != SERVER_SLOT_ENVELOPE_VERSION ||
+            header_size != SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            reserved != 0 || reserved2 != 0 ||
+            (flags & ~(SERVER_SLOT_ENVELOPE_HAS_LOGITS |
+                       SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND)) != 0) {
+            return result;
+        }
+        std::array<uint8_t, 32> saved_runtime = {};
+        std::array<uint8_t, 32> saved_adapter = {};
+        std::array<uint8_t, 32> saved_serialized = {};
+        std::array<uint8_t, 32> saved_logits = {};
+        for (auto * digest : { &saved_runtime, &saved_adapter,
+                &result.token_digest, &saved_serialized, &saved_logits }) {
+            if (offset + digest->size() > size) {
+                return result;
+            }
+            std::memcpy(digest->data(), data + offset, digest->size());
+            offset += digest->size();
+        }
+        uint64_t logits_bytes = 0;
+        if (!server_slot_load_le_u64(data, size, offset, logits_bytes) ||
+            offset != SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            token_bytes == 0 || token_bytes % 4 != 0 ||
+            token_bytes > size - offset || logits_bytes > size - offset - token_bytes ||
+            offset + token_bytes + logits_bytes != size) {
+            return result;
+        }
+        if (saved_runtime != runtime_identity.digest) {
+            result.status = server_slot_frontier_logits_status::model_family_mismatch;
+            return result;
+        }
+        if (saved_adapter != server_slot_frontier_string_digest(
+                "buun.server.slot-frontier-adapter/v1", adapter_identity)) {
+            result.status = server_slot_frontier_logits_status::adapter_mismatch;
+            return result;
+        }
+        result.next_position = int64_t(next_position);
+        result.serialized_tokens.assign(data + offset, data + offset + token_bytes);
+        if (saved_serialized != server_slot_frontier_tagged_digest(
+                "buun.server.slot-token-envelope/v2",
+                result.serialized_tokens.data(), result.serialized_tokens.size())) {
+            result.status =
+                server_slot_frontier_logits_status::serialized_payload_mismatch;
+            return result;
+        }
+        offset += token_bytes;
+        const bool has_logits = (flags & SERVER_SLOT_ENVELOPE_HAS_LOGITS) != 0;
+        if (!has_logits) {
+            if (logits_bytes != 0 || saved_vocab != 0 ||
+                saved_logits != std::array<uint8_t, 32> {}) {
+                result.status = server_slot_frontier_logits_status::payload_mismatch;
+                return result;
+            }
+            result.status = server_slot_frontier_logits_status::not_present;
+            return result;
+        }
+        if ((flags & SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND) == 0 ||
+            !runtime_identity.family_compatible || saved_vocab != vocabulary_size) {
+            result.status = saved_vocab != vocabulary_size
+                ? server_slot_frontier_logits_status::vocabulary_mismatch
+                : server_slot_frontier_logits_status::not_present;
+            return result;
+        }
+        if (logits_bytes != uint64_t(saved_vocab)*sizeof(float)) {
+            result.status = server_slot_frontier_logits_status::payload_mismatch;
+            return result;
+        }
+        result.logits.resize(saved_vocab);
+        std::memcpy(result.logits.data(), data + offset, size_t(logits_bytes));
+        if (saved_logits != server_slot_frontier_logits_digest(result.logits)) {
+            result.status = server_slot_frontier_logits_status::logits_digest_mismatch;
+            return result;
+        }
+        if (!std::all_of(result.logits.begin(), result.logits.end(),
+                [](float value) { return std::isfinite(value); })) {
+            result.status = server_slot_frontier_logits_status::payload_mismatch;
+            return result;
+        }
+        result.status = server_slot_frontier_logits_status::loaded;
+        return result;
+    } catch (...) {
+        result = {};
+        result.status = server_slot_frontier_logits_status::io_error;
+        return result;
+    }
+}
+
+server_slot_envelope server_slot_envelope_parse(
+        const llama_tokens & packed,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint32_t vocabulary_size) noexcept {
+    return server_slot_envelope_parse_bytes(
+        packed.data(), packed.size()*sizeof(llama_token), runtime_identity,
+        adapter_identity, vocabulary_size);
+}
+
+server_slot_frontier_logits_status server_slot_envelope_token_binding_status(
+        const server_slot_envelope & envelope,
+        uint64_t token_count,
+        int64_t next_position,
+        const std::array<uint8_t, 32> & token_digest) noexcept {
+    if (envelope.status != server_slot_frontier_logits_status::loaded) {
+        return envelope.status;
+    }
+    if (envelope.token_count != token_count) {
+        return server_slot_frontier_logits_status::token_count_mismatch;
+    }
+    if (envelope.next_position != next_position) {
+        return server_slot_frontier_logits_status::next_position_mismatch;
+    }
+    if (envelope.token_digest != token_digest) {
+        return server_slot_frontier_logits_status::token_digest_mismatch;
+    }
+    return server_slot_frontier_logits_status::loaded;
 }
 
 struct server_slot; // forward declaration
