@@ -66,6 +66,32 @@ struct server_vbr_reclaim_policy_result {
 server_vbr_reclaim_policy_result
 server_vbr_reclaim_policy_for_test();
 
+// fork 9l-d4b7v: server_committed_decode_reset_test_result (fork server-context.h 34-41)
+struct server_committed_decode_reset_test_result {
+    bool processing_prompt_cleared = false;
+    bool processing_family_cleared = false;
+    bool idle_prompt_preserved = false;
+};
+
+server_committed_decode_reset_test_result
+server_committed_decode_reset_for_test();
+
+// fork 9l-d4b7v: server_active_prefix_retention_for_test (fork server-context.h 43-43)
+bool server_active_prefix_retention_for_test();
+
+// fork 9l-d4b7v: server_vbr_retention_wiring_result (fork server-context.h 177-187)
+struct server_vbr_retention_wiring_result {
+    bool slot_metadata_wired = false;
+    bool slot_lifecycle_absent = false;
+    bool slot_lease_absent = false;
+    bool prefix_tracking_enabled = false;
+    bool authority_prefix_tracking_enabled = false;
+    bool external_coverage_exact = false;
+};
+
+server_vbr_retention_wiring_result
+server_vbr_retention_wiring_for_test();
+
 // Inputs to the empty-slot handoff decision. The scheduler fills these from the
 // live slot table; the predicates below are pure so the policy can be reasoned
 // about (and tested) without a server.

@@ -16587,6 +16587,185 @@ server_vbr_reclaim_policy_for_test() {
         mixed_host[0] && !mixed_host[2] && !mixed_host[3];
     return result;
 }
+// fork 9l-d4b7v: server_active_prefix_retention_for_test (fork server-context.cpp 19904-19984)
+bool server_active_prefix_retention_for_test() {
+    bool passed = true;
+    const auto check = [&](bool value, const char * label) {
+        if (!value) { std::fprintf(stderr, "active prefix retention: %s\n", label); }
+        passed &= value;
+    };
+    // Exercise the real slot receipt methods without loading a model. Cancellation
+    // uses the same clear method that reset() calls; live cancellation has its own gate.
+    for (const auto mode : { "success", "source-retired", "cancel", "cold", "trimmed", "short", "system", "missing" }) {
+        server_retention_sidecar_store store;
+        store.configure(nullptr, {}, nullptr);
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER, 0, 512);
+        const auto source = server_retention_instance_key::for_slot(0);
+        const auto incumbent = server_retention_instance_key::for_slot(2);
+        check(store.publish(source, common_retention_pool::attention, spans, true, 512, 512, true), "source admission");
+        check(store.publish(incumbent, common_retention_pool::attention, spans, true, 512, 512, true), "incumbent admission");
+        server_slot slot;
+        slot.id = 1;
+        slot.retention_obs = &store;
+        auto task = std::make_unique<server_task>();
+        task->params.message_spans = spans;
+        check(store.acquire_lineage_ticket(incumbent, slot.retention_reuse_source), "old receipt");
+        const auto old_lineage = slot.retention_reuse_source.lineage_id;
+        slot.retention_reuse_pending = true;
+        slot.retention_reuse_tokens = 512;
+        slot.retention_branch_pending = true;
+        server_retention_candidate candidate;
+        check(store.candidate_for_instance(source, candidate), "source candidate");
+        const auto lineage = candidate.record.stamp.lineage_id;
+        const auto hits = [&](uint64_t id) {
+            for (const auto & row : store.snapshot().lineages) {
+                if (row.lineage_id == id) { return row.reuse_hits; }
+            }
+            return UINT64_MAX;
+        };
+        const bool short_prefix = std::strcmp(mode, "short") == 0;
+        const bool system_prefix = std::strcmp(mode, "system") == 0;
+        const bool missing = std::strcmp(mode, "missing") == 0;
+        if (system_prefix) {
+            task->params.message_spans = {};
+            task->params.message_spans.add(COMMON_CHAT_ROLE_SYSTEM, 0, 8);
+            task->params.message_spans.add(COMMON_CHAT_ROLE_USER, 8, 504);
+        }
+        const uint64_t n = short_prefix ? 255 : system_prefix ? 8 : 256;
+        slot.task = std::move(task);
+        slot.stage_active_prefix_reuse(missing ? server_retention_instance_key::for_slot(99) : source, n);
+        slot.stats.n_prompt_cached = n;
+        check(!slot.retention_branch_pending, "discarded incumbent branch cleared");
+        check(hits(lineage) == 0 && hits(old_lineage) == 0, "staging earns no credit");
+        check(slot.retention_reuse_pending == (!short_prefix && !missing), "useful prefix threshold");
+        check(!slot.retention_destination.valid(), "destination lineage not adopted");
+        server_retention_lineage_ticket audit;
+        if (std::strcmp(mode, "source-retired") == 0) {
+            check(store.acquire_lineage_ticket(source, audit), "audit pin");
+            store.retire(source);
+            check(hits(lineage) == 0, "ticket retains retired source");
+        }
+        if (std::strcmp(mode, "cancel") == 0) {
+            slot.clear_retention_reuse();
+        } else if (std::strcmp(mode, "cold") == 0) {
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            slot.stats.n_prompt_cached = 0;
+        } else if (std::strcmp(mode, "trimmed") == 0) {
+            slot.stats.n_prompt_cached = 255;
+        }
+        slot.commit_retention_reuse();
+        const bool credited = std::strcmp(mode, "success") == 0 || system_prefix || audit.valid();
+        check(hits(lineage) == uint64_t(credited), "only successful useful reuse credited");
+        check(hits(old_lineage) == 0, "incumbent never credited");
+        check(!slot.retention_reuse_pending && !slot.retention_reuse_source.valid(), "receipt closed");
+        store.begin_competition_wave();
+        slot.commit_retention_reuse();
+        check(hits(lineage) == uint64_t(credited), "exactly once across epochs");
+        store.release_lineage_ticket(audit);
+        store.retire(source);
+        store.retire(incumbent);
+        check(store.snapshot().lineages.empty() && store.live_bytes() == 0, "no retained lineage or geometry");
+    }
+    return passed;
+}
+
+// fork 9l-d4b7v: server_committed_decode_reset_for_test (fork server-context.cpp 20098-20122)
+server_committed_decode_reset_test_result
+server_committed_decode_reset_for_test() {
+    server_committed_decode_reset_test_result result;
+    std::vector<server_slot> slots(2);
+
+    auto & processing = slots[0];
+    processing.id = 0;
+    processing.state = SLOT_STATE_PROCESSING_PROMPT;
+    processing.prompt.tokens = server_tokens(llama_tokens { 1, 2, 3 }, false);
+    processing.cache_family = {
+        common_cache_family_id { 73 }, common_cache_family_role::branch,
+    };
+
+    auto & idle = slots[1];
+    idle.id = 1;
+    idle.state = SLOT_STATE_IDLE;
+    idle.prompt.tokens = server_tokens(llama_tokens { 4, 5 }, false);
+
+    server_reset_processing_slots_after_committed_failure(slots);
+    result.processing_prompt_cleared = processing.prompt.tokens.empty();
+    result.processing_family_cleared = !processing.cache_family.declared();
+    result.idle_prompt_preserved = idle.prompt.tokens.get_tokens() ==
+        llama_tokens({ 4, 5 });
+    return result;
+}
+
+// fork 9l-d4b7v: server_vbr_retention_wiring_for_test (fork server-context.cpp 20430-20496)
+server_vbr_retention_wiring_result
+server_vbr_retention_wiring_for_test() {
+    server_vbr_retention_wiring_result result;
+    std::vector<server_slot> slots(2);
+    slots[0].id = 0;
+    slots[1].id = 1;
+
+    server_retention_sidecar_store metadata;
+    const auto metadata_plan = server_retention_owner_plan_for(
+        false, false, false, true, false);
+    server_wire_standalone_retention_metadata(
+        metadata, slots, nullptr, common_retention_pool::attention,
+        metadata_plan);
+    result.slot_metadata_wired =
+        slots[0].retention_obs == &metadata &&
+        slots[1].retention_obs == &metadata;
+    result.slot_lifecycle_absent =
+        slots[0].lifecycle_authority == nullptr &&
+        slots[1].lifecycle_authority == nullptr;
+    result.slot_lease_absent =
+        slots[0].lease_obs == nullptr && slots[1].lease_obs == nullptr;
+    result.prefix_tracking_enabled = metadata.prefix_tracking_enabled();
+
+    common_chat_msg_spans spans0;
+    spans0.add(COMMON_CHAT_ROLE_USER, 0, 4);
+    common_chat_msg_spans spans1;
+    spans1.add(COMMON_CHAT_ROLE_USER, 0, 3);
+    const auto key0 = server_retention_instance_key::for_slot(0);
+    const auto key1 = server_retention_instance_key::for_slot(1);
+    const llama_tokens tokens0 { 1, 2, 3, 4 };
+    const llama_tokens tokens1 { 1, 2, 9 };
+    const bool published =
+        metadata.publish(
+            key0, common_retention_pool::attention, spans0,
+            true, 4, 4, true) &&
+        metadata.publish_prefix(key0, "vbr-test", tokens0) &&
+        metadata.publish(
+            key1, common_retention_pool::attention, spans1,
+            true, 3, 3, true) &&
+        metadata.publish_prefix(key1, "vbr-test", tokens1);
+    struct coverage_capture {
+        size_t rows = 0;
+        bool exact = true;
+    } capture;
+    const auto snapshot = metadata.value_snapshots(
+        &capture,
+        +[](void * context,
+            const server_retention_value_snapshot & row) noexcept {
+            auto & value = *static_cast<coverage_capture *>(context);
+            value.rows++;
+            value.exact = value.exact &&
+                row.external_shared_coverage_tokens == 2;
+            return true;
+        });
+    result.external_coverage_exact = published &&
+        snapshot.status == server_retention_value_snapshot_status::complete &&
+        snapshot.size == 2 && capture.rows == 2 && capture.exact;
+
+    server_retention_sidecar_store authority_metadata;
+    const auto authority_plan = server_retention_owner_plan_for(
+        false, true, false, true, false);
+    server_request_retention_prefix_tracking(
+        authority_metadata, nullptr, authority_plan);
+    result.authority_prefix_tracking_enabled =
+        authority_metadata.prefix_tracking_enabled();
+    return result;
+}
+
 //
 // server_context (public API)
 //
