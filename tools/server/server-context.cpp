@@ -3123,6 +3123,24 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // fork 9l-d4b8x: cancel and drain an in-flight idle capture first -- the
+        // bounded worker points into the context that is about to go away.
+        if (vbr_idle_exact_capture) {
+            vbr_idle_exact_capture->session.cancel();
+            (void) finish_idle_exact_vbr_capture(false);
+        }
+        // fork 9l-d4b8x: release whatever the decode path pinned on the hard seal
+        // guard, while the target context is still alive.
+        if (ctx_tgt) {
+            llama_get_memory(ctx_tgt)->vbr_hard_seal_guard_set({});
+        }
+        // fork 9l-d4b8x: slot-held SWA window images point into the target's
+        // storage. `slots` is declared before that storage's owner, so member
+        // destruction order would free the storage first -- close every
+        // dependency explicitly instead.
+        for (auto & slot : slots) {
+            slot.swa_windows.clear();
+        }
         spec.reset();
         spec_init.reset();
 
