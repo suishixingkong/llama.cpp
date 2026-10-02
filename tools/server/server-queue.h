@@ -190,6 +190,16 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    // fork 9l-d4b9b: is there external work the scheduler has not taken yet?
+    // (fork server-queue.h 186-190)  The readiness scan below stands down
+    // while any real or deferred task is waiting, so the predicate and its
+    // use land together.
+    bool has_pending_tasks() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty() || !queue_tasks_deferred.empty() ||
+            !queue_tasks_unhandled.empty();
+    }
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //

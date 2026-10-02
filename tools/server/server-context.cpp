@@ -10403,6 +10403,38 @@ private:
                 sample_frontier_logits(slot);
             }
         }
+
+        // fork 9l-d4b9b: dynamic VBR, mid-decode pressure -- generation can cross
+        // a page/budget boundary long after launch.  Same floor-gated reclaim
+        // before the cache pays with tiers (idle slots only; every generating
+        // slot is processing and untouchable).
+        //
+        // CR readiness begins from the normal decode cadence, BEFORE the
+        // reclaim/degrade boundary.  Only immutable preparation runs here;
+        // exact bulk transfer is handed to the bounded worker and the
+        // scheduler remains the sole publication terminal.
+        if (batch.size() > 0) {
+            if (params_base.vbr_prompt_cache &&
+                !vbr_idle_exact_capture &&
+                !queue_tasks.has_pending_tasks() &&
+                ggml_time_ms() >= vbr_capture_readiness_next_scan_ms) {
+                // Full retention ranking and catalog classification are
+                // scheduler work, not a per-ubatch probe.  Idle/mutation wakes
+                // remain immediate; sustained decode gets one conservative
+                // pre-pressure sample per second.
+                vbr_capture_readiness_next_scan_ms =
+                    ggml_time_ms()+VBR_READINESS_SCAN_INTERVAL_MS;
+                auto capture = queue_tasks.try_begin_idle_capture();
+                if (capture) {
+                    (void) publish_idle_vbr_batch(capture, true);
+                }
+            }
+            const uint64_t requested = uint64_t(batch.size()) +
+                vbr_capture_reserved_cells();
+            vbr_reclaim_before_degrade(
+                -1, uint32_t(std::min<uint64_t>(requested, UINT32_MAX)),
+                "decode");
+        }
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -10795,6 +10827,13 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // fork 9l-d4b9b: preserve the near-end reusable frontier without
+                // splitting prefill, before the frontier capture below relies on
+                // it.  Capture declines if those earlier rows were recycled.
+                if (swa_window_eligible(slot) && slot.prompt.n_tokens() >= 68) {
+                    capture_swa_window(slot, slot.prompt.n_tokens() - 4);
+                }
 
                 // fork 9l-d4b6x: wait_for_prompt_capture assignment (fork server-context.cpp 18861-18862)
                 wait_for_prompt_capture = capture_vbr_swa_prompt_frontier(
