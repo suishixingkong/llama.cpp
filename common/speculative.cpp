@@ -3247,6 +3247,42 @@ bool common_speculative_mtp_carry_state_load(
     return true;
 }
 
+// fork 9l-d4b8h: both bodies, byte for byte (fork common/speculative.cpp:157-188).
+// checkpoint_policy_resolve is what the VBR capture path reads to decide whether
+// an empty draft sequence needs its full image; preflight_resolve is what decides
+// whether a multi-sequence batch may advance at all.
+common_speculative_checkpoint_policy common_speculative_checkpoint_policy_resolve(
+        bool has_draft_context,
+        bool vbr_prompt_cache,
+        bool can_speculate,
+        bool mtp_primary) noexcept {
+    const bool require_mtp = has_draft_context && can_speculate && mtp_primary;
+    return {
+        has_draft_context && (vbr_prompt_cache || require_mtp),
+        require_mtp,
+    };
+}
+
+common_speculative_mtp_process_preflight
+common_speculative_mtp_process_preflight_resolve(
+        const std::vector<common_speculative_mtp_carry_lifecycle> & lifecycles,
+        const std::vector<int32_t> & active_batch_beg,
+        const llama_pos * positions) noexcept {
+    if (lifecycles.size() != active_batch_beg.size() || positions == nullptr) {
+        return common_speculative_mtp_process_preflight::target_only;
+    }
+    for (size_t seq = 0; seq < lifecycles.size(); ++seq) {
+        if (active_batch_beg[seq] < 0) {
+            continue;
+        }
+        if (lifecycles[seq].target_process_mode(positions[active_batch_beg[seq]]) ==
+                common_speculative_mtp_carry_lifecycle::process_mode::target_only) {
+            return common_speculative_mtp_process_preflight::target_only;
+        }
+    }
+    return common_speculative_mtp_process_preflight::cold_or_retained;
+}
+
 // fork common/speculative.cpp:6103
 void common_speculative_sequence_transition(
         common_speculative * spec,

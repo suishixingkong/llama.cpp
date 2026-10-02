@@ -228,6 +228,100 @@ int main(void) {
         }
     }
 
+    // fork 9l-d4b8h: the batch preflight and the checkpoint policy, both
+    // pinned to the fork rows (fork tests/test-mtp-vocab-trim.cpp
+    // 65-93 and 133-151) in this harness counted style.
+    // ------------------------------------------------- batch preflight
+    // fork tests/test-mtp-vocab-trim.cpp:65-93 asserts exactly these five rows.
+    // The rule: one active sequence at a nonzero frontier without an
+    // authenticated carry makes the WHOLE batch target-only, so no sibling
+    // advances on a partial row.
+    printf("== the batch preflight is target-only if any active sequence lacks a carry ==\n");
+    {
+        std::vector<lifecycle> batch(2);
+        const std::vector<int32_t> active = { 0, 1 };
+        llama_pos positions[] = { 0, 0 };
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, active, positions) ==
+              common_speculative_mtp_process_preflight::cold_or_retained,
+              "preflight: cold + frontier 0 is cold_or_retained");
+
+        positions[1] = 37;
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, active, positions) ==
+              common_speculative_mtp_process_preflight::target_only,
+              "preflight: one cold sequence at frontier 37 poisons the batch");
+
+        batch[1].target_process_refreshed();
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, active, positions) ==
+              common_speculative_mtp_process_preflight::cold_or_retained,
+              "preflight: refreshing that sequence clears the poison");
+
+        batch[0].target_process_refreshed();
+        positions[0] = 91;
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, active, positions) ==
+              common_speculative_mtp_process_preflight::cold_or_retained,
+              "preflight: a refreshed nonzero frontier is harmless");
+
+        // an INACTIVE sequence (active_batch_beg < 0) is skipped entirely, so a
+        // poisoned row on it must NOT block the active one
+        const std::vector<int32_t> only_first = { 0, -1 };
+        batch[0].sequence_transition(
+            common_speculative_sequence_event::prompt_rewind);
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, only_first, positions) ==
+              common_speculative_mtp_process_preflight::target_only,
+              "preflight: an active sequence that lost its carry still poisons");
+
+        // the inactive row is skipped, not inspected: with only seq 0 active and
+        // seq 0 refreshed, the batch may proceed even though seq 1 is cold
+        batch[0].target_process_refreshed();
+        check(common_speculative_mtp_process_preflight_resolve(
+                  batch, only_first, positions) ==
+              common_speculative_mtp_process_preflight::cold_or_retained,
+              "preflight: an INACTIVE cold sequence is skipped, not fatal");
+    }
+
+    // ---------------------------------------------- checkpoint policy
+    // fork tests/test-mtp-vocab-trim.cpp:133-151.
+    //   capture_draft = has_draft_context && (vbr_prompt_cache || require_mtp)
+    //   require_complete_draft_and_state = has_draft_context && can_speculate && mtp_primary
+    // require_complete_draft_and_state is a STRICTER claim than capture_draft:
+    // it says the draft image is useless without the pending hidden carry, so
+    // publishing one without the other must be refused.
+    printf("== the checkpoint policy decides draft capture and the stricter completeness ==\n");
+    {
+        const auto none = common_speculative_checkpoint_policy_resolve(
+            false, false, true, true);
+        check(!none.capture_draft,
+              "policy: no draft context captures no draft, even with mtp_primary");
+        check(!none.require_complete_draft_and_state,
+              "policy: no draft context requires nothing");
+
+        const auto vbr_only = common_speculative_checkpoint_policy_resolve(
+            true, true, false, false);
+        check(vbr_only.capture_draft,
+              "policy: VBR alone captures the draft without any speculation");
+        check(!vbr_only.require_complete_draft_and_state,
+              "policy: VBR alone does NOT demand the carry");
+
+        const auto mtp = common_speculative_checkpoint_policy_resolve(
+            true, false, true, true);
+        check(mtp.capture_draft,
+              "policy: an active MTP primary captures the draft");
+        check(mtp.require_complete_draft_and_state,
+              "policy: an active MTP primary demands the carry too");
+
+        const auto inactive_mtp = common_speculative_checkpoint_policy_resolve(
+            true, false, false, true);
+        check(!inactive_mtp.capture_draft,
+              "policy: mtp_primary without can_speculate captures nothing");
+        check(!inactive_mtp.require_complete_draft_and_state,
+              "policy: mtp_primary without can_speculate requires nothing");
+    }
+
     // ------------------------------------------------- negative control
     // Proves the counter and the exit code can actually move. The injected
     // failure is rolled back so it never reaches the reported total.

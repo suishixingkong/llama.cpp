@@ -194,6 +194,34 @@ bool common_speculative_mtp_carry_state_load(
         std::vector<float> & pending_h,
         const std::vector<uint8_t> & data);
 
+// fork 9l-d4b8h: the checkpoint policy and the batch preflight both live
+// between the MTP carry codec and the sequence-transition owner
+// (fork common/speculative.h:204-228).
+struct common_speculative_checkpoint_policy {
+    bool capture_draft = false;
+    bool require_complete_draft_and_state = false;
+};
+
+common_speculative_checkpoint_policy common_speculative_checkpoint_policy_resolve(
+        bool has_draft_context,
+        bool vbr_prompt_cache,
+        bool can_speculate,
+        bool mtp_primary) noexcept;
+
+enum class common_speculative_mtp_process_preflight {
+    cold_or_retained,
+    target_only,
+};
+
+// Resolve every active sequence before process() mutates draft memory. A
+// single nonzero frontier without an authenticated carry makes the whole
+// multi-sequence batch target-only so no sequence advances on partial state.
+common_speculative_mtp_process_preflight
+common_speculative_mtp_process_preflight_resolve(
+    const std::vector<common_speculative_mtp_carry_lifecycle> & lifecycles,
+    const std::vector<int32_t> & active_batch_beg,
+    const llama_pos * positions) noexcept;
+
 // One owner for external sequence lifecycle mutations. Implementations discard
 // branch-local state and apply the event-specific memory/ring policy.
 void common_speculative_sequence_transition(
