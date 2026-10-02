@@ -4527,6 +4527,10 @@ private:
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
+            // fork 9l-d4b8u (cont): the same two flags that arm the host cache
+            // also change what an idle slot is published AS -- a projected
+            // artifact rather than a plain KV snapshot -- so the trace line
+            // above the non-VBR branch would describe the wrong behaviour.
             } else if (params_base.vbr_prompt_cache) {
                 SRV_TRC("%s", "idle dynamic-VBR slots will be published as projected prompt-cache artifacts; live sources remain resident during the initial restore rollout\n");
             } else {
