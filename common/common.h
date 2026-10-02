@@ -392,6 +392,26 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    // fork 9l-d4b8i: the MTP-primary-drafter predicate (fork common/common.h 447-466).
+    // The VBR capture kernel reads it to decide whether an empty draft sequence
+    // still needs its complete draft image (fork 17791-17798).
+    bool has_non_mtp_model_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+        // ADAPTATION: the fork disjoins one more member here,
+        // `has_type(COMMON_SPECULATIVE_TYPE_DFLASH)` -- the block-diffusion drafter.
+        // That enumerator is fork-only (the DFlash pipeline is out of scope in this
+        // tree), so a byte-for-byte copy would not compile. It is omitted rather than
+        // aliased onto DRAFT_DFLASH: those are two different enumerators in the fork.
+    }
+
+    bool uses_mtp_as_primary_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+               !has_non_mtp_model_drafter();
+    }
+
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }

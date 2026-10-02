@@ -70,6 +70,47 @@ static nlohmann::ordered_json server_ordered_from_json(const json & value) {
 
 #endif
 
+// fork 9l-d4b8i: the fixed-capacity capture writer (fork server-context.cpp 87-122).
+// The VBR capture kernel hands this to a QSA capture_stream so an index image
+// lands in exactly the buffer its size probe reserved; `complete()` is what
+// rejects a short or overrunning write before anything is published.
+class server_fixed_io_writer final : public llama_io_write_i {
+  public:
+    server_fixed_io_writer(uint8_t * data, size_t capacity) noexcept
+        : data_(data), capacity_(capacity) {}
+
+    void write(const void * source, size_t size) override {
+        if (!source || !reserve(size)) {
+            valid_ = false;
+            return;
+        }
+        std::memcpy(data_ + offset_, source, size);
+        offset_ += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (!tensor || !reserve(size)) {
+            valid_ = false;
+            return;
+        }
+        ggml_backend_tensor_get(tensor, data_ + offset_, offset, size);
+        offset_ += size;
+    }
+
+    size_t n_bytes() override { return offset_; }
+    bool complete() const noexcept { return valid_ && offset_ == capacity_; }
+
+  private:
+    bool reserve(size_t size) const noexcept {
+        return valid_ && size <= capacity_ - offset_;
+    }
+
+    uint8_t * data_ = nullptr;
+    size_t capacity_ = 0;
+    size_t offset_ = 0;
+    bool valid_ = true;
+};
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // Keep the C-style memory API balanced across every server early return. A scope only
@@ -2238,6 +2279,12 @@ struct server_slot {
         server_cache_checkpoint_ring_changed(context);
     }
 
+    // fork 9l-d4b8i: the publication-attempt latch (fork server-context.cpp 1850-1853)
+    bool checkpoint_publication_attempt_begin() noexcept {
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_publication_attempt_begin(context);
+    }
+
     // fork server-context.cpp:1855
     void vbr_idle_capture_source_reset() noexcept {
         vbr_idle_capture_attempt_identity = {};
@@ -2442,6 +2489,22 @@ struct server_slot {
         return checkpoint_drop_joined_impl(first, last);
     }
 
+    // fork 9l-d4b8i: capacity floor + publication-skip (fork server-context.cpp 2208-2222)
+    bool checkpoint_capacity_floor(
+            int checkpoint_task_id,
+            const common_prompt_checkpoint * seam_heuristic,
+            checkpoint_iterator & victim,
+            common_cache_plan_destruction_reason & refusal) noexcept {
+        auto context = checkpoint_authority_context();
+        return server_cache_checkpoint_capacity_floor(
+            context, checkpoint_task_id, seam_heuristic, victim, refusal);
+    }
+
+    void checkpoint_publication_skipped(
+            common_cache_plan_destruction_reason reason) noexcept {
+        auto context = checkpoint_authority_context();
+        server_cache_checkpoint_publication_skipped(context, reason);
+    }
     // fork server-context.cpp:2224-2226  — the token_ledger_truncate row's physical
     // choke point. The fallback arm of the restore/trim transaction truncates the
     // ledger to 0 when a rejected suffix trim has already cleared everything.
@@ -9243,7 +9306,14 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    // fork 9l-d4b8i: typed SWA windows make checkpoints reachable even with
+                    // n_ctx_checkpoints == 0, and give the ring its own frontier
+                    // (fork server-context.cpp 17407-17411).
+                    const bool typed_swa_checkpoint = swa_window_eligible(slot);
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 || typed_swa_checkpoint;
+                    const int64_t last_checkpoint = typed_swa_checkpoint
+                        ? (slot.swa_windows.empty() ? -1 : slot.swa_windows.back().image->frontier())
+                        : (slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens);
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -9361,9 +9431,10 @@ private:
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
-
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            // fork 9l-d4b8i: last_checkpoint supersedes the ad-hoc
+                            // checkpoints.back() lookup, so a typed SWA window is
+                            // measured against its own frontier (fork server-context.cpp 17537).
+                            if (pos == last_user_pos || last_checkpoint < 0 || pos > last_checkpoint + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -9447,6 +9518,12 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
+                    // fork 9l-d4b8i: the empty/small floor (fork server-context.cpp 17604-17608)
+                    // no need for empty or small checkpoints
+                    // for hybrid/recurrent models, lower the checkpoint threshold so short prompts also get checkpointed
+                    const int checkpoint_min_tokens = (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
+                    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
+
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -9456,17 +9533,687 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
+                    // fork 9l-d4b8i: the inline VBR checkpoint capture kernel
+                    // (fork server-context.cpp 17618-18282).  Replaces this tree's single
+                    // `create_checkpoint(...)` call: the fork deleted that helper (its note
+                    // is at fork 11159) and made this region the ONE capture path, because
+                    // the helper alone populated data_dft/spec state that the live path
+                    // never fills.  The byte range below is the fork's, unmodified.
+                    //
+                    // `create_checkpoint` itself stays in this tree: its remaining caller
+                    // is the port-only --checkpoint-recurrent-prev snapshot, which the
+                    // fork does not have.
+                    //
+                    // ADAPTATION: the fork owns its draft context as a smart pointer and
+                    // writes `ctx_dft.get()` at three sites (17812 / 17829 / 17911); this
+                    // tree keeps upstream's raw `llama_context * ctx_dft` (see the member
+                    // block, where ctx_dft_shared holds the ownership), so those three
+                    // drop `.get()`.  Nothing else in the range differs.
+
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
+                            last_checkpoint < 0 ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > last_checkpoint + params_base.checkpoint_min_step);
+
+                    const bool checkpoint_exact_frontier =
+                        llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+
+                    // A hybrid/recurrent checkpoint captures a
+                    // point-in-time state valid ONLY at its exact frontier -- never a [pos_min, pos_max]
+                    // range. If seq_pos_min and seq_pos_max disagree (a hybrid whose attention and
+                    // recurrent frontiers diverged), that range is a LIE for this state: a later restore
+                    // reads pos_min (see :4578) and would install the frontier state at the wrong
+                    // position -> wrong continuation. Fail CLOSED here -- skip the capture and keep
+                    // existing good checkpoints (do NOT evict for one we won't create). In a coherent
+                    // recurrent/hybrid cache equality holds (one recurrent frontier row) so this should
+                    // never fire; if it does, it is a real memory-frontier bug worth the loud warning.
+                    if (do_checkpoint && checkpoint_exact_frontier && pos_min != pos_max) {
+                        SLT_WRN(slot, "[frontier-validity] skipping context checkpoint: recurrent/hybrid seq_pos_min (%d) != seq_pos_max (%d) -- range invalid for a point-in-time state\n",
+                                pos_min, pos_max);
+                        do_checkpoint = false;
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
+                    const int ckpt_id_task = slot.task->id;
+                    const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+                    if (do_checkpoint && typed_swa_checkpoint) {
+                        // A natural multi-slot batch may leave fewer than four
+                        // tokens. The deferred near-end capture below already
+                        // covers that boundary; do not save an overlapping later one.
+                        if (ckpt_n_tokens + 4 <= slot.task->n_tokens()) {
+                            capture_swa_window(slot, ckpt_n_tokens);
+                        }
+                        do_checkpoint = false; // never route a typed window through legacy serialization
+                    }
+                    const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
+                    llama_memory_vbr_state_data vbr_now = {};
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
+                    }
+
+                    common_computation_frontier ckpt_frontier;
+                    if (do_checkpoint) {
+                        try {
+                            ckpt_frontier.version =
+                                common_computation_frontier::VERSION;
+                            ckpt_frontier.sequence_epoch =
+                                ensure_frontier_sequence_epoch(slot.prompt);
+                            ckpt_frontier.token_count = ckpt_n_tokens;
+                            ckpt_frontier.next_position =
+                                slot.prompt.tokens.pos_next(ckpt_n_tokens);
+                            ckpt_frontier.execution_identity =
+                                frontier_execution_identity;
+                            ckpt_frontier.adapter_config_identity =
+                                lora_config_identity(slot.lora);
+
+                            if (!slot.prompt.tokens.media_content_identity(
+                                    ckpt_n_tokens,
+                                    ckpt_frontier.media_content_identity)) {
+                                SLT_WRN(slot,
+                                        "FRONTIER_RECORD event=capture_reject "
+                                        "reason=unverifiable_media "
+                                        "n_tokens=%" PRId64 "\n",
+                                        ckpt_n_tokens);
+                                do_checkpoint = false;
+                            } else if (pos_max < 0 ||
+                                       ckpt_frontier.next_position <= 0 ||
+                                       ckpt_frontier.next_position - 1 != pos_max) {
+                                // Dual-write only records a frontier when the live
+                                // logical ledger and legacy physical end agree.
+                                SLT_WRN(slot,
+                                        "FRONTIER_RECORD event=capture_reject "
+                                        "reason=legacy_frontier_disagreement "
+                                        "n_tokens=%" PRId64
+                                        " next_position=%d pos_max=%d\n",
+                                        ckpt_n_tokens,
+                                        ckpt_frontier.next_position,
+                                        pos_max);
+                                do_checkpoint = false;
+                            }
+                        } catch (const std::exception & e) {
+                            SLT_WRN(slot,
+                                    "FRONTIER_RECORD event=capture_reject "
+                                    "reason=identity_failure error=%s\n",
+                                    e.what());
+                            do_checkpoint = false;
+                        }
+                    }
+
+                    // An equivalent checkpoint already exists (e.g. one just
+                    // restored, or an unchanged frontier). Length + pos_max alone are NOT an
+                    // identity: SWA may have a different pos_min, and VBR can change the paired
+                    // attention representation without moving the logical frontier. Only adopt a
+                    // complete snapshot whose full validity and representation key match.
+                    if (do_checkpoint && !slot.prompt.checkpoints.empty()) {
+                        auto & last = slot.prompt.checkpoints.back();
+                        if (!last.empty() &&
+                            last.n_tokens                == ckpt_n_tokens &&
+                            last.pos_min                 == ckpt_pos_min &&
+                            last.pos_max                 == pos_max &&
+                            last.checkpoint_epoch     == vbr_now.checkpoint_epoch &&
+                            last.checkpoint_epoch_swa == vbr_now.checkpoint_epoch_swa &&
+                            computation_frontiers_equal(
+                                last.computation_frontier,
+                                ckpt_frontier)) {
+                            last.id_task = ckpt_id_task;
+                            SLT_DBG(slot, "context checkpoint dedup: last already covers n_tokens = %" PRId64 ", pos_min = %d, pos_max = %d, checkpoint epochs = (%" PRIu64 ", %" PRIu64 ") -- adopting\n",
+                                    ckpt_n_tokens, ckpt_pos_min, pos_max,
+                                    vbr_now.checkpoint_epoch, vbr_now.checkpoint_epoch_swa);
+                            do_checkpoint = false;
+
+                        }
+                    }
+
+                    if (do_checkpoint && slot.retention_geometry_failed) {
+                        // This slot's retention geometry is permanently
+                        // unavailable for the current live lineage. Avoid
+                        // repeatedly serializing target/draft/ring images that
+                        // the lifecycle owner is guaranteed to refuse.
+                        do_checkpoint = false;
+                    }
+                    std::list<common_prompt_checkpoint> staged;
+                    if (do_checkpoint) {
+                        // Stage the complete checkpoint in a detached list node before evicting
+                        // anything. Allocation failure or a short state write must retain every good
+                        // published checkpoint and must never leave a half-filled entry selectable.
+                        try {
+                            staged.emplace_back(); // allocate the eventual list node before mutation
+                            auto & next = staged.back();
+
+                            next.id_task  = ckpt_id_task;
+                            next.pos_min  = ckpt_pos_min;
+                            next.pos_max  = pos_max;
+                            next.n_tokens = ckpt_n_tokens;
+                            next.checkpoint_epoch     = vbr_now.checkpoint_epoch;
+                            next.checkpoint_epoch_swa = vbr_now.checkpoint_epoch_swa;
+                            next.computation_frontier = ckpt_frontier;
+                            next.cache_family = slot.cache_family;
+
+                            const size_t checkpoint_size =
+                                llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            llama_memory_hybrid_idx * qsa_owner = nullptr;
+                            bool qsa_topology_ready = true;
+                            if (params_base.vbr_prompt_cache) {
+                                std::vector<llama_memory_tree_child> tree;
+                                qsa_topology_ready = llama_memory_tree_collect(
+                                    llama_get_memory(ctx_tgt), tree);
+                                for (const auto & child : tree) {
+                                    if (!child.qsa_index_owner) {
+                                        continue;
+                                    }
+                                    if (qsa_owner &&
+                                        qsa_owner != child.qsa_index_owner) {
+                                        qsa_topology_ready = false;
+                                        break;
+                                    }
+                                    qsa_owner = child.qsa_index_owner;
+                                }
+                            }
+                            const auto qsa_provider = qsa_owner
+                                ? vbr_qsa_index_capture_provider(*qsa_owner)
+                                : vbr_explicit_companion_provider {};
+                            uint64_t qsa_size = 0;
+                            const bool qsa_required = qsa_owner != nullptr &&
+                                params_base.vbr_prompt_cache;
+                            const bool qsa_size_ready = qsa_topology_ready &&
+                                (!qsa_required ||
+                                (qsa_provider.size && qsa_provider.size(
+                                    qsa_provider.context, slot.id, qsa_size) &&
+                                 qsa_size != 0 && qsa_size <= SIZE_MAX));
+                            const auto checkpoint_policy =
+                                common_speculative_checkpoint_policy_resolve(
+                                    ctx_dft != nullptr,
+                                    params_base.vbr_prompt_cache,
+                                    slot.can_speculate(),
+                                    params_base.speculative.uses_mtp_as_primary_drafter());
+                            const bool mtp_checkpoint_required =
+                                checkpoint_policy.require_complete_draft_and_state;
+                            // An empty DFlash2 sequence needs its complete draft
+                            // image (including retained SWA), not just target RS.
+                            const bool capture_dflash = active_prefix_enabled() && slot.can_speculate() &&
+                                !slot.prompt.tokens.has_media() &&
+                                active_prefix_draft_type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+                            const bool capture_draft = checkpoint_policy.capture_draft || capture_dflash;
+                            std::vector<uint8_t> spec_state;
+                            const bool mtp_state_ready = !mtp_checkpoint_required ||
+                                (common_speculative_get_state(
+                                    slot.get_spec(), slot.id, spec_state) &&
+                                 !spec_state.empty());
+                            const size_t draft_size = capture_draft
+                                ? llama_state_seq_get_size_ext(
+                                    ctx_dft, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_NONE)
+                                : 0;
+                            const size_t ring_size = slot.can_speculate()
+                                ? common_speculative_ring_state_size(
+                                    slot.get_spec())
+                                : 0;
+                            const uint64_t exact_capture_limit =
+                                vbr_automatic_exact_capture_max_bytes();
+                            const bool qsa_vbr_fits = qsa_size_ready &&
+                                uint64_t(checkpoint_size) <=
+                                    exact_capture_limit &&
+                                qsa_size <= exact_capture_limit-
+                                    uint64_t(checkpoint_size);
+                            const bool draft_vbr_fits =
+                                draft_size != 0 && qsa_vbr_fits &&
+                                (!capture_dflash || llama_memory_seq_pos_max(
+                                    llama_get_memory(ctx_dft), slot.id) == pos_max) &&
+                                mtp_state_ready &&
+                                uint64_t(ring_size) <=
+                                    exact_capture_limit-
+                                        uint64_t(checkpoint_size)-qsa_size &&
+                                uint64_t(spec_state.size()) <=
+                                    exact_capture_limit-
+                                        uint64_t(checkpoint_size)-qsa_size-
+                                        uint64_t(ring_size) &&
+                                uint64_t(draft_size) <=
+                                    exact_capture_limit-
+                                        uint64_t(checkpoint_size)-
+                                        qsa_size-
+                                        uint64_t(ring_size)-
+                                        uint64_t(spec_state.size());
+                            if (!qsa_topology_ready) {
+                                SLT_ERR(slot, "%s",
+                                    "skipping context checkpoint: QSA topology is unavailable\n");
+                                staged.clear();
+                            } else if (checkpoint_size == 0) {
+                                SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
+                                staged.clear();
+                            } else {
+                                size_t n = 0;
+                                next.data_tgt.overwrite(
+                                    checkpoint_size,
+                                    [&](uint8_t * data, size_t size) {
+                                        n = llama_state_seq_get_data_ext(
+                                            ctx_tgt, data, size, slot.id,
+                                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    });
+                                if (n != checkpoint_size) {
+                                    SLT_ERR(slot,
+                                            "skipping context checkpoint: target state short write (expected %zu, got %zu)\n",
+                                            checkpoint_size, n);
+                                    staged.clear();
+                                }
+                            }
+
+                            if (!staged.empty() && qsa_required && qsa_vbr_fits) {
+                                bool qsa_captured = false;
+                                next.data_qsa.overwrite(
+                                    size_t(qsa_size),
+                                    [&](uint8_t * data, size_t size) {
+                                        server_fixed_io_writer writer(data, size);
+                                        qsa_captured =
+                                            qsa_provider.capture_stream &&
+                                            qsa_provider.capture_stream(
+                                                qsa_provider.context, slot.id,
+                                                writer) &&
+                                            writer.complete();
+                                    });
+                                if (!qsa_captured) {
+                                    SLT_ERR(slot, "%s",
+                                        "skipping context checkpoint: QSA index capture failed\n");
+                                    staged.clear();
+                                }
+                            } else if (!staged.empty() && qsa_required) {
+                                SLT_DBG(slot,
+                                    "VBR QSA checkpoint companion skipped: "
+                                    "target=%zu qsa=%" PRIu64 " exceeds "
+                                    "automatic capture runway=%" PRIu64 "\n",
+                                    checkpoint_size, qsa_size,
+                                    exact_capture_limit);
+                            }
+
+                            // A VBR frontier artifact restores target
+                            // attention separately, but an empty draft target
+                            // needs a complete same-frontier draft image.  The
+                            // legacy checkpoint restore only consumed
+                            // PARTIAL_ONLY and historically left this field
+                            // empty; retain the full draft sequence here so a
+                            // checkpoint-backed MTP/DFlash prefix can be
+                            // published as one atomic companion set.
+                            if (!staged.empty() && capture_draft) {
+                                if (draft_vbr_fits) {
+                                    size_t draft_written = 0;
+                                    next.data_dft.overwrite(
+                                        draft_size,
+                                        [&](uint8_t * data, size_t size) {
+                                            draft_written =
+                                                llama_state_seq_get_data_ext(
+                                                    ctx_dft, data, size,
+                                                    slot.id,
+                                                    LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        });
+                                    next.data_dft_full_sequence = true;
+                                    if (draft_written != draft_size) {
+                                        SLT_ERR(slot,
+                                            "skipping context checkpoint: draft state short write (expected %zu, got %zu)\n",
+                                            draft_size, draft_written);
+                                        staged.clear();
+                                    } else if (mtp_checkpoint_required) {
+                                        next.accel.spec.overwrite(
+                                            spec_state.size(),
+                                            [&](uint8_t * data, size_t size) {
+                                                std::memcpy(data, spec_state.data(), size);
+                                            });
+                                    }
+                                } else {
+                                    if (mtp_checkpoint_required) {
+                                        SLT_ERR(slot,
+                                            "MTP checkpoint companion skipped: "
+                                            "target=%zu draft=%zu spec=%zu ring=%zu "
+                                            "runway=%" PRIu64 " state-ready=%d\n",
+                                            checkpoint_size, draft_size,
+                                            spec_state.size(), ring_size,
+                                            exact_capture_limit,
+                                            (int) mtp_state_ready);
+                                    } else {
+                                        SLT_DBG(slot,
+                                            "VBR checkpoint companion skipped: "
+                                            "target=%zu draft=%zu spec=%zu ring=%zu "
+                                            "runway=%" PRIu64 " state-ready=%d\n",
+                                            checkpoint_size, draft_size,
+                                            spec_state.size(), ring_size,
+                                            exact_capture_limit,
+                                            (int) mtp_state_ready);
+                                    }
+                                    // An MTP restore without both its complete
+                                    // draft sequence and pending hidden carry
+                                    // permanently disables drafting. Prefer no
+                                    // checkpoint over publishing that partial
+                                    // accelerator image.
+                                    if (mtp_checkpoint_required) {
+                                        staged.clear();
+                                    }
+                                }
+                            }
+
+                            // Allocate the optional DFlash ring while still detached, then fill it.
+                            // Its save routine is exact-size and non-consuming.
+                            if (!staged.empty() && slot.can_speculate()) {
+                                if (ring_size > 0) {
+                                    next.accel.ring.overwrite(
+                                        ring_size,
+                                        [&](uint8_t * data, size_t size) {
+                                            common_speculative_ring_state_save(
+                                                slot.get_spec(), data, size);
+                                        });
+                                }
+                            }
+                        } catch (const std::exception & e) {
+                            SLT_ERR(slot, "skipping context checkpoint: staging failed: %s\n", e.what());
+                            staged.clear();
+                        }
+
+                        if (staged.empty()) {
+                            do_checkpoint = false;
+                        }
+                    }
+
+                    bool staged_checkpoint_published = false;
+                    bool staged_checkpoint_acquired_destination = false;
+                    server_retention_instance_key staged_checkpoint_key;
+                    if (do_checkpoint && slot.lifecycle_authority) {
+                        // The detached node has its final address, so publish and
+                        // account it before thinning any incumbent. A failed
+                        // checkpoint publication must be a no-mutation result for
+                        // the already-retained ring.
+                        auto & cur = staged.back();
+                        staged_checkpoint_key =
+                            server_retention_instance_key::for_checkpoint(
+                                slot.id, &cur);
+                        bool prepared = slot.retention_obs &&
+                            !slot.retention_geometry_failed;
+                        const bool frontier_valid =
+                            cur.computation_frontier.valid() &&
+                            cur.computation_frontier.token_count == cur.n_tokens &&
+                            cur.n_tokens >= 0 &&
+                            cur.n_tokens <= slot.task->n_tokens();
+                        server_cache_lease_identity checkpoint_identity;
+                        if (frontier_valid) {
+                            checkpoint_identity.execution_identity =
+                                cur.computation_frontier.execution_identity;
+                            checkpoint_identity.adapter_config_identity =
+                                cur.computation_frontier.adapter_config_identity;
+                            checkpoint_identity.media_content_identity =
+                                cur.computation_frontier.media_content_identity;
+                        }
+                        const auto live_lineage_source =
+                            server_retention_instance_key::for_slot(slot.id);
+                        if (prepared) {
+                            // Defer lineage activation until the payload operation
+                            // has been attached. This keeps policy inventory closed
+                            // throughout the fallible accounting preparation.
+                            prepared = slot.retention_obs->publish(
+                                staged_checkpoint_key,
+                                slot.retention_pool,
+                                slot.task->params.message_spans,
+                                !slot.task->params.message_spans.spans.empty(),
+                                uint64_t(slot.task->n_tokens()),
+                                uint64_t(cur.n_tokens),
+                                frontier_valid,
+                                checkpoint_identity.valid()
+                                    ? &checkpoint_identity : nullptr,
+                                nullptr,
+                                &live_lineage_source,
+                                slot.retention_destination.valid()
+                                    ? &slot.retention_destination : nullptr,
+                                true);
+                        }
+                        llama_cache_acct_artifact_id artifact;
+                        std::vector<llama_cache_acct_op_id> ops;
+                        if (prepared) {
+                            prepared = slot.retention_obs->
+                                checkpoint_admission_artifact(
+                                    staged_checkpoint_key, artifact) &&
+                                slot.lifecycle_authority->admit_live_checkpoint(
+                                    artifact, cur, ops) &&
+                                slot.retention_obs->attach_release_ops(
+                                    staged_checkpoint_key, std::move(ops));
+                        }
+                        if (prepared && !slot.retention_destination.valid()) {
+                            prepared = slot.retention_obs->acquire_lineage_ticket(
+                                staged_checkpoint_key,
+                                slot.retention_destination);
+                            staged_checkpoint_acquired_destination = prepared;
+                        }
+                        if (prepared && !slot.retention_branch_pending) {
+                            prepared = slot.retention_destination.valid() &&
+                                slot.retention_obs->activate_lineage_ticket(
+                                    slot.retention_destination);
+                        }
+                        if (!prepared) {
+                            if (slot.retention_obs) {
+                                slot.retention_obs->retire(
+                                    staged_checkpoint_key);
+                                if (staged_checkpoint_acquired_destination) {
+                                    slot.retention_obs->release_lineage_ticket(
+                                        slot.retention_destination);
+                                    staged_checkpoint_acquired_destination = false;
+                                }
+                            }
+                            slot.retention_geometry_failed = true;
+                            staged.clear();
+                            do_checkpoint = false;
+                            SLT_WRN(slot, "%s\n",
+                                "checkpoint publication/accounting preparation failed; retained ring is unchanged");
+                        } else {
+                            staged_checkpoint_published = true;
+                        }
+                    }
+
+                    if (do_checkpoint) {
+                        // First evict thin checkpoints that sit within
+                        // checkpoint_min_step of the previous KEPT one (redundantly close), never
+                        // evicting the current task's own -- this keeps early anchors alive across
+                        // edited/compacted agentic histories instead of FIFO-dropping the oldest.
+                        // With lifecycle accounting, preserve incumbents and suppress redundant
+                        // incoming checkpoints only when bounded same-lineage replay is proven.
+                        const common_prompt_checkpoint *
+                            seam_heuristic_checkpoint =
+                                slot.checkpoint_seam_heuristic;
+                        bool checkpoint_publication_allowed = true;
+                        const bool publication_check =
+                            slot.lifecycle_authority &&
+                            slot.checkpoint_publication_attempt_begin();
+                        if (publication_check) {
+                            seam_heuristic_checkpoint = nullptr;
+                            const llama_pos seam_next =
+                                slot.prompt.tokens.pos_next();
+                            const bool has_new_tokens =
+                                slot.prompt.n_tokens() < slot.task->n_tokens();
+                            const llama_pos seam_min = std::max(
+                                0, seam_next - n_swa -
+                                    (has_new_tokens ? 0 : 1));
+                            const bool recurrent =
+                                llama_model_is_recurrent(model_tgt) ||
+                                llama_model_is_hybrid(model_tgt);
+                            const auto adapter = lora_config_identity(slot.lora);
+                            for (auto it = slot.prompt.checkpoints.rbegin();
+                                 it != slot.prompt.checkpoints.rend(); ++it) {
+                                const bool frontier_current =
+                                    checkpoint_frontier_is_current(
+                                        slot, *it, adapter);
+                                const bool checkpoint_lineage_matches =
+                                    common_prompt_checkpoint_lineage_matches(
+                                        *it, vbr_now);
+                                const auto evaluation =
+                                    server_cache_plan_evaluate_checkpoint(
+                                        !it->empty(), frontier_current,
+                                        recurrent, checkpoint_lineage_matches,
+                                        it->pos_min, it->pos_max,
+                                        seam_next, seam_min, it->size());
+                                if (evaluation.reason ==
+                                        COMMON_CACHE_PLAN_REASON_COST_NOT_MINIMAL) {
+                                    seam_heuristic_checkpoint = &*it;
+                                    break;
+                                }
+                            }
+                            // The pointer remains valid while the ring generation
+                            // is unchanged. A committed erase/publication clears it
+                            // in checkpoint_ring_changed(). The heuristic is only
+                            // noise reduction; bounded replay is the proof.
+                            slot.checkpoint_seam_heuristic =
+                                seam_heuristic_checkpoint;
+                        }
+                        if (publication_check) {
+                            if (slot.retention_obs && slot.lease_obs &&
+                                server_cache_checkpoint_publication_redundant(
+                                    slot.prompt.checkpoints, staged.back(), ckpt_id_task,
+                                    uint64_t(std::max(0, params_base.checkpoint_min_step)))) {
+                                slot.checkpoint_publication_skipped(
+                                    common_cache_plan_destruction_reason::redundant_checkpoint);
+                                checkpoint_publication_allowed = false;
+                            }
+                        } else if (!slot.lifecycle_authority) {
+                            // The incoming image is already captured. Supersede only an
+                            // identical frontier, not merely an equal token count from
+                            // another request/adapter/media or VBR representation.
+                            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                                const auto & incoming = staged.back();
+                                if (it->pos_min == incoming.pos_min && it->pos_max == incoming.pos_max &&
+                                    server_cache_checkpoint_bounded_replay(*it, incoming, 0)) {
+                                    it = slot.checkpoint_drop(
+                                        it, std::next(it),
+                                        server_cache_destruction_reason::checkpoint_thin);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                            int64_t last = -1;
+                            for (auto it = slot.prompt.checkpoints.begin();
+                                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                                 it != slot.prompt.checkpoints.end(); ) {
+                                if (it->id_task != ckpt_id_task && last >= 0 &&
+                                    it->n_tokens <= last + params_base.checkpoint_min_step) {
+                                    SLT_TRC(slot,
+                                            "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
+                                            it->pos_min, it->pos_max, it->n_tokens);
+                                    it = slot.checkpoint_drop(
+                                        it, std::next(it),
+                                        server_cache_destruction_reason::checkpoint_thin);
+                                    continue;
+                                }
+                                last = it->n_tokens;
+                                ++it;
+                            }
+                        }
+
+                        while (checkpoint_publication_allowed &&
+                               slot.prompt.checkpoints.size() >=
+                                   (size_t) params_base.n_ctx_checkpoints) {
+                            auto victim = slot.prompt.checkpoints.begin();
+                            if (slot.lifecycle_authority) {
+                                common_cache_plan_destruction_reason refusal;
+                                if (!slot.checkpoint_capacity_floor(
+                                        ckpt_id_task,
+                                        seam_heuristic_checkpoint,
+                                        victim, refusal)) {
+                                    slot.checkpoint_publication_skipped(refusal);
+                                    checkpoint_publication_allowed = false;
+                                    break;
+                                }
+                            }
+                            // Make room for the new checkpoint in legacy order
+                            // among members not protected by the retention floor.
+                            const auto & cur = *victim;
+
+                            SLT_WRN(slot,
+                                    "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                    ", size = %.3f MiB)\n",
+                                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data_tgt.size() / 1024 / 1024);
+
+                            if (seam_heuristic_checkpoint == &cur) {
+                                seam_heuristic_checkpoint = nullptr;
+                            }
+
+                            (void) slot.checkpoint_drop(
+                                victim, std::next(victim),
+                                server_cache_destruction_reason::checkpoint_capacity);
+                        }
+
+                        if (!checkpoint_publication_allowed) {
+                            if (staged_checkpoint_published &&
+                                slot.retention_obs) {
+                                slot.retention_obs->retire(
+                                    staged_checkpoint_key);
+                                if (staged_checkpoint_acquired_destination) {
+                                    slot.retention_obs->release_lineage_ticket(
+                                        slot.retention_destination);
+                                    staged_checkpoint_acquired_destination = false;
+                                }
+                            }
+                            staged.clear();
+                        } else {
+                            slot.prompt.checkpoints.splice(
+                                slot.prompt.checkpoints.end(), staged);
+                            if (slot.lifecycle_authority) {
+                                slot.checkpoint_ring_changed();
+                            }
+                            const auto & cur = slot.prompt.checkpoints.back();
+                            if (!slot.lifecycle_authority &&
+                                slot.retention_obs &&
+                                !slot.retention_geometry_failed) {
+                                const bool frontier_valid =
+                                    cur.computation_frontier.valid() &&
+                                    cur.computation_frontier.token_count ==
+                                        cur.n_tokens &&
+                                    cur.n_tokens >= 0 &&
+                                    cur.n_tokens <= slot.task->n_tokens();
+                                server_cache_lease_identity checkpoint_identity;
+                                if (frontier_valid) {
+                                    checkpoint_identity.execution_identity =
+                                        cur.computation_frontier.execution_identity;
+                                    checkpoint_identity.adapter_config_identity =
+                                        cur.computation_frontier.adapter_config_identity;
+                                    checkpoint_identity.media_content_identity =
+                                        cur.computation_frontier.media_content_identity;
+                                }
+                                const auto live_lineage_source =
+                                    server_retention_instance_key::for_slot(
+                                        slot.id);
+                                const bool published =
+                                    slot.retention_obs->publish(
+                                        server_retention_instance_key::
+                                            for_checkpoint(slot.id, &cur),
+                                        slot.retention_pool,
+                                        slot.task->params.message_spans,
+                                        !slot.task->params.message_spans.spans.empty(),
+                                        uint64_t(slot.task->n_tokens()),
+                                        cur.n_tokens >= 0
+                                            ? uint64_t(cur.n_tokens)
+                                            : 0,
+                                        frontier_valid,
+                                        checkpoint_identity.valid()
+                                            ? &checkpoint_identity : nullptr,
+                                        nullptr,
+                                        &live_lineage_source,
+                                        slot.retention_destination.valid()
+                                            ? &slot.retention_destination
+                                            : nullptr,
+                                        slot.retention_branch_pending);
+                                if (!published) {
+                                    slot.retention_geometry_failed = true;
+                                }
+                                if (published &&
+                                    !slot.retention_destination.valid()) {
+                                    (void) slot.retention_obs->
+                                        acquire_lineage_ticket(
+                                            server_retention_instance_key::
+                                                for_checkpoint(slot.id, &cur),
+                                            slot.retention_destination);
+                                }
+                            }
+
+                            SLT_WRN(slot,
+                                    "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                                    ", size = %.3f MiB)\n",
+                                    (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                                    cur.pos_max, cur.n_tokens, (float) cur.size() / 1024.0 / 1024.0);
+                        }
                     }
                 }
 
@@ -10988,6 +11735,19 @@ private:
                 return slot.id == slot_id;
             });
         return found == slots.end() ? nullptr : &*found;
+    }
+
+    // fork 9l-d4b8i: the frontier identity comparison (fork server-context.cpp 4692-4702)
+    static bool computation_frontiers_equal(
+            const common_computation_frontier & a,
+            const common_computation_frontier & b) {
+        return a.version == b.version &&
+               a.sequence_epoch == b.sequence_epoch &&
+               a.token_count == b.token_count &&
+               a.next_position == b.next_position &&
+               a.execution_identity == b.execution_identity &&
+               a.adapter_config_identity == b.adapter_config_identity &&
+               a.media_content_identity == b.media_content_identity;
     }
 
     // fork server-context.cpp:4704  (21 lines)

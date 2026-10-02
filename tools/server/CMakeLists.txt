@@ -157,6 +157,25 @@ if (LLAMA_BUILD_TESTS)
     set_property(TEST test-cache-checkpoint-ring-changed PROPERTY LABELS main)
 endif()
 
+# C++ unit test for the checkpoint-publication latch trio (slice 9l-d4b8i):
+# server_cache_checkpoint_publication_attempt_begin,
+# server_cache_checkpoint_refusal_state_changed, and
+# server_cache_checkpoint_publication_skipped.  Declared in
+# server-cache-authority.h since 8q, defined nowhere until this slice -- the same
+# latent dangling declaration as the ring-changed test above, and whose first
+# caller is the VBR capture kernel landed by the same slice.  Model-free.
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-cache-checkpoint-publication-latch
+        ${PROJECT_SOURCE_DIR}/tests/test-cache-checkpoint-publication-latch.cpp)
+    target_link_libraries(test-cache-checkpoint-publication-latch PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-cache-checkpoint-publication-latch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-cache-checkpoint-publication-latch PRIVATE cxx_std_17)
+    add_test(NAME test-cache-checkpoint-publication-latch COMMAND test-cache-checkpoint-publication-latch)
+    set_property(TEST test-cache-checkpoint-publication-latch PROPERTY LABELS main)
+endif()
+
 # The fork's model-free prompt-cache suite (slice 9l-d4b8d).  5,114 lines, and the
 # reason 9l-d4b8b/9l-d4b8c exist: it constructs a `server_prompt_cache` with NO
 # llama_context and pins each phase of a host restore, of the retention mirror, and

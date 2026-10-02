@@ -8489,7 +8489,76 @@ void server_prompt_cache::commit_restore_delivery(
 }
 
 
-// fork 9l-d4b8d: server_cache_checkpoint_capacity_floor (fork server-task.cpp 4494-4563).
+// fork 9l-d4b8i: the publication-attempt latch trio (fork server-task.cpp 4445-4456 and
+// 4565-4584).  Declared in server-cache-authority.h since 8q but never DEFINED in
+// this tree -- like server_cache_checkpoint_capacity_floor next door, they are the
+// accounting half of the checkpoint publication decision, and the VBR capture
+// kernel is their first caller here:
+//   * attempt_begin arms the `publication_check` lane once per ring generation, so
+//     an unchanged ring pays one integer comparison instead of rebuilding every
+//     identity and lease on each pass;
+//   * refusal_state_changed is the two-lane refusal latch that decides whether a
+//     skip is worth reporting at all;
+//   * publication_skipped turns a refused publication into one destruction receipt
+//     and bumps the ledger sequence, without ever deleting an incumbent.
+bool server_cache_checkpoint_publication_attempt_begin(
+        server_cache_checkpoint_authority_context & context) noexcept {
+    return context.attempts.begin(
+        server_cache_checkpoint_attempt_lane::publication_check);
+}
+
+bool server_cache_checkpoint_refusal_state_changed(
+        server_cache_checkpoint_authority_context & context,
+        common_cache_plan_destruction_reason reason,
+        bool publication_skip) noexcept {
+    return context.attempts.refusal_changed(reason, publication_skip);
+}
+
+// fork 9l-d4b8i: emit_checkpoint_destruction (fork server-task.cpp 4473-4492)
+namespace {
+
+
+void emit_checkpoint_destruction(
+        const server_cache_checkpoint_authority_context & context,
+        const common_cache_plan_destruction_receipt & receipt) noexcept {
+    if (!context.debug_observability) {
+        return;
+    }
+    try {
+        json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
+            receipt, 0, "checkpoint_drop"));
+        SRV_INF("CACHE_HOST_DESTRUCTION %s\n",
+                payload.dump().c_str());
+    } catch (...) {
+        // Debug evidence must never perturb checkpoint ownership.
+    }
+}
+
+} // namespace
+
+// fork 9l-d4b8i: publication_skipped (fork server-task.cpp 4565-4584)
+void server_cache_checkpoint_publication_skipped(
+        server_cache_checkpoint_authority_context & context,
+        common_cache_plan_destruction_reason reason) noexcept {
+    if (!context.authority ||
+        !server_cache_checkpoint_refusal_state_changed(context, reason, true)) {
+        return;
+    }
+    common_cache_plan_destruction_receipt receipt;
+    receipt.state = common_cache_plan_destruction_state::refused;
+    receipt.reason = reason;
+    receipt.effects = common_cache_plan_destruction_effect_bit(
+        common_cache_plan_destruction_effect::checkpoint_member_drop);
+    receipt.admission_sequence =
+        ++context.authority->destruction_quote_sequence;
+    context.authority->observe_host_destruction(receipt, true);
+    if (context.destruction) {
+        context.destruction->note_checkpoint_publication_skip();
+    }
+    emit_checkpoint_destruction(context, receipt);
+}
+
+
 // Declared in server-cache-authority.h since forever but never DEFINED in this
 // tree -- the ported prompt-cache suite is what exposed that: it links against it.
 // One adaptation: the victim parameter is spelled as the nested typedef this
