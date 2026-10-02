@@ -3564,6 +3564,79 @@ static void test_packed_h2d_projection_max_ranges() {
 
 } // namespace
 
+// fork 9l-d4b8t: the final-recheck and checkpoint-frontier tests
+// (fork tests/test-vbr-artifact-adopt.cpp 5874-5936).
+//
+// The last two pieces of the portable program: the recovery-reservation
+// predicate must ignore only the caller's OWN operation, and the recurrent
+// companion's terminal frontier is read from the header only at
+// cell_count 1.  The cut is a definition boundary -- 5937 is blank and 5938
+// opens the DFlash ring test, which is ruled out of this port -- so both
+// functions stay whole and reach for nothing defined after them.
+static void test_final_recheck_excludes_only_own_reservation() {
+    vbr_generation_tracker tracker(1, 256, 1,
+                                  vbr_lineage_uuid { 0xe1, 0xf2 });
+    CHECK(tracker.active());
+    auto binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    const int32_t own = vbr_recovery_reserve(
+        operation.id(), tracker.runtime_instance());
+    CHECK(own >= 0);
+    CHECK(vbr_recovery_pending_for(tracker.runtime_instance()));
+    CHECK(!vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+
+    auto second_binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation second(second_binding);
+    CHECK(bool(second));
+    const int32_t foreign = vbr_recovery_reserve(
+        second.id(), tracker.runtime_instance());
+    CHECK(foreign >= 0);
+    CHECK(vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+    CHECK(vbr_recovery_release_unused(foreign, second.id()));
+    second.close(vbr_operation_outcome::aborted);
+    CHECK(!vbr_recovery_pending_for_except(
+        tracker.runtime_instance(), operation.id()));
+    CHECK(vbr_recovery_release_unused(own, operation.id()));
+    operation.close(vbr_operation_outcome::aborted);
+}
+
+static void test_checkpoint_recurrent_frontier_header() {
+    std::array<uint8_t,
+        2*sizeof(uint32_t)+sizeof(llama_seq_id)+sizeof(llama_pos)> bytes = {};
+    const uint32_t magic = 0xaf143cd8;
+    const llama_seq_id sequence = 3;
+    const uint32_t cell_count = 1;
+    const llama_pos terminal = 37;
+    size_t cursor = 0;
+    std::memcpy(bytes.data()+cursor, &magic, sizeof(magic));
+    cursor += sizeof(magic);
+    std::memcpy(bytes.data()+cursor, &sequence, sizeof(sequence));
+    cursor += sizeof(sequence);
+    std::memcpy(bytes.data()+cursor, &cell_count, sizeof(cell_count));
+    cursor += sizeof(cell_count);
+    std::memcpy(bytes.data()+cursor, &terminal,
+                sizeof(terminal));
+    llama_pos parsed = -1;
+    CHECK(vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+    CHECK(parsed == terminal);
+
+    const llama_pos swapped_frontier = 19;
+    std::memcpy(bytes.data()+cursor, &swapped_frontier,
+                sizeof(swapped_frontier));
+    CHECK(vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+    CHECK(parsed != terminal);
+    const uint32_t multiple_cells = 2;
+    std::memcpy(bytes.data()+cursor-sizeof(cell_count), &multiple_cells,
+                sizeof(multiple_cells));
+    CHECK(!vbr_explicit_recurrent_companion_terminal(
+        bytes.data(), bytes.size(), parsed));
+}
+
 int main() {
     adoption_fixture::test_occupied_replacement_free_cell_adoption();
     adoption_fixture::test_occupied_replacement_fault_preserves_incumbent();
@@ -3573,6 +3646,7 @@ int main() {
     adoption_fixture::test_occupied_recycle_replay_failure_quarantines();
     adoption_fixture::test_occupied_transformed_recycle_uses_recovery_geometry();
     adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map();
+    test_checkpoint_recurrent_frontier_header();
     test_epoch_capacity_preflight();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();
@@ -3588,6 +3662,7 @@ int main() {
     adoption_fixture::test_serial_and_admission_faults();
     adoption_fixture::test_downward_subphase_matrix();
     adoption_fixture::test_upward_reconstruction();
+    test_final_recheck_excludes_only_own_reservation();
     test_packed_h2d_projection_stream();
     test_packed_h2d_projection_max_ranges();
 
