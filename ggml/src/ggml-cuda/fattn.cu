@@ -3222,6 +3222,231 @@ static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, 
     }
 }
 
+// ---- Dynamic VBR transcode, Stage 1 (read side) ------------------------------------------------------
+// fork 9l-d4b8l: this tree's answer to the fork's VBR decode block (fork fattn.cu
+// 1403-1513).  Three fork facilities are absent here and are SUBSTITUTED, not ported:
+//
+//   * RUNTIME decode codebooks (fork d_turbo_centroids_*_fattn, staged by
+//     turbo_vanilla_cb_load_fattn / turbo_tcq_load_kv_decode / turbo1_tcq_load_cb_fattn).
+//     The port's books are compile-time (turbo-quant.cuh) and they DIFFER from the
+//     fork's -- turbo4 0/16 entries equal (max |d| 3.1e-5), turbo3 0/8 (max |d| 3.0e-3),
+//     turbo2 4/4.  Porting the fork's kernels verbatim would decode with the WRONG
+//     book, so every element below goes through the port's own element accessor
+//     (turbo{1,2,3,4,8}_dequant_element) -- the same call this tree's dequantize.cuh
+//     makes.  The WHT sign arrays agree (128/128), which is why the inverse-FWHT pair
+//     below IS the fork's, verbatim.
+//   * K/V-split TCQ books: the port keeps ONE book per TCQ tier and set_rows encodes
+//     both sides with it, so `is_v` selects nothing on this path.
+//   * the TCQ decode alpha (fork turbo-tcq-alpha.cuh) and the InnerQ inverse channel
+//     scale: the port's decode has neither, so both are the identity here.  A->A stays
+//     faithful because stage 2 re-encodes through the port's own set_rows.
+
+// In-place 128-point inverse FWHT spread across 128 threads, one element per thread.
+// fork 9l-d4b8l: verbatim from fork fattn.cu 798-825 -- the signs agree (see above) and
+// the butterfly is pure geometry, so there is nothing to adapt.
+// h=1..16 use intra-warp __shfl_xor_sync (no smem, no syncthreads).
+// h=32 and h=64 cross warp boundaries, so we fall back to smem with syncs.
+// Caller supplies a __shared__ float[128] scratch buffer.
+static __device__ __forceinline__ float fwht128_butterfly_inplace(float val, float * smem) {
+    const int tid = threadIdx.x;
+
+    // Intra-warp passes: shuffle xor with stride h, no smem, no sync.
+    #pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFULL, val, h);
+        val = (tid & h) ? (other - val) : (val + other);
+    }
+
+    // h=32 (cross-warp within block, smem needed)
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 32) ? (smem[tid - 32] - val) : (val + smem[tid + 32]);
+    __syncthreads();
+
+    // h=64 (cross-warp within block, smem needed)
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 64) ? (smem[tid - 64] - val) : (val + smem[tid + 64]);
+    __syncthreads();
+
+    return val;
+}
+
+// Pair-pack two adjacent threads' fp16 outputs into a single 32-bit half2 store.
+// fork 9l-d4b8l: verbatim from fork fattn.cu 827-837.
+static __device__ __forceinline__ void fwht128_store_half(
+        float val, half * dst_base) {
+    const int tid = threadIdx.x;
+    const float neighbor = __shfl_xor_sync(0xFFFFFFFFULL, val, 1);
+    if ((tid & 1) == 0) {
+        const half2 packed = __floats2half2_rn(val, neighbor);
+        *((half2 *)(dst_base + tid)) = packed;
+    }
+}
+
+// f16 -> f32. fork 9l-d4b8l: verbatim from fork fattn.cu 1408-1412.  In the fork the
+// scale carries the V decode-alpha correction; here it is always 1.0 (no decode alpha).
+static __global__ void k_vbr_f16_to_f32_scaled(const half * __restrict__ src, float * __restrict__ dst,
+                                               int64_t n, float scale) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] = __half2float(src[i]) * scale; }
+}
+
+// F16 source rows (nb1-strided) -> dense scratch_f16. fork 9l-d4b8l: verbatim from fork
+// fattn.cu 1414-1428.  The f16 entry tier stores plain original-domain rows (no
+// rotation, no mean-sub), so the "dequant" is a gather; the encode tap then runs
+// UNsuppressed for f16 sources (see vbr-transcode.cu).
+static __global__ void k_vbr_f16_gather(const char * __restrict__ src, half * __restrict__ dst,
+                                        const int64_t ne0, const int64_t n_rows, const size_t nb1) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const half * s = (const half *)(src + (size_t) row * nb1);
+    half       * d = dst + row * ne0;
+    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
+// Port-side turbo dequant with inverse FWHT: emits one 128-element rotation group in the
+// ORIGINAL domain, which is what the transcode's second stage expects (set_rows rotates
+// its input itself).  Every turbo tier in this tree is 128-wide in its stored block
+// (QK_TURBO3 / QK_TURBO4 / QK_TURBO8 / QK_TURBO{1,2,3}_TCQ are all 128), so one template
+// covers all five; only the codebook read differs, and that read is the port's own
+// accessor with norm = 1.0, the group norm being applied after the inverse FWHT -- the
+// same split the fork uses.
+template <ggml_type T> struct vbr_turbo_dequant_traits;
+
+template <> struct vbr_turbo_dequant_traits<GGML_TYPE_TURBO4_0> {
+    using block_t = block_turbo4_0;
+    static __device__ __forceinline__ float element(const block_t * blk, const int j) {
+        return turbo4_dequant_element(blk, j, 1.0f);
+    }
+};
+
+template <> struct vbr_turbo_dequant_traits<GGML_TYPE_TURBO8_0> {
+    using block_t = block_turbo8_0;
+    static __device__ __forceinline__ float element(const block_t * blk, const int j) {
+        return turbo8_dequant_element(blk, j, 1.0f);
+    }
+};
+
+template <> struct vbr_turbo_dequant_traits<GGML_TYPE_TURBO3_TCQ> {
+    using block_t = block_turbo3_tcq;
+    static __device__ __forceinline__ float element(const block_t * blk, const int j) {
+        return turbo3_tcq_dequant_element(blk, j, 1.0f);
+    }
+};
+
+template <> struct vbr_turbo_dequant_traits<GGML_TYPE_TURBO2_TCQ> {
+    using block_t = block_turbo2_tcq;
+    static __device__ __forceinline__ float element(const block_t * blk, const int j) {
+        return turbo2_tcq_dequant_element(blk, j, 1.0f);
+    }
+};
+
+template <> struct vbr_turbo_dequant_traits<GGML_TYPE_TURBO1_TCQ> {
+    using block_t = block_turbo1_tcq;
+    static __device__ __forceinline__ float element(const block_t * blk, const int j) {
+        return turbo1_tcq_dequant_element(blk, j, 1.0f);
+    }
+};
+
+template <ggml_type T>
+static __global__ void k_vbr_turbo_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    using block_t = typename vbr_turbo_dequant_traits<T>::block_t;
+
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    const int n_blocks = (int)(ne0 / 128);   // every turbo tier in this tree is 128-wide
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_t * blk = (const block_t *)src_row + blk_idx;
+        const float norm = __half2float(blk->norm);
+
+        // signs2 -> inverse butterfly -> signs1, then the group norm: the exact mirror of
+        // this tree's turbo_rotate_forward (signs1 -> FWHT -> signs2), whose FWHT folds in
+        // the same 1/sqrt(128) that the fork's raw butterfly leaves to the caller.
+        float val = fwht128_butterfly_inplace(
+            vbr_turbo_dequant_traits<T>::element(blk, tid) * TURBO_WHT_SIGNS2[tid], smem);
+
+        val = val * inv_sqrt_128 * TURBO_WHT_SIGNS1[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
+        __syncthreads();
+    }
+}
+
+// Dequant n_cells rows of a turbo KV tensor (type A) to ORIGINAL-domain dense f32
+// [n_cells, ne0], pre-scaled so re-encoding to type B then decoding B reproduces A's
+// reconstruction.  Lives in fattn.cu for the same reason the fork's does: the decode
+// codebooks are TU-static (__constant__ in turbo-quant.cuh) and this TU reaches them
+// through fattn-common.cuh.
+//
+// fork 9l-d4b8l: `type_B` and `is_v` exist in the fork's signature only to pick the target
+// tier's decode alpha and the K/V codebook.  This tree has neither, which leaves the
+// scaling identity -- the same reason the fidelity check below cannot fail on them.
+void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type type_B,
+                              half * scratch_f16, float * dst_f32,
+                              int64_t n_cells, int64_t ne0, size_t nb1,
+                              bool is_v, int device, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % 128 == 0); // turbo FWHT blocks are 128-wide; the dequant loops ne0/128 blocks per cell
+    GGML_UNUSED(type_B);  // no decode alpha in this tree, so the target tier adds no scale
+    GGML_UNUSED(is_v);    // one TCQ book per tier, shared by K and V (see the banner above)
+    GGML_UNUSED(device);  // no per-device codebook staging to do
+
+    // Treat the tensor as [ne0, n_cells]: one block per cell, 128 threads, ne0/128 FWHT
+    // blocks per cell. head/stream dims collapse to 1 (nb2/nb3 unused, blockIdx.y/z == 0).
+    const dim3 grid((unsigned) n_cells, 1, 1);
+    switch (src_type) {
+        case GGML_TYPE_TURBO4_0:
+            k_vbr_turbo_dequant_f16_inv_fwht<GGML_TYPE_TURBO4_0><<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO8_0:
+            k_vbr_turbo_dequant_f16_inv_fwht<GGML_TYPE_TURBO8_0><<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO3_TCQ:
+            k_vbr_turbo_dequant_f16_inv_fwht<GGML_TYPE_TURBO3_TCQ><<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO2_TCQ:
+            k_vbr_turbo_dequant_f16_inv_fwht<GGML_TYPE_TURBO2_TCQ><<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_TURBO1_TCQ:
+            k_vbr_turbo_dequant_f16_inv_fwht<GGML_TYPE_TURBO1_TCQ><<<grid, 128, 0, stream>>>(
+                src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1);
+            break;
+        case GGML_TYPE_F16:
+            k_vbr_f16_gather<<<grid, 128, 0, stream>>>(src, scratch_f16, ne0, n_cells, nb1);
+            break;
+        default:
+            GGML_ABORT("vbr_dequant_turbo_to_f32: unsupported src_type %d", (int) src_type);
+    }
+
+    // f16 -> f32.  The fork divides V by the TARGET tier's decode alpha here; with no
+    // decode alpha in this tree the factor is 1.0 for both sides and both tiers.
+    const int64_t n_elem  = n_cells * ne0;
+    const int64_t threads = 256;
+    const int64_t blocks  = (n_elem + threads - 1) / threads;
+    k_vbr_f16_to_f32_scaled<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(
+        scratch_f16, dst_f32, n_elem, 1.0f);
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
