@@ -82,6 +82,8 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    // fork 9l-d4b8w: the loop wait-timeout hook -- VBR idle maintenance
+    std::function<void(void)>                 callback_idle;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -204,6 +206,13 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // fork 9l-d4b8w: register the function to be called on the loop's wait
+    // timeout while the queue is empty (~1s cadence, same thread as
+    // callback_update_slots; not called while sleeping)
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

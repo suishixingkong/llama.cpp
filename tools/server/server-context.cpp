@@ -4512,7 +4512,29 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
+            // fork 9l-d4b8w: task arrival has already cancelled the shared
+            // idle-capture session. Drain the bounded worker before any decode can
+            // mutate its source; an unpublished private build is simply abandoned.
+            (void) finish_idle_exact_vbr_capture(true, true);
             return process_single_task(std::move(task), is_yielding);
+        });
+        queue_tasks.on_idle([this]() {
+            if (params_base.vbr_prompt_cache && vbr_idle_exact_capture) {
+                (void) finish_idle_exact_vbr_capture(true);
+                if (vbr_idle_exact_capture) {
+                    return;
+                }
+            }
+            // quiet moment on the decode thread: flush deferred VBR maintenance.
+            // target-only is deliberate: draft/MTP KV types are parsed with
+            // allow_vbr=false, so those contexts can never have anything to breathe
+            llama_memory_breathe(llama_get_memory(ctx_tgt));
+            if (params_base.vbr_prompt_cache) {
+                auto capture = queue_tasks.try_begin_idle_capture();
+                if (capture) {
+                    (void) publish_idle_vbr_batch(capture);
+                }
+            }
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();

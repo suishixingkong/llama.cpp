@@ -448,8 +448,16 @@ std::exception_ptr server_queue::yield_to_queue_capture_exception(
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
-    running = true;
-    time_last_task = ggml_time_ms();
+    {
+        // fork 9l-d4b8w: an exact idle capture owns the loop's state while it
+        // runs, so a start_loop arriving then must not restart it.
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        if (idle_capture_stopped) {
+            return;
+        }
+        running = true;
+        time_last_task = ggml_time_ms();
+    }
 
     // spawn the worker thread used by yield_to_queue()
     GGML_ASSERT(!worker.thread.joinable() && "start_loop() is already running");
@@ -523,13 +531,33 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // process new tasks
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
+                // fork 9l-d4b8w: the idle-maintenance request is part of the wait
+                // predicate, so the requested work runs on a scheduler wake rather
+                // than only on the notify -- and the flag is CONSUMED here, which is
+                // what stops a spurious wakeup from leaving it set forever.
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running);
+                    return (!queue_tasks.empty() || !running ||
+                            idle_maintenance_requested.load(
+                                std::memory_order_acquire));
                 });
                 if (res) {
+                    if (running && queue_tasks.empty() &&
+                        idle_maintenance_requested.exchange(
+                            false, std::memory_order_acq_rel)) {
+                        if (callback_idle) {
+                            lock.unlock();
+                            callback_idle();
+                            continue;
+                        }
+                    }
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // timeout with an empty queue: give the context a quiet moment for
+                // deferred maintenance (memory breathing), outside the queue lock
+                if (callback_idle) {
+                    lock.unlock();
+                    callback_idle();
+                }
             }
         }
     }
