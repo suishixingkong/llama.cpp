@@ -6418,6 +6418,31 @@ private:
                         }
                     }
 
+                    // fork 9l-d4b8f: the group-wide preselection admission
+                    // (fork server-context.cpp 14392-14413)
+                    // Establish final prompt geometry before slot selection can
+                    // save, restore, retarget, or reclaim any cached state.
+                    // Validate the entire parallel-sampling group before the
+                    // first child is launched, so a rejected sibling cannot
+                    // leave another slot partially committed.
+                    GGML_ASSERT(!slots.empty());
+                    const auto prepare_and_admit = [&](server_task & candidate) {
+                        prepare_prompt_tokens_for_launch(
+                            slots.front(), candidate);
+                        return admit_task_for_slot(
+                            slots.front(), candidate);
+                    };
+                    bool group_admitted = prepare_and_admit(task);
+                    for (auto & child : task.child_tasks) {
+                        if (!group_admitted || !prepare_and_admit(child)) {
+                            group_admitted = false;
+                            break;
+                        }
+                    }
+                    if (!group_admitted) {
+                        break;
+                    }
+
                     const int id_task = task.id;
 
                     server_slot * slot = get_available_slot(task);
