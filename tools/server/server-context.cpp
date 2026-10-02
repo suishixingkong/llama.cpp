@@ -9323,10 +9323,15 @@ private:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
+                    // fork 9l-d4b8j: a hybrid model keeps one frontier across its attention
+                    // and recurrent halves, so it must checkpoint even when its memory
+                    // module advertises plain partial `seq_rm` (fork server-context.cpp
+                    // 17420-17424, the gate's fourth disjunct).
                     do_checkpoint = do_checkpoint && (
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0);
+                            n_swa > 0 ||
+                            llama_model_is_hybrid(model_tgt));
 
                     bool has_mtmd = false;
 
