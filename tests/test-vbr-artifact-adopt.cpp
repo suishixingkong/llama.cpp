@@ -15,8 +15,9 @@
 //     program above, so it comes with it rather than with this slice.
 //   * fork 5938-5962 -- test_dflash_ring_frontier_header.  DFlash is ruled out
 //     of this port.
-//   * fork 2976-3901 -- the occupied-replacement, fault-matrix and upward
-//     reconstruction tests.  Slices 2 and 3 of the fixture below.
+//   * fork 3365-3901 -- the phase-fault, shard-child, complete-tree, serial,
+//     downward-subphase and upward-reconstruction matrices.  Slice 3 of the
+//     fixture below.
 //   * fork 3905-4040 -- the packed h2d projection (CPU, later).
 //
 // Self-reporting (a failure counter and an explicit pass line), so NDEBUG
@@ -2474,9 +2475,416 @@ static void test_real_driver_smoke() {
     f.target.erase_imported();
     CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
 }
+
+// fork 9l-d4b8q: the adoption fixture, part 2 -- the occupied tests
+// (fork tests/test-vbr-artifact-adopt.cpp 2976-3363).
+//
+// `adopt_occupied` is the shared driver of all nine tests here: the same
+// adoption state machine as part 1, against a target that already holds
+// an incumbent artifact.  The cut is a definition boundary -- 3363 closes
+// test_erase_releases_receipt_for_second_adopt and 3364 is blank -- and
+// the range reaches for nothing defined after it, so it compiles alone.
+// All nine are added to main() below; 388 lines with no callers would
+// compile and pass while asserting nothing at all.
+static vbr_adopt_result adopt_occupied(
+        fixture & f, vbr_adopt_phase fail_phase = vbr_adopt_phase::_count,
+        bool fail_after = false) {
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return {};
+    }
+    CHECK(staged.staged->read_count() ==
+          (f.recycle ? 4u : 2u) + (f.with_companion ? 1u : 0u));
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    if (f.with_companion) {
+        hooks.companions.push_back(f.companion_provider());
+    }
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    if (fail_after) {
+        test.fault.fail_after = fail_phase;
+    } else {
+        test.fault.fail_before = fail_phase;
+    }
+    hooks.test = &test;
+    return vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+}
+
+static void test_occupied_spec_companion_replacement_and_rollback() {
+    fixture success(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true, true, false, true);
+    const auto adopted = adopt_occupied(success);
+    CHECK(adopted.status == vbr_adopt_status::adopted);
+    CHECK(adopted.companions == 1);
+    CHECK(success.target.recurrent.replacement_prepares == 1);
+    CHECK(success.target.recurrent.rollbacks == 0);
+    CHECK(success.target.recurrent.live_image == 2);
+    CHECK(success.target.recurrent.published);
+
+    fixture late(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true, true, false, true);
+    const auto refused = adopt_occupied(
+        late, vbr_adopt_phase::complete_tree_barrier, false);
+    CHECK(refused.status != vbr_adopt_status::adopted);
+    CHECK(refused.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(late.target.recurrent.replacement_prepares == 1);
+    CHECK(late.target.recurrent.rollbacks == 1);
+    CHECK(late.target.recurrent.live_image == 1);
+    CHECK(late.target.recurrent.published);
+    CHECK(!late.target.operation_quarantined);
+
+    fixture recurrent(
+        true, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16, 0,
+        vbr_artifact_clean_stash_state::absent_at_source,
+        false, false, true);
+    const auto recurrent_adopted = adopt_occupied(recurrent);
+    CHECK(recurrent_adopted.status == vbr_adopt_status::adopted);
+    CHECK(recurrent_adopted.companions == 1);
+    CHECK(recurrent.target.recurrent.kind ==
+          vbr_artifact_companion_kind::recurrent);
+    CHECK(recurrent.target.recurrent.replacement_prepares == 1);
+    CHECK(recurrent.target.recurrent.live_image == 2);
+}
+
+static uint64_t device_transfer_staging_value(
+        const llama_cache_acct_snapshot & snapshot,
+        llama_cache_acct_measure measure) {
+    uint64_t total = 0;
+    for (const auto & row : snapshot.cells) {
+        if (row.category != llama_cache_acct_category::transfer_staging ||
+            row.domain.residency != llama_cache_acct_residency::device) {
+            continue;
+        }
+        const auto & value = row.cell.measures[size_t(measure)];
+        if (value.state == llama_cache_acct_known::known) {
+            total += value.value;
+        }
+    }
+    return total;
+}
+
+static uint64_t device_transfer_staging_reserved(
+        const llama_cache_acct_snapshot & snapshot) {
+    return device_transfer_staging_value(
+        snapshot, llama_cache_acct_measure::reserved);
+}
+
+static void test_occupied_replacement_free_cell_adoption() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    const auto result = adopt_occupied(f);
+    CHECK(result.status == vbr_adopt_status::adopted);
+    CHECK(result.h2d_bytes == 10);
+    CHECK(f.target.occupied_rechecks == 2);
+    CHECK(f.target.relocated_prepares == 1);
+    CHECK(f.target.relocated_images == 1);
+    CHECK(f.target.children[0].published);
+    CHECK(f.target.children[0].receipts);
+    CHECK(f.target.relocated_offsets.size() == 2);
+    for (const auto & offset : f.target.relocated_offsets) {
+        CHECK(offset.first == 0);
+        CHECK(offset.second == 5);
+    }
+}
+
+static void test_occupied_replacement_fault_preserves_incumbent() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    const auto sentinel = f.target.incumbent_sentinel;
+    const auto result = adopt_occupied(
+        f, vbr_adopt_phase::unit_h2d, true);
+    CHECK(result.status == vbr_adopt_status::transfer_failed);
+    CHECK(f.target.publish_calls == 0);
+    CHECK(f.target.transfer_calls == 2);
+    CHECK(f.target.children[0].mapped == 0);
+    CHECK(!f.target.children[0].published);
+    CHECK(!f.target.children[0].image_ready);
+    CHECK(f.target.incumbent_sentinel == sentinel);
+    CHECK(std::all_of(
+        f.target.children[0].destination.begin(),
+        f.target.children[0].destination.end(),
+        [](uint8_t value) { return value == 0; }));
+}
+
+static void check_recycle_restored(
+        fixture & f, const vbr_adopt_result & result,
+        uint32_t expected_incoming) {
+    CHECK(result.status != vbr_adopt_status::adopted);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(result.recovery_h2d_bytes == 10);
+    CHECK(result.recovery_h2d_chunks == 2);
+    CHECK(f.target.incoming_transfer_calls == expected_incoming);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    CHECK(f.target.recovery_syncs == 1);
+    CHECK(!f.target.operation_quarantined);
+    CHECK(f.target.publish_calls == 0);
+    CHECK(!f.target.children[0].published);
+    CHECK(f.target.children[0].destination == f.target.incumbent_image);
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    CHECK(f.target.transfer_order.size() == size_t(expected_incoming + 2));
+    for (uint32_t i = 0; i < expected_incoming; ++i) {
+        CHECK(f.target.transfer_order[i] ==
+              vbr_staged_read_kind::unit_payload);
+    }
+    for (size_t i = expected_incoming;
+         i < f.target.transfer_order.size(); ++i) {
+        CHECK(f.target.transfer_order[i] ==
+              vbr_staged_read_kind::recovery_unit_payload);
+    }
+}
+
+static void test_occupied_recycle_success_and_zero_growth() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return;
+    }
+    CHECK(staged.staged->read_count() == 4);
+    CHECK(device_transfer_staging_reserved(f.ledger.snapshot()) == 0);
+
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    hooks.test = &test;
+    const auto result = vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+    CHECK(result.status == vbr_adopt_status::adopted);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::not_needed);
+    CHECK(result.recovery_h2d_bytes == 0);
+    CHECK(result.recovery_h2d_chunks == 0);
+    CHECK(f.target.incoming_transfer_calls == 2);
+    CHECK(f.target.recovery_transfer_calls == 0);
+    CHECK(f.target.recovery_syncs == 0);
+    CHECK(f.target.transfer_order ==
+          std::vector<vbr_staged_read_kind>({
+              vbr_staged_read_kind::unit_payload,
+              vbr_staged_read_kind::unit_payload,
+          }));
+    CHECK(f.target.children[0].destination != f.target.incumbent_image);
+    CHECK(f.target.children[0].published);
+}
+
+static void test_occupied_recycle_partial_write_and_late_fault_matrix() {
+    for (const uint32_t bytes_before_failure : { 1u, 3u, 5u }) {
+        fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                  0, vbr_artifact_clean_stash_state::absent_at_source,
+                  false, false, true, true);
+        f.target.fail_incoming_transfer_at = 0;
+        f.target.fail_incoming_after_bytes = bytes_before_failure;
+        const auto result = adopt_occupied(f);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        check_recycle_restored(f, result, 1);
+    }
+
+    fixture late(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+                 0, vbr_artifact_clean_stash_state::absent_at_source,
+                 false, false, true, true);
+    const auto late_result = adopt_occupied(
+        late, vbr_adopt_phase::complete_tree_barrier, false);
+    CHECK(late_result.status != vbr_adopt_status::adopted);
+    check_recycle_restored(late, late_result, 2);
+}
+
+static void test_occupied_recycle_replay_failure_quarantines() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true);
+    f.target.fail_incoming_transfer_at = 0;
+    f.target.fail_incoming_after_bytes = 3;
+    f.target.fail_recovery_transfer_at = 1;
+    const auto result = adopt_occupied(f);
+    CHECK(result.status == vbr_adopt_status::quarantined);
+    CHECK(result.phase == vbr_adopt_phase::rollback);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::quarantined);
+    CHECK(result.recovery_h2d_bytes == 5);
+    CHECK(result.recovery_h2d_chunks == 1);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    CHECK(f.target.recovery_syncs == 0);
+    CHECK(f.target.operation_quarantined);
+    CHECK(f.target.publish_calls == 0);
+}
+
+static void test_occupied_transformed_recycle_uses_recovery_geometry() {
+    fixture f(false, true, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true, true, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.staged);
+    if (!staged.manifest || !staged.staged) {
+        return;
+    }
+    uint32_t incoming = 0;
+    uint32_t recovery = 0;
+    for (const auto & read : staged.staged->reads()) {
+        if (read.kind == vbr_staged_read_kind::unit_payload) {
+            ++incoming;
+            CHECK(read.size == 10);
+        } else if (read.kind ==
+                       vbr_staged_read_kind::recovery_unit_payload) {
+            ++recovery;
+            CHECK(read.size == 5);
+            CHECK(read.destination_type == GGML_TYPE_TURBO3_TCQ);
+        }
+    }
+    CHECK(incoming == 2);
+    CHECK(recovery == 2);
+
+    f.target.fail_incoming_transfer_at = 0;
+    f.target.fail_incoming_after_bytes = 3;
+    vbr_composite_publish_hooks hooks;
+    hooks.context = &f.target.target;
+    hooks.owner_token = &f.target.target;
+    hooks.validate_owner_token = owner_token_valid;
+    vbr_adopt_test_control test;
+    test.target = &f.target;
+    hooks.test = &test;
+    const auto result = vbr_adopt_empty_manifest(
+        f.target.target, 0, std::move(*staged.manifest),
+        std::move(*staged.staged), f.ledger, hooks);
+    CHECK(result.status == vbr_adopt_status::transfer_failed);
+    CHECK(result.recovery == vbr_adopt_recovery_outcome::replayed);
+    CHECK(result.recovery_h2d_bytes == 10);
+    CHECK(f.target.recovery_transfer_calls == 2);
+    // Only the compact incumbent row geometry is authoritative after replay;
+    // the wider source alias tail is scratch and may remain cleared.
+    for (const size_t base : { size_t(0), size_t(8) }) {
+        CHECK(std::equal(
+            f.target.children[0].destination.begin() + base,
+            f.target.children[0].destination.begin() + base + 5,
+            f.target.incumbent_image.begin() + base));
+    }
+    CHECK(!f.target.children[0].published);
+    CHECK(!f.target.operation_quarantined);
+}
+
+static void test_occupied_replacement_tracker_consumes_canonical_map() {
+    fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
+              0, vbr_artifact_clean_stash_state::absent_at_source,
+              false, false, true);
+    auto staged = f.stage();
+    CHECK(staged.status == vbr_adopt_stage_status::staged);
+    CHECK(staged.manifest && staged.manifest->is_occupied_replacement());
+    if (!staged.manifest || !staged.manifest->is_occupied_replacement()) {
+        return;
+    }
+    const auto * guard = staged.manifest->occupied_replacement();
+    const auto * source = staged.manifest->source_controller(0);
+    CHECK(guard && source);
+    CHECK(staged.manifest->tracker_install().children.size() == 1);
+    if (!guard || !source ||
+        staged.manifest->tracker_install().children.size() != 1) {
+        return;
+    }
+
+    auto plan = staged.manifest->tracker_install().children.front();
+    vbr_generation_tracker tracker(
+        1, 10, uint32_t(plan.units.size()),
+        vbr_lineage_uuid { 0x81, 0x82 });
+    CHECK(tracker.active());
+    for (uint32_t unit = 0; unit < plan.units.size(); ++unit) {
+        CHECK(tracker.initialize_unit(
+            unit, plan.units[unit].current_type, plan.units[unit].domain));
+    }
+    CHECK(tracker.global_transition(
+        vbr_mutation_registrant::authenticated_recovery,
+        vbr_operation_class::controller));
+    CHECK(tracker.controller_generation() == 2);
+    std::vector<vbr_unit_generation> live_units;
+    for (uint32_t unit = 0; unit < plan.units.size(); ++unit) {
+        live_units.push_back(tracker.unit_generation(unit));
+    }
+    plan.target_instance = tracker.runtime_instance();
+    plan.lineage_uuid = tracker.lineage_identity();
+    plan.transition = vbr_tracker_install_transition::whole_import;
+    plan.global_generation = 1;
+    for (auto & unit : plan.units) {
+        unit.repr_gen = 1;
+        unit.last_transition = vbr_repr_transition::whole_import;
+    }
+    vbr_tracker_import_image image;
+    CHECK(tracker.prepare_relocated_import_image(
+        plan, *source, 0, *guard, image));
+    CHECK(image.ready());
+    CHECK(image.stable());
+    auto binding = import_binding(tracker.runtime_instance());
+    vbr_scoped_operation operation(binding);
+    CHECK(bool(operation));
+    CHECK(tracker.import_image_installable(image, operation.id()));
+    tracker.install_import_image_swap(image);
+    CHECK(tracker.controller_generation() == 2);
+    for (uint32_t unit = 0; unit < live_units.size(); ++unit) {
+        const auto current = tracker.unit_generation(unit);
+        CHECK(current.repr_gen == live_units[unit].repr_gen);
+        CHECK(current.current_type == live_units[unit].current_type);
+        CHECK(current.last_source_type == live_units[unit].last_source_type);
+        CHECK(current.domain == live_units[unit].domain);
+        CHECK(current.promote_hops == live_units[unit].promote_hops);
+        CHECK(current.last_transition == live_units[unit].last_transition);
+    }
+    for (const auto & mapping : guard->cell_mapping()) {
+        CHECK(tracker.dependency_generation(
+                  0, mapping.destination_physical_cell) == 1);
+        CHECK(tracker.membership_generation(
+                  0, mapping.destination_physical_cell) == 1);
+        CHECK(tracker.last_membership_seq(
+                  0, mapping.destination_physical_cell) == 0);
+    }
+    CHECK(operation.close(vbr_operation_outcome::committed));
+}
+
+static void test_erase_releases_receipt_for_second_adopt() {
+    fixture f;
+    const auto first = adopt(f);
+    CHECK(first.status == vbr_adopt_status::adopted);
+    CHECK(f.ledger.snapshot().live_ops > f.catalog_live_ops);
+
+    // Model the production seq_rm empty transition. This is the same receipt
+    // group and real accounting ledger used by the phase driver, not a second
+    // accounting algorithm.
+    f.target.erase_imported();
+    CHECK(f.target.construction_empty());
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+
+    const auto second = adopt(f);
+    CHECK(second.status == vbr_adopt_status::adopted);
+    CHECK(second.phase == vbr_adopt_phase::close);
+    CHECK(f.ledger.snapshot().live_ops > f.catalog_live_ops);
+    f.target.erase_imported();
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+}
 } // namespace adoption_fixture
 
 int main() {
+    adoption_fixture::test_occupied_replacement_free_cell_adoption();
+    adoption_fixture::test_occupied_replacement_fault_preserves_incumbent();
+    adoption_fixture::test_occupied_spec_companion_replacement_and_rollback();
+    adoption_fixture::test_occupied_recycle_success_and_zero_growth();
+    adoption_fixture::test_occupied_recycle_partial_write_and_late_fault_matrix();
+    adoption_fixture::test_occupied_recycle_replay_failure_quarantines();
+    adoption_fixture::test_occupied_transformed_recycle_uses_recovery_geometry();
+    adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map();
     test_epoch_capacity_preflight();
     test_native_tracker_image_preserves_lineage_and_runtime();
     test_real_tracker_import_settle_and_teardown();
@@ -2485,6 +2893,7 @@ int main() {
     test_closed_vocabularies();
     test_complete_tree_barrier_fail_closed();
     adoption_fixture::test_real_driver_smoke();
+    adoption_fixture::test_erase_releases_receipt_for_second_adopt();
 
     if (failures > 0) {
         std::fprintf(stderr, "%d VBR artifact-adoption test(s) failed\n", failures);
