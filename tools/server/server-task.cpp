@@ -2248,14 +2248,81 @@ void server_prompt_cache::abandon_vbr_publication_metadata(
     prepared.clear();
 }
 
+// fork 9l-d4b8g: size() is a MEASUREMENT, not a sum -- a checkpoint
+// plane aliased with a live handle is not host-cache residency
+// (fork server-task.cpp 2287-2359)
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
-
+    size_t naive = 0;
+    bool has_vbr = false;
+    bool has_anchor = false;
+    bool has_shared_fixed_plane = false;
     for (const auto & state : states) {
-        res += state.size();
+        naive += state.size();
+        if (state.payload.kind() ==
+                server_prompt_cache_payload_kind::vbr_artifact) {
+            has_vbr = true;
+            has_anchor |= state.payload.vbr_has_quality_anchor();
+        } else {
+            for (const auto & checkpoint : state.prompt.checkpoints) {
+                has_shared_fixed_plane |=
+                    checkpoint.data_tgt.storage_use_count() > 1 ||
+                    checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
+                    checkpoint.accel.ring.storage_use_count() > 1 ||
+                    checkpoint.accel.spec.storage_use_count() > 1;
+            }
+        }
     }
-
-    return res;
+    if (!has_vbr) {
+        if (!has_shared_fixed_plane || !acct) {
+            return naive;
+        }
+        const auto measured = server_prompt_cache_measure_budgets(
+            states, acct);
+        return measured.exact ? measured.compact : naive;
+    }
+    if (!has_anchor) {
+        if (!acct) {
+            return naive;
+        }
+        if (has_shared_fixed_plane) {
+            const auto measured = server_prompt_cache_measure_budgets(
+                states, acct);
+            return measured.exact
+                ? measured.compact + measured.anchor : naive;
+        }
+        try {
+            std::vector<const server_prompt_cache_payload *> payloads;
+            payloads.reserve(states.size());
+            size_t fixed_bytes = 0;
+            for (const auto & state : states) {
+                if (state.payload.kind() ==
+                        server_prompt_cache_payload_kind::vbr_artifact) {
+                    payloads.push_back(&state.payload);
+                } else {
+                    fixed_bytes += state.size();
+                }
+            }
+            llama_cache_acct_release_set_preview preview;
+            if (!server_prompt_cache_payload::preview_vbr_retire_union(
+                    payloads, acct->serial(), preview)) {
+                return naive;
+            }
+            uint64_t vbr_bytes = 0;
+            for (const auto & row : preview.rows) {
+                if (row.resident_allocated > UINT64_MAX - vbr_bytes) {
+                    return naive;
+                }
+                vbr_bytes += row.resident_allocated;
+            }
+            return vbr_bytes <= SIZE_MAX - fixed_bytes
+                ? fixed_bytes + size_t(vbr_bytes) : naive;
+        } catch (...) {
+            return naive;
+        }
+    }
+    const auto measured = server_prompt_cache_measure_budgets(states, acct);
+    return measured.exact ? measured.compact + measured.anchor : naive;
 }
 
 size_t server_prompt_cache::n_tokens() const {
