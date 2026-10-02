@@ -15,9 +15,6 @@
 //     program above, so it comes with it rather than with this slice.
 //   * fork 5938-5962 -- test_dflash_ring_frontier_header.  DFlash is ruled out
 //     of this port.
-//   * fork 3365-3901 -- the phase-fault, shard-child, complete-tree, serial,
-//     downward-subphase and upward-reconstruction matrices.  Slice 3 of the
-//     fixture below.
 //   * fork 3905-4040 -- the packed h2d projection (CPU, later).
 //
 // Self-reporting (a failure counter and an explicit pass line), so NDEBUG
@@ -2874,6 +2871,554 @@ static void test_erase_releases_receipt_for_second_adopt() {
     f.target.erase_imported();
     CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
 }
+
+// fork 9l-d4b8r: the adoption fixture, part 3 -- the fault matrices
+// (fork tests/test-vbr-artifact-adopt.cpp 3365-3901).
+//
+// `check_failed_transaction` is the shared tail of every test here: a
+// refused adoption must leave the target construction-empty, the ledger
+// back at its catalogue baseline, and the view still validating.  The cut
+// is a definition boundary -- 3901 closes test_upward_reconstruction and
+// 3902 is blank -- and the range reaches for nothing defined after it, so
+// it compiles alone.  All six tests are added to main() below; 537 lines
+// with no callers would compile and pass while asserting nothing at all.
+static void check_failed_transaction(
+        fixture & f, const vbr_adopt_result & result) {
+    CHECK(result.status != vbr_adopt_status::adopted);
+    CHECK(f.target.construction_empty());
+    CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    CHECK(f.view.validate() == vbr_artifact_status::ok);
+}
+
+static void test_phase_fault_matrix() {
+    // Every phase through tracker preparation is fallible on both sides of
+    // its work. Composite publication has only the pre-boundary seam; its
+    // publication and close are the deliberately seam-free no-fail region.
+    for (uint8_t raw = uint8_t(vbr_adopt_phase::consume_capabilities);
+         raw <= uint8_t(vbr_adopt_phase::tracker_prepare); ++raw) {
+        for (const bool after : { false, true }) {
+            fixture f;
+            f.target.inject_phase = vbr_adopt_phase(raw);
+            f.target.inject_after = after;
+            const auto result = adopt(f);
+            check_failed_transaction(f, result);
+            if (raw < uint8_t(vbr_adopt_phase::private_backing) ||
+                (raw == uint8_t(vbr_adopt_phase::private_backing) &&
+                 !after)) {
+                CHECK(f.target.map_calls == 0);
+            }
+            if (raw < uint8_t(vbr_adopt_phase::unit_h2d) ||
+                (raw == uint8_t(vbr_adopt_phase::unit_h2d) && !after)) {
+                CHECK(f.target.transfer_calls == 0);
+            }
+        }
+    }
+    {
+        fixture f;
+        f.target.inject_phase = vbr_adopt_phase::composite_publish;
+        const auto result = adopt(f);
+        check_failed_transaction(f, result);
+    }
+
+    // There is intentionally no post-publication or pre-close injection
+    // point: attempts to arm those non-boundaries are inert and must commit.
+    for (const auto & attempt : {
+            std::make_pair(vbr_adopt_phase::composite_publish, true),
+            std::make_pair(vbr_adopt_phase::close, false),
+            std::make_pair(vbr_adopt_phase::close, true) }) {
+        fixture f;
+        f.target.inject_phase = attempt.first;
+        f.target.inject_after = attempt.second;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.phase == vbr_adopt_phase::close);
+        f.target.erase_imported();
+        CHECK(f.ledger.snapshot().live_ops == f.catalog_live_ops);
+    }
+}
+
+static void test_shard_child_and_partial_map_matrix() {
+    for (uint32_t child = 0; child < 2; ++child) {
+        for (uint32_t shard_index = 0; shard_index < 2; ++shard_index) {
+            fixture f;
+            f.target.fail_transfer_child = child;
+            f.target.fail_transfer_shard = shard_index;
+            const auto result = adopt(f);
+            CHECK(result.status == vbr_adopt_status::transfer_failed);
+            CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+            CHECK(result.units == 0);
+            CHECK(f.target.mark_calls == 0);
+            CHECK(f.target.publish_calls == 0);
+            check_failed_transaction(f, result);
+        }
+    }
+    {
+        fixture f;
+        f.target.fail_map_child = 0;
+        f.target.fail_map_after = 3;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::private_backing_failed);
+        CHECK(f.target.map_calls == 3);
+        CHECK(f.target.children[0].unmapped == 3);
+        CHECK(f.target.children[0].unmapped_ranges ==
+              std::vector<uint32_t>({ 2, 1, 0 }));
+        CHECK(f.target.children[1].mapped == 0);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        vbr_adopt_fault fault;
+        fault.fail_h2d_completion = 0;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.h2d_bytes == 0);
+        CHECK(f.target.transfer_calls == 0);
+        check_failed_transaction(f, result);
+    }
+}
+
+static void test_complete_tree_barrier_matrix() {
+    {
+        fixture f;
+        f.target.drop_attention_at_barrier = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        f.target.add_recurrent_at_barrier = true;
+        const auto result = adopt(f);
+        CHECK(result.status ==
+              vbr_adopt_status::required_companion_unavailable);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(true);
+        f.target.drift_recurrent_at_barrier = true;
+        const auto result = adopt(f, nullptr, true);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        CHECK(f.target.recurrent.rollbacks == 1);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(true);
+        f.target.recurrent.fail_prepare = true;
+        const auto result = adopt(f, nullptr, true);
+        CHECK(result.status == vbr_adopt_status::companion_failed);
+        CHECK(result.phase == vbr_adopt_phase::stash_and_companions);
+        // Both attention children reached private backing/H2D first, then
+        // the recurrent failure rolled both journals back to empty.
+        CHECK(f.target.children[0].unmapped == 5);
+        CHECK(f.target.children[1].unmapped == 5);
+        CHECK(f.target.transfer_calls == 4);
+        CHECK(f.target.mark_calls == 2);
+        check_failed_transaction(f, result);
+    }
+}
+
+static void test_serial_and_admission_faults() {
+    {
+        fixture f;
+        f.target.drift_serial_at_phase3 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::target_drift);
+        CHECK(result.phase == vbr_adopt_phase::target_recheck);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        f.target.drift_serial_at_phase10 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::barrier_failed);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f;
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        vbr_adopt_stage_fault fault;
+        fault.fail_before_prepare = true;
+        auto staged = f.stage(fault);
+        CHECK(staged.status == vbr_adopt_stage_status::internal_error);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+    {
+        fixture f;
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        auto refused = f.budget;
+        for (auto & device : refused.devices) {
+            device.configured_cache_cap = 0;
+            device.cache_cap_state =
+                llama_cache_budget_capacity_state::known;
+        }
+        auto staged = f.stage({}, &refused);
+        CHECK(staged.status == vbr_adopt_stage_status::admission_refused);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+}
+
+static void test_downward_subphase_matrix() {
+    {
+        fixture f(false, true);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.decision == vbr_import_decision::downward_rebase);
+        CHECK(result.consistency ==
+              vbr_artifact_consistency_kind::live_rebased);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_completion);
+        CHECK(f.target.downward_zero_inits == f.view.units().size());
+        CHECK(f.target.downward_edges != 0);
+        CHECK(f.target.downward_syncs == 2);
+        // The fake reserve makes only child 0 stashless. Child 1 proves that
+        // the first outgoing tapped edge regenerates a clean stash and that
+        // stashless evidence is keyed by (child,unit), not a colliding unit id.
+        CHECK(f.target.downward_stashes ==
+              f.view.units()[1].descriptor.shards.size());
+    }
+
+    vbr_downward_recipe recipe;
+    CHECK(vbr_downward_resolve_recipe(
+        GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO3_TCQ,
+        GGML_TYPE_TURBO1_TCQ, true, recipe) ==
+        vbr_downward_recipe_status::resolved);
+    for (uint32_t edge = 0; edge < recipe.n_edges; ++edge) {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_edge = edge;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_transform_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_transcode);
+        CHECK(result.downward_edge == edge);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        f.target.drift_downward_at_phase10 = true;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::barrier_failed);
+        CHECK(result.phase == vbr_adopt_phase::complete_tree_barrier);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        f.target.fail_transfer_child = 0;
+        f.target.fail_transfer_shard = 0;
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::source_h2d);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_stash = true;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_stash_unavailable);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_stash_capture);
+        check_failed_transaction(f, result);
+    }
+    {
+        fixture f(false, true);
+        vbr_adopt_fault fault;
+        fault.fail_downward_completion = true;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::downward_transform_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::edge_completion);
+        check_failed_transaction(f, result);
+    }
+    for (const auto status : {
+            vbr_downward_reserve_status::not_attempted,
+            vbr_downward_reserve_status::projection_unavailable,
+            vbr_downward_reserve_status::accounting_refused,
+            vbr_downward_reserve_status::workspace_reserve_failed,
+            vbr_downward_reserve_status::required_stash_reserve_failed,
+            vbr_downward_reserve_status::internal_error }) {
+        fixture f(false, true);
+        const uint64_t baseline = f.ledger.snapshot().live_ops;
+        f.downward_reserve_status = status;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(staged.transform_status == status);
+        CHECK(!staged.staged);
+        CHECK(f.target.construction_empty());
+        CHECK(f.ledger.snapshot().live_ops == baseline);
+    }
+}
+
+static void test_upward_reconstruction() {
+    {
+        fixture f(false, false, true);
+        uint64_t compact_bytes = 0;
+        for (const auto & unit : f.view.units()) {
+            for (const auto & shard : unit.descriptor.shards) {
+                compact_bytes += shard.payload_bytes;
+            }
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.decision == vbr_import_decision::upward_reconstruct);
+        CHECK(result.consistency ==
+              vbr_artifact_consistency_kind::live_rebased);
+        CHECK(result.h2d_bytes == compact_bytes);
+        CHECK(f.target.upward_zero_inits == f.view.units().size());
+        CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms ==
+              f.view.units().size());
+        CHECK(f.target.upward_syncs == 2);
+        CHECK(f.target.downward_edges == 0);
+        CHECK(f.target.downward_stashes == 0);
+        CHECK(f.target.downward_syncs == 0);
+        CHECK(result.downward_subphase ==
+              vbr_downward_adopt_subphase::none);
+        CHECK(result.downward_edge == UINT32_MAX);
+    }
+    {
+        fixture f(false, false, true);
+        vbr_adopt_fault fault;
+        fault.fail_after = vbr_adopt_phase::unit_h2d;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(result.phase == vbr_adopt_phase::unit_h2d);
+        CHECK(f.target.upward_transforms == f.view.units().size());
+        CHECK(f.target.upward_syncs == 2);
+        check_failed_transaction(f, result);
+    }
+    // A tapped-domain reconstruction is one direct transform over the
+    // source-sized upload.  Its authenticated clean stash survives and the
+    // quality history advances exactly once.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.transform_kind ==
+                  vbr_import_transform_kind::upward_same_domain);
+            CHECK(plan.source_domain == vbr_repr_domain::tapped);
+            CHECK(plan.selected_target_domain == vbr_repr_domain::tapped);
+            CHECK(plan.target_last_source_type == GGML_TYPE_TURBO2_TCQ);
+            CHECK(plan.target_promote_hops == 1);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::restore_exact);
+            CHECK(plan.descriptor.clean_stash.valid_rows == 5);
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 60); // 20 source + 40 f16 clean-stash bytes
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_null_stash_transforms == 0);
+        CHECK(f.target.upward_stash_rows == 10);
+        CHECK(f.target.upward_syncs == 2);
+        CHECK(std::is_sorted(
+            f.target.upward_events.begin(), f.target.upward_events.end()));
+        for (const auto event : {
+                seam::upward_event::unit_h2d,
+                seam::upward_event::stash_h2d,
+                seam::upward_event::transform,
+                seam::upward_event::synchronize }) {
+            CHECK(std::find(
+                f.target.upward_events.begin(),
+                f.target.upward_events.end(), event) !=
+                f.target.upward_events.end());
+        }
+    }
+    // Cross-domain reconstruction consumes the authenticated centered stash,
+    // adds the baked source mean, and publishes full-domain bytes without
+    // retaining the now-inapplicable tapped stash.
+    for (const ggml_type target : {
+            GGML_TYPE_TURBO8_0, GGML_TYPE_F16 }) {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, target, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.transform_kind ==
+                  vbr_import_transform_kind::upward_cross_domain);
+            CHECK(plan.upward_recipe.edges[0].mean_action ==
+                  vbr_upward_mean_action::add_baked_source_mean);
+            CHECK(plan.transcode_source_identity.meansub_baked);
+            CHECK(plan.transcode_source_identity.meansub_model_id ==
+                  plan.transcode_target_identity.meansub_model_id);
+            CHECK(plan.transcode_source_identity.meansub_layer ==
+                  plan.transcode_target_identity.meansub_layer);
+            CHECK(plan.target_last_source_type == GGML_TYPE_TURBO2_TCQ);
+            CHECK(plan.target_promote_hops == 1);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::consume_exact_then_drop);
+        }
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 60);
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_stash_rows == 10);
+        CHECK(f.target.upward_syncs == 2);
+    }
+    // A tapped exact-stash import cannot use downward's stashless fallback.
+    // Its mandatory physical endpoint is rejected while staging, before any
+    // source or stash byte reaches the target.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        f.downward_reserve_status =
+            vbr_downward_reserve_status::required_stash_reserve_failed;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(staged.transform_status ==
+              vbr_downward_reserve_status::required_stash_reserve_failed);
+        CHECK(!staged.staged);
+        CHECK(f.target.transfer_calls == 0);
+        CHECK(std::all_of(
+            f.target.children.begin(), f.target.children.end(),
+            [](const child_state & child) { return child.h2d_bytes == 0; }));
+        CHECK(f.target.construction_empty());
+    }
+    // A second tapped promotion is allowed, while a third is rejected before
+    // any stage/adoption work is created.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 1,
+            vbr_artifact_clean_stash_state::present, false, true);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        for (const auto & plan : validation.proof->children()) {
+            CHECK(plan.target_promote_hops == 2);
+            CHECK(plan.stash_action ==
+                  vbr_validated_stash_action::omit_live_rebased);
+        }
+        CHECK(adopt(f).status == vbr_adopt_status::adopted);
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms == 2);
+    }
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 2);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::representation_mismatch);
+        CHECK(!validation.proof);
+        CHECK(f.target.construction_empty());
+    }
+    // Exact siblings stay byte-identical and do not acquire a transform; the
+    // transformed child still uses one source upload and one backend sync.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, true);
+        f.refresh();
+        auto validation = vbr_validate_unit_manifest_snapshot(
+            f.snapshot, f.view, f.policy);
+        CHECK(validation.status ==
+              vbr_manifest_validation_status::validated);
+        CHECK(validation.proof);
+        CHECK(validation.proof->children().size() == 2);
+        CHECK(validation.proof->children()[0].transform_kind ==
+              vbr_import_transform_kind::upward_same_domain);
+        CHECK(validation.proof->children()[1].transform_kind ==
+              vbr_import_transform_kind::none);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(result.h2d_bytes == 20);
+        CHECK(f.target.upward_zero_inits == 1);
+        CHECK(f.target.upward_transforms == 1);
+        CHECK(f.target.upward_stash_transforms == 0);
+        CHECK(f.target.upward_null_stash_transforms == 1);
+        CHECK(f.target.upward_syncs == 1);
+    }
+    // A full-stash exact sibling in a distinct child participates in the same
+    // pre-transfer resource wave even though it has no codec workspace. Both
+    // authenticated stash reads precede the one transformed child's work.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, false);
+        const auto result = adopt(f);
+        CHECK(result.status == vbr_adopt_status::adopted);
+        CHECK(f.transform_reserve_plans == 2);
+        CHECK(f.transform_reserve_stash_only == 1);
+        CHECK(f.target.upward_transforms == 1);
+        CHECK(f.target.upward_stash_transforms == 1);
+        CHECK(f.target.upward_syncs == 1);
+    }
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present, true, false);
+        f.downward_reserve_status =
+            vbr_downward_reserve_status::required_stash_reserve_failed;
+        auto staged = f.stage();
+        CHECK(staged.status ==
+              vbr_adopt_stage_status::transform_reserve_failed);
+        CHECK(!staged.staged);
+        CHECK(f.transform_reserve_plans == 2);
+        CHECK(f.transform_reserve_stash_only == 1);
+        CHECK(f.target.transfer_calls == 0);
+        CHECK(f.target.construction_empty());
+    }
+    // A post-transform fault synchronizes the submitted work, then returns to
+    // the construction-empty state without publishing partial metadata.
+    {
+        fixture f(
+            false, false, true,
+            GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO4_0, 0,
+            vbr_artifact_clean_stash_state::present);
+        vbr_adopt_fault fault;
+        fault.fail_after = vbr_adopt_phase::unit_h2d;
+        const auto result = adopt(f, &fault);
+        CHECK(result.status == vbr_adopt_status::transfer_failed);
+        CHECK(f.target.upward_transforms == 2);
+        CHECK(f.target.upward_stash_transforms == 2);
+        CHECK(f.target.upward_null_stash_transforms == 0);
+        CHECK(f.target.upward_stash_rows == 10);
+        CHECK(f.target.upward_syncs == 2);
+        check_failed_transaction(f, result);
+    }
+}
 } // namespace adoption_fixture
 
 int main() {
@@ -2894,6 +3439,12 @@ int main() {
     test_complete_tree_barrier_fail_closed();
     adoption_fixture::test_real_driver_smoke();
     adoption_fixture::test_erase_releases_receipt_for_second_adopt();
+    adoption_fixture::test_phase_fault_matrix();
+    adoption_fixture::test_shard_child_and_partial_map_matrix();
+    adoption_fixture::test_complete_tree_barrier_matrix();
+    adoption_fixture::test_serial_and_admission_faults();
+    adoption_fixture::test_downward_subphase_matrix();
+    adoption_fixture::test_upward_reconstruction();
 
     if (failures > 0) {
         std::fprintf(stderr, "%d VBR artifact-adoption test(s) failed\n", failures);
