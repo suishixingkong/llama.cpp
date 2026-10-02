@@ -1782,6 +1782,21 @@ struct server_slot {
             if (kv_bpv >= 0.0) {
                 res["kv_bpv"] = kv_bpv;
             }
+            // fork 9l-d4b8y: the retier freeze gate is invisible from outside
+            // except through how often it defers a retier, so emit the counters
+            // ONLY when it engaged -- an always-present all-zero object would read
+            // as a subsystem that is present but idle.
+            const auto vbr = llama_memory_vbr_state(llama_get_memory(ctx_tgt), id, 0);
+            if (vbr.retier_freeze_enters > 0 || vbr.retier_freeze_depth > 0) {
+                res["vbr_retier_freeze"] = json {
+                    { "depth",              vbr.retier_freeze_depth },
+                    { "env_freeze",         vbr.retier_env_freeze != 0 },
+                    { "enters_total",       vbr.retier_freeze_enters },
+                    { "exits_total",        vbr.retier_freeze_exits },
+                    { "deferred_total",     vbr.retier_deferred_decisions },
+                    { "reconciles_total",   vbr.retier_reconciles },
+                };
+            }
         }
 
         const auto & ptask = task ? task : task_prev;
