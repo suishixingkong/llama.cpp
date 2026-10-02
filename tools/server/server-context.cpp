@@ -4527,6 +4527,8 @@ private:
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
+            } else if (params_base.vbr_prompt_cache) {
+                SRV_TRC("%s", "idle dynamic-VBR slots will be published as projected prompt-cache artifacts; live sources remain resident during the initial restore rollout\n");
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
@@ -4537,6 +4539,26 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+
+        // fork 9l-d4b8u: the VBR startup contract (fork 8453-8477).
+        //
+        // Armed dynamic VBR is a precondition of the host prompt cache, not
+        // an optimisation: without it there is no artifact store to publish
+        // into and no staged payload to restore from, so a request that
+        // cannot be honoured is refused at startup rather than silently
+        // downgraded.  The anchor-cache pool is part of the same contract.
+        if (params_base.vbr_prompt_cache &&
+            (!server_vbr_dynamic_active(params_base) ||
+             !params_base.cache_idle_slots || !prompt_cache ||
+             !vbr_artifact_store)) {
+            SRV_ERR("%s", "--vbr-prompt-cache requires armed dynamic VBR, --cache-idle-slots, --cache-ram, and the artifact store\n");
+            return false;
+        }
+        if (!params_base.vbr_prompt_cache &&
+            params_base.vbr_anchor_cache_mib > 0) {
+            SRV_ERR("%s", "--vbr-anchor-cache-mib requires --vbr-prompt-cache\n");
+            return false;
         }
 
         {
