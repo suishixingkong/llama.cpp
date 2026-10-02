@@ -587,6 +587,21 @@ target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-artifact-capture.cpp)
 target_include_directories(test-vbr-artifact-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Artifact adoption: the portable, device-free half of the fork's
+# tests/test-vbr-artifact-adopt.cpp. Self-reporting (a failure counter and an
+# explicit pass line), so no /UNDEBUG. The other half of that file -- the CUDA
+# H2D adapter and the two model-backed drivers, 1831 lines -- is deliberately
+# NOT ported: it needs a GPU, and its first statement is an early-out
+# `if (!device) return;`, so it would pass here while asserting nothing. The
+# model-adoption harness that only that half references is left with it.
+#
+# No tools/server include directory: the ported range references ZERO `server_*`
+# symbols, and the fork's server includes are not free -- server-task.h reaches
+# server-common.h which reaches mtmd.h, and tools/mtmd is not on a test's
+# include path here (measured: fatal error C1083 on "mtmd.h").
+llama_build_and_test(test-vbr-artifact-adopt.cpp)
+target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # Artifact codec admission gates, the first test that reaches the whole artifact strongly-connected
 # component (artifact + generation + occupied-replacement + catalog + validate). Self-reporting, so
 # no /UNDEBUG. Scope is admission plus the two shared helpers; a full encode/decode round trip needs
