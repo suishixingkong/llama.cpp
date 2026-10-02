@@ -15,7 +15,6 @@
 //     program above, so it comes with it rather than with this slice.
 //   * fork 5938-5962 -- test_dflash_ring_frontier_header.  DFlash is ruled out
 //     of this port.
-//   * fork 3905-4040 -- the packed h2d projection (CPU, later).
 //
 // Self-reporting (a failure counter and an explicit pass line), so NDEBUG
 // cannot hollow it out and it needs no /UNDEBUG.  The counter is deliberate:
@@ -3421,6 +3420,150 @@ static void test_upward_reconstruction() {
 }
 } // namespace adoption_fixture
 
+// fork 9l-d4b8s: the packed-h2d projection tests
+// (fork tests/test-vbr-artifact-adopt.cpp 3905-4040).
+//
+// The fork calls both tests from inside its --vbr-*-cuda branch, which this
+// port does not carry; copied verbatim that would be 136 lines that compile,
+// pass and assert nothing.  They have no device dependency at all -- their
+// closure is zero -- so they are wired into the PORTABLE main() instead.
+namespace {
+
+struct packed_h2d_source {
+    std::vector<uint8_t> bytes;
+    uint64_t bytes_read = 0;
+    uint64_t read_calls = 0;
+
+    static bool read(const void * opaque, uint64_t offset,
+                     uint8_t * output, size_t size) noexcept {
+        auto & source = *const_cast<packed_h2d_source *>(
+            static_cast<const packed_h2d_source *>(opaque));
+        if (!output || offset > source.bytes.size() ||
+            size > source.bytes.size() - size_t(offset)) {
+            return false;
+        }
+        std::copy_n(source.bytes.data() + size_t(offset), size, output);
+        source.bytes_read += size;
+        ++source.read_calls;
+        return true;
+    }
+};
+
+struct packed_h2d_destination {
+    std::vector<uint8_t> bytes;
+
+    static bool issue(void * opaque, uint64_t, uint64_t offset,
+                      const uint8_t * data, size_t size,
+                      bool asynchronous) noexcept {
+        auto & destination =
+            *static_cast<packed_h2d_destination *>(opaque);
+        if (!data || asynchronous || offset > destination.bytes.size() ||
+            size > destination.bytes.size() - size_t(offset)) {
+            return false;
+        }
+        std::copy_n(data, size, destination.bytes.data() + size_t(offset));
+        return true;
+    }
+
+    static bool complete(void *, uint64_t) noexcept { return true; }
+};
+
+static void test_packed_h2d_projection_stream() {
+    packed_h2d_source source;
+    source.bytes.resize(64);
+    for (size_t i = 0; i < source.bytes.size(); ++i) {
+        source.bytes[i] = uint8_t(i + 1);
+    }
+    const std::array<vbr_h2d_source_range, 3> ranges {{
+        { 40, 7 }, { 3, 5 }, { 20, 9 },
+    }};
+    std::vector<uint8_t> expected(4, 0xa5);
+    for (const auto & range : ranges) {
+        expected.insert(expected.end(),
+            source.bytes.begin() + range.source_offset,
+            source.bytes.begin() + range.source_offset + range.size);
+    }
+    expected.resize(32, 0xa5);
+    packed_h2d_destination destination { std::vector<uint8_t>(32, 0xa5) };
+
+    vbr_h2d_status status;
+    auto ring = vbr_h2d_chunk_ring::create({ {} }, 16, 8, status);
+    CHECK(ring && status == vbr_h2d_status::ok);
+    if (!ring) {
+        return;
+    }
+    auto operation = ring->try_begin_operation();
+    CHECK(bool(operation));
+    vbr_h2d_packed_transfer transfer;
+    transfer.source = { source.bytes.size(), &source, packed_h2d_source::read };
+    transfer.ranges = ranges.data();
+    transfer.range_count = ranges.size();
+    transfer.size = 21;
+    transfer.destination_offset = 4;
+    transfer.fake = {
+        &destination, packed_h2d_destination::issue,
+        packed_h2d_destination::complete, false,
+    };
+    vbr_h2d_stats stats;
+    CHECK(ring->stream_packed_reserved(operation, transfer, stats) ==
+          vbr_h2d_status::ok);
+    CHECK(destination.bytes == expected);
+    CHECK(source.bytes_read == transfer.size);
+    CHECK(stats.bytes == transfer.size);
+    CHECK(stats.chunks == 3);
+
+    // The reservation spans the complete projected unit set rather than
+    // permitting the other direction to splice work between shards.
+    vbr_h2d_transfer competing;
+    competing.source = transfer.source;
+    competing.size = 1;
+    competing.fake = transfer.fake;
+    CHECK(ring->stream(competing, stats) ==
+          vbr_h2d_status::ring_unavailable);
+    operation = {};
+    CHECK(ring->stream(competing, stats) == vbr_h2d_status::ok);
+}
+
+static void test_packed_h2d_projection_max_ranges() {
+    static constexpr size_t n = 1024*1024;
+    packed_h2d_source source;
+    source.bytes.resize(n);
+    std::vector<vbr_h2d_source_range> ranges(n);
+    for (size_t i = 0; i < n; ++i) {
+        source.bytes[i] = uint8_t(i & 0xff);
+        ranges[i] = { n - 1 - i, 1 };
+    }
+    packed_h2d_destination destination { std::vector<uint8_t>(n) };
+    vbr_h2d_status status;
+    auto ring = vbr_h2d_chunk_ring::create(
+        { {} }, 128*1024, 64*1024, status);
+    CHECK(ring && status == vbr_h2d_status::ok);
+    if (!ring) {
+        return;
+    }
+    auto operation = ring->try_begin_operation();
+    vbr_h2d_packed_transfer transfer;
+    transfer.source = { source.bytes.size(), &source, packed_h2d_source::read };
+    transfer.ranges = ranges.data();
+    transfer.range_count = ranges.size();
+    transfer.size = n;
+    transfer.fake = {
+        &destination, packed_h2d_destination::issue,
+        packed_h2d_destination::complete, false,
+    };
+    vbr_h2d_stats stats;
+    CHECK(ring->stream_packed_reserved(operation, transfer, stats) ==
+          vbr_h2d_status::ok);
+    CHECK(stats.bytes == n);
+    CHECK(stats.chunks == 16);
+    CHECK(source.bytes_read == n);
+    CHECK(source.read_calls == n);
+    CHECK(destination.bytes.front() == source.bytes.back());
+    CHECK(destination.bytes.back() == source.bytes.front());
+}
+
+} // namespace
+
 int main() {
     adoption_fixture::test_occupied_replacement_free_cell_adoption();
     adoption_fixture::test_occupied_replacement_fault_preserves_incumbent();
@@ -3445,6 +3588,8 @@ int main() {
     adoption_fixture::test_serial_and_admission_faults();
     adoption_fixture::test_downward_subphase_matrix();
     adoption_fixture::test_upward_reconstruction();
+    test_packed_h2d_projection_stream();
+    test_packed_h2d_projection_max_ranges();
 
     if (failures > 0) {
         std::fprintf(stderr, "%d VBR artifact-adoption test(s) failed\n", failures);
