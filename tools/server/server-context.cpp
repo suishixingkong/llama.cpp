@@ -3724,6 +3724,14 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                if (params_base.vbr_prompt_cache) {
+                    // fork 9l-d4b9a (fork 7459-7466): the request has already
+                    // received its terminal response and the source is now idle.
+                    // Start durable publication at the next scheduler boundary
+                    // instead of waiting for the periodic idle poll; newly queued
+                    // work still wins and cancels the bounded capture session.
+                    queue_tasks.request_idle_maintenance();
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -3734,6 +3742,61 @@ private:
             };
 
             slot.reset();
+        }
+
+        // fork 9l-d4b9a: classify the support the run DECLARES, before the store
+        // is built (fork 7498-7533).  The port's only other classification site
+        // is the store-failure one at :4426, which cannot speak for a codec that
+        // can never produce a host-cache artifact in the first place.
+        if (params_base.vbr_prompt_cache) {
+            const bool all_slots_speculative = !slots.empty() &&
+                std::all_of(
+                    slots.begin(), slots.end(),
+                    [](const server_slot & slot) {
+                        return slot.can_speculate();
+                    });
+            vbr_prompt_cache_support =
+                params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC
+                    ? server_vbr_prompt_cache_support_status::codec_unsupported
+                    : server_vbr_prompt_cache_support_for(
+                        ctx_dft != nullptr, all_slots_speculative,
+                        false, false);
+            const auto fallback =
+                server_vbr_prompt_cache_fallback_action_for(
+                    vbr_prompt_cache_automatic,
+                    vbr_prompt_cache_support);
+            if (fallback ==
+                    server_vbr_prompt_cache_fallback_action::live_only) {
+                params_base.vbr_prompt_cache = false;
+                params_base.cache_idle_slots = false;
+                params_base.cache_ram_mib = 0;
+                SRV_WRN(
+                    "automatic dynamic VBR host caching fallback=live_only "
+                    "reason=%s; cache-ram disabled\n",
+                    server_vbr_prompt_cache_support_status_name(
+                        vbr_prompt_cache_support));
+            } else if (fallback ==
+                    server_vbr_prompt_cache_fallback_action::startup_error) {
+                SRV_ERR(
+                    "--vbr-prompt-cache is unsupported reason=%s\n",
+                    server_vbr_prompt_cache_support_status_name(
+                        vbr_prompt_cache_support));
+                return false;
+            }
+        }
+
+        // fork 9l-d4b9a: the per-seq scratch the retention wave indexes by slot
+        // id (fork 7535-7544).  Every reader is written against `.size()`, so
+        // leaving these unsized does not crash -- it makes the readers inert.
+        if (server_vbr_dynamic_active(params_base) &&
+            params_base.vbr_prompt_cache) {
+            vbr_durable_sources_by_seq.resize(slots.size());
+            vbr_durable_stems_by_seq.resize(slots.size());
+            vbr_reclaim_refused_by_seq.resize(slots.size());
+            vbr_idle_parent_values.resize(slots.size());
+            vbr_idle_parent_values.clear();
+            vbr_idle_durability_order.resize(slots.size());
+            vbr_idle_frontier_queries.resize(slots.size());
         }
 
         {
