@@ -3430,6 +3430,15 @@ private:
 
         const std::string & mmproj_path = params_base.mmproj.path;
 
+        // fork 9l-d4b9c: seed the dynamic-VBR growth headroom from the largest
+        // requested device target (fork 6398-6402).  The field is declared in
+        // common.h and referenced nowhere else, so without this the fitter sees 0.
+        if (params_base.vbr_dynamic() && params_base.fit_params_vbr_growth_headroom_bytes == 0 &&
+            !params_base.fit_params_target.empty()) {
+            params_base.fit_params_vbr_growth_headroom_bytes = *std::max_element(
+                    params_base.fit_params_target.begin(), params_base.fit_params_target.end());
+        }
+
         // The GPU swap destroys the draft context for the duration of an image encode, which
         // is only viable for MTP: it is recreated against the target model without reloading
         // anything. An external draft model would have to be loaded from disk again, so the
@@ -3856,6 +3865,22 @@ private:
                 // restoring once the target cache has degraded — predictably off beats flaky
                 params_base.slot_save_path.clear();
                 SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            // fork 9l-d4b9c: serialized SWA checkpoints are tier-sensitive bytes, so
+            // they are disabled under dynamic VBR and replaced by the typed
+            // active-window limit (fork 7651-7662).  Both members exist and are read
+            // elsewhere in this file; nothing in load_model ever set them.
+            if (params_base.n_ctx_checkpoints > 0 &&
+                llama_model_n_swa(model_tgt) > 0) {
+                if (vbr_swa_window_supported(*ctx_tgt)) {
+                    swa_window_checkpoint_limit = params_base.n_ctx_checkpoints;
+                    llama_sha256 hash;
+                    hash.update(frontier_execution_identity.data(), frontier_execution_identity.size());
+                    swa_window_execution_identity = hash.finish();
+                }
+                params_base.n_ctx_checkpoints = 0;
+                SRV_WRN("legacy serialized SWA checkpoints disabled under dynamic VBR; typed active-window limit = %d\n",
+                        swa_window_checkpoint_limit);
             }
         }
 
@@ -9336,7 +9361,14 @@ private:
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
-                            return;
+                            // fork 9l-d4b9c: a checkpoint restore's scoped VBR freeze must
+                            // cover the paired attention trim below.  Delay only this
+                            // lambda return until the trim; unscoped/non-VBR behavior
+                            // stays byte-for-byte on the old branch (fork 17271-17277).
+                            if (!vbr_restore_freeze) {
+                                return;
+                            }
+                            return_after_vbr_restore_trim = true;
                         }
                     }
 
