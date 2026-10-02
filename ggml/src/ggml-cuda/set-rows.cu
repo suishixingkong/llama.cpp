@@ -12,6 +12,12 @@
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
+// fork 9l-d4b8k: the definition for the extern in vbr-transcode.cu (fork set-rows.cu
+// 13-15).  When true, the encode mean-sub tap is skipped -- which is what the
+// VBR transcode re-encode needs: its input is already stored-domain (V - mu_V
+// / K - mu_K on the tapped tiers), so the tap must not subtract mu again.
+bool g_turbo_meansub_suppress = false;
+
 // ─── TurboQuant mean-sub: capture + K affine tap ─────────────────────────────────────────────
 // See ggml/include/ggml-turbo-meansub.h. Both features are dormant unless requested:
 //
@@ -171,6 +177,12 @@ void meansub_capture_dump() {
 // table is immutable for the process lifetime (see ggml-turbo-meansub.h), so upload it once
 // per device and hand out per-layer rows. Returns nullptr when the tap must stay disabled.
 static const float * meansub_k_dev_row(int layer) {
+    // fork 9l-d4b8k: the VBR re-encode brackets its set_rows dispatch with this flag
+    // (fork turbo-quant-cuda.cuh 332-348 gates the getter the same way); the
+    // K tap must stay off for the whole window or a tapped tier is tapped twice.
+    if (g_turbo_meansub_suppress) {
+        return nullptr;
+    }
     constexpr int max_devices = 16;
     static float * dev[max_devices] = {};
     static std::mutex mtx;
