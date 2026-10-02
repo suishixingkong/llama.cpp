@@ -4875,9 +4875,30 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
+                // fork 9l-d4b8z: an idle purge now goes through the durability
+                // classifier and the publication-aware clear door, so a slot whose
+                // cache cannot be republished is KEPT instead of being destroyed
+                // silently.  Both callees were already live in this port.
+                // Approved guard, not destruction-authority certification.
+                if (slot.hard_lease_blocks_live_prefix()) {
+                    SLT_INF(slot, "%s", "idle purge skipped: hard lease seals the live prefix\n");
+                    continue;
+                }
+                if (!vbr_idle_source_durable(slot)) {
+                    SLT_DBG(slot, "%s",
+                            "idle purge skipped: no durable VBR frontier\n");
+                    continue;
+                }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear();
+                // fork 9l-d4b8z: the clear door can refuse (full-slot lease), which the
+                // upstream unconditional prompt_clear() could not.
+                const bool removed = vbr_clear_idle_source(slot);
+                if (!removed) {
+                    SLT_DBG(slot, "%s",
+                            "idle purge skipped: full-slot lease refused displacement\n");
+                    continue;
+                }
 
                 res = true;
 
