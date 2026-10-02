@@ -1132,7 +1132,20 @@ struct server_slot {
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
-    common_speculative * spec;
+    // fork 9l-d4b8e: the fork declares TWO members here (fork server-context.cpp
+    // 1597-1598) -- an OWNING `common_speculative_ptr spec` and a non-owning
+    // `common_speculative * spec_shared = nullptr` -- and get_spec() picks
+    // whichever is live.  This port holds one non-owning raw pointer to the
+    // shared owner (see get_spec() below), so it must carry the UNION of the
+    // fork's two initialisers: in the fork the null default came from the
+    // pointee TYPE, and collapsing the pair into a raw pointer removes exactly
+    // that carrier.  Without `= nullptr` the slot's spec is indeterminate, and
+    // get_spec() hands it straight to common_speculative_sequence_transition(),
+    // whose `spec == nullptr` test is the ONLY thing that makes a slot with no
+    // speculative consumer safe.  A default-constructed server_slot -- which is
+    // what the model-free prompt-cache suite builds -- then iterates a garbage
+    // `impls` and jumps through a garbage vtable entry.
+    common_speculative * spec = nullptr;
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
