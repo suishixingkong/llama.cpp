@@ -4539,6 +4539,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DEBUG"));
 
+    // fork 9l-d4b9d: the cache-plan preflight flag (fork arg.cpp 4731-4737)
+    add_opt(common_arg(
+        {"--cache-plan-preflight"},
+        string_format("expose trusted-local POST /cache/plan previews (default: %s)", params.cache_plan_preflight ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_plan_preflight = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PLAN_PREFLIGHT"));
+
     add_opt(common_arg(
         {"--cache-control-api"},
         string_format("expose trusted-local cache-control routes and enable their required cache-lifecycle authority (default: %s)", params.cache_control_api ? "enabled" : "disabled"),

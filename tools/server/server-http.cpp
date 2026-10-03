@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#include "server-cache-control.h"
 #include "ui.h"
 
 #include <cpp-httplib/httplib.h>
@@ -20,6 +21,23 @@ class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
 };
+
+// fork 9l-d4b9d: the route-local body policy (fork server-http.cpp 26-40).
+// Route-local body policy. Keep this separate from log level: even if the
+// generic httplib logger is enabled in a future build, cache-plan prompts and
+// cache-oracle responses are never eligible for body logging. api_prefix may
+// precede the registered route, hence the suffix match on a path boundary.
+static bool server_http_is_cache_control_route(const std::string & path) {
+    return server_cache_control_is_route(path);
+}
+
+static bool server_http_redacts_request_bodies(const std::string & path) {
+    static constexpr std::string_view cache_plan = "/cache/plan";
+    return server_http_is_cache_control_route(path) ||
+        (path.size() >= cache_plan.size() &&
+         path.compare(path.size() - cache_plan.size(),
+                      cache_plan.size(), cache_plan) == 0);
+}
 
 server_http_context::server_http_context()
     : pimpl(std::make_unique<Impl>())
@@ -43,8 +61,14 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
 
     SRV_TRC("done request: %s %s %s %d\n", req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), res.status);
 
-    SRV_DBG("request:  %s\n", req.body.c_str());
-    SRV_DBG("response: %s\n", res.body.c_str());
+    // fork 9l-d4b9d: redact the bodies of reviewed routes (fork server-http.cpp 64-70)
+    if (server_http_redacts_request_bodies(req.path)) {
+        SRV_DBG("%s", "request:  [body redacted]\n");
+        SRV_DBG("%s", "response: [body redacted]\n");
+    } else {
+        SRV_DBG("request:  %s\n", req.body.c_str());
+        SRV_DBG("response: %s\n", res.body.c_str());
+    }
 }
 
 // returns true if the Origin header value's host is localhost / 127.0.0.1 / ::1 (any port)
@@ -273,17 +297,23 @@ bool server_http_context::init(const common_params & params) {
         return true;
     };
 
-    // Cache receipts protect every dynamic response. Install this hook only
-    // when the feature needs it so everything stays zero-work while disabled.
-    // FORK-DIFF: the fork condition and body also cover --cache-plan-preflight
-    // and --cache-control-api (fork server-http.cpp:316-335), whose params do
-    // not exist in this tree yet. Only the receipt limb is reachable here;
-    // widen this when those two land so no response loses its no-store.
-    if (params.cache_receipt) {
+    // fork 9l-d4b9d: the receipt / cache-oracle no-store hook (fork server-http.cpp 316-335).
+    // Cache receipts protect every dynamic response. Cache-plan preflight's route-local rule is
+    // narrower but must also cover middleware-generated 401/503 responses,
+    // which never reach its handler. Install this hook only when one feature
+    // needs it so both features remain zero-work while disabled.
+    if (params.cache_receipt || params.cache_plan_preflight ||
+        params.cache_control_api) {
         srv->set_post_routing_handler([
-                cache_receipt = params.cache_receipt](
+                cache_receipt = params.cache_receipt,
+                cache_plan_preflight = params.cache_plan_preflight,
+                cache_control_api = params.cache_control_api](
                 const httplib::Request & req, httplib::Response & res) {
-            if (cache_receipt && !frontend_paths.count(req.path)) {
+            const bool cache_oracle_route =
+                (cache_plan_preflight || cache_control_api) &&
+                server_http_redacts_request_bodies(req.path);
+            if (cache_oracle_route ||
+                (cache_receipt && !frontend_paths.count(req.path))) {
                 res.set_header("Cache-Control", "no-store");
             }
         });
@@ -742,7 +772,10 @@ void server_http_context::register_gcp_compat() const {
     // e.g. "chatCompletions" -> "/v1/chat/completions"
     std::unordered_map<std::string, std::string> alias_to_path;
     for (const auto & [path, _] : handlers) {
-        alias_to_path.emplace(path_to_gcp_format(path), path);
+        // fork 9l-d4b9d: the reviewed routes are not /predict aliases (fork 789-792)
+        if (server_http_gcp_predict_dispatch_allowed(path)) {
+            alias_to_path.emplace(path_to_gcp_format(path), path);
+        }
     }
 
     if (!gcp.path_health.empty()) {
@@ -814,7 +847,9 @@ void server_http_context::register_gcp_compat() const {
                     auto it_alias = alias_to_path.find(format);
                     if (it_alias != alias_to_path.end()) {
                         dispatch_path = it_alias->second;
-                    } else if (handlers.count(format)) {
+                    // fork 9l-d4b9d: the direct-path branch honours the same boundary (fork 864-865)
+                    } else if (server_http_gcp_predict_dispatch_allowed(format) &&
+                               handlers.count(format)) {
                         dispatch_path = format;
                     } else {
                         return build_error("no handler registered for @requestFormat: " + format, ERROR_TYPE_INVALID_REQUEST);

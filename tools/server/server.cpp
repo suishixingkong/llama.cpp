@@ -143,6 +143,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
     params.cache_lifecycle = server_cache_lifecycle_default(
         params.cache_lifecycle, false, params.cache_control_api);
 
+    // fork 9l-d4b9d: the exposure gate for the preview surface (fork server.cpp 146-152)
+    if (params.cache_plan_preflight &&
+        (is_router_server ||
+         !server_cache_plan_preflight_exposure_allowed(
+             params.hostname, params.api_keys.size()))) {
+        SRV_ERR("%s", "--cache-plan-preflight requires a single-model, trusted-local, single-principal server\n");
+        return 1;
+    }
     // fork 9l-d4b7e: the exposure gate for the control surface (fork server.cpp 153-159)
     if (params.cache_control_api &&
         (is_router_server ||
@@ -300,9 +308,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // fork 9l-d4b9d: the cache-plan preflight route (fork server.cpp 309)
+    ctx_http.post("/cache/plan",                ex_wrapper(routes.post_cache_plan));
     // fork 9l-d4b7e: the cache-control routes (fork server.cpp 310-315).
-    // The fork's POST /cache/plan (309) belongs to --cache-plan-preflight
-    // and goes above this block when it lands.
     if (params.cache_control_api) {
         for (const auto & route : SERVER_CACHE_CONTROL_ROUTES) {
             ctx_http.post(std::string(route.path),

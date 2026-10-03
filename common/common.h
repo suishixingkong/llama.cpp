@@ -813,6 +813,12 @@ struct common_params {
     // Cache-plan observer: strictly zero observer work when disabled.
     bool cache_debug = false;
 
+    // fork 9l-d4b9d: the cache-plan preview surface (fork common.h 917-920).
+    // Trusted-local, single-principal cache-plan preview surface. This flag
+    // only exposes the route; ordinary requests allocate no observer
+    // state merely because it is enabled.
+    bool cache_plan_preflight = false;
+
     // Trusted-local, single-principal cache-control HTTP surface. Server
     // startup enables its required cache-lifecycle authority; this flag also
     // registers the reviewed routes.

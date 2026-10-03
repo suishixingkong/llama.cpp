@@ -1,16 +1,29 @@
 #pragma once
 
+#include "server-cache-control.h"
+
 #include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
 
 struct common_params;
+
+// fork 9l-d4b9d: the reviewed-route boundary for the GCP /predict dispatcher
+// (fork server-http.h 18-24).
+// Vertex /predict is a compatibility dispatcher, not an alternate security
+// boundary. Cache-plan preflight is intentionally reachable only through its
+// reviewed route so its no-store and body-redaction contracts cannot be lost.
+inline bool server_http_gcp_predict_dispatch_allowed(
+        std::string_view path) noexcept {
+    return path != "/cache/plan" && !server_cache_control_is_route(path);
+}
 
 // generator-like API for HTTP response generation
 // this object response with one of the 2 modes:
