@@ -1452,6 +1452,21 @@ struct server_slot {
         // stale authenticated row from the task that owned it before.
         frontier_logits.pending = false;
 
+        // fork 9l-d4b9e: fork server-context.cpp:2380-2388.  A recycled slot
+        // must not inherit the previous request's retention limb either: the
+        // staged reuse receipt and the destination lineage ticket are the
+        // slot's most expensive state, and the three pending/succeeded/failed
+        // flags gate what release() publishes on the *next* completion.
+        clear_retention_reuse();
+        if (retention_obs) {
+            retention_obs->release_lineage_ticket(retention_destination);
+        } else {
+            retention_destination = {};
+        }
+        retention_branch_pending = false;
+        retention_request_succeeded = false;
+        retention_geometry_failed = false;
+
         spec_is_replay = false;
 
         last_nl_pos    = 0;
@@ -1625,10 +1640,21 @@ struct server_slot {
     }
 
     void release() {
+        // fork 9l-d4b9e: fork server-context.cpp:2663.  Slot-held SWA window
+        // images point into the target context's storage, so a released slot
+        // must not keep them alive even when it was not processing.
+        swa_windows.clear();
         if (is_processing()) {
             GGML_ASSERT(task);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            // fork 9l-d4b9e: fork server-context.cpp:2669-2672 -- cache-plan
+            // observer: a request that ends before its record finalized (error,
+            // cancel) resolves the in-flight record here, exactly once, by
+            // deliberate drop -- an incomplete request has no truthful outcome
+            // to emit.
+            cache_plan.reset();
 
             t_last_used = ggml_time_us();
 
@@ -1637,6 +1663,156 @@ struct server_slot {
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear();
+            }
+
+            // fork 9l-d4b9e: fork server-context.cpp:2689-2728.  A checkpoint
+            // beyond the request prompt is generation-phase, but generated
+            // tokens normally become the next turn's prefix. Keep those
+            // checkpoints while their logical frontier is still represented by
+            // prompt.tokens. Only a checkpoint beyond BOTH the request prompt
+            // and the accepted/retained token ledger is unreachable by any
+            // future LCP and therefore genuinely dead (for example, an abandoned
+            // speculative branch). This is position-layout independent:
+            // recurrent pos_min is the full sequence frontier, so the upstream
+            // `pos_min > prompt_end` test would erase every recurrent generation
+            // checkpoint. Erasing metadata here cannot alter the live model
+            // state, and retaining continuation checkpoints is the
+            // output-neutral choice when lineage is not provably dead. Child
+            // slots were cleared above and deliberately skip this lifecycle.
+            if (!task->is_child()) {
+                const int64_t prompt_end   = task->n_tokens();
+                const int64_t retained_end = prompt.n_tokens();
+                int n_erased = 0;
+
+                for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+                    const bool is_generation_checkpoint = it->n_tokens > prompt_end;
+                    const bool is_outside_retained       = it->n_tokens > retained_end;
+
+                    if (is_generation_checkpoint && is_outside_retained) {
+                        SLT_DBG(*this,
+                                "release: erasing dead generation checkpoint "
+                                "(n_tokens=%" PRId64 ", prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
+                                it->n_tokens, prompt_end, retained_end);
+                        it = checkpoint_drop(
+                            it, std::next(it),
+                            server_cache_destruction_reason::checkpoint_invalidated);
+                        n_erased++;
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (n_erased > 0) {
+                    SLT_INF(*this,
+                            "release: erased %d dead generation checkpoint(s) "
+                            "(prompt_end=%" PRId64 ", retained_end=%" PRId64 ")\n",
+                            n_erased, prompt_end, retained_end);
+                }
+            }
+
+            // fork 9l-d4b9e: fork server-context.cpp:2730-2827.  The completion
+            // face of the retention limb. A request whose geometry failed under
+            // a live VBR prompt cache, or whose branch never succeeded, retires
+            // its record instead of publishing; every other non-child request
+            // with a non-empty prompt publishes an artifact, stamps the
+            // bounded cold-start prior and renews the implicit soft lease.
+            if (retention_obs) {
+                if ((retention_geometry_failed &&
+                     !vbr_prompt_cache_enabled) ||
+                    (retention_branch_pending &&
+                     !retention_request_succeeded)) {
+                    retention_obs->retire(
+                        server_retention_instance_key::for_slot(id));
+                    for (const auto & checkpoint : prompt.checkpoints) {
+                        retention_obs->retire(
+                            server_retention_instance_key::for_checkpoint(
+                                id, &checkpoint));
+                    }
+                } else if (!task->is_child() && prompt.n_tokens() > 0) {
+                    const auto live_key =
+                        server_retention_instance_key::for_slot(id);
+                    const auto prior_artifact =
+                        retention_obs->artifact_id(live_key);
+                    std::string adapter_identity;
+                    if ((lease_obs && lease_execution_identity) ||
+                        retention_obs->prefix_tracking_enabled()) {
+                        adapter_identity = lora_config_identity(lora);
+                    }
+                    server_cache_lease_identity identity;
+                    const bool identity_known = lease_obs &&
+                        lease_execution_identity &&
+                        server_cache_lease_build_identity(
+                            *lease_execution_identity,
+                            adapter_identity, prompt.tokens,
+                            prompt.n_tokens(), identity);
+                    const server_cache_lease_frontier frontier {
+                        prompt.sequence_epoch,
+                        uint64_t(prompt.n_tokens()),
+                        prompt.n_tokens(),
+                    };
+                    // launch_slot_with_task leaves the prior association in
+                    // place only for exact append continuity. Publication
+                    // still refreshes the immutable retention record, then
+                    // atomically migrates matching leases to its fresh
+                    // artifact after checking identity and proven-frontier
+                    // containment. A trim/rebind has no prior association and
+                    // therefore reaches the normal subject_lost terminal.
+                    const bool published = retention_obs->publish(
+                            live_key,
+                            retention_pool,
+                            task->params.message_spans,
+                            !task->params.message_spans.spans.empty(),
+                            uint64_t(prompt.n_tokens()),
+                            uint64_t(prompt.n_tokens()),
+                            prompt.n_tokens() >= 0,
+                            identity_known ? &identity : nullptr,
+                            identity_known && prior_artifact.v != 0
+                                ? &frontier : nullptr,
+                            nullptr,
+                            retention_destination.valid()
+                                ? &retention_destination : nullptr);
+                    if (published) {
+                        (void) server_prompt_retention_publish_exact_prefix(
+                            *retention_obs, live_key, prompt,
+                            adapter_identity, prompt.n_tokens());
+                    }
+                    if (published) {
+                        // The historical automatic-main/family signal becomes
+                        // one bounded cold-start prior. It does not stack with
+                        // the implicit soft lease and decays with competition.
+                        (void) retention_obs->set_lineage_prior(
+                            live_key,
+                            server_prompt_cache_retention_prior_milli(
+                                cache_family, true));
+                    }
+                    if (published && lease_obs) {
+                        const auto artifact = retention_obs->artifact_id(
+                            live_key);
+                        if (!implicit_soft_lease_scope.v) {
+                            implicit_soft_lease_scope =
+                                lease_obs->new_context_scope();
+                        }
+                        const server_cache_lease_subject subject {
+                            artifact,
+                            common_retention_artifact_kind::live_slot,
+                            id,
+                        };
+                        if (identity_known &&
+                            subject.valid() &&
+                            implicit_soft_lease_scope.v != 0) {
+                            (void) lease_obs->grant_soft(
+                                subject,
+                                server_cache_lease_scope::from(implicit_soft_lease_scope),
+                                identity,
+                                server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
+                        } else if (subject.valid()) {
+                            lease_obs->artifact_identity_unavailable(subject);
+                        }
+                    }
+                } else {
+                    retention_obs->retire(
+                        server_retention_instance_key::for_slot(id));
+                }
             }
 
             callback_on_reset(*this);
@@ -2108,6 +2284,11 @@ struct server_slot {
     server_retention_sidecar_store * retention_obs = nullptr;
     // fork server-context.cpp:1512
     server_cache_lease_table * lease_obs = nullptr;
+    // fork 9l-d4b9e: fork server-context.cpp:1513-1516.  One scheduler-owned
+    // context scope follows this slot across immutable append replacements.
+    // Reusing it lets grant_soft renew the migrated implicit lease instead of
+    // accumulating one lease per completion turn.
+    server_cache_context_scope_id implicit_soft_lease_scope;
     // fork server-context.cpp:1517
     const std::string * lease_execution_identity = nullptr;
     // fork server-context.cpp:1518
