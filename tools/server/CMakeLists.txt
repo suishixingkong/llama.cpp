@@ -192,4 +192,29 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-prompt-cache PRIVATE cxx_std_17)
     add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache)
     set_property(TEST test-server-prompt-cache PROPERTY LABELS main)
+    set_property(TEST test-server-prompt-cache APPEND PROPERTY LABELS vbr-cache)
+    # fork 9l-d4b9k: fork tools/server/CMakeLists.txt 130-146.  Two of the three
+    # model-free fault modes of the prompt-cache suite.  They pin ordering
+    # guarantees that only fire on a failed accounting commit and on a partial
+    # checkpoint ownership at restore.  The modes exist in the test's main()
+    # either way; without these registrations they were never run.
+    #
+    # The third mode (`--clone-fault`, LLAMA_SERVER_FAULT=load_clone_fail) is NOT
+    # registered: its test asserts the cache-plan OBSERVER row
+    # (`rec.selected_row(...) != nullptr`), and this port's load is the
+    # fork's UNOBSERVED instantiation flattened into a plain function -- the
+    # observed/unobserved dispatch is a separate refactor.  Registering it here
+    # would add a permanently red test that measures a feature this port does not
+    # carry, not a defect in the restore path.  See the 9l-d4b9k log.
+    add_test(NAME test-server-prompt-cache-accounting-fault
+        COMMAND test-server-prompt-cache --accounting-fault)
+    set_tests_properties(test-server-prompt-cache-accounting-fault PROPERTIES
+        LABELS "main;vbr-cache"
+        ENVIRONMENT "LLAMA_SERVER_FAULT=cache_lifecycle_after_commit")
+    add_test(NAME test-server-prompt-cache-restore-checkpoint-fault
+        COMMAND test-server-prompt-cache --restore-checkpoint-fault)
+    set_tests_properties(
+        test-server-prompt-cache-restore-checkpoint-fault PROPERTIES
+        LABELS "main;vbr-cache"
+        ENVIRONMENT "LLAMA_SERVER_FAULT=restore_checkpoint_artifact_missing")
 endif()

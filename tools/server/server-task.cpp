@@ -2495,8 +2495,14 @@ bool server_prompt_cache::load(
     restore_shape = server_prompt_cache_restore_shape::none;
     // The fork dispatches on `rec` to an observed / unobserved load_impl.  This port's
     // load carries no observer, so `rec` is accepted and ignored: taking it keeps the
-    // signature identical to the fork's while the observer stays a separate refactor.
+    // signature identical to the fork's while the cache-plan observer stays a separate
+    // refactor.  The restore DELIVERY seam, by contrast, is wired below (9l-d4b9k).
     (void) rec;
+    // fork 9l-d4b9k: fork server-task.cpp 8523.  The winning entry's exact LCP.
+    // It feeds the delivery's `reused_prefix_tokens` / `continues_lineage` pair so
+    // the retention mirror credits an exact same-length reuse as a lineage
+    // continuation instead of branching the source into a divergent destination.
+    int reuse_lcp_best = 0;
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2543,55 +2549,60 @@ bool server_prompt_cache::load(
             f_sim_best  = f_sim_cur;
 
             it_best = it;
+            // fork 9l-d4b9k: fork server-task.cpp 8567.
+            reuse_lcp_best = lcp_cur;
         }
     }
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        auto * best_fixed = it_best->payload.fixed_state();
-        if (best_fixed == nullptr) {
-            SRV_ERR("%s", "cached prompt has no fixed state to restore\n");
+        // fork 9l-d4b9k: fork server-task.cpp 8604-8611.  Immutable host restore
+        // stages the immutable source copy before either main or draft context is
+        // touched.  Allocation failure therefore leaves the source and both target
+        // contexts at the caller-owned pre-restore boundary.
+        server_prompt_cache_restore_delivery delivery;
+        if (!prepare_restore_delivery(it_best, delivery)) {
+            SRV_ERR("%s\n", "failed to stage non-consuming host restore");
 
             return false;
         }
 
-        bool draft_image_restored = false; // fork 9l-d4b8b: which sides were restored
-
+        // fork 9l-d4b9k: fork server-task.cpp 8617-8636.  Source bytes stay
+        // immutable throughout the restore.  The upstream form emptied the payload
+        // (`data.clear(); data.shrink_to_fit();`) before consuming the entry; that
+        // early free is dropped here because the entry is released by the delivery
+        // terminal below, and clearing a payload aliased with a live handle would
+        // corrupt the other holder.
         {
-            auto & data = best_fixed->main;
+            const auto * fixed = it_best->payload.fixed_state();
+            GGML_ASSERT(fixed != nullptr);
 
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+            const size_t size_tgt = fixed->main.size();
+            size_t n_tgt = llama_state_seq_set_data_ext(
+                ctx_tgt, fixed->main.data(), size_tgt, id_slot, 0);
+            if (server_fault("load_fail")) { n_tgt = size_tgt > 0 ? size_tgt - 1 : 0; } // Restore fault seam.
+            if (n_tgt != size_tgt) {
+                SRV_ERR("failed to restore target state (%zu != %zu bytes)\n", n_tgt, size_tgt);
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
-        {
-            auto & data = best_fixed->drft;
+        // fork 9l-d4b9k: fork server-task.cpp 8638-8656.
+        const auto * fixed = it_best->payload.fixed_state();
+        GGML_ASSERT(fixed != nullptr);
+        bool draft_image_restored = false;
+        if (ctx_dft && !fixed->drft.empty()) {
+            const size_t size_dft = fixed->drft.size();
+            const size_t n_dft = llama_state_seq_set_data_ext(
+                ctx_dft, fixed->drft.data(), size_dft, id_slot, 0);
+            if (n_dft != size_dft) {
+                SRV_WRN("failed to restore draft state (%zu != %zu bytes)\n", n_dft, size_dft);
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                draft_image_restored = true;
-
-                data.clear();
-                data.shrink_to_fit();
+                return false;
             }
+            draft_image_restored = true;
         }
 
         // fork 9l-d4b8b: the two outputs, set only after BOTH restores succeeded and
@@ -2599,15 +2610,21 @@ bool server_prompt_cache::load(
         // terminal read against the caller's live lineage seed: an entry whose family
         // differs from the slot's must replace it, not be silently adopted.
         if (restored_family) {
-            *restored_family = it_best->cache_family;
+            *restored_family = delivery.cache_family;
         }
         restore_shape = draft_image_restored
             ? server_prompt_cache_restore_shape::target_and_draft
             : server_prompt_cache_restore_shape::target_only;
 
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+        // fork 9l-d4b9k: fork server-task.cpp 8671-8674.  One atomic terminal:
+        // lifecycle-on retains the source (the delivery already cloned it);
+        // lifecycle-off is the historical move+release+erase, now routed through
+        // the destruction terminal so the retention/accounting ledgers observe the
+        // consumption instead of a bare list erase.
+        commit_restore_delivery(
+            it_best, std::move(delivery), prompt, id_slot, -1,
+            uint64_t(std::max(reuse_lcp_best, 0)),
+            reuse_lcp_best == int(it_best->prompt.tokens.size()));
     }
 
     return true;
