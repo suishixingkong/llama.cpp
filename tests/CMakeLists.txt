@@ -408,6 +408,15 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     # Run twice on the device: default = mma mode (counter must advance), "fallback" = env off
     # (counter must stay 0). See BUUN_MERGE_PLAN.md section 10.9.
     llama_build_and_test(test-turbo-mma-fa.cpp LABEL cuda)
+    # fork 9l-d4b9j: the VBR CUDA VMM test (fork tests/test-vbr-vmm.cpp:1-402), landed
+    # VERBATIM. It drives the CUDA VBR backend interface directly -- ggml_backend_cuda_vbr_iface()
+    # then vmm_pool_{init,map,unmap,mapped,mapped_in_range,residency_epoch,clear} + kv_transcode --
+    # so it needs ggml-cuda linked as a regular library, exactly like the kv-stream/turbo tests
+    # above. This tree's ggml-vbr.h (the iface struct) is byte-identical to the fork's, and
+    # ggml_backend_cuda_vbr_iface() is defined in ggml/src/ggml-cuda/ggml-cuda.cu, so the file
+    # compiles unchanged. On a host with no VMM-capable device main() prints
+    # "SKIP: GPU device N has no VMM support" and returns 0, i.e. a GPU-less run is a PASS.
+    llama_build_and_test(test-vbr-vmm.cpp LABEL cuda)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
