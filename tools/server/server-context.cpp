@@ -2708,6 +2708,39 @@ struct server_slot {
         prompt.tokens.keep_first(n_tokens);
     }
 
+    // fork 9l-d4b9f: fork server-context.cpp:2228-2230.  The transient sibling
+    // of the choke point above.  The speculative rollback truncates the prompt
+    // back to the verified prefix; this is the fork's named choke point for that
+    // operation, not the durable ledger truncation.
+    void server_cache_transient_token_truncate_impl(size_t n_tokens) {
+        prompt.tokens.keep_first(n_tokens);
+    }
+
+    // fork 9l-d4b9f: fork server-context.cpp:2232-2250.  The dormant
+    // ledger-truncation admission seam, verbatim.  No caller exists in either
+    // tree yet -- it is the named logical admission owner of the
+    // token_ledger_truncate row in server-cache-lifecycle.h, kept so that
+    // inventory stays 1:1.
+    // No standalone caller exists yet: current physical token truncations are children of
+    // live_range_drop or mandatory_recovery_reset. Keep this closed admission seam ready for
+    // the first independent retained-ledger truncation rather than weakening the 1:1 inventory.
+    void token_ledger_truncate(
+            size_t n_tokens,
+            server_cache_destruction_reason reason) {
+        if (destruction_obs && n_tokens < prompt.tokens.size()) {
+            server_cache_destruction_request request;
+            request.cls    =
+                server_cache_destruction_class::token_ledger_truncate;
+            request.reason = reason;
+            request.add_target(
+                server_cache_destruction_target_kind::token_ledger, id);
+            request.add_yield(
+                llama_cache_acct_category::artifact_descriptor_metadata);
+            (void) server_cache_retention_admit(destruction_obs, request);
+        }
+        server_cache_token_ledger_truncate_impl(n_tokens);
+    }
+
     // fork server-context.cpp:2431-2483  (9 + 13 + 29 lines)
     void clear_retention_reuse() noexcept {
         if (retention_obs) {
@@ -11157,6 +11190,14 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // fork 9l-d4b9f: fork server-context.cpp:19141-19144.  Keep the small
+            // output-index table until token stop handling has had a chance to
+            // retain the exact terminal vocabulary row.  This tree clears
+            // spec_i_batch inside the accept block below, so the snapshot is
+            // taken at function scope, ahead of that clear.
+            const std::vector<int32_t> verified_output_rows =
+                slot.spec_i_batch;
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -11240,7 +11281,11 @@ private:
             }
 
             // add accepted tokens to the prompt
-            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            // fork 9l-d4b9f: fork server-context.cpp:19209-19210.  Route the
+            // speculative truncation through the fork's named transient choke
+            // point instead of calling the raw primitive here.
+            slot.server_cache_transient_token_truncate_impl(
+                slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
@@ -11284,6 +11329,17 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    // fork 9l-d4b9f: fork server-context.cpp:19330-19337.  Retain
+                    // the exact terminal vocabulary row on the speculative stop
+                    // path, symmetric with the non-speculative half landed in
+                    // 9l-d4b6y.
+                    if ((params_base.vbr_prompt_cache ||
+                         !params_base.slot_save_path.empty()) &&
+                        i < verified_output_rows.size()) {
+                        (void) ensure_frontier_sequence_epoch(slot.prompt);
+                        (void) slot.capture_synchronized_frontier_logits(
+                            verified_output_rows[i]);
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
