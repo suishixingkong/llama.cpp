@@ -1404,6 +1404,11 @@ struct server_prompt_cache {
 
     size_t size() const;
 
+    // fork 9l-d4b9g: fork server-task.h:1383.  The anchor-pool counterpart of
+    // size().  A payload with no quality anchor contributes zero here no matter
+    // how much compact state it owns, so the two pools are measured apart.
+    size_t anchor_size() const;
+
     size_t n_tokens() const;
 
     // fork 9l-d4b7s: true if a token-identical entry with the SAME adapter identity is already fully
@@ -1421,6 +1426,18 @@ struct server_prompt_cache {
     // published entry, never an eviction that bought nothing.  This replaces the upstream
     // `alloc()` (absent from the fork), which evicted before it knew the bytes could be written.
     std::list<server_prompt_cache_state> stage(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, std::string adapter_config_key);
+
+    // fork 9l-d4b9g: fork server-task.h:1582-1593.  The detached logical
+    // publication contract, verbatim:
+    // Detached logical publication for an already-sealed catalog payload.
+    // This validates the exact capture frontier and allocates/clones all
+    // logical metadata without copying artifact bytes. VBR restore consumes
+    // these entries through the VBR restore transaction.
+    std::list<server_prompt_cache_state> stage_vbr(
+        const server_prompt & prompt,
+        server_prompt_cache_payload payload,
+        const std::string & execution_identity,
+        std::string adapter_config_key);
 
     // fork 9l-d4b8b: the three outputs the fork added (fork server-task.h
     // 1610-1615).  `rec` is the cache-plan observer row and stays nullptr

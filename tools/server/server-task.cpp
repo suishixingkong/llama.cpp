@@ -2325,6 +2325,31 @@ size_t server_prompt_cache::size() const {
     return measured.exact ? measured.compact + measured.anchor : naive;
 }
 
+// fork 9l-d4b9g: fork server-task.cpp:2361-2377.  The anchor-pool counterpart
+// of size().  It never folds compact residency in: a payload with no quality
+// anchor contributes zero regardless of how much fixed state it holds, because
+// the compact current artifact stays usable when anchors are stripped.  The
+// fork returns the measured anchor marginal on an exact measurement and the
+// naive sum otherwise.  This is a test-surface interface: no production caller
+// exists in either tree, but the fork's model-free cache test pins it.
+size_t server_prompt_cache::anchor_size() const {
+    size_t naive = 0;
+    bool has_anchor = false;
+    for (const auto & state : states) {
+        const auto bytes = state.payload.vbr_anchor_resident_bytes();
+        has_anchor |= bytes != 0 || state.payload.vbr_has_quality_anchor();
+        if (bytes > SIZE_MAX - naive) {
+            return SIZE_MAX;
+        }
+        naive += size_t(bytes);
+    }
+    if (!has_anchor) {
+        return 0;
+    }
+    const auto measured = server_prompt_cache_measure_budgets(states, acct);
+    return measured.exact ? measured.anchor : naive;
+}
+
 size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
@@ -5683,6 +5708,53 @@ void server_prompt_cache_vbr_replacement_ticket::clear() noexcept {
     provisional_artifact_ = {};
     publish_prepared_ = false;
     published_ = false;
+}
+
+// fork 9l-d4b9g: fork server-task.cpp:3621-3658.  The detached-publication
+// sibling of stage().  It is the fork's only producer of a VBR catalog payload
+// entry that does NOT copy artifact bytes: the already-sealed payload is moved
+// in intact, after the exact capture frontier and the execution identity have
+// been revalidated against the live prompt.  Allocation failure drops the
+// staged node rather than returning a half-filled entry.  Like anchor_size()
+// above this is a test-surface interface -- the fork's model-free cache test
+// drives it; the fork's own server never calls it.
+std::list<server_prompt_cache_state> server_prompt_cache::stage_vbr(
+        const server_prompt & prompt,
+        server_prompt_cache_payload payload,
+        const std::string & execution_identity,
+        std::string adapter_config_key) {
+    if (payload.kind() != server_prompt_cache_payload_kind::vbr_artifact ||
+        !payload.publishable() ||
+        !server_prompt_cache_vbr_frontier_matches(
+            prompt, payload, execution_identity, adapter_config_key)) {
+        return {};
+    }
+    const size_t payload_size = payload.size();
+    if (payload_size == 0 ||
+        !fits_bytes(payload_size) ||
+        (limit_size == 0 && limit_tokens > 0 &&
+         size_t(prompt.n_tokens()) > limit_tokens)) {
+        return {};
+    }
+
+    std::array<uint8_t, 32> token_identity_digest = {};
+    if (!prompt.tokens.retention_token_digest(token_identity_digest)) {
+        return {};
+    }
+    std::list<server_prompt_cache_state> staged;
+    try {
+        staged.emplace_back();
+        auto & entry = staged.back();
+        entry.prompt.tokens = prompt.tokens.clone();
+        entry.prompt.sequence_epoch = prompt.sequence_epoch;
+        entry.payload = std::move(payload);
+        entry.adapter_config_key = std::move(adapter_config_key);
+        entry.vbr_execution_identity = execution_identity;
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate VBR prompt cache metadata: %s\n", e.what());
+        return {};
+    }
+    return staged;
 }
 
 // fork 9l-b: release_vbr_occupied_replacement (fork server-task.cpp 7927-7939)
