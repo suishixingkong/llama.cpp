@@ -1438,6 +1438,15 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // fork 9l-d4b9h: fork server-context.cpp:2279-2282.  The verify/rollback
+    // histogram -- the joint (draft length, rollback depth) distribution the VBR
+    // capture-cost model needs and which marginal acceptance rates cannot
+    // recover.  The fork's own prose is kept verbatim below.
+    // Gate-5 observation: exact joint distribution needed to weight plane-vs-tape
+    // capture and rollback costs. Outer index = generated draft length; inner
+    // index = rejected target rows (rollback depth).
+    std::vector<std::vector<int32_t>> n_verify_rollback;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -1491,6 +1500,8 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        // fork 9l-d4b9h: fork server-context.cpp:2408.
+        n_verify_rollback.clear();
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -1937,6 +1948,29 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            // fork 9l-d4b9h: fork server-context.cpp:2951-2969.  Log the
+            // verify/rollback histogram beside the per-position acceptance rates
+            // it complements.  Log-only: the fork exports no metrics copy of it.
+            std::string verify_rollback_hist;
+            for (size_t n_draft = 0; n_draft < n_verify_rollback.size(); ++n_draft) {
+                for (size_t rollback = 0;
+                     rollback < n_verify_rollback[n_draft].size();
+                     ++rollback) {
+                    const int32_t count = n_verify_rollback[n_draft][rollback];
+                    if (count == 0) {
+                        continue;
+                    }
+                    if (!verify_rollback_hist.empty()) {
+                        verify_rollback_hist += ", ";
+                    }
+                    verify_rollback_hist += string_format(
+                        "%zu/%zu:%d", n_draft, rollback, count);
+                }
+            }
+            SLT_INF(*this,
+                    "verify/rollback histogram (draft/rejected:cycles) = (%s)\n",
+                    verify_rollback_hist.c_str());
         }
 
         common_speculative_print_stats(spec);
@@ -11271,6 +11305,27 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            // fork 9l-d4b9h: fork server-context.cpp:19172-19186.  Record the
+            // joint (draft length, rollback depth) observation.  This tree's
+            // `n_accepted` carries the upstream replay adjustment set above, so
+            // the rollback depth is measured against the same accepted count the
+            // per-position histogram below uses.
+            // Verification evaluates [sampled, draft...]. The sampled row is
+            // always retained; rollback depth is exactly the rejected draft
+            // suffix. Preserve the joint distribution because marginal
+            // acceptance rates cannot recover capture cost by verify length.
+            const size_t n_accepted_draft = n_accepted;
+            GGML_ASSERT(n_accepted_draft <= n_draft);
+            const size_t rollback_depth = n_draft - n_accepted_draft;
+            if (slot.n_verify_rollback.size() <= n_draft) {
+                slot.n_verify_rollback.resize(n_draft + 1);
+            }
+            auto & rollback_counts = slot.n_verify_rollback[n_draft];
+            if (rollback_counts.size() <= rollback_depth) {
+                rollback_counts.resize(rollback_depth + 1, 0);
+            }
+            rollback_counts[rollback_depth]++;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
