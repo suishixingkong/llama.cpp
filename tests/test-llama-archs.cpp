@@ -653,6 +653,49 @@ static void test_qwen4_vbr_admission_scope(const size_t seed) {
     }
 }
 
+// fork 9l-d4b9u: the runtime VBR params must reach the attention child of the indexed hybrid
+// memory, not stop at every other memory type in create_memory(). The base hands them to mem_attn
+// only, where an armed degrade controller converts each movable host-bound F16 side to q8_0. That
+// conversion is the observable: it needs neither a GPU nor a log capture, and it moves the cache's
+// reported bits-per-value from 16.0 (F16, 2 bytes/value) to 8.5 (q8_0, 34 bytes per 32 values).
+// The negative side is a real control -- a node that was never given the params must keep its F16
+// sides untouched -- so a probe that only asserted the 8.5 side could pass vacuously.
+static void test_qwen4_vbr_indexed_param_delivery(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    const auto attention_bpv = [&](bool vbr_dynamic) {
+        llama_memory_params params = {};
+        params.type_k = GGML_TYPE_F16;
+        params.type_v = GGML_TYPE_F16;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        cparams.vbr_dynamic = vbr_dynamic;
+
+        std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
+        auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(indexed_memory != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_idx() != nullptr);
+        // the index child is fixed F16 state and is not a VBR owner, so the params must not
+        // reach it even when the attention child does receive them
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        // hybrid forwards kv_bpv() to the attention child, the sole Turbo/VBR owner
+        return memory->kv_bpv();
+    };
+
+    const double bpv_default = attention_bpv(false);
+    const double bpv_dynamic = attention_bpv(true);
+    fprintf(stderr, "test_qwen4_vbr_indexed_param_delivery: attn kv_bpv = %.6f (default) / %.6f (vbr_dynamic)\n",
+            bpv_default, bpv_dynamic);
+    GGML_ASSERT(bpv_default == 16.0);
+    GGML_ASSERT(bpv_dynamic ==  8.5);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1089,6 +1132,9 @@ int main(int argc, char ** argv) {
             // fork 9l-d4b9s: the admission-scope cases run alongside the accounting
             // contract, under the same arch gate.
             test_qwen4_vbr_admission_scope(seed);
+            // fork 9l-d4b9u: the params are delivered all the way down to the attention
+            // child of the indexed hybrid memory, and no further.
+            test_qwen4_vbr_indexed_param_delivery(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

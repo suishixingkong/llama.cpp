@@ -37,7 +37,12 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* fork 9l-d4b9u: the runtime VBR params reach the attention child only.
+                               The base hands `vbr` to mem_attn and to nothing else, which is exactly
+                               the fork's topology: the index child is fixed F16 and the recurrent
+                               child is fixed-layout, so they must not receive budget or pins. */
+    const llama_memory_vbr_params & vbr = {});
 
     ~llama_memory_hybrid_idx() = default;
 

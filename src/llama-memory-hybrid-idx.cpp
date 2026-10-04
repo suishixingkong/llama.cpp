@@ -38,13 +38,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+    const llama_memory_vbr_params & vbr) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
+        // fork 9l-d4b9u: the base grew three block-KV-stream parameters after the reference fork,
+        // so the fork's `filter_attn, filter_recr, vbr` cannot be copied verbatim -- `vbr` would
+        // land in the `kv_stream_stage_bytes` slot. The indexed hybrid memory does not take part
+        // in block KV streaming, so those three keep the defaults the wrapper has always used.
+        filter_attn, filter_recr, 0, nullptr, 0, vbr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own

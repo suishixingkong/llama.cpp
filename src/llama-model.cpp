@@ -2698,6 +2698,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr), vbr);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
+                        // fork 9l-d4b9u: the ordinary attention child is the sole Turbo/VBR owner --
+                        // the indexed child is fixed F16 and the recurrent child remains fixed-layout.
+                        // Every other memory type below already receives `vbr`; handing it down here
+                        // is what keeps a Qwen4 model from silently running with VBR disarmed.
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2716,7 +2720,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* vbr               */ vbr);
                     } else {
                         // Block KV streaming is validated for the target context only:
                         // llama_kv_stream_config_validate() rejects anything but
