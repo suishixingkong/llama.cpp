@@ -333,6 +333,18 @@ llama_build_and_test(test-arg-parser.cpp)
 # Guarded so the `if`-block above (which already creates the target on other configs) wins.
 if (NOT TARGET test-llama-archs)
     llama_build(test-llama-archs.cpp)
+    # fork 9l-d4b9s: the four `assert(...)` statements this file now carries -- the VBR admission
+    # predicates in test_backends -- are plain <cassert>, not GGML_ASSERT.  Release defines NDEBUG,
+    # so without /UNDEBUG they compile to nothing and the slice would ship four dead lines.  This
+    # was not a guess: flipping one of them to a deliberately false condition still exited 0, which
+    # is how the slice found out.  The flag is the convention this file's neighbours already use
+    # (see the test-vbr-policy / test-vbr-downward groups below).  The fork itself does not pass it
+    # here, so in the fork's Release build the same four lines are inert.
+    if (MSVC)
+        target_compile_options(test-llama-archs PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test-llama-archs PRIVATE -UNDEBUG)
+    endif()
 endif()
 
 # Pure unit test of tools/llama-bench/llama-bench-vbr.h (the header this tree landed

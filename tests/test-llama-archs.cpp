@@ -17,6 +17,13 @@
 #include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-memory-recurrent.h"
 #include "../src/llama-kv-cache.h"
+// fork 9l-d4b9s: the admission-scope cases call llama_model::create_memory() and read
+// llama_model::hparams, and they walk the memory tree -- none of which the headers
+// already included above expose. llama-model.h does not pull llama-cparams.h, which the
+// cases also need by name. The fork's version of this file carries the same set.
+#include "../src/llama-cparams.h"
+#include "../src/llama-model.h"
+#include "../src/llama-memory-tree.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -530,6 +537,122 @@ static void test_qwen4_vbr_memory_accounting(const size_t seed) {
     }
 }
 
+// fork 9l-d4b9s: the fork's remaining device-free indexed-memory admission cases (fork
+// 1381-1484 of tests/test-llama-archs.cpp). They construct memory on the CPU model and pin
+// four contracts that the CUDA gate below cannot reach here: an absent indexer must not
+// advertise a QSA companion, a CPU-bound Turbo side must fall back to Q8_0 rather than
+// refuse the architecture, an admitted controller request stays scoped to mem_attn, and the
+// fixed QSA index child must stay F16 even when the attention type is not.
+static void test_qwen4_vbr_admission_scope(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    const auto make_indexed_memory = [&](ggml_type type_k, ggml_type type_v, const auto & configure) {
+        llama_memory_params params = {};
+        params.type_k = type_k;
+        params.type_v = type_v;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        configure(cparams);
+
+        std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
+        auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(indexed_memory != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_idx() != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
+        return memory;
+    };
+
+    // Qwen4-family checkpoints without indexer tensors still use the indexed
+    // hybrid wrapper, but they must not advertise an impossible QSA artifact
+    // companion. Model the loader's absent-indexer state by clearing the
+    // index width before constructing memory and pin the canonical tree.
+    {
+        const uint32_t saved_indexer_head_size =
+            model_and_ctx.first->hparams.indexer_head_size;
+        model_and_ctx.first->hparams.indexer_head_size = 0;
+        llama_memory_params params = {};
+        params.type_k = GGML_TYPE_F16;
+        params.type_v = GGML_TYPE_F16;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        std::unique_ptr<llama_memory_i> without_qsa(
+            model_and_ctx.first->create_memory(params, cparams));
+        model_and_ctx.first->hparams.indexer_head_size =
+            saved_indexer_head_size;
+        auto * wrapper = dynamic_cast<llama_memory_hybrid_idx *>(without_qsa.get());
+        GGML_ASSERT(wrapper != nullptr && wrapper->get_mem_idx() == nullptr);
+        std::vector<llama_memory_tree_child> tree;
+        GGML_ASSERT(llama_memory_tree_collect(wrapper, tree));
+        GGML_ASSERT(tree.size() == 2);
+        GGML_ASSERT(std::none_of(tree.begin(), tree.end(), [](const auto & child) {
+            return child.qsa_index_owner != nullptr;
+        }));
+    }
+
+    // CPU-bound movable Turbo sides follow the generic partial-offload policy and
+    // pin to Q8_0. This is a safe backend fallback, not an architecture refusal;
+    // the fixed QSA child remains F16 in both asymmetric cases.
+    const auto expect_cpu_turbo_fallback = [&](ggml_type type_k, ggml_type type_v) {
+        auto memory = make_indexed_memory(type_k, type_v, [](llama_cparams &) {});
+        auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(indexed_memory != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_k() ==
+                    (ggml_is_turbo_kv_type(type_k) ? GGML_TYPE_Q8_0 : type_k));
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_v() ==
+                    (ggml_is_turbo_kv_type(type_v) ? GGML_TYPE_Q8_0 : type_v));
+    };
+    expect_cpu_turbo_fallback(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16);
+    expect_cpu_turbo_fallback(GGML_TYPE_F16, GGML_TYPE_TURBO3_TCQ);
+
+    // Controller requests are admitted and remain scoped to mem_attn. These CPU
+    // construction cases deliberately do not claim that a CUDA VMM controller armed;
+    // the focused CUDA gate below owns that runtime contract.
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+        cparams.vbr_dynamic = true;
+    });
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+        cparams.vbr_vram_budget_bytes = 1;
+    });
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+        cparams.vbr_min_bits = 1.0;
+    });
+
+    // The internal indexed owner is now representation-ready even though public Turbo/VBR
+    // admission remains refused: an ordinary non-F16 attention type must never leak into the
+    // fixed QSA index child.
+    {
+        llama_memory_params params = {};
+        params.type_k = GGML_TYPE_Q8_0;
+        params.type_v = GGML_TYPE_Q8_0;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
+        auto * q8_indexed = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(q8_indexed != nullptr);
+        GGML_ASSERT(q8_indexed->get_mem_attn()->type_k() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(q8_indexed->get_mem_attn()->type_v() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(q8_indexed->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(q8_indexed->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
+        GGML_ASSERT(q8_indexed->memory_breakdown_vbr_managed() ==
+                    q8_indexed->get_mem_attn()->memory_breakdown_vbr_managed());
+    }
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -835,6 +958,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        assert(model_and_ctx_cpu.first->supports_classic_vbr() ==
+                               (arch == LLM_ARCH_BAILINGMOE3));
+                        if (arch == LLM_ARCH_BAILINGMOE3) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_QWEN4EXP) {
+                            assert(model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_GLM_DSA ||
+                                arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_DOTS3NOTE) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
@@ -951,6 +1086,9 @@ int main(int argc, char ** argv) {
         // backend matrix. `--arch qwen4exp` selects it; the default (UNKNOWN) runs everything.
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_vbr_memory_accounting(seed);
+            // fork 9l-d4b9s: the admission-scope cases run alongside the accounting
+            // contract, under the same arch gate.
+            test_qwen4_vbr_admission_scope(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

@@ -61,8 +61,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // fork 9l-d4b9s: passing `type_k, type_v` through here makes the index child inherit the
+        // ATTENTION type, so on a Turbo/VBR model the QSA index keys silently become a codec type.
+        // The fork pins F16 for both and says why -- the two lines below are its text.
+        // QSA index keys come from a separate learned projection and are consumed by ordinary
+        // selection matmuls. They are fixed F16 state, never attention Turbo/VBR storage.
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, GGML_TYPE_F16, GGML_TYPE_F16, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
