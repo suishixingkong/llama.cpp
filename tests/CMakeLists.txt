@@ -614,12 +614,30 @@ llama_test_cmd(test-vbr-artifact
 llama_build_and_test(test-vbr-artifact-vocabulary.cpp)
 target_include_directories(test-vbr-artifact-vocabulary PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-# Segment chain and Merkle range proofs. Self-reporting, so no /UNDEBUG. The oracle is adversarial
-# rather than arithmetic: the tree is a black box that must bind content (one differing byte changes
-# the root), stay sound (a proof fails against any other bytes) and admit nothing malformed.
-# Restriction is asserted to never widen authority rather than to return one specific status.
-llama_build_and_test(test-vbr-artifact-capture.cpp)
-target_include_directories(test-vbr-artifact-capture PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# Segment chain and Merkle range proofs: the fork's tests/test-vbr-artifact-capture.cpp, ported whole
+# (fork 9l-d4b9o). Unlike the model-backed fork tests this one has no macro gate -- its only GPU case
+# (test_cuda_ring) is dispatched under `argv[1] == "--cuda"`, which ctest never passes, so the default
+# run is entirely device-free. Two tools/server modules are what it links against (both byte-identical
+# to the fork's); ggml/include/ggml-turbo-meansub.h is on the include path already.
+llama_build_and_test(
+    test-vbr-artifact-capture.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-vbr-artifact-store.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp)
+target_include_directories(test-vbr-artifact-capture PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+# The fork's scale arm: the same binary building a fragmented range-packing benchmark.
+llama_test_cmd(test-vbr-artifact-capture
+    NAME test-vbr-range-proof-scale
+    LABEL "vbr-cache;slow"
+    ARGS --range-pack-bench)
+
+# The adversarial oracle the port wrote for the same header before the fork's file landed. Kept
+# because it pins properties the fork's test never names: overlapping / unsorted / out-of-extent
+# range lists and "restriction never widens authority" (asserted as status != restricted, not as one
+# enum spelling). Self-reporting, so no /UNDEBUG.
+llama_build_and_test(test-vbr-artifact-capture-oracle.cpp)
+target_include_directories(test-vbr-artifact-capture-oracle PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # Artifact adoption: the portable, device-free half of the fork's
 # tests/test-vbr-artifact-adopt.cpp. Self-reporting (a failure counter and an
