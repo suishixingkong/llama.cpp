@@ -10,6 +10,13 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+// fork 9l-d4b9r: the Qwen4 VBR memory-accounting contract reaches the memory subsystem
+// through internal types. The fork's version of this file carries the same set transitively.
+#include "../src/llama-ext.h"
+#include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-kv-cache.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -461,6 +468,68 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// fork 9l-d4b9r: Phase-0 VBR memory-ownership/accounting contract. Qwen4's attention KV is
+// the only storage whose representation may be selected by Turbo/VBR; the recurrent state is
+// fixed and the QSA indexer is a separate context-linear F16 cache. This is the device-free
+// half of the fork's tests/test-llama-archs.cpp test_qwen4_indexed_cache_admission (fork
+// 1166-1749): the QSA index/watermark and sequence-mutation arms of that function are a
+// separate Qwen4 concern and are not part of this slice. The fork reaches the memory object
+// through a synthetic in-memory GGUF (get_gguf_ctx), so no fixture file is required here.
+static void test_qwen4_vbr_memory_accounting(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    // Phase-0 VBR ownership/accounting contract. Qwen4's attention KV is the only storage whose
+    // representation may be selected by Turbo/VBR; recurrent state is fixed and the QSA indexer
+    // is a separate context-linear F16 cache. Pin both the production tree and the reference
+    // full-model arithmetic before enabling the currently-refused controller.
+    {
+        constexpr uint64_t n_ctx_train       = 262144;
+        constexpr uint64_t n_attn_layers     = 12;
+        constexpr uint64_t n_kv_values_side  = 2 * 256;
+        constexpr uint64_t n_index_values    = 128;
+        constexpr uint64_t bytes_f16         = 2;
+        constexpr uint64_t ref_attn_f16      = n_attn_layers * 2 * n_kv_values_side * bytes_f16 * n_ctx_train;
+        constexpr uint64_t ref_index_generic = n_attn_layers * n_index_values * bytes_f16 * n_ctx_train;
+        GGML_ASSERT(ref_attn_f16 == 6ULL * 1024 * 1024 * 1024);
+        GGML_ASSERT(ref_index_generic == 768ULL * 1024 * 1024);
+
+        auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(model_and_ctx.second.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(memory->get_mem_attn() != nullptr);
+        GGML_ASSERT(memory->get_mem_recr() != nullptr);
+        GGML_ASSERT(memory->get_mem_idx()  != nullptr);
+        GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
+
+        const auto merge = [](auto dst, const auto & src) {
+            for (const auto & [buft, size] : src) {
+                dst[buft] += size;
+            }
+            return dst;
+        };
+
+        const auto attn    = memory->get_mem_attn()->memory_breakdown();
+        const auto recurrent = memory->get_mem_recr()->memory_breakdown();
+        const auto index   = memory->get_mem_idx()->memory_breakdown();
+        const auto managed = memory->memory_breakdown_vbr_managed();
+        const auto fixed   = memory->memory_breakdown_fixed();
+        const auto total   = memory->memory_breakdown();
+
+        GGML_ASSERT(managed == memory->get_mem_attn()->memory_breakdown_vbr_managed());
+        GGML_ASSERT(managed == attn);
+        GGML_ASSERT(fixed == memory->get_mem_recr()->memory_breakdown_fixed());
+        GGML_ASSERT(total == merge(merge(attn, recurrent), index));
+
+        const llama_memory_breakdown public_breakdown = llama_get_memory_breakdown(model_and_ctx.second.get());
+        for (const auto & [buft, mb] : public_breakdown) {
+            const auto it = managed.find(buft);
+            GGML_ASSERT(mb.context_vbr_managed == (it == managed.end() ? 0 : it->second));
+            GGML_ASSERT(mb.context_vbr_managed <= mb.context);
+        }
+    }
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -877,6 +946,11 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
+        }
+        // fork 9l-d4b9r: the device-free Qwen4 VBR memory contract runs before the generic
+        // backend matrix. `--arch qwen4exp` selects it; the default (UNKNOWN) runs everything.
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
+            test_qwen4_vbr_memory_accounting(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

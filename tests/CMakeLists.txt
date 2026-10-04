@@ -322,6 +322,19 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+# fork 9l-d4b9r: test-llama-archs hosts the device-free Qwen4 VBR memory-accounting contract
+# (see test_qwen4_vbr_memory_accounting in that file).  Upstream registers the target inside
+# `if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)` because those tests use internal types that are
+# not exported with LLAMA_API under a shared-library Windows build -- but this tree sets
+# WINDOWS_EXPORT_ALL_SYMBOLS on the llama target (src/CMakeLists.txt), so the internal types
+# are linkable here.  Build the executable without registering a ctest: upstream and the fork
+# both reach this target only through a manual `-a qwen4exp` invocation, and registering the
+# default (all-architectures) run would make `ctest` far slower for no coverage gain.
+# Guarded so the `if`-block above (which already creates the target on other configs) wins.
+if (NOT TARGET test-llama-archs)
+    llama_build(test-llama-archs.cpp)
+endif()
+
 # Pure unit test of tools/llama-bench/llama-bench-vbr.h (the header this tree landed
 # in slice 8b). It includes that header by relative path and does `#undef NDEBUG`
 # before <cassert>, so its asserts are live without needing /UNDEBUG -- which is
