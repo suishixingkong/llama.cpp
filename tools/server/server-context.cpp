@@ -4880,6 +4880,10 @@ private:
         GGML_ASSERT(!sleeping);
 
         // wiring up server queues
+        // fork 9l-d4b9l: route --cache-debug into the queue-diagnostics tracing
+        // (fork server-context.cpp 8412-8413).  Off by default: no behavioural effect.
+        queue_tasks.set_diagnostics(params_base.cache_debug);
+        queue_results.set_diagnostics(params_base.cache_debug);
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
             // fork 9l-d4b8w: task arrival has already cancelled the shared
             // idle-capture session. Drain the bounded worker before any decode can

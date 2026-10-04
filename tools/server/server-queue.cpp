@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <chrono>
+// fork 9l-d4b9l: <cinttypes> for PRIu64 in the CACHE_QUEUE diagnostics trace
+#include <cinttypes>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -168,6 +170,36 @@ void server_queue::request_idle_maintenance() noexcept {
     condition_tasks.notify_one();
 }
 
+// fork 9l-d4b9l: capture-time queue snapshot for cache-debug tracing
+// (fork server-queue.cpp 171-197).  Never perturbs request processing.
+server_queue::diagnostic_snapshot server_queue::diagnostics(
+        const std::unordered_set<int> & task_ids) noexcept {
+    diagnostic_snapshot result;
+    try {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        result.running = running;
+        result.sleeping = sleeping;
+        result.maintenance_requested = idle_maintenance_requested.load(
+            std::memory_order_acquire);
+        result.queued = queue_tasks.size() + queue_tasks_unhandled.size();
+        result.deferred = queue_tasks_deferred.size();
+        result.posts = diagnostic_posts_;
+        result.dequeues = diagnostic_dequeues_;
+        for (const auto & task : queue_tasks) {
+            result.matching_queued += task_ids.count(task.id) != 0;
+        }
+        for (const auto & task : queue_tasks_unhandled) {
+            result.matching_queued += task_ids.count(task.id) != 0;
+        }
+        for (const auto & task : queue_tasks_deferred) {
+            result.matching_deferred += task_ids.count(task.id) != 0;
+        }
+    } catch (...) {
+        // Diagnostics must never perturb request processing.
+    }
+    return result;
+}
+
 static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
@@ -177,6 +209,9 @@ int server_queue::post(server_task && task, bool front) {
     // fork 9l-d4b8d: a post invalidates any idle capture in flight.
     cancel_idle_capture_locked();
     GGML_ASSERT(task.id != -1);
+    // fork 9l-d4b9l: scheduler wakes are not external work (fork server-queue.cpp 207-208)
+    const bool diagnostic_task =
+        task.type != SERVER_TASK_TYPE_NEXT_RESPONSE;
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -188,6 +223,17 @@ int server_queue::post(server_task && task, bool front) {
         queue_tasks.push_front(std::move(task));
     } else {
         queue_tasks.push_back(std::move(task));
+    }
+    // fork 9l-d4b9l: CACHE_QUEUE event=post (fork server-queue.cpp 221-230)
+    if (diagnostics_enabled() && diagnostic_task) {
+        ++diagnostic_posts_;
+        QUE_INF(
+            "CACHE_QUEUE event=post task=%d count=1 front=%d queued=%zu "
+            "deferred=%zu posts=%" PRIu64 " dequeues=%" PRIu64 "\n",
+            task_id, int(front),
+            queue_tasks.size() + queue_tasks_unhandled.size(),
+            queue_tasks_deferred.size(), diagnostic_posts_,
+            diagnostic_dequeues_);
     }
     if (reset_timer) {
         time_last_task = ggml_time_ms();
@@ -202,6 +248,10 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     if (!tasks.empty()) {
         cancel_idle_capture_locked();
     }
+    // fork 9l-d4b9l: (fork server-queue.cpp 243-245)
+    size_t diagnostic_task_count = 0;
+    int first_task_id = -1;
+    int last_task_id = -1;
     bool reset_timer = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
@@ -211,6 +261,15 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);
         }
+        // fork 9l-d4b9l: count only real work, not scheduler wakes
+        // (fork server-queue.cpp 255-261)
+        if (task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
+            if (first_task_id == -1) {
+                first_task_id = task.id;
+            }
+            last_task_id = task.id;
+            ++diagnostic_task_count;
+        }
         reset_timer |= task_resets_idle_timer(task.type);
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
@@ -218,6 +277,18 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         } else {
             queue_tasks.push_back(std::move(task));
         }
+    }
+    // fork 9l-d4b9l: CACHE_QUEUE event=post (batch) (fork server-queue.cpp 270-280)
+    if (diagnostics_enabled() && diagnostic_task_count != 0) {
+        diagnostic_posts_ += diagnostic_task_count;
+        QUE_INF(
+            "CACHE_QUEUE event=post task_first=%d task_last=%d count=%zu "
+            "front=%d queued=%zu deferred=%zu posts=%" PRIu64
+            " dequeues=%" PRIu64 "\n",
+            first_task_id, last_task_id, diagnostic_task_count, int(front),
+            queue_tasks.size() + queue_tasks_unhandled.size(),
+            queue_tasks_deferred.size(),
+            diagnostic_posts_, diagnostic_dequeues_);
     }
     if (reset_timer) {
         time_last_task = ggml_time_ms();
@@ -306,6 +377,17 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         }
         server_task task = std::move(queue_tasks.front());
         queue_tasks.pop_front();
+        // fork 9l-d4b9l: CACHE_QUEUE event=dequeue (fork server-queue.cpp 365-374)
+        if (diagnostics_enabled() &&
+            task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
+            ++diagnostic_dequeues_;
+            QUE_INF(
+                "CACHE_QUEUE event=dequeue task=%d queued=%zu deferred=%zu "
+                "posts=%" PRIu64 " dequeues=%" PRIu64 "\n",
+                task.id, queue_tasks.size() + queue_tasks_unhandled.size(),
+                queue_tasks_deferred.size(), diagnostic_posts_,
+                diagnostic_dequeues_);
+        }
         lock.unlock();
 
         QUE_DBG("processing task, id = %d\n", task.id);
@@ -686,9 +768,26 @@ void server_response::send(server_task_result_ptr && result) {
             RES_DBG("task id = %d pushed to result queue\n", result->id);
 
             queue_results.emplace_back(std::move(result));
+            // fork 9l-d4b9l: CACHE_QUEUE event=result_terminal (fork server-queue.cpp 753-762)
+            if (diagnostics_enabled_.load(std::memory_order_acquire) &&
+                (queue_results.back()->is_stop() ||
+                 queue_results.back()->is_error())) {
+                RES_INF(
+                    "CACHE_QUEUE event=result_terminal task=%d matched=1 waiting=%zu "
+                    "results=%zu\n",
+                    id_task, waiting_task_ids.size(), queue_results.size());
+            }
             condition_results.notify_all();
             return;
         }
+    }
+    // fork 9l-d4b9l: CACHE_QUEUE event=result (fork server-queue.cpp 765-771)
+    if (diagnostics_enabled_.load(std::memory_order_acquire)) {
+        RES_INF(
+            "CACHE_QUEUE event=result task=%d matched=0 waiting=%zu "
+            "results=%zu\n",
+            result ? result->id : -1, waiting_task_ids.size(),
+            queue_results.size());
     }
 }
 
@@ -751,11 +850,40 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
     while (true) {
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
+            // fork 9l-d4b9l: CACHE_QUEUE event=response_wait (fork server-queue.cpp 833-856).
+            // A waiter that hears nothing logs a queue snapshot so a stalled
+            // cache-lifecycle wake is visible without a debugger.
+            if (queue_tasks.diagnostics_enabled()) {
+                diagnostic_wait_seconds += uint64_t(std::max(
+                    polling_interval_seconds, 0));
+                if (diagnostic_wait_seconds == 10 ||
+                    (diagnostic_wait_seconds > 10 &&
+                     diagnostic_wait_seconds % 30 == 0)) {
+                    const auto snapshot = queue_tasks.diagnostics(id_tasks);
+                    const int first_task = id_tasks.empty()
+                        ? -1 : *id_tasks.begin();
+                    RES_INF(
+                        "CACHE_QUEUE event=response_wait task=%d count=%zu "
+                        "wait_s=%" PRIu64 " queued=%zu deferred=%zu "
+                        "matching_queued=%zu matching_deferred=%zu "
+                        "posts=%" PRIu64 " dequeues=%" PRIu64
+                        " running=%d sleeping=%d maintenance=%d\n",
+                        first_task, id_tasks.size(), diagnostic_wait_seconds,
+                        snapshot.queued, snapshot.deferred,
+                        snapshot.matching_queued,
+                        snapshot.matching_deferred, snapshot.posts,
+                        snapshot.dequeues, int(snapshot.running),
+                        int(snapshot.sleeping),
+                        int(snapshot.maintenance_requested));
+                }
+            }
             // timeout, check stop condition
             if (should_stop()) {
                 return nullptr;
             }
         } else {
+            // fork 9l-d4b9l: the waiter heard something; reset the wait clock
+            diagnostic_wait_seconds = 0;
             if (result->is_error()) {
                 stop(); // cancel remaining tasks
                 SRV_DBG("%s", "received error result, stopping further processing\n");

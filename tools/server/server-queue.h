@@ -2,7 +2,10 @@
 
 #include "server-task.h"
 
+// fork 9l-d4b9l: <atomic> backs the diagnostics gate, <cstdint> the counters
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -18,6 +21,20 @@ struct server_queue_idle_capture_state;
 struct server_queue {
     // fork 9l-d4a: move-only idle capture session (fork server-queue.h 34-61)
 public:
+    // fork 9l-d4b9l: a queue-state snapshot for cache-debug tracing
+    // (fork server-queue.h 22-32).  Read under mutex_tasks; never mutates state.
+    struct diagnostic_snapshot {
+        bool running = false;
+        bool sleeping = false;
+        bool maintenance_requested = false;
+        size_t queued = 0;
+        size_t deferred = 0;
+        size_t matching_queued = 0;
+        size_t matching_deferred = 0;
+        uint64_t posts = 0;
+        uint64_t dequeues = 0;
+    };
+
     // Move-only cancellation session for one synchronous idle capture. Task
     // arrivals cancel it; they never wait for or reject normal queue work.
     class idle_capture_session {
@@ -67,6 +84,12 @@ private:
     uint64_t idle_capture_generation = 0;
     bool idle_capture_stopped = false;
     std::atomic<bool> idle_maintenance_requested { false };
+    // fork 9l-d4b9l: cache-debug queue-diagnostics gate + counters
+    // (fork server-queue.h 82-84).  diagnostic_posts_/dequeues_ are only
+    // touched under mutex_tasks.
+    std::atomic<bool> diagnostics_enabled_ { false };
+    uint64_t diagnostic_posts_ = 0;
+    uint64_t diagnostic_dequeues_ = 0;
 
     // used by yield_to_queue, all fields are guarded by mutex_tasks
     struct worker_t {
@@ -118,6 +141,19 @@ public:
     // maintenance callback. It never fabricates a task or bypasses task
     // priority; a concurrently queued task wins and cancels the capture.
     void request_idle_maintenance() noexcept;
+
+    // fork 9l-d4b9l: cache-debug-only lifecycle tracing (fork server-queue.h 207-216).
+    // Gated by set_diagnostics(params.cache_debug); a snapshot never changes queue state.
+    // Cache-debug-only lifecycle tracing for a response waiter that has not
+    // heard from the scheduler. The snapshot never changes queue state.
+    void set_diagnostics(bool enabled) noexcept {
+        diagnostics_enabled_.store(enabled, std::memory_order_release);
+    }
+    bool diagnostics_enabled() const noexcept {
+        return diagnostics_enabled_.load(std::memory_order_acquire);
+    }
+    diagnostic_snapshot diagnostics(
+        const std::unordered_set<int> & task_ids) noexcept;
 
 
     // Add a new task to the end of the queue
@@ -263,8 +299,15 @@ private:
 
     std::mutex mutex_results;
     std::condition_variable condition_results;
+    // fork 9l-d4b9l: per-response diagnostics gate (fork server-queue.h 279)
+    std::atomic<bool> diagnostics_enabled_ { false };
 
 public:
+    // fork 9l-d4b9l: (fork server-queue.h 282-284)
+    void set_diagnostics(bool enabled) noexcept {
+        diagnostics_enabled_.store(enabled, std::memory_order_release);
+    }
+
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
@@ -307,6 +350,8 @@ struct server_response_reader {
     size_t received_count = 0;
     bool cancelled = false;
     int polling_interval_seconds;
+    // fork 9l-d4b9l: how long this waiter has been waiting (fork server-queue.h 328)
+    uint64_t diagnostic_wait_seconds = 0;
 
     // tracking generation state and partial tool calls
     // only used by streaming completions
