@@ -1,31 +1,11 @@
 #include "../src/llama-vbr-downward.h"
-// The two consumer-side includes the upstream file carries are removed here: they are what
-// makes the preflight and stash cases below unportable at this stage.
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-iswa.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <limits>
-
-
-// Ported from buun-llama-cpp at the stage-2.6d slice: the thirteen cases that exercise
-// llama-vbr-downward / llama-vbr-upward alone. Five upstream cases are deliberately absent
-// because they are written against the *consumer* side, which does not exist in this tree yet:
-//
-//   test_iswa_physical_preflight_preserves_device_skew       } need llama_memory_vbr_preflight_data,
-//   test_iswa_physical_preflight_shared_scratch_and_overflow } llama_memory_vbr_physical_growth and
-//   test_incremental_preflight_tree_matches_full_fold        } llama_memory_vbr_preflight_tree, all
-//                                                            three declared in src/llama-memory.h
-//   llama_kv_cache_vbr_stash_batch_test + test_trusted_stash_batch_validation_is_linear
-//                                                            need llama_kv_cache::vbr_pool and
-//                                                            vbr_stash_requests_valid (llama-kv-cache.h)
-//
-// llama-memory.h and llama-kv-cache.h are the consumer work of stage 2.9, so those cases move there
-// together with the upstream file itself. The helper structs only they used (the backend-identity
-// constants and fake_preflight_source) are dropped with them; nothing else in this file referenced
-// them, so the remaining coverage is unaffected rather than reduced.
-//
-// Assert-based like the stage-2.6a tests, which is also why upstream attaches /UNDEBUG to it.
 
 static const auto HOST = llama_cache_acct_resource_domain::non_device(
     llama_cache_acct_residency::pageable_host);
@@ -35,6 +15,259 @@ static constexpr ggml_type tiers[] = {
     GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ,
 };
 
+static const unsigned char VBR_TEST_BACKEND_IDENTITY = 0;
+static const unsigned char VBR_TEST_BACKEND_IDENTITY_SECOND = 0;
+
+struct fake_preflight_source {
+    llama_memory_vbr_preflight_data result = {};
+    std::vector<llama_memory_vbr_physical_growth> evidence;
+    mutable uint32_t calls = 0;
+    mutable uint32_t n_tokens_extra = 0;
+
+    llama_memory_vbr_preflight_data vbr_retier_preflight(
+            uint32_t requested,
+            std::vector<llama_memory_vbr_physical_growth> * physical) const {
+        calls++;
+        n_tokens_extra = requested;
+        assert(physical != nullptr);
+        *physical = evidence;
+        return result;
+    }
+};
+
+static void test_iswa_physical_preflight_preserves_device_skew() {
+    llama_memory_vbr_preflight_data first = {};
+    llama_memory_vbr_preflight_data second = {};
+    first.active = second.active = true;
+    first.fits = second.fits = true;
+    first.pools = second.pools = 2;
+    const void * backend = &VBR_TEST_BACKEND_IDENTITY;
+    const std::vector<llama_memory_vbr_physical_growth> first_rows {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+        { backend, 1, 20, 0, 0, 0, 0, 100 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_rows {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+        { backend, 1, 20, 0, 0, 0, 0, 100 },
+    };
+    std::vector<llama_memory_vbr_physical_growth> merged;
+    const auto skewed = llama_memory_vbr_merge_preflight_children(
+        first, first_rows, second, second_rows, &merged);
+    assert(!skewed.fits);
+    assert(skewed.physical_growth_needed == 200);
+    assert(skewed.physical_growth_available == 200);
+    assert(skewed.max_deficit == 60);
+    assert(merged.size() == 2);
+
+    const std::vector<llama_memory_vbr_physical_growth> balanced_second {
+        { backend, 0, 20, 0, 0, 0, 0, 100 },
+        { backend, 1, 80, 0, 0, 0, 0, 100 },
+    };
+    const auto balanced = llama_memory_vbr_merge_preflight_children(
+        first, first_rows, second, balanced_second);
+    assert(balanced.fits);
+    assert(balanced.physical_growth_needed == 200);
+    assert(balanced.physical_growth_available == 200);
+    assert(balanced.max_deficit == 0);
+
+    // Device ordinals are backend-local. Two backends' device 0 rows must stay
+    // independent rather than sharing availability or combining requirements.
+    const void * second_backend = &VBR_TEST_BACKEND_IDENTITY_SECOND;
+    const std::vector<llama_memory_vbr_physical_growth> first_backend_row {
+        { backend, 0, 80, 0, 0, 0, 0, 100 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_backend_row {
+        { second_backend, 0, 80, 0, 0, 0, 0, 100 },
+    };
+    const auto separate_backends = llama_memory_vbr_merge_preflight_children(
+        first, first_backend_row, second, second_backend_row, &merged);
+    assert(separate_backends.fits);
+    assert(separate_backends.physical_growth_needed == 160);
+    assert(separate_backends.physical_growth_available == 200);
+    assert(merged.size() == 2);
+    assert(merged[0].backend != merged[1].backend);
+    assert(merged[0].device == 0 && merged[1].device == 0);
+
+    // Exercise the same collection helper used by the production iSWA override.
+    // This pins both child calls, their output evidence, and the replay bound.
+    fake_preflight_source first_source { first, first_rows };
+    fake_preflight_source second_source { second, second_rows };
+    std::vector<llama_memory_vbr_physical_growth> forwarded;
+    const auto collected = llama_memory_vbr_preflight_children(
+        first_source, second_source, 7, &forwarded);
+    assert(!collected.fits);
+    assert(first_source.calls == 1 && second_source.calls == 1);
+    assert(first_source.n_tokens_extra == 7 && second_source.n_tokens_extra == 7);
+    assert(forwarded.size() == 2);
+}
+
+static void test_iswa_physical_preflight_shared_scratch_and_overflow() {
+    llama_memory_vbr_preflight_data first = {};
+    llama_memory_vbr_preflight_data second = {};
+    first.active = second.active = true;
+    first.fits = second.fits = true;
+    const void * backend = &VBR_TEST_BACKEND_IDENTITY;
+
+    // KV mappings are child-owned and additive. K/V materialization scratch is
+    // device-owned and each side is therefore reduced by max, not by sum.
+    const std::vector<llama_memory_vbr_physical_growth> first_scratch {
+        { backend, 0, 10, 100, 40, 20, 20, 150 },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> second_scratch {
+        { backend, 0, 15, 80, 60, 50, 10, 150 },
+    };
+    std::vector<llama_memory_vbr_physical_growth> merged;
+    const auto shared = llama_memory_vbr_merge_preflight_children(
+        first, first_scratch, second, second_scratch, &merged);
+    assert(shared.fits);
+    assert(shared.physical_growth_needed == 115);
+    assert(shared.physical_growth_available == 150);
+    assert(merged.size() == 1);
+    assert(merged[0].kv_needed == 25);
+    assert(merged[0].scratch_k_needed == 100);
+    assert(merged[0].scratch_v_needed == 60);
+    assert(merged[0].scratch_k_current == 50);
+    assert(merged[0].scratch_v_current == 20);
+
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const std::vector<llama_memory_vbr_physical_growth> maximum_row {
+        { backend, 0, maximum, 0, 0, 0, 0, maximum },
+    };
+    const std::vector<llama_memory_vbr_physical_growth> zero_row {
+        { backend, 0, 0, 0, 0, 0, 0, maximum },
+    };
+    const auto exact_boundary = llama_memory_vbr_merge_preflight_children(
+        first, maximum_row, second, zero_row);
+    assert(exact_boundary.fits);
+    assert(exact_boundary.physical_growth_needed == maximum);
+
+    const std::vector<llama_memory_vbr_physical_growth> overflowing_row {
+        { backend, 0, 1, 0, 0, 0, 0, maximum },
+    };
+    const auto overflow = llama_memory_vbr_merge_preflight_children(
+        first, maximum_row, second, overflowing_row);
+    assert(!overflow.fits);
+    assert(overflow.physical_growth_needed == maximum);
+    assert(overflow.max_deficit == std::numeric_limits<int64_t>::max());
+}
+
+static void test_incremental_preflight_tree_matches_full_fold() {
+    const auto make_preflight = [](uint64_t logical, uint64_t available) {
+        llama_memory_vbr_preflight_data value = {};
+        value.active = true;
+        value.fits = logical <= available;
+        value.pools = 1;
+        value.watermark_cells = 64;
+        value.bytes_needed = logical;
+        value.bytes_available = available;
+        value.max_deficit = logical > available
+            ? int64_t(logical - available) : 0;
+        return value;
+    };
+    const auto row = [](const void * backend, int device,
+                        uint64_t kv, uint64_t available) {
+        return llama_memory_vbr_physical_growth {
+            backend, device, kv, 0, 0, 0, 0, available };
+    };
+    std::vector<llama_memory_vbr_preflight_data> leaves = {
+        make_preflight(10, 100), make_preflight(20, 100),
+        make_preflight(30, 100), make_preflight(40, 100),
+        make_preflight(50, 100),
+    };
+    std::vector<std::vector<llama_memory_vbr_physical_growth>> physical = {
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 10, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 1, 20, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 30, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY_SECOND, 0, 40, 500) },
+        { row(&VBR_TEST_BACKEND_IDENTITY, 0, 50, 500),
+          row(&VBR_TEST_BACKEND_IDENTITY_SECOND, 0, 5, 500) },
+    };
+    const auto assert_equal = [](const auto & actual,
+                                 const auto & actual_physical,
+                                 const auto & expected,
+                                 const auto & expected_physical) {
+        assert(actual.active == expected.active);
+        assert(actual.fits == expected.fits);
+        assert(actual.pools == expected.pools);
+        assert(actual.watermark_cells == expected.watermark_cells);
+        assert(actual.bytes_needed == expected.bytes_needed);
+        assert(actual.bytes_available == expected.bytes_available);
+        assert(actual.physical_growth_needed ==
+               expected.physical_growth_needed);
+        assert(actual.physical_growth_available ==
+               expected.physical_growth_available);
+        assert(actual.max_deficit == expected.max_deficit);
+        assert(actual_physical.size() == expected_physical.size());
+        for (size_t i = 0; i < actual_physical.size(); ++i) {
+            const auto & a = actual_physical[i];
+            const auto & e = expected_physical[i];
+            assert(a.same_domain(e));
+            assert(a.kv_needed == e.kv_needed);
+            assert(a.scratch_k_needed == e.scratch_k_needed);
+            assert(a.scratch_v_needed == e.scratch_v_needed);
+            assert(a.scratch_k_current == e.scratch_k_current);
+            assert(a.scratch_v_current == e.scratch_v_current);
+            assert(a.available == e.available);
+        }
+    };
+    const auto full_fold = [&](llama_memory_vbr_preflight_data & aggregate,
+                               std::vector<llama_memory_vbr_physical_growth> & rows) {
+        aggregate = leaves[0];
+        rows = physical[0];
+        for (size_t i = 1; i < leaves.size(); ++i) {
+            std::vector<llama_memory_vbr_physical_growth> merged;
+            aggregate = llama_memory_vbr_merge_preflight_children(
+                aggregate, rows, leaves[i], physical[i], &merged);
+            rows.swap(merged);
+        }
+    };
+
+    llama_memory_vbr_preflight_tree tree;
+    assert(tree.reset(leaves.size()));
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        assert(tree.set_leaf(i, leaves[i], physical[i]));
+    }
+    assert(tree.build());
+    llama_memory_vbr_preflight_data expected;
+    std::vector<llama_memory_vbr_physical_growth> expected_physical;
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+    assert(tree.merge_count() == 7);
+
+    leaves[4] = make_preflight(15, 100);
+    physical[4][0].kv_needed = 15;
+    physical[4][1].kv_needed = 7;
+    std::sort(physical[4].begin(), physical[4].end());
+    assert(tree.replace_leaf(4, leaves[4], physical[4]));
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+
+    leaves[1] = make_preflight(25, 100);
+    physical[1][0].kv_needed = 25;
+    assert(tree.replace_leaf(1, leaves[1], physical[1]));
+    full_fold(expected, expected_physical);
+    assert_equal(tree.preflight(), tree.physical(),
+                 expected, expected_physical);
+    assert(tree.merge_count() == 13);
+    assert(tree.domain_comparison_count() < 256);
+
+    const auto before = tree.preflight();
+    auto wrong_shape = physical[1];
+    wrong_shape.push_back(row(&VBR_TEST_BACKEND_IDENTITY, 2, 1, 500));
+    std::sort(wrong_shape.begin(), wrong_shape.end());
+    assert(!tree.replace_leaf(1, leaves[1], wrong_shape));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+    auto wrong_domain = physical[1];
+    wrong_domain[0].device = 7;
+    assert(!tree.replace_leaf(1, leaves[1], wrong_domain));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+    auto wrong_order = physical[4];
+    std::reverse(wrong_order.begin(), wrong_order.end());
+    assert(!tree.replace_leaf(4, leaves[4], wrong_order));
+    assert(tree.preflight().bytes_needed == before.bytes_needed);
+}
 
 static void test_all_recipes_and_rejections() {
     size_t pairs = 0;
@@ -714,6 +947,40 @@ static void test_mixed_transform_and_stash_only_receipts() {
     assert(exact_stash.reserve_calls == 1);
 }
 
+struct llama_kv_cache_vbr_stash_batch_test {
+    static bool run(size_t request_count, uint64_t & request_checks) {
+        if (request_count == 0 || request_count > UINT32_MAX) {
+            return false;
+        }
+        llama_kv_cache::vbr_pool pool;
+        pool.gran = 1;
+        pool.stash_size = request_count*sizeof(uint16_t);
+        pool.k.resize(request_count);
+        ggml_tensor tensor = {};
+        tensor.ne[0] = 1;
+        std::vector<llama_kv_cache::vbr_stash_request> requests;
+        requests.reserve(request_count);
+        for (size_t i = 0; i < request_count; ++i) {
+            auto & extent = pool.k[i];
+            extent.t = &tensor;
+            extent.stash_off = i*sizeof(uint16_t);
+            requests.push_back({ &extent, 1 });
+        }
+        bool needs_mapping = false;
+        return llama_kv_cache::vbr_stash_requests_valid(
+                   pool, requests, 1, true, needs_mapping,
+                   &request_checks) && needs_mapping;
+    }
+};
+
+static void test_trusted_stash_batch_validation_is_linear() {
+    constexpr size_t request_count = 16384;
+    uint64_t request_checks = 0;
+    assert(llama_kv_cache_vbr_stash_batch_test::run(
+        request_count, request_checks));
+    assert(request_checks == request_count);
+}
+
 static void test_workspace_prices_max_shape_but_reserves_once() {
     constexpr size_t request_count = 16384;
     llama_cache_acct_ledger ledger;
@@ -824,6 +1091,9 @@ static void test_mean_addback_launch_shape_is_row_bounded() {
 }
 
 int main() {
+    test_iswa_physical_preflight_preserves_device_skew();
+    test_iswa_physical_preflight_shared_scratch_and_overflow();
+    test_incremental_preflight_tree_matches_full_fold();
     test_all_recipes_and_rejections();
     test_import_destination_selects_shortest_controller_prefix();
     test_policy_stream_max_shape_is_heap_bounded();
@@ -834,11 +1104,11 @@ int main() {
     test_projection_reserve_retry_and_stashless();
     test_required_stash_reserve_fails_closed();
     test_mixed_transform_and_stash_only_receipts();
+    test_trusted_stash_batch_validation_is_linear();
     test_workspace_prices_max_shape_but_reserves_once();
     test_cross_domain_workspace_prices_mean_plane_once();
     test_cross_domain_workspace_refuses_legacy_only_backend();
     test_mean_addback_launch_shape_is_row_bounded();
-    // The five consumer-side cases listed at the top of this file run at stage 2.9.
-    std::puts("test-vbr-downward: OK (13 of the upstream 18 cases; see the note at the top)");
+    std::puts("test-vbr-downward: OK");
     return 0;
 }

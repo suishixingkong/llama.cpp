@@ -550,11 +550,12 @@ target_include_directories(test-vbr-hard-seal PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-identity-digest.cpp)
 target_include_directories(test-vbr-identity-digest PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-# Downward/upward representation algebra: the consumer-free subset of upstream's test-vbr-downward.
-# The five upstream cases that need llama-memory.h's preflight types or llama-kv-cache.h's stash
-# helpers are stage 2.9 work; the test file's own header comment names them. Unlike the identity and
-# hard-seal tests this one *is* assert-based, so it gets /UNDEBUG for the reason the 2.6a group does.
-# It includes its header by bare name, hence the src include directory.
+# Downward/upward representation algebra: the fork's test-vbr-downward.cpp, ported whole (fork
+# 9l-d4b9n). The five consumer-side cases withheld at stage 2.6d (they need llama-memory.h's preflight
+# types and llama-kv-cache.h's stash helpers) now run -- the consumer side landed, so the reason for
+# the deferral died (§58.1) and the live file is byte-identical to the fork's again. Assert-based, so
+# it gets /UNDEBUG for the reason the 2.6a group does. It includes its header by bare name, hence the
+# src include directory.
 llama_build_and_test(test-vbr-downward.cpp)
 target_include_directories(test-vbr-downward PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (MSVC)
