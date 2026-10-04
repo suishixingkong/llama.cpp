@@ -646,6 +646,40 @@ llama_context::llama_context(
             /*.swa_full              =*/ params.swa_full,
             /*.ctx_type              =*/ cparams.ctx_type,
             /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
+            // fork 9l-d4b9v: resolve a simple KV buffer type to this context's own compute
+            // backend instance. VBR needs the exact instance to reserve the backend-context-owned
+            // flash-attention dequant scratch; without this binding the VMM pool path treats a
+            // nullptr as a construction error and aborts context creation.
+            /*.compute_backend_for_buft =*/ [this](ggml_backend_buffer_type_t buft) -> ggml_backend_t {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev == nullptr) {
+                    return nullptr;
+                }
+
+                // Under tensor split the context owns one meta backend; the KV allocator hands
+                // us each simple child buft. Descend the meta backend to return the child backend
+                // whose context actually owns that device's fattn scratch.
+                std::function<ggml_backend_t(ggml_backend_t)> find_backend =
+                        [&](ggml_backend_t backend) -> ggml_backend_t {
+                    if (ggml_backend_is_meta(backend)) {
+                        const size_t n = ggml_backend_meta_n_backends(backend);
+                        for (size_t i = 0; i < n; ++i) {
+                            if (ggml_backend_t found = find_backend(
+                                        ggml_backend_meta_simple_backend(backend, i))) {
+                                return found;
+                            }
+                        }
+                        return nullptr;
+                    }
+                    return ggml_backend_get_device(backend) == dev ? backend : nullptr;
+                };
+                for (const auto & backend : backends) {
+                    if (ggml_backend_t found = find_backend(backend.get())) {
+                        return found;
+                    }
+                }
+                return nullptr;
+            },
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
