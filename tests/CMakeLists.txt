@@ -581,13 +581,37 @@ target_include_directories(test-vbr-extent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-vbr-pinned-ring.cpp)
 target_include_directories(test-vbr-pinned-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-# Unit-artifact format vocabulary: the header-only half of llama-vbr-artifact.h. Self-reporting, so
-# no /UNDEBUG. The codec (.cpp) is NOT here yet - it links against
-# vbr_generation_production_covered_set(), which only llama-vbr-generation.cpp defines, and that
-# file cannot land until artifact-validate/occupied-replacement/artifact-capture do. See
-# BUUN_MERGE_PLAN §10.35. The portable-domain ordering is pinned against a std::tuple oracle.
-llama_build_and_test(test-vbr-artifact.cpp)
-target_include_directories(test-vbr-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# The artifact codec / catalog / validator / staging test: the fork's
+# tests/test-vbr-artifact.cpp, ported whole (fork 9l-d4b9m). Self-reporting (a failure counter and
+# an explicit PASS line), so no /UNDEBUG. This is the full prepare/encode/decode round trip that
+# BUUN_MERGE_PLAN §10.38 recorded as the outstanding gap.
+#
+# The fork splits this file in two with `#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST`. That half
+# reaches the live server (it includes server-context.h / server-task.h and the server module adds
+# `server-context`, `mtmd` and tools/mtmd to the target). The macro is NOT defined here, so exactly
+# the device-free half compiles -- and the three tools/server modules below are what it links
+# against (each byte-identical to the fork's).
+llama_build_and_test(
+    test-vbr-artifact.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-lease.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-cache-vbr-proof.cpp
+    ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-payload.cpp)
+target_include_directories(test-vbr-artifact PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/server)
+# The fork's scale arm: the same binary in its --capture-projection-bench mode (it builds a
+# million-cell projection union and reports the elapsed time, ~90 ms here).
+llama_test_cmd(test-vbr-artifact
+    NAME test-vbr-capture-projection-scale
+    LABEL "vbr-cache;slow"
+    ARGS --capture-projection-bench)
+
+# Format vocabulary the fork's own test does NOT cover: the wire-version gates, the token-block
+# codec version, and the portable-domain ordering pinned against a std::tuple oracle. Port-only
+# (upstream has no test for llama-vbr-artifact.h at all), and kept after the fork's file landed
+# because the fork never asserts any of it. Self-reporting, so no /UNDEBUG.
+llama_build_and_test(test-vbr-artifact-vocabulary.cpp)
+target_include_directories(test-vbr-artifact-vocabulary PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # Segment chain and Merkle range proofs. Self-reporting, so no /UNDEBUG. The oracle is adversarial
 # rather than arithmetic: the tree is a black box that must bind content (one differing byte changes
