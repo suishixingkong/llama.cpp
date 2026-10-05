@@ -2960,6 +2960,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// fork 9l-d4b9w: the GGML_CUDA_TURBO_MMA opt-in, split out of
+// ggml_cuda_flash_attn_ext_mma_turbo_selectable() so that "the user asked for the tensor-core
+// path" and "this (K,V) pair has compiled turbo instances" are two separate questions. The
+// uncompiled-pair fallback in ggml_cuda_get_best_fattn_kernel() needs the first one alone.
+static bool ggml_cuda_flash_attn_ext_mma_turbo_enabled(void) {
+    static const bool turbo_mma_enabled = [] {
+        const char * env = std::getenv("GGML_CUDA_TURBO_MMA");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return turbo_mma_enabled;
+}
+
 #define FATTN_VEC_CASE(D, type_K_case, type_V_case)                                                                                \
     if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                                                                    \
         const bool type_K_okay = type_K == GGML_TYPE_##type_K_case || (type_K == GGML_TYPE_F32 && GGML_TYPE_##type_K_case == GGML_TYPE_F16); \
@@ -3622,6 +3634,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // env var gives a clean A/B against whatever the regular selection below would pick.
         if (ggml_cuda_flash_attn_ext_mma_turbo_selectable(dst)) {
             return BEST_FATTN_KERNEL_MMA_TURBO;
+        }
+        // fork 9l-d4b9w: the opt-in means "tensor cores, whatever it takes". A pair whose turbo
+        // instances were not compiled (GGML_CUDA_FA_MMA off, or the pair missing from
+        // GGML_CUDA_FA_QUANTS) must still land on MMA_F16 -- launch_fattn() materialises K and V
+        // into the reserved f16 scratch -- instead of falling through to VEC/TILE. Falling
+        // through made the A/B meaningless: the turbo kernel was compared against the vector
+        // kernel, and a build that omitted the pair looked identical to a build where the turbo
+        // path was merely slower. Scoped to quantized/turbo KV so a plain f16 cache keeps the
+        // selection it already had.
+        if (ggml_cuda_flash_attn_ext_mma_turbo_enabled() &&
+                (is_turbo_kv(K->type) || is_turbo_kv(V->type) ||
+                 ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
