@@ -25,7 +25,7 @@
 // the ncols2=1 non-GQA path. No model file needed.
 //
 // Usage: test-turbo-mma-fa [fallback|nopair] [--only <substr>]
-//   (default)  sets GGML_CUDA_TURBO_MMA=1, then holds each pair to the contract its build state
+//   (default)  sets GGML_CUDA_FA_MMA=1, then holds each pair to the contract its build state
 //              implies: a pair this build compiled must be dispatched to the turbo kernel, and a
 //              pair it did not compile must NOT be claimed by the opt-in -- 9l-d4b9w has to land
 //              it on the f16 tensor-core kernel, not on VEC/TILE. Green on any build config,
@@ -38,7 +38,7 @@
 //              A pair that turns out to be compiled makes the mode void for it -- reported as a
 //              void premise, never as a kernel bug.
 //   fallback   leaves the env var off and REQUIRES that it really is off, by reading it back. An
-//              exported GGML_CUDA_TURBO_MMA would otherwise turn this mode into a silent duplicate
+//              exported GGML_CUDA_FA_MMA would otherwise turn this mode into a silent duplicate
 //              of nopair while every one of its `== 0` assertions still reported PASS.
 //   --only     runs only the cases whose name contains <substr> (fast device iteration).
 //
@@ -268,30 +268,30 @@ int main(int argc, char ** argv) {
     // the whole difference between it and fallback.
     if (!fallback_mode) {
 #ifdef _WIN32
-        _putenv_s("GGML_CUDA_TURBO_MMA", "1");
+        _putenv_s("GGML_CUDA_FA_MMA", "1");
 #else
-        setenv("GGML_CUDA_TURBO_MMA", "1", 1);
+        setenv("GGML_CUDA_FA_MMA", "1", 1);
 #endif
     }
 
     // fallback's premise is an ABSENCE, so it has to be asserted, not merely not-created. A
-    // GGML_CUDA_TURBO_MMA exported by the shell turns this mode into a copy of nopair, and every
+    // GGML_CUDA_FA_MMA exported by the shell turns this mode into a copy of nopair, and every
     // assertion in it is of the `== 0` form, so it would keep reporting PASS while measuring
     // something else. Refuse to run instead of printing a claim that is not true.
-    const char * env_now = std::getenv("GGML_CUDA_TURBO_MMA");
+    const char * env_now = std::getenv("GGML_CUDA_FA_MMA");
     const bool env_on = env_now != nullptr && std::atoi(env_now) != 0;
     if (fallback_mode && env_on) {
-        printf("FATAL: GGML_CUDA_TURBO_MMA=%s is set in the environment, but this mode's whole\n"
+        printf("FATAL: GGML_CUDA_FA_MMA=%s is set in the environment, but this mode's whole\n"
                "  premise is that the opt-in is OFF. With it on, this run degenerates into nopair\n"
                "  and any PASS below would be measuring the wrong cell. Clear it and re-run:\n"
-               "    set GGML_CUDA_TURBO_MMA=\n", env_now);
+               "    set GGML_CUDA_FA_MMA=\n", env_now);
         return 2;
     }
     if (!fallback_mode && !env_on) {
-        printf("FATAL: failed to set GGML_CUDA_TURBO_MMA for this mode.\n");
+        printf("FATAL: failed to set GGML_CUDA_FA_MMA for this mode.\n");
         return 2;
     }
-    printf("mode: %s (GGML_CUDA_TURBO_MMA=%s)\n",
+    printf("mode: %s (GGML_CUDA_FA_MMA=%s)\n",
            fallback_mode ? "fallback" : nopair_mode ? "nopair" : "mma",
            env_now != nullptr ? env_now : "unset");
     if (nopair_mode) {

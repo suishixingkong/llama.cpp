@@ -209,7 +209,7 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char 
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
 // Number of FLASH_ATTN_EXT ops dispatched to the opt-in TurboQuant MMA kernel
-// (GGML_CUDA_TURBO_MMA=1) since library start. Read a delta around a compute to verify the
+// (GGML_CUDA_FA_MMA=1) since library start. Read a delta around a compute to verify the
 // path actually taken: a delta of 0 means the regular VEC/TILE/MMA_F16 kernels served the op
 // (e.g. the shape had no compiled instance, or the env var was off) -- a silent fallback
 // would otherwise make a "turbo MMA" benchmark measure the regular kernels.

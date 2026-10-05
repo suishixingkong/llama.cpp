@@ -282,6 +282,27 @@ Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
 Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
+#### GGML_CUDA_FA_MMA
+
+Opt in to the tensor-core (MMA) FlashAttention path. With `GGML_CUDA_FA_MMA=1`, a `FLASH_ATTN_EXT`
+whose KV cache is a decoded codec (quantized, TurboQuant or bf16) is dispatched to an MMA kernel
+instead of the regular VEC/TILE selection. The TurboQuant MMA kernel is preferred; when this build
+did not compile it for the pair, the op falls back to the always-compiled f16-f16 MMA kernel,
+materialising K and V into f16 on the fly, so the opt-in always measures a tensor-core path. A plain
+`f16` cache keeps the selection it always had. Unset means off; the value is read once per process.
+
+This is the **runtime half** of the `GGML_CUDA_FA_MMA` build option above, and the name is shared on
+purpose — the option decides whether the MMA kernels are in the build, the variable whether they are
+preferred at run time. The two cannot collide: the option resolves at configure time into a
+preprocessor macro, and a macro is never substituted inside a string literal, so the
+`getenv("GGML_CUDA_FA_MMA")` in the source always names this environment variable. Nor is the
+variable conditional on the option: with the option `OFF` there is simply no TurboQuant kernel left
+to prefer, and such a pair still goes to the f16-f16 MMA kernel.
+
+`ggml_backend_cuda_get_fattn_kernel_invocations()` reports how many ops reached each FA kernel
+family and `ggml_backend_cuda_get_turbo_mma_fa_invocations()` counts the TurboQuant MMA family
+alone; read either as a delta around a compute to verify which kernel actually served it.
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
@@ -302,7 +323,7 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16;q8_0-q4_0;f16-q8_0;f16-turbo4_0;q8_0-turbo4_0;q8_0-turbo3_0;q8_0-turbo2_0;turbo4_0-turbo4_0;turbo4_0-turbo3_0;turbo4_0-turbo2_0;turbo3_0-turbo3_0;turbo3_0-turbo2_0;turbo2_0-turbo2_0 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to the f16-f16 kernel with a warning. The same list also decides which K/V pairs block KV streaming can attend to natively instead of converting the staged pages to f16. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, turbo2_0, turbo3_0, turbo4_0. |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
-| GGML_CUDA_FA_MMA              | Boolean                | false   | Compile the MMA (tensor-core) FlashAttention kernels for the K/V type combinations listed in `GGML_CUDA_FA_QUANTS`. When off, `template-instances/fattn-mma-f16-instance-*.cu` (f16-f16) is the only MMA kernel in the build; the vector kernels are unaffected and still follow `GGML_CUDA_FA_QUANTS`. This is a separate and stricter gate than that list: a pair selected there gets its vector kernel regardless, but no MMA kernel unless this is on. Turning it on adds several hundred translation units to the build. With this on, the runtime opt-in `GGML_CUDA_TURBO_MMA=1` selects a turbo MMA kernel for a quantized/turbo KV pair that has one, and otherwise falls back to the f16 MMA kernel (K and V are converted to f16 on the fly), so the opt-in always measures a tensor-core path; with this off there is no non-f16 MMA kernel to select and such a pair keeps the regular VEC/TILE/f16-MMA selection. |
+| GGML_CUDA_FA_MMA              | Boolean                | false   | Compile the MMA (tensor-core) FlashAttention kernels for the K/V type combinations listed in `GGML_CUDA_FA_QUANTS`. When off, `template-instances/fattn-mma-f16-instance-*.cu` (f16-f16) is the only MMA kernel in the build; the vector kernels are unaffected and still follow `GGML_CUDA_FA_QUANTS`. This is a separate and stricter gate than that list: a pair selected there gets its vector kernel regardless, but no MMA kernel unless this is on. Turning it on adds several hundred translation units to the build. Its runtime half, the environment variable `GGML_CUDA_FA_MMA=1`, deliberately shares this name — see [Runtime CUDA environmental variables](#runtime-cuda-environmental-variables): it selects a TurboQuant MMA kernel for a pair this build compiled and otherwise falls back to the f16-f16 MMA kernel (K and V converted to f16 on the fly), so it measures a tensor-core path either way. |
 
 ## MUSA
 

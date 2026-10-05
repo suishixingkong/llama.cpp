@@ -210,8 +210,13 @@ set   (GGML_CUDA_FA_QUANTS "f16-f16;turbo8_0-turbo8_0;q5_1-q5_1;q4_1-q4_1;turbo4
 # GGML_CUDA_FA_QUANTS are compiled at all. ON compiles template-instances/fattn-mma-<K>-<V>-instance-*.cu
 # for every selected combination; OFF compiles none of them, leaving template-instances/fattn-mma-f16-instance-*.cu
 # (the f16-f16 MMA kernel) as the only MMA kernel in the build. The vector kernels are unaffected:
-# they follow GGML_CUDA_FA_QUANTS either way. The runtime opt-in GGML_CUDA_TURBO_MMA=1 only has an
-# effect when this is ON -- otherwise there is no turbo MMA kernel for it to select.
+# they follow GGML_CUDA_FA_QUANTS either way. The runtime opt-in GGML_CUDA_FA_MMA=1 carries the
+# same name by design -- this option answers "are the MMA kernels in the build?", the variable
+# answers "should they be preferred at run time?" -- and the two cannot collide because a
+# preprocessor macro is never substituted inside a string literal. It selects a turbo MMA kernel
+# for a compiled pair and, since fork 9l-d4b9w, sends every other decoded-KV pair to the
+# always-compiled f16-f16 MMA kernel instead of VEC/TILE; so it keeps its meaning with this
+# option OFF, it just has no turbo kernel to select then.
 option(GGML_CUDA_FA_MMA                     "ggml: compile MMA FlashAttention kernels for the GGML_CUDA_FA_QUANTS K-V combinations" OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)

@@ -2960,20 +2960,39 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// fork 9l-d4b9w: the GGML_CUDA_TURBO_MMA opt-in, split out of
+// fork 9l-d4b9w: the GGML_CUDA_FA_MMA opt-in, split out of
 // ggml_cuda_flash_attn_ext_mma_turbo_selectable() so that "the user asked for the tensor-core
 // path" and "this (K,V) pair has compiled turbo instances" are two separate questions. The
 // uncompiled-pair fallback in ggml_cuda_get_best_fattn_kernel() needs the first one alone.
+//
+// The name. This variable used to be GGML_CUDA_TURBO_MMA, which stopped being true once 9l-d4b9w
+// made the opt-in reach pairs that have no turbo kernel at all: what it asks for is the MMA
+// (tensor-core) path, and turbo is only the preferred kernel along it. It is now spelled exactly
+// like the CMake option that decides whether those kernels are compiled. The two cannot collide.
+// The option resolves at configure time into a preprocessor macro, and a macro is never
+// substituted inside a string literal, so `getenv("GGML_CUDA_FA_MMA")` names this environment
+// variable however the build was configured; CMake, in turn, never reads an environment variable
+// of that name. The shared spelling is the point -- one question ("use the MMA kernels?"), asked
+// once at build time ("are they in the build?"), once at run time ("should they be preferred?").
+// The second question is not conditional on the first: with the option OFF there is no turbo
+// kernel to select, but the 9l-d4b9w fallback still lands in-scope pairs on the f16-f16 MMA
+// kernel, which is always compiled.
+//
+// This opt-in is read in TWO places -- here, and ggml_cuda_flash_attn_ext_mma_turbo_selectable()
+// further down. The second cannot simply call this helper because it sits inside slice
+// 9l-d4b8l's frozen neighbourhood (see the `blast` row of test_9l_d4b8l_guards.py);
+// test_fa_mma_env_name_guards.py pins the two literals equal and pins the old name absent, so the
+// two read sites cannot drift apart.
 static bool ggml_cuda_flash_attn_ext_mma_turbo_enabled(void) {
     static const bool turbo_mma_enabled = [] {
-        const char * env = std::getenv("GGML_CUDA_TURBO_MMA");
+        const char * env = std::getenv("GGML_CUDA_FA_MMA");
         return env != nullptr && std::atoi(env) != 0;
     }();
     return turbo_mma_enabled;
 }
 
 // fork 9l-d4b9w: the authoritative scope of the opt-in's uncompiled-pair fallback -- "with
-// GGML_CUDA_TURBO_MMA=1, which KV codecs must land on the f16 tensor-core kernel rather than
+// GGML_CUDA_FA_MMA=1, which KV codecs must land on the f16 tensor-core kernel rather than
 // falling through to the VEC/TILE ladder when their turbo MMA instance is missing?"
 //
 // The turbo types repeat the list inside ggml_cuda_get_best_fattn_kernel()'s is_turbo_kv lambda,
@@ -3194,7 +3213,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 }
 
 // Opt-in gate for the TurboQuant tensor-core FA path (B+ Stage 1c L1, BUUN_MERGE_PLAN.md
-// section 1.4a). Enabled via GGML_CUDA_TURBO_MMA=1 (value-based, 0 = off) for A/B benchmarking
+// section 1.4a). Enabled via GGML_CUDA_FA_MMA=1 (value-based, 0 = off) for A/B benchmarking
 // against the regular kernel selection below. Returns true only for shapes that have compiled
 // instances per the pair table in fattn-mma-turbo.cuh (13 symmetric pairs across turbo and
 // standard quantized KV types, plus turbo8_0-turbo3_tcq and f16-turbo8_0), head dims 128/256,
@@ -3203,7 +3222,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 // uncompiled pair silently falls back.
 static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * dst) {
     static const bool turbo_mma_enabled = [] {
-        const char * env = std::getenv("GGML_CUDA_TURBO_MMA");
+        const char * env = std::getenv("GGML_CUDA_FA_MMA");
         return env != nullptr && std::atoi(env) != 0;
     }();
     if (!turbo_mma_enabled) {
@@ -3655,7 +3674,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        // Opt-in TurboQuant tensor-core path (GGML_CUDA_TURBO_MMA=1). When enabled it takes
+        // Opt-in TurboQuant tensor-core path (GGML_CUDA_FA_MMA=1). When enabled it takes
         // precedence over VEC/TILE/MMA_F16 for the shapes with compiled instances, so the
         // env var gives a clean A/B against whatever the regular selection below would pick.
         if (ggml_cuda_flash_attn_ext_mma_turbo_selectable(dst)) {
