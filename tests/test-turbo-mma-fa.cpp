@@ -5,7 +5,10 @@
 //   1. Dispatch: with GGML_CUDA_TURBO_MMA=1 every case below must increment the
 //      ggml_backend_cuda_get_turbo_mma_fa_invocations() counter (i.e. the op really ran on
 //      the non-f16 MMA kernel, not silently on the regular VEC/TILE/MMA_F16 path). Without the
-//      env var ("fallback" mode) the counter must stay at 0.
+//      env var ("fallback" mode) the counter must stay at 0. With the env var but no compiled
+//      instance for the pair ("nopair" mode) it must also stay at 0 -- and the numeric check
+//      must still pass, because 9l-d4b9w routes that case to the f16 tensor-core kernel rather
+//      than letting it fall into VEC/TILE.
 //   2. Numerics: the MMA kernel decodes the same quantized KV blocks the CPU reference
 //      decodes, so the two outputs may only differ by in-kernel fp16 tile rounding and
 //      accumulation order -- asserted to stay far below quantization-error scale, and far
@@ -17,10 +20,19 @@
 // large nq -> 32-column and 64-column rungs, and a no-mask case -> the ncols2=1 non-GQA path.
 // No model file needed.
 //
-// Usage: test-turbo-mma-fa [fallback] [--only <substr>]
+// Usage: test-turbo-mma-fa [fallback|nopair] [--only <substr>]
 //   (default)  sets GGML_CUDA_TURBO_MMA=1 and asserts the MMA counter advances.
 //   fallback   leaves the env var off and asserts the counter never advances; the numeric
 //              comparison still runs against whatever regular kernel the backend picks.
+//   nopair     sets the env var (so the opt-in is live) and asserts the counter stays at 0 for
+//              every non-f16 pair: this is the 9l-d4b9w contract -- a pair with no compiled MMA
+//              instance must be reported uncompiled and routed to the f16 tensor-core kernel,
+//              not silently dropped into the VEC/TILE ladder. The numeric comparison must still
+//              pass, which is the point: the fallback decodes correctly, it is not a no-op.
+//              Only meaningful on a build where the pairs really are uncompiled (the default
+//              GGML_CUDA_FA_MMA=OFF, or a FA_QUANTS list without them); the mode says so loudly
+//              if a pair turns out to be compiled after all, because then it is measuring
+//              nothing.
 //   --only     runs only the cases whose name contains <substr> (fast device iteration).
 //
 // Each case reports nan(cpu/cuda) and sentinel_left; an output element still holding the
@@ -180,16 +192,37 @@ std::vector<float> run_fa(
 int main(int argc, char ** argv) {
     testing t;
 
-    const bool mma_mode = !(argc > 1 && std::string(argv[1]) == "fallback");
-    if (mma_mode) {
+    // Three modes, distinguished by (env var, expected counter):
+    //   mma      env=1  counter >= 1 on non-f16 pairs  -- the opt-in reaches the turbo kernel
+    //   fallback env=0  counter == 0 everywhere        -- the opt-in changes nothing by default
+    //   nopair   env=1  counter == 0 everywhere        -- the opt-in is live but no pair is
+    //                                                      compiled, so 9l-d4b9w must route to
+    //                                                      the f16 tensor-core kernel instead
+    //                                                      of falling into VEC/TILE
+    // The first argv token selects the mode; anything else is treated as the default (mma).
+    const std::string mode = argc > 1 ? std::string(argv[1]) : std::string("mma");
+    const bool fallback_mode = mode == "fallback";
+    const bool nopair_mode   = mode == "nopair";
+    const bool mma_mode      = !fallback_mode && !nopair_mode;
+
+    // fallback is the only mode that leaves the opt-in off; nopair deliberately sets it, that is
+    // the whole difference between it and fallback.
+    if (!fallback_mode) {
 #ifdef _WIN32
         _putenv_s("GGML_CUDA_TURBO_MMA", "1");
 #else
         setenv("GGML_CUDA_TURBO_MMA", "1", 1);
 #endif
     }
-    printf("mode: %s (GGML_CUDA_TURBO_MMA=%s)\n", mma_mode ? "mma" : "fallback",
-           mma_mode ? "1" : "unset");
+    printf("mode: %s (GGML_CUDA_TURBO_MMA=%s)\n",
+           fallback_mode ? "fallback" : nopair_mode ? "nopair" : "mma",
+           fallback_mode ? "unset" : "1");
+    if (nopair_mode) {
+        printf("  expecting: every non-f16 pair has NO compiled MMA instance, so the opt-in\n"
+               "  routes to the f16 tensor-core kernel. If a pair reports a counter advance,\n"
+               "  this build DOES have that instance compiled and the mode measures nothing\n"
+               "  (use the default mode instead, or configure without that pair).\n");
+    }
 
     ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(0));
     if (!cuda_backend) {
@@ -313,6 +346,28 @@ int main(int argc, char ** argv) {
                     } else {
                         tt.assert_true("control pair f16/f16 keeps the original f16 loader",
                                        inv_delta == 0);
+                    }
+                } else if (nopair_mode) {
+                    // 9l-d4b9w: the opt-in is live, so the pair is *not* skipped for lack of an
+                    // env var -- it lacks an instance. The counter must therefore stay at 0, and
+                    // the numeric comparison below is the load-bearing half: it proves the
+                    // f16-MMA fallback actually decodes the same blocks correctly.
+                    //
+                    // A counter advance here is not a kernel bug, it means the premise is false
+                    // (this pair IS compiled in this build), so say that instead of leaving the
+                    // reader to guess from a bare "expected 0, got 1".
+                    tt.assert_true(
+                        "opt-in with an uncompiled pair does NOT reach the turbo MMA kernel",
+                        inv_delta == 0);
+                    if (inv_delta != 0) {
+                        printf("    (nopair mode is void for this pair: \"%s-%s\" has a compiled "
+                               "MMA instance in this build -- counter advanced. Use the default "
+                               "mode to test the turbo kernel.)\n",
+                               ggml_type_name(p.k), ggml_type_name(p.v));
+                    } else {
+                        printf("    (uncompiled pair routed away from the turbo MMA kernel as "
+                               "expected; the numeric check below is what proves the fallback "
+                               "decodes correctly)\n");
                     }
                 } else {
                     tt.assert_true("MMA dispatch counter stayed at 0 without the env var",
