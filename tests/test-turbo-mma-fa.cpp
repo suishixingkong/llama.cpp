@@ -18,11 +18,10 @@
 //      below what a wrong tile/group addressing bug (O(1) garbage) would produce.
 //
 // The pairs cover every non-f16 MMA instantiation set (turbo scalar/TCQ, standard quantized,
-// bf16; plus the mixed pairs) and 14 of the 17 combinations in the default GGML_CUDA_FA_QUANTS
-// selection -- f16-q5_1, q5_1-turbo4_0 and q4_1-turbo4_0 are the three it does not reach. The
-// shapes cover every tile the Volta dispatch ladder can select for D in {128, 256}: gqa 8/4/2/1 ->
-// ncols2 8/4/2/1, small and large nq -> 32-column and 64-column rungs, and a no-mask case ->
-// the ncols2=1 non-GQA path. No model file needed.
+// bf16; plus the mixed pairs) and all 17 combinations in the default GGML_CUDA_FA_QUANTS
+// selection. The shapes cover every tile the Volta dispatch ladder can select for D in {128, 256}:
+// gqa 8/4/2/1 -> ncols2 8/4/2/1, small and large nq -> 32-column and 64-column rungs, and a
+// no-mask case -> the ncols2=1 non-GQA path. No model file needed.
 //
 // Usage: test-turbo-mma-fa [fallback|nopair] [--only <substr>]
 //   (default)  sets GGML_CUDA_FA_MMA=1, then holds each pair to the contract its build state
@@ -310,7 +309,7 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(cpu_backend);
 
     // K/V type pairs: the symmetric pairs (turbo scalar/TCQ, standard quantized, bf16) plus the
-    // mixed pairs, covering every non-f16 MMA instantiation set and 14 of the 17 combinations in
+    // mixed pairs, covering every non-f16 MMA instantiation set and all 17 combinations in
     // the default GGML_CUDA_FA_QUANTS list. This exercises every general-loader decode branch
     // (turbo 128-element rotation groups, q4_0/q4_1/q5_0/q5_1/q8_0 32-element blocks, bf16
     // pseudo-blocks) and the asymmetric combinations, not only the original turbo pairs. Whether
@@ -351,6 +350,21 @@ int main(int argc, char ** argv) {
         {GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_Q8_0,      GGML_TYPE_TURBO4_0},
         {GGML_TYPE_F16,       GGML_TYPE_Q8_0},
+        // The three default-list combinations the table above does not reach. Each pairs a
+        // standard-quant or f16 K with a turbo4_0 / q5_1 V, and no VBR ladder produces any of them
+        // (fa_ladder_coverage.py shows the turbo and classic closures contain none), yet they are
+        // legal *explicit* selections: kv_cache_types accepts Q4_1/Q5_1/TURBO4_0 as a -ctk/-ctv
+        // value, so `-ctk q4_1 -ctv turbo4_0` parses, and with both sides pinned it is a static
+        // cache the VBR controller never touches. FA_QUANTS exists to instantiate exactly those
+        // build-time combinations, and the tree carries all of it: a vec instance AND its
+        // FATTN_VEC_CASES_ALL_D dispatch entry (so VEC is a real candidate for these, which is
+        // what makes nopair's "VEC == 0" assertion mean something), 16 MMA tiles, and the
+        // pair_compiled + typed-dispatch guard entries. K is the finer side in all three
+        // (f16/q5_1 = 16.0/6.0, q5_1/t4 = 6.0/4.125, q4_1/t4 = 5.0/4.125 bpv), so they exercise
+        // 9l-d4b9z's K>=V rule from the allowed direction. Before this they had no coverage.
+        {GGML_TYPE_F16,       GGML_TYPE_Q5_1},
+        {GGML_TYPE_Q5_1,      GGML_TYPE_TURBO4_0},
+        {GGML_TYPE_Q4_1,      GGML_TYPE_TURBO4_0},
     };
 
     // Optional case filter for fast iteration on the device: --only <substr> matches the case
