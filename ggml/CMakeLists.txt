@@ -204,7 +204,7 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
-set   (GGML_CUDA_FA_QUANTS "f16-f16;turbo8_0-turbo8_0;q5_1-q5_1;q4_1-q4_1;f16-turbo8_0;f16-q5_1;turbo8_0-q5_1;turbo8_0-q4_1;turbo8_0-turbo4_0;turbo8_0-turbo3_tcq;q5_1-q4_1;q5_1-turbo4_0;q5_1-turbo3_tcq;q4_1-turbo4_0;q4_1-turbo3_tcq;turbo4_0-turbo3_tcq;turbo4_0-turbo2_tcq" CACHE STRING
+set   (GGML_CUDA_FA_QUANTS "f16-f16;turbo8_0-turbo8_0;q5_1-q5_1;q4_1-q4_1;f16-turbo8_0;f16-q5_1;turbo8_0-q5_1;turbo8_0-q4_1;turbo8_0-turbo4_0;turbo8_0-turbo3_tcq;q5_1-q4_1;q5_1-turbo4_0;q5_1-turbo3_tcq;q4_1-turbo4_0;q4_1-turbo3_tcq" CACHE STRING
                                             "ggml: FlashAttention K-V type combinations to compile. (includes the TurboQuant KV-cache combinations); \"all\" for every available instance; or an explicit list such as \"q8_0-q8_0;q8_0-q4_0\"")
 # Whether the MMA (tensor-core) FlashAttention kernels for the combinations listed in
 # GGML_CUDA_FA_QUANTS are compiled at all. ON compiles template-instances/fattn-mma-<K>-<V>-instance-*.cu
