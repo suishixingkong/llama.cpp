@@ -127,18 +127,57 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
     set(GGML_FA_COMBINATIONS "${FA_COMBINATIONS}" PARENT_SCOPE)
 endfunction()
 
-# Determines which TurboQuant MMA FlashAttention template instances to compile, returns them in
-# OUT_SRCS. The turbo MMA instances follow the vec instances: a symmetric pair is only compiled
-# when its <type_K>-<type_V> combination was selected via GGML_CUDA_FA_QUANTS (or exists under
+# Determines which non-f16 MMA FlashAttention template instances to compile, returns them in
+# OUT_SRCS. These instances follow the vec instances: a <type_K>-<type_V> pair is only compiled
+# when its combination was selected via GGML_CUDA_FA_QUANTS (or exists under
 # GGML_CUDA_FA_QUANTS=all). Combinations without any instance files are silently skipped, and the
 # FA dispatch in fattn.cu guards every turbo case reference with the same GGML_CUDA_FA_<K>_<V>
 # macros that this selection defines, so an uncompiled pair falls back to the regular kernels
 # instead of failing to link.
+#
+# This function is only reached when GGML_CUDA_FA_MMA is ON -- it is called from
+# ggml_fattn_mma_quant_instances() below, which is the single gate for the whole family. With the
+# switch OFF none of these files are compiled and GGML_CUDA_FA_MMA is left undefined, which
+# fattn-mma-turbo.cuh reads as 0 and ANDs into every per-pair guard, so a pair selected in
+# GGML_CUDA_FA_QUANTS -- whose GGML_CUDA_FA_<K>_<V> macro is still 1, because that macro gates the
+# VEC instances too -- is not referenced here. The VEC instances are deliberately left alone:
+# GGML_CUDA_FA_MMA is about MMA kernels only.
 function(ggml_cuda_fattn_mma_turbo_instances DIR COMBINATIONS OUT_SRCS)
     set(SRCS "")
     foreach (COMBINATION IN LISTS ${COMBINATIONS})
         file(GLOB TURBO_MMA_SRCS "${DIR}/template-instances/fattn-mma-${COMBINATION}-instance-*.cu")
         list(APPEND SRCS ${TURBO_MMA_SRCS})
     endforeach()
+    set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
+endfunction()
+
+# Master switch for the non-f16 MMA (tensor-core) FlashAttention kernels: GGML_CUDA_FA_MMA
+# (CMake option, default OFF). Shared by the CUDA, HIP and MUSA backends -- they all compile the
+# same fattn-mma-<k>-<v>-instance-*.cu sources -- and returns the selected files in OUT_SRCS.
+#
+# Two halves, and both are required:
+#   * the source list: with the switch off, none of those instance files are compiled, leaving
+#     fattn-mma-f16-instance-*.cu (f16-f16) as the only MMA kernel in the build;
+#   * the compile definition: fattn-mma-turbo.cuh ANDs GGML_CUDA_FA_MMA into every
+#     per-pair guard, so with the define absent no translation unit references an instance this
+#     selection did not compile. Dropping it makes the ON build silently useless (instances
+#     compiled, nothing reachable) and the OFF build a LINK error rather than a fallback:
+#     GGML_CUDA_FA_<K>_<V> stays 1 for every GGML_CUDA_FA_QUANTS pair, because that macro gates
+#     the VEC instances too and those are compiled either way.
+#
+# The define is added ONLY in the ON branch, deliberately. add_compile_definitions() is a
+# directory property, so adding `-D...=0` for the OFF case would change the compile command of
+# every source in the backend and force a full rebuild of it (hundreds of CUDA translation units)
+# the first time the option is seen. The header's own `#ifndef ... #define ... 0` supplies the
+# same value, so the default OFF build recompiles nothing and only relinks.
+function(ggml_fattn_mma_quant_instances DIR COMBINATIONS OUT_SRCS)
+    if (GGML_CUDA_FA_MMA)
+        add_compile_definitions(GGML_CUDA_FA_MMA=1)
+        ggml_cuda_fattn_mma_turbo_instances(${DIR} ${COMBINATIONS} SRCS)
+        message(STATUS "FlashAttention MMA K-V instances: ${${COMBINATIONS}}")
+    else()
+        set(SRCS "")
+        message(STATUS "FlashAttention MMA K-V instances: none (f16-f16 MMA only, set GGML_CUDA_FA_MMA=ON to compile them)")
+    endif()
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
 endfunction()

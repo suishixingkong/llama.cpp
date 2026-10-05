@@ -206,6 +206,13 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 set   (GGML_CUDA_FA_QUANTS "f16-f16;turbo8_0-turbo8_0;q5_1-q5_1;q4_1-q4_1;f16-turbo8_0;f16-q5_1;turbo8_0-q5_1;turbo8_0-q4_1;turbo8_0-turbo4_0;turbo8_0-turbo3_tcq;q5_1-q4_1;q5_1-turbo4_0;q5_1-turbo3_tcq;q4_1-turbo4_0;q4_1-turbo3_tcq" CACHE STRING
                                             "ggml: FlashAttention K-V type combinations to compile. (includes the TurboQuant KV-cache combinations); \"all\" for every available instance; or an explicit list such as \"q8_0-q8_0;q8_0-q4_0\"")
+# Whether the MMA (tensor-core) FlashAttention kernels for the combinations listed in
+# GGML_CUDA_FA_QUANTS are compiled at all. ON compiles template-instances/fattn-mma-<K>-<V>-instance-*.cu
+# for every selected combination; OFF compiles none of them, leaving template-instances/fattn-mma-f16-instance-*.cu
+# (the f16-f16 MMA kernel) as the only MMA kernel in the build. The vector kernels are unaffected:
+# they follow GGML_CUDA_FA_QUANTS either way. The runtime opt-in GGML_CUDA_TURBO_MMA=1 only has an
+# effect when this is ON -- otherwise there is no turbo MMA kernel for it to select.
+option(GGML_CUDA_FA_MMA                     "ggml: compile MMA FlashAttention kernels for the GGML_CUDA_FA_QUANTS K-V combinations" OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING

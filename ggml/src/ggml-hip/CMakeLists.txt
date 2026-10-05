@@ -63,8 +63,9 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
-# Only the f16 MMA instances are globbed unconditionally; the TurboQuant MMA instances
-# (fattn-mma-<k>-<v>-instance-*.cu) follow the GGML_CUDA_FA_QUANTS selection below.
+# The f16-f16 MMA instances are always compiled: with GGML_CUDA_FA_MMA off they are
+# the only MMA kernel in the build. Everything else of the form
+# fattn-mma-<k>-<v>-instance-*.cu is gated on that option in ggml_fattn_mma_quant_instances().
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma-f16-instance-*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
@@ -75,7 +76,7 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-ggml_cuda_fattn_mma_turbo_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda GGML_FA_COMBINATIONS SRCS)
+ggml_fattn_mma_quant_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda GGML_FA_COMBINATIONS SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 ggml_add_backend_library(ggml-hip

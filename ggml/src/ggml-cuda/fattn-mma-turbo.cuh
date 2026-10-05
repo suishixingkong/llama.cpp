@@ -13,10 +13,12 @@
 //   - the (K,V) pair table: which pairs have instances, and the pair-resolving typed dispatch.
 //
 // Instance files: template-instances/fattn-mma-<type_K>-<type_V>-instance-dkq<D>-ncols1_<A>-ncols2_<B>.cu
-// Which of them are compiled follows the vec instances (GGML_CUDA_FA_QUANTS -> FA_COMBINATIONS),
-// see ggml_cuda_fattn_mma_turbo_instances() in ggml/cmake/common.cmake. Every reference to these
-// cases is guarded with the same GGML_CUDA_FA_<K>_<V> macros that gate the vec instances, so an
-// uncompiled pair silently keeps the regular kernel selection.
+// Which of them exist as source files follows the vec instances (GGML_CUDA_FA_QUANTS ->
+// FA_COMBINATIONS), see ggml_cuda_fattn_mma_turbo_instances() in ggml/cmake/common.cmake. Whether
+// any of them are *compiled* is a separate, stricter gate: GGML_CUDA_FA_MMA (CMake, default
+// OFF). With that gate off the build contains no non-f16 MMA kernel at all, so every reference
+// below is ANDed with GGML_CUDA_FA_MMA and an unreachable pair keeps the regular kernel
+// selection instead of producing an undefined symbol at link time.
 //
 // The streamed span prefill (kv-stream) additionally uses the partial-output variant
 // (ggml_cuda_flash_attn_ext_mma_turbo_partial_case) for the (D=256, tile 8x8) shape so that
@@ -26,6 +28,17 @@
 
 #include "common.cuh"
 #include "fattn-mma-f16.cuh"
+
+// Master switch for the non-f16 MMA kernels. CMake (ggml_fattn_mma_quant_instances() in
+// ggml/cmake/common.cmake) defines it as 1 when GGML_CUDA_FA_MMA is ON and leaves it
+// undefined otherwise, which this block turns into 0. It is ANDed into every per-pair guard below
+// because GGML_CUDA_FA_<K>_<V> alone is not evidence that a pair's MMA instance was compiled:
+// that macro also gates the VEC instances and stays 1 for every GGML_CUDA_FA_QUANTS pair even when
+// the MMA instances were switched off. Defaulting to 0 also keeps a translation unit compiled
+// outside CMake from referencing an instance that does not exist.
+#ifndef GGML_CUDA_FA_MMA
+#define GGML_CUDA_FA_MMA 0
+#endif
 
 // Dynamic shared memory the MMA FA kernel requests for a non-f16 (DKQ, DV, ncols1, ncols2)
 // combination on this arch. Same formula as ggml_cuda_fattn_mma_f16_shared_bytes(), but with
@@ -167,82 +180,82 @@ void ggml_cuda_flash_attn_ext_mma_turbo_partial_case(
 static bool ggml_cuda_fattn_mma_turbo_pair_compiled(ggml_type type_k, ggml_type type_v) {
 #define TURBO_MMA_PAIR_TEST(tk, tv) \
     if (type_k == GGML_TYPE_##tk && type_v == GGML_TYPE_##tv) { return true; }
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO3_TCQ, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO2_TCQ, TURBO2_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO1_TCQ, TURBO1_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0
+#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(F16, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO4_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0
+#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO3_0, TURBO3_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0
+#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO2_0, TURBO2_0)
 #endif
-#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0
+#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q8_0, Q8_0)
 #endif
-#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0
+#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q5_0, Q5_0)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q5_1, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0
+#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q4_0, Q4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q4_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16
+#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(BF16, BF16)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO8_0, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO8_0, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q5_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q4_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q5_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO8_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0
+#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q8_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0
+#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(F16, Q8_0)
 #endif
-#if defined(GGML_CUDA_FA_F16_Q5_1) && GGML_CUDA_FA_F16_Q5_1
+#if defined(GGML_CUDA_FA_F16_Q5_1) && GGML_CUDA_FA_F16_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(F16, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO4_0) && GGML_CUDA_FA_Q5_1_TURBO4_0
+#if defined(GGML_CUDA_FA_Q5_1_TURBO4_0) && GGML_CUDA_FA_Q5_1_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q5_1, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO4_0) && GGML_CUDA_FA_Q4_1_TURBO4_0
+#if defined(GGML_CUDA_FA_Q4_1_TURBO4_0) && GGML_CUDA_FA_Q4_1_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(Q4_1, TURBO4_0)
 #endif
 #undef TURBO_MMA_PAIR_TEST
@@ -262,82 +275,82 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_typed(ggml_backend_cuda_cont
         ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_##tk, GGML_TYPE_##tv>(ctx, dst); \
         return;                                                                                         \
     }
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO3_TCQ, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO2_TCQ, TURBO2_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO1_TCQ, TURBO1_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0
+#if defined(GGML_CUDA_FA_F16_TURBO8_0) && GGML_CUDA_FA_F16_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(F16, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO4_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0
+#if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO3_0, TURBO3_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0
+#if defined(GGML_CUDA_FA_TURBO2_0_TURBO2_0) && GGML_CUDA_FA_TURBO2_0_TURBO2_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO2_0, TURBO2_0)
 #endif
-#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0
+#if defined(GGML_CUDA_FA_Q8_0_Q8_0) && GGML_CUDA_FA_Q8_0_Q8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q8_0, Q8_0)
 #endif
-#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0
+#if defined(GGML_CUDA_FA_Q5_0_Q5_0) && GGML_CUDA_FA_Q5_0_Q5_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q5_0, Q5_0)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q5_1, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0
+#if defined(GGML_CUDA_FA_Q4_0_Q4_0) && GGML_CUDA_FA_Q4_0_Q4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q4_0, Q4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q4_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16
+#if defined(GGML_CUDA_FA_BF16_BF16) && GGML_CUDA_FA_BF16_BF16 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(BF16, BF16)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO8_0, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO8_0, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q5_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q4_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q5_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO4_0) && GGML_CUDA_FA_TURBO8_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO8_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0
+#if defined(GGML_CUDA_FA_Q8_0_TURBO4_0) && GGML_CUDA_FA_Q8_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q8_0, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0
+#if defined(GGML_CUDA_FA_F16_Q8_0) && GGML_CUDA_FA_F16_Q8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(F16, Q8_0)
 #endif
-#if defined(GGML_CUDA_FA_F16_Q5_1) && GGML_CUDA_FA_F16_Q5_1
+#if defined(GGML_CUDA_FA_F16_Q5_1) && GGML_CUDA_FA_F16_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(F16, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO4_0) && GGML_CUDA_FA_Q5_1_TURBO4_0
+#if defined(GGML_CUDA_FA_Q5_1_TURBO4_0) && GGML_CUDA_FA_Q5_1_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q5_1, TURBO4_0)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO4_0) && GGML_CUDA_FA_Q4_1_TURBO4_0
+#if defined(GGML_CUDA_FA_Q4_1_TURBO4_0) && GGML_CUDA_FA_Q4_1_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(Q4_1, TURBO4_0)
 #endif
 #undef TURBO_MMA_PAIR_CALL
@@ -359,40 +372,40 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_case_typed(
         ggml_cuda_flash_attn_ext_mma_turbo_partial_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_##tk, GGML_TYPE_##tv>(ctx, dst, partial_dst, partial_meta); \
         return true;                                                                                    \
     }
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO8_0, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO3_TCQ, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO2_TCQ, TURBO2_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO1_TCQ, TURBO1_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO8_0, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO8_0, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO8_0, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(Q5_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(Q4_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(Q5_1, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(Q5_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(Q4_1, Q4_1)
 #endif
 #undef TURBO_MMA_PARTIAL_CALL
@@ -405,40 +418,40 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_case_typed(
 static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_available(ggml_type type_k, ggml_type type_v) {
 #define TURBO_MMA_PARTIAL_TEST(tk, tv) \
     if (type_k == GGML_TYPE_##tk && type_v == GGML_TYPE_##tv) { return true; }
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO8_0) && GGML_CUDA_FA_TURBO8_0_TURBO8_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO8_0, TURBO8_0)
 #endif
-#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO3_TCQ, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ
+#if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO2_TCQ, TURBO2_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ
+#if defined(GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ) && GGML_CUDA_FA_TURBO1_TCQ_TURBO1_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO1_TCQ, TURBO1_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO8_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO8_0, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q5_1) && GGML_CUDA_FA_TURBO8_0_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO8_0, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1
+#if defined(GGML_CUDA_FA_TURBO8_0_Q4_1) && GGML_CUDA_FA_TURBO8_0_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO8_0, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q5_1_TURBO3_TCQ) && GGML_CUDA_FA_Q5_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(Q5_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ
+#if defined(GGML_CUDA_FA_Q4_1_TURBO3_TCQ) && GGML_CUDA_FA_Q4_1_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(Q4_1, TURBO3_TCQ)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1
+#if defined(GGML_CUDA_FA_Q5_1_Q5_1) && GGML_CUDA_FA_Q5_1_Q5_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(Q5_1, Q5_1)
 #endif
-#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1
+#if defined(GGML_CUDA_FA_Q5_1_Q4_1) && GGML_CUDA_FA_Q5_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(Q5_1, Q4_1)
 #endif
-#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1
+#if defined(GGML_CUDA_FA_Q4_1_Q4_1) && GGML_CUDA_FA_Q4_1_Q4_1 && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(Q4_1, Q4_1)
 #endif
 #undef TURBO_MMA_PARTIAL_TEST
