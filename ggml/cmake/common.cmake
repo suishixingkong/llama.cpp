@@ -111,12 +111,30 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
 
     message(STATUS "FlashAttention K-V type combinations: ${FA_COMBINATIONS}")
 
-    set(SRCS "")
+    # fork 9l-d4b9z: this tree only ships instances for pairs with bpv(K) >= bpv(V) -- K is the
+    # side dot-producted against Q, so a coarser K would drop precision the V side still has.
+    # Report every offender at once: a stale GGML_CUDA_FA_QUANTS cache naming a removed pair
+    # otherwise fails one line at a time, which reads like a missing file rather than a
+    # configuration that has to be re-derived.
+    set(FA_MISSING_INSTANCES "")
     foreach (COMBINATION IN LISTS FA_COMBINATIONS)
         set(SRC "${DIR}/template-instances/fattn-vec-instance-${COMBINATION}.cu")
         if (NOT EXISTS "${SRC}")
-            message(FATAL_ERROR "FlashAttention template instance \"${SRC}\" does not exist")
+            list(APPEND FA_MISSING_INSTANCES "${COMBINATION}")
         endif()
+    endforeach()
+    if (FA_MISSING_INSTANCES)
+        message(FATAL_ERROR
+            "GGML_CUDA_FA_QUANTS names ${#FA_MISSING_INSTANCES} combination(s) with no template "
+            "instance in this tree: ${FA_MISSING_INSTANCES}\n"
+            "Only pairs with bpv(K) >= bpv(V) are instantiated (K is the dot-product side). "
+            "Drop them from GGML_CUDA_FA_QUANTS, or rebuild the cache from scratch "
+            "(-U GGML_CUDA_FA_QUANTS) to pick up the current default.")
+    endif()
+
+    set(SRCS "")
+    foreach (COMBINATION IN LISTS FA_COMBINATIONS)
+        set(SRC "${DIR}/template-instances/fattn-vec-instance-${COMBINATION}.cu")
         list(APPEND SRCS "${SRC}")
     endforeach()
 

@@ -2991,11 +2991,6 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
     FATTN_VEC_CASES_ALL_D(F16,  F16)
-    FATTN_VEC_CASES_ALL_D(Q4_0, F16)
-    FATTN_VEC_CASES_ALL_D(Q4_1, F16)
-    FATTN_VEC_CASES_ALL_D(Q5_0, F16)
-    FATTN_VEC_CASES_ALL_D(Q5_1, F16)
-    FATTN_VEC_CASES_ALL_D(Q8_0, F16)
     FATTN_VEC_CASES_ALL_D(BF16, F16)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_0)
@@ -3007,7 +3002,6 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(BF16, Q4_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_1)
-    FATTN_VEC_CASES_ALL_D(Q4_0, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q4_1, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q5_0, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_1)
@@ -3015,35 +3009,21 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(BF16, Q4_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_0)
-    FATTN_VEC_CASES_ALL_D(Q4_0, Q5_0)
-    FATTN_VEC_CASES_ALL_D(Q4_1, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q5_0, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_1)
-    FATTN_VEC_CASES_ALL_D(Q4_0, Q5_1)
-    FATTN_VEC_CASES_ALL_D(Q4_1, Q5_1)
-    FATTN_VEC_CASES_ALL_D(Q5_0, Q5_1)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_1)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_1)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q8_0)
-    FATTN_VEC_CASES_ALL_D(Q4_0, Q8_0)
-    FATTN_VEC_CASES_ALL_D(Q4_1, Q8_0)
-    FATTN_VEC_CASES_ALL_D(Q5_0, Q8_0)
-    FATTN_VEC_CASES_ALL_D(Q5_1, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q8_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q8_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  BF16)
-    FATTN_VEC_CASES_ALL_D(Q4_0, BF16)
-    FATTN_VEC_CASES_ALL_D(Q4_1, BF16)
-    FATTN_VEC_CASES_ALL_D(Q5_0, BF16)
-    FATTN_VEC_CASES_ALL_D(Q5_1, BF16)
-    FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
     // TurboQuant KV cache types. These instances are always compiled (see
@@ -3053,56 +3033,37 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO4_0)
 
     FATTN_VEC_CASES_ALL_D(F16,      TURBO2_0)
-    FATTN_VEC_CASES_ALL_D(TURBO2_0, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,     TURBO2_0)
-    FATTN_VEC_CASES_ALL_D(TURBO2_0, Q8_0)
 
     FATTN_VEC_CASES_ALL_D(F16,      TURBO3_0)
-    FATTN_VEC_CASES_ALL_D(TURBO3_0, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,     TURBO3_0)
-    FATTN_VEC_CASES_ALL_D(TURBO3_0, Q8_0)
 
     FATTN_VEC_CASES_ALL_D(F16,      TURBO4_0)
-    FATTN_VEC_CASES_ALL_D(TURBO4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,     TURBO4_0)
-    FATTN_VEC_CASES_ALL_D(TURBO4_0, Q8_0)
 
-    FATTN_VEC_CASES_ALL_D(TURBO2_0, TURBO3_0)
     FATTN_VEC_CASES_ALL_D(TURBO3_0, TURBO2_0)
-    FATTN_VEC_CASES_ALL_D(TURBO2_0, TURBO4_0)
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO2_0)
-    FATTN_VEC_CASES_ALL_D(TURBO3_0, TURBO4_0)
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO3_0)
 
     FATTN_VEC_CASES_ALL_D(TURBO8_0, TURBO8_0)
     FATTN_VEC_CASES_ALL_D(F16,      TURBO8_0)
-    FATTN_VEC_CASES_ALL_D(TURBO8_0, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,     TURBO8_0)
-    FATTN_VEC_CASES_ALL_D(TURBO8_0, Q8_0)
     FATTN_VEC_CASES_ALL_D(TURBO8_0, TURBO4_0)
-    FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO8_0)
 
     // TurboQuant TCQ (trellis-coded) vec cases.
     FATTN_VEC_CASES_ALL_D(TURBO3_TCQ, TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D(TURBO2_TCQ, TURBO2_TCQ)
     FATTN_VEC_CASES_ALL_D(TURBO3_TCQ, TURBO2_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO2_TCQ, TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D(F16,    TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D(F16,    TURBO2_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO3_TCQ, F16)
-    FATTN_VEC_CASES_ALL_D(TURBO2_TCQ, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,   TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D(Q8_0,   TURBO2_TCQ)
     // TurboQuant TCQ1 (1.25 bpv).
     FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, TURBO1_TCQ)
     FATTN_VEC_CASES_ALL_D(TURBO3_TCQ, TURBO1_TCQ)
     FATTN_VEC_CASES_ALL_D(TURBO2_TCQ, TURBO1_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, TURBO3_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, TURBO2_TCQ)
     FATTN_VEC_CASES_ALL_D(F16,    TURBO1_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0,   TURBO1_TCQ)
-    FATTN_VEC_CASES_ALL_D(TURBO1_TCQ, Q8_0)
     FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO1_TCQ)
 
     // Mixed turbo8 / standard-quant / TCQ pairs (VBR mixed-precision caches): each side's
@@ -3114,6 +3075,14 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q4_1,     TURBO3_TCQ)
     FATTN_VEC_CASES_ALL_D(Q5_1,     TURBO4_0)
     FATTN_VEC_CASES_ALL_D(Q4_1,     TURBO4_0)
+
+    // fork 9l-d4b9y: the t4 -> t3/t2 transitions. A VBR cache whose K side has bottomed out at
+    // t4 while the V side keeps degrading passes through exactly these, and they were the only
+    // rung of the ladder with no instance in either tree, so the pair could not be reached by any
+    // GGML_CUDA_FA_QUANTS list (`all` included). Forward only: the mirrored t3-t4 / t2-t4 pairs
+    // are the ones that would mean K is the coarser side.
+    FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(TURBO4_0, TURBO2_TCQ)
 
     return nullptr;
 }
@@ -3584,6 +3553,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // fork 9l-d4b9x: the TurboQuant MMA opt-in is not Volta-only. The kernel body has no
+        // architecture hardcoding (the (DKQ, DV, ncols1, ncols2, type_K, type_V) template takes
+        // `cc` as a runtime argument only to size shared memory against smpbo), and the Volta
+        // branch below already dispatches it. What kept it off Volta's successors is the call
+        // site living inside that branch -- and the Turing branch returns from four places, so
+        // the pick has to go here rather than be hoisted above both.
+        //
+        // The tile ladder in fattn-mma-turbo.cuh stays Volta-shaped: no rung below ncols 32 and
+        // no sparse variant, because the kernel body compiles those to NO_DEVICE_CODE on Volta
+        // and the ladder applies that restriction unconditionally. On Turing+ that costs the
+        // narrow tiles (small query batches stay on VEC) but the wide rungs are correct as-is.
+        if (ggml_cuda_flash_attn_ext_mma_turbo_selectable(dst)) {
+            return BEST_FATTN_KERNEL_MMA_TURBO;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
