@@ -215,6 +215,45 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 // would otherwise make a "turbo MMA" benchmark measure the regular kernels.
 GGML_BACKEND_API uint64_t ggml_backend_cuda_get_turbo_mma_fa_invocations(void);
 
+// fork 9l-d4b9w: the FA kernel families a FLASH_ATTN_EXT can be dispatched to. This is the
+// public spelling of the internal best_fattn_kernel enum; the values are contiguous so they can
+// index ggml_backend_cuda_get_fattn_kernel_invocations().
+//
+// Why this exists next to the turbo counter: that counter counts ONE family, so a delta of 0 is
+// consistent both with "routed to the f16 tensor-core kernel" and with "fell through to
+// VEC/TILE" -- and both decode correctly, so no numeric assertion can separate them either. A
+// guard for a routing claim ("X instead of Y") must be able to observe which of X and Y ran.
+enum ggml_cuda_fattn_kernel {
+    GGML_CUDA_FATTN_KERNEL_NONE        = 0,
+    GGML_CUDA_FATTN_KERNEL_VEC         = 1,
+    GGML_CUDA_FATTN_KERNEL_TILE        = 2,
+    GGML_CUDA_FATTN_KERNEL_MMA_F16     = 3,
+    GGML_CUDA_FATTN_KERNEL_MMA_TURBO   = 4,
+    GGML_CUDA_FATTN_KERNEL_VOLTA_Q8_W4 = 5,
+    GGML_CUDA_FATTN_KERNEL_COUNT       = 6,
+};
+
+// Number of FLASH_ATTN_EXT ops dispatched to each FA kernel family since library start. Read
+// deltas around one compute, exactly like the turbo counter: this is the observable that can
+// tell "9l-d4b9w routed the pair to the f16 tensor-core kernel" from "it was dropped into the
+// VEC/TILE ladder". An out-of-range `kernel` returns 0.
+GGML_BACKEND_API uint64_t ggml_backend_cuda_get_fattn_kernel_invocations(int kernel);
+
+// Does this build have a compiled turbo MMA instance for this (K,V) type pair? False when
+// GGML_CUDA_FA_MMA is off or the pair is absent from GGML_CUDA_FA_QUANTS -- i.e. exactly the
+// condition under which the opt-in must fall back instead of selecting the turbo kernel. Lets a
+// test separate "this build cannot serve the pair" from "this build can, but did not".
+GGML_BACKEND_API bool ggml_backend_cuda_fattn_mma_turbo_pair_compiled(enum ggml_type type_k,
+                                                                     enum ggml_type type_v);
+
+// Does the opt-in's uncompiled-pair fallback (9l-d4b9w) apply to this (K,V) type pair? When it
+// does and the pair has no compiled turbo instance, the dispatch MUST land on
+// GGML_CUDA_FATTN_KERNEL_MMA_F16 rather than on the ordinary VEC/TILE ladder. False for a plain
+// f16 cache, which keeps the selection it always had. Single source of truth: the dispatch calls
+// the same predicate, so a test built on this query cannot drift from the behaviour it asserts.
+GGML_BACKEND_API bool ggml_backend_cuda_fattn_mma_turbo_fallback_applies(enum ggml_type type_k,
+                                                                        enum ggml_type type_v);
+
 // #88: boundary-time reserve of one backend context's fattn f16 dequant scratch
 // (ggml-vbr.h vtable slot)
 GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(

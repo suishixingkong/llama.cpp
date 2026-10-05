@@ -2,43 +2,51 @@
 // BUUN_MERGE_PLAN.md sections 1.4a / 10.9).
 //
 // What it verifies, per (K/V type pair, shape):
-//   1. Dispatch: with GGML_CUDA_TURBO_MMA=1 every case below must increment the
-//      ggml_backend_cuda_get_turbo_mma_fa_invocations() counter (i.e. the op really ran on
-//      the non-f16 MMA kernel, not silently on the regular VEC/TILE/MMA_F16 path). Without the
-//      env var ("fallback" mode) the counter must stay at 0. With the env var but no compiled
-//      instance for the pair ("nopair" mode) it must also stay at 0 -- and the numeric check
-//      must still pass, because 9l-d4b9w routes that case to the f16 tensor-core kernel rather
-//      than letting it fall into VEC/TILE.
+//   1. Routing: WHICH kernel family served the op -- read as a delta of
+//      ggml_backend_cuda_get_fattn_kernel_invocations() around the compute, so the test names the
+//      kernel that actually ran instead of inferring it from an absence. A claim of the form "the
+//      opt-in must route this pair to X rather than Y" needs that: the turbo counter reads 0 for
+//      every non-turbo family, and every one of those families decodes within tolerance, so
+//      "counter stayed 0" cannot tell a correct fallback from the VEC/TILE drop that 9l-d4b9w
+//      removed. Two further queries make the mode's premise checkable rather than assumed:
+//      ggml_backend_cuda_fattn_mma_turbo_pair_compiled() (did this build compile the pair?) and
+//      ggml_backend_cuda_fattn_mma_turbo_fallback_applies() (is the pair inside the fallback's
+//      scope?). Both are answered by the backend, so the test cannot drift from the behaviour.
 //   2. Numerics: the MMA kernel decodes the same quantized KV blocks the CPU reference
 //      decodes, so the two outputs may only differ by in-kernel fp16 tile rounding and
 //      accumulation order -- asserted to stay far below quantization-error scale, and far
 //      below what a wrong tile/group addressing bug (O(1) garbage) would produce.
 //
-// The pairs cover every non-f16 MMA instantiation set (13 symmetric pairs: turbo scalar/TCQ,
-// standard quantized, bf16; plus the mixed pairs); the shapes cover every tile the Volta
-// dispatch ladder can select for D in {128, 256}: gqa 8/4/2/1 -> ncols2 8/4/2/1, small and
-// large nq -> 32-column and 64-column rungs, and a no-mask case -> the ncols2=1 non-GQA path.
-// No model file needed.
+// The pairs cover every non-f16 MMA instantiation set (turbo scalar/TCQ, standard quantized,
+// bf16; plus the mixed pairs) and 14 of the 17 combinations in the default GGML_CUDA_FA_QUANTS
+// selection -- f16-q5_1, q5_1-turbo4_0 and q4_1-turbo4_0 are the three it does not reach. The
+// shapes cover every tile the Volta dispatch ladder can select for D in {128, 256}: gqa 8/4/2/1 ->
+// ncols2 8/4/2/1, small and large nq -> 32-column and 64-column rungs, and a no-mask case ->
+// the ncols2=1 non-GQA path. No model file needed.
 //
 // Usage: test-turbo-mma-fa [fallback|nopair] [--only <substr>]
-//   (default)  sets GGML_CUDA_TURBO_MMA=1 and asserts the MMA counter advances.
-//   fallback   leaves the env var off and asserts the counter never advances; the numeric
-//              comparison still runs against whatever regular kernel the backend picks.
-//   nopair     sets the env var (so the opt-in is live) and asserts the counter stays at 0 for
-//              every non-f16 pair: this is the 9l-d4b9w contract -- a pair with no compiled MMA
-//              instance must be reported uncompiled and routed to the f16 tensor-core kernel,
-//              not silently dropped into the VEC/TILE ladder. The numeric comparison must still
-//              pass, which is the point: the fallback decodes correctly, it is not a no-op.
-//              Only meaningful on a build where the pairs really are uncompiled (the default
-//              GGML_CUDA_FA_MMA=OFF, or a FA_QUANTS list without them); the mode says so loudly
-//              if a pair turns out to be compiled after all, because then it is measuring
-//              nothing.
+//   (default)  sets GGML_CUDA_TURBO_MMA=1, then holds each pair to the contract its build state
+//              implies: a pair this build compiled must be dispatched to the turbo kernel, and a
+//              pair it did not compile must NOT be claimed by the opt-in -- 9l-d4b9w has to land
+//              it on the f16 tensor-core kernel, not on VEC/TILE. Green on any build config,
+//              because "this pair was never compiled here" is a fact about the build, not a
+//              defect, and the counter-only assertion used to report it as 184 failures.
+//   nopair     sets the env var AND requires the stronger premise that this build compiled NO
+//              pair. That is the only cell where the fallback is the sole thing that can serve the
+//              pair, so the "the op ran on the f16 tensor-core kernel, and on neither VEC nor
+//              TILE" assertion is 9l-d4b9w's proof rather than a restatement of "nothing ran".
+//              A pair that turns out to be compiled makes the mode void for it -- reported as a
+//              void premise, never as a kernel bug.
+//   fallback   leaves the env var off and REQUIRES that it really is off, by reading it back. An
+//              exported GGML_CUDA_TURBO_MMA would otherwise turn this mode into a silent duplicate
+//              of nopair while every one of its `== 0` assertions still reported PASS.
 //   --only     runs only the cases whose name contains <substr> (fast device iteration).
 //
-// Each case reports nan(cpu/cuda) and sentinel_left; an output element still holding the
-// pre-compute sentinel was never written by the kernel. Both are asserted to be 0 -- without
-// them a NaN output would silently "pass" (every diff comparison against NaN is false, so a
-// naive max_diff stays 0).
+// Every case prints the kernel family that served it (kernel=...), so a log says which path ran
+// rather than leaving the reader to deduce it. Each case also reports nan(cpu/cuda) and
+// sentinel_left; an output element still holding the pre-compute sentinel was never written by
+// the kernel. Both are asserted to be 0 -- without them a NaN output would silently "pass" (every
+// diff comparison against NaN is false, so a naive max_diff stays 0).
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -120,6 +128,59 @@ struct run_stats {
     size_t n_sentinel = 0;
 };
 
+// Which FA kernel family served an op. The family counters are the only observable that can name
+// the kernel, so they are read as a delta around the compute, like the turbo counter.
+struct fa_kernel_counters {
+    uint64_t by_family[GGML_CUDA_FATTN_KERNEL_COUNT];
+    uint64_t turbo;
+
+    static fa_kernel_counters read() {
+        fa_kernel_counters c{};
+        for (int k = 0; k < GGML_CUDA_FATTN_KERNEL_COUNT; ++k) {
+            c.by_family[k] = ggml_backend_cuda_get_fattn_kernel_invocations(k);
+        }
+        c.turbo = ggml_backend_cuda_get_turbo_mma_fa_invocations();
+        return c;
+    }
+
+    fa_kernel_counters delta(const fa_kernel_counters & before) const {
+        fa_kernel_counters d{};
+        for (int k = 0; k < GGML_CUDA_FATTN_KERNEL_COUNT; ++k) {
+            d.by_family[k] = by_family[k] - before.by_family[k];
+        }
+        d.turbo = turbo - before.turbo;
+        return d;
+    }
+
+    // The one family this op was dispatched to, or -1 when the deltas do not describe exactly
+    // one op. One FLASH_ATTN_EXT is one launch, so anything else means the probe, not the kernel.
+    int which() const {
+        int found = -1;
+        for (int k = 0; k < GGML_CUDA_FATTN_KERNEL_COUNT; ++k) {
+            if (by_family[k] == 0) {
+                continue;
+            }
+            if (found >= 0 || by_family[k] != 1) {
+                return -1;
+            }
+            found = k;
+        }
+        return found;
+    }
+};
+
+const char * fattn_kernel_name(const int k) {
+    switch (k) {
+        case GGML_CUDA_FATTN_KERNEL_NONE:        return "none";
+        case GGML_CUDA_FATTN_KERNEL_VEC:         return "vec";
+        case GGML_CUDA_FATTN_KERNEL_TILE:        return "tile";
+        case GGML_CUDA_FATTN_KERNEL_MMA_F16:     return "mma_f16";
+        case GGML_CUDA_FATTN_KERNEL_MMA_TURBO:   return "mma_turbo";
+        case GGML_CUDA_FATTN_KERNEL_VOLTA_Q8_W4: return "volta_q8_w4";
+        default:                                 return "none-or-mixed";
+    }
+}
+
 // Builds and runs one FLASH_ATTN_EXT on `backend`, returns the f32 output plus run_stats.
 // `prefill_sentinel` (when not NaN) is written into the output tensor before the compute so
 // that unwritten elements can be told apart from written NaN.
@@ -192,13 +253,11 @@ std::vector<float> run_fa(
 int main(int argc, char ** argv) {
     testing t;
 
-    // Three modes, distinguished by (env var, expected counter):
-    //   mma      env=1  counter >= 1 on non-f16 pairs  -- the opt-in reaches the turbo kernel
-    //   fallback env=0  counter == 0 everywhere        -- the opt-in changes nothing by default
-    //   nopair   env=1  counter == 0 everywhere        -- the opt-in is live but no pair is
-    //                                                      compiled, so 9l-d4b9w must route to
-    //                                                      the f16 tensor-core kernel instead
-    //                                                      of falling into VEC/TILE
+    // Three modes, distinguished by (env var, expected routing):
+    //   mma      env=1  compiled pair -> turbo kernel; uncompiled pair -> the fallback's target
+    //   fallback env=0  no family may be the turbo kernel
+    //   nopair   env=1  AND no pair compiled: every in-scope pair must land on the f16
+    //                   tensor-core kernel, and on neither VEC nor TILE -- 9l-d4b9w's proof
     // The first argv token selects the mode; anything else is treated as the default (mma).
     const std::string mode = argc > 1 ? std::string(argv[1]) : std::string("mma");
     const bool fallback_mode = mode == "fallback";
@@ -214,14 +273,32 @@ int main(int argc, char ** argv) {
         setenv("GGML_CUDA_TURBO_MMA", "1", 1);
 #endif
     }
+
+    // fallback's premise is an ABSENCE, so it has to be asserted, not merely not-created. A
+    // GGML_CUDA_TURBO_MMA exported by the shell turns this mode into a copy of nopair, and every
+    // assertion in it is of the `== 0` form, so it would keep reporting PASS while measuring
+    // something else. Refuse to run instead of printing a claim that is not true.
+    const char * env_now = std::getenv("GGML_CUDA_TURBO_MMA");
+    const bool env_on = env_now != nullptr && std::atoi(env_now) != 0;
+    if (fallback_mode && env_on) {
+        printf("FATAL: GGML_CUDA_TURBO_MMA=%s is set in the environment, but this mode's whole\n"
+               "  premise is that the opt-in is OFF. With it on, this run degenerates into nopair\n"
+               "  and any PASS below would be measuring the wrong cell. Clear it and re-run:\n"
+               "    set GGML_CUDA_TURBO_MMA=\n", env_now);
+        return 2;
+    }
+    if (!fallback_mode && !env_on) {
+        printf("FATAL: failed to set GGML_CUDA_TURBO_MMA for this mode.\n");
+        return 2;
+    }
     printf("mode: %s (GGML_CUDA_TURBO_MMA=%s)\n",
            fallback_mode ? "fallback" : nopair_mode ? "nopair" : "mma",
-           fallback_mode ? "unset" : "1");
+           env_now != nullptr ? env_now : "unset");
     if (nopair_mode) {
-        printf("  expecting: every non-f16 pair has NO compiled MMA instance, so the opt-in\n"
-               "  routes to the f16 tensor-core kernel. If a pair reports a counter advance,\n"
-               "  this build DOES have that instance compiled and the mode measures nothing\n"
-               "  (use the default mode instead, or configure without that pair).\n");
+        printf("  expecting: this build compiled NO turbo MMA pair, so the opt-in must report each\n"
+               "  one uncompiled and 9l-d4b9w must route it to the f16 tensor-core kernel -- which\n"
+               "  is asserted by name below. A pair that turns out to be compiled makes this mode\n"
+               "  void for that pair (reported as such, not as a kernel bug).\n");
     }
 
     ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(0));
@@ -232,19 +309,23 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr cpu_backend(ggml_backend_cpu_init());
     GGML_ASSERT(cpu_backend);
 
-    // K/V type pairs: every non-f16 MMA pair instantiated by the current GGML_CUDA_FA_QUANTS
-    // selection -- the 13 symmetric pairs (turbo scalar/TCQ, standard quantized, bf16) plus the
-    // mixed pairs. This exercises every general-loader decode branch (turbo 128-element rotation
-    // groups, q4_0/q4_1/q5_0/q5_1/q8_0 32-element blocks, bf16 pseudo-blocks) and the asymmetric
-    // combinations, not only the original turbo pairs. All pairs are in GGML_CUDA_FA_QUANTS, so
-    // the dispatch-counter assertions apply to every case.
+    // K/V type pairs: the symmetric pairs (turbo scalar/TCQ, standard quantized, bf16) plus the
+    // mixed pairs, covering every non-f16 MMA instantiation set and 14 of the 17 combinations in
+    // the default GGML_CUDA_FA_QUANTS list. This exercises every general-loader decode branch
+    // (turbo 128-element rotation groups, q4_0/q4_1/q5_0/q5_1/q8_0 32-element blocks, bf16
+    // pseudo-blocks) and the asymmetric combinations, not only the original turbo pairs. Whether
+    // a pair is *compiled* in a given build is a separate question, asked per pair below -- it is
+    // not assumed, because the default list, GGML_CUDA_FA_MMA and the configure cache can each
+    // disagree with it.
     struct kv_pair {
         ggml_type k;
         ggml_type v;
     };
     const kv_pair pairs[] = {
         // f16 K/V goes through the original f16 loader: this is the control that separates
-        // "test harness + MMA path" from "the general non-f16 tile loader".
+        // "test harness + MMA path" from "the general non-f16 tile loader". It is also outside
+        // the opt-in's fallback scope, so the control arm below is derived from the predicate
+        // rather than from "everything except f16".
         {GGML_TYPE_F16,       GGML_TYPE_F16},
         {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO8_0},
         {GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ},
@@ -267,6 +348,7 @@ int main(int argc, char ** argv) {
         {GGML_TYPE_Q4_1,      GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_Q5_1,      GGML_TYPE_Q4_1},
         {GGML_TYPE_TURBO8_0,  GGML_TYPE_TURBO4_0},
+        {GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO3_TCQ},
         {GGML_TYPE_Q8_0,      GGML_TYPE_TURBO4_0},
         {GGML_TYPE_F16,       GGML_TYPE_Q8_0},
     };
@@ -281,9 +363,16 @@ int main(int argc, char ** argv) {
     }
 
     for (const kv_pair & p : pairs) {
+        // Two build/scope facts the mode's contract is written in terms of. Asking the backend
+        // (rather than re-deriving them here) is what keeps the test honest: these are the same
+        // predicates the dispatch uses, so a PASS here means what it says.
+        const bool pair_compiled = ggml_backend_cuda_fattn_mma_turbo_pair_compiled(p.k, p.v);
+        const bool in_scope      = ggml_backend_cuda_fattn_mma_turbo_fallback_applies(p.k, p.v);
+        const char * name_k = ggml_type_name(p.k);
+        const char * name_v = ggml_type_name(p.v);
+
         for (const fa_shape & s : shapes) {
-            std::string name = std::string(ggml_type_name(p.k)) + "-" +
-                ggml_type_name(p.v) + " " + s.label;
+            std::string name = std::string(name_k) + "-" + name_v + " " + s.label;
             if (!only.empty() && name.find(only) == std::string::npos) {
                 continue;
             }
@@ -322,36 +411,56 @@ int main(int argc, char ** argv) {
                 // element that still holds it after the compute was never written by the kernel.
                 constexpr float SENTINEL = 1234.5f;
                 run_stats cuda_stats;
-                const uint64_t inv_before = ggml_backend_cuda_get_turbo_mma_fa_invocations();
+                const fa_kernel_counters kc_before = fa_kernel_counters::read();
                 const std::vector<float> cuda_out = run_fa(
                     cuda_backend.get(), p.k, p.v, s, q_src, k_bytes, v_bytes, mask_ptr,
                     SENTINEL, &cuda_stats);
-                const uint64_t inv_delta =
-                    ggml_backend_cuda_get_turbo_mma_fa_invocations() - inv_before;
+                const fa_kernel_counters kc = fa_kernel_counters::read().delta(kc_before);
+                const int  ran       = kc.which();
+                const uint64_t inv_delta = kc.turbo;
 
-                // 1. Dispatch sanity: the counter proves which kernel family ran.
-                //    f16 K/V is the control - it goes through the original f16 loader, so the
-                //    TurboQuant MMA path must NOT claim it. Every other pair must be claimed,
-                //    which is what separates "harness + MMA path" from the non-f16 tile loader.
-                const bool expect_turbo_mma = !(p.k == GGML_TYPE_F16 && p.v == GGML_TYPE_F16);
+                // 1. Routing: name the family that served this case, then hold it to what this
+                //    mode can legitimately require. "Compiled here?" and "in the fallback's
+                //    scope?" come from the backend, so each arm below states a fact, not a guess.
                 if (mma_mode) {
-                    if (expect_turbo_mma) {
-                        tt.assert_true("opt-in MMA dispatch counter advanced (GGML_CUDA_TURBO_MMA=1)",
-                                       inv_delta >= 1);
-                        if (inv_delta == 0) {
-                            printf("    (MMA path not selected: is \"%s-%s\" in this build's "
-                                   "GGML_CUDA_FA_QUANTS, and is the device Volta?)\n",
-                                   ggml_type_name(p.k), ggml_type_name(p.v));
+                    if (pair_compiled) {
+                        tt.assert_true("compiled pair is dispatched to the turbo MMA kernel",
+                                       ran == GGML_CUDA_FATTN_KERNEL_MMA_TURBO);
+                        if (ran != GGML_CUDA_FATTN_KERNEL_MMA_TURBO) {
+                            printf("    (this build reports \"%s-%s\" as COMPILED, yet the dispatch "
+                                   "chose %s. That is a routing defect -- the guard tables and the "
+                                   "compiled instances disagree -- not a build-configuration "
+                                   "question.)\n", name_k, name_v, fattn_kernel_name(ran));
                         }
                     } else {
-                        tt.assert_true("control pair f16/f16 keeps the original f16 loader",
-                                       inv_delta == 0);
+                        tt.assert_true("the opt-in does not claim a pair this build did not compile",
+                                       ran != GGML_CUDA_FATTN_KERNEL_MMA_TURBO);
+                        if (in_scope) {
+                            // 9l-d4b9w checked in the default mode too: with the opt-in live and the
+                            // instance missing, "tensor cores, whatever it takes" means MMA_F16.
+                            tt.assert_true("9l-d4b9w: uncompiled pair lands on the f16 tensor-core kernel",
+                                           ran == GGML_CUDA_FATTN_KERNEL_MMA_F16);
+                            tt.assert_true("9l-d4b9w: uncompiled pair is NOT dropped into VEC/TILE",
+                                           kc.by_family[GGML_CUDA_FATTN_KERNEL_VEC] == 0 &&
+                                           kc.by_family[GGML_CUDA_FATTN_KERNEL_TILE] == 0);
+                            if (ran != GGML_CUDA_FATTN_KERNEL_MMA_F16) {
+                                printf("    (9l-d4b9w: \"%s-%s\" is uncompiled in this build and in the "
+                                       "fallback's scope, so MMA_F16 was required -- but %s served it.)\n",
+                                       name_k, name_v, fattn_kernel_name(ran));
+                            }
+                        } else {
+                            printf("    (control: \"%s-%s\" is outside the opt-in's fallback scope "
+                                   "(plain f16 KV), so the opt-in deliberately changes nothing and the "
+                                   "ordinary selection stands -- %s)\n",
+                                   name_k, name_v, fattn_kernel_name(ran));
+                        }
                     }
                 } else if (nopair_mode) {
                     // 9l-d4b9w: the opt-in is live, so the pair is *not* skipped for lack of an
-                    // env var -- it lacks an instance. The counter must therefore stay at 0, and
-                    // the numeric comparison below is the load-bearing half: it proves the
-                    // f16-MMA fallback actually decodes the same blocks correctly.
+                    // env var -- it lacks an instance. The counter must stay at 0, and the family
+                    // must be the f16 tensor-core kernel: that pair of facts is the fallback's
+                    // proof, and it is only available in this mode because only here is the
+                    // fallback the sole candidate.
                     //
                     // A counter advance here is not a kernel bug, it means the premise is false
                     // (this pair IS compiled in this build), so say that instead of leaving the
@@ -362,16 +471,34 @@ int main(int argc, char ** argv) {
                     if (inv_delta != 0) {
                         printf("    (nopair mode is void for this pair: \"%s-%s\" has a compiled "
                                "MMA instance in this build -- counter advanced. Use the default "
-                               "mode to test the turbo kernel.)\n",
-                               ggml_type_name(p.k), ggml_type_name(p.v));
+                               "mode to test the turbo kernel.)\n", name_k, name_v);
+                    } else if (in_scope) {
+                        tt.assert_true("9l-d4b9w: the uncompiled pair IS routed to the f16 tensor-core kernel",
+                                       ran == GGML_CUDA_FATTN_KERNEL_MMA_F16);
+                        tt.assert_true("9l-d4b9w: the uncompiled pair is NOT dropped into VEC/TILE",
+                                       kc.by_family[GGML_CUDA_FATTN_KERNEL_VEC] == 0 &&
+                                       kc.by_family[GGML_CUDA_FATTN_KERNEL_TILE] == 0);
+                        if (ran != GGML_CUDA_FATTN_KERNEL_MMA_F16) {
+                            printf("    (9l-d4b9w: \"%s-%s\" is uncompiled and in the fallback's scope, "
+                                   "so the f16 tensor-core kernel was required -- but %s served it. "
+                                   "Before 9l-d4b9w this is exactly what the VEC/TILE ladder did.)\n",
+                                   name_k, name_v, fattn_kernel_name(ran));
+                        }
                     } else {
-                        printf("    (uncompiled pair routed away from the turbo MMA kernel as "
-                               "expected; the numeric check below is what proves the fallback "
-                               "decodes correctly)\n");
+                        printf("    (control: \"%s-%s\" is outside the opt-in's fallback scope "
+                               "(plain f16 KV) and has no turbo instance to begin with, so this pair "
+                               "cannot witness the fallback; the ordinary selection stands -- %s)\n",
+                               name_k, name_v, fattn_kernel_name(ran));
                     }
                 } else {
                     tt.assert_true("MMA dispatch counter stayed at 0 without the env var",
                                    inv_delta == 0);
+                    tt.assert_true("no turbo MMA launch without the env var",
+                                   ran != GGML_CUDA_FATTN_KERNEL_MMA_TURBO);
+                    if (pair_compiled) {
+                        printf("    (the opt-in is off, so this pair's compiled turbo instance is "
+                               "deliberately not selected -- %s served it)\n", fattn_kernel_name(ran));
+                    }
                 }
 
                 // 2. Output sanity: NaN/Inf and unwritten elements must never survive a compute.
@@ -410,8 +537,9 @@ int main(int argc, char ** argv) {
                 // MMA as fp16 as well, so ~1e-3 relative is expected fp noise; a wrong tile or
                 // rotation-group addressing bug would produce O(|out|) garbage instead.
                 const double tol = 2e-2*max_out + 1e-4;
-                printf("    invocations=%llu nan(cpu/cuda)=%zu/%zu sentinel_left=%zu "
-                       "max_diff=%.3e (at %zu) mean_diff=%.3e max|out|=%.3f tol=%.3e\n",
+                printf("    kernel=%-9s compiled=%d in_scope=%d invocations=%llu nan(cpu/cuda)=%zu/%zu "
+                       "sentinel_left=%zu max_diff=%.3e (at %zu) mean_diff=%.3e max|out|=%.3f tol=%.3e\n",
+                       fattn_kernel_name(ran), (int) pair_compiled, (int) in_scope,
                        (unsigned long long) inv_delta, cpu_stats.n_nan, cuda_stats.n_nan,
                        cuda_stats.n_sentinel, max_diff, arg, mean_diff, max_out, tol);
                 tt.assert_true("MMA output matches the CPU reference decode within fp16 tile noise",
@@ -420,5 +548,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    return 0;
+    // Exit code and a summary with the failure counts: without this the process returned 0 no
+    // matter how many assertions failed, so a ctest/CI invocation could not see a red run at all.
+    return t.summary();
 }

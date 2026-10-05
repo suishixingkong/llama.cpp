@@ -2972,6 +2972,49 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_enabled(void) {
     return turbo_mma_enabled;
 }
 
+// fork 9l-d4b9w: the authoritative scope of the opt-in's uncompiled-pair fallback -- "with
+// GGML_CUDA_TURBO_MMA=1, which KV codecs must land on the f16 tensor-core kernel rather than
+// falling through to the VEC/TILE ladder when their turbo MMA instance is missing?"
+//
+// The turbo types repeat the list inside ggml_cuda_get_best_fattn_kernel()'s is_turbo_kv lambda,
+// which sits in slice 9l-d4b8l's frozen neighbourhood and therefore cannot be hoisted (see
+// test_9l_d4b8l_guards.py's `blast` row). test_9l_d4b9w_guards.py pins the two lists equal, and
+// pins that each of those types is ALSO ggml_is_quantized(), so the explicit cases are documentation
+// plus a drift alarm rather than the only thing standing between turbo and the ladder. The dispatch
+// below and the exported query read THIS function, so the scope has exactly one edit site.
+//
+// bf16 belongs here, and is why the list is explicit. It reports ggml_is_quantized() == false
+// (ggml.c: blck_size 1, is_quantized false) while every TURBO* type reports true, so the previous
+// `is_turbo_kv || ggml_is_quantized` test let bf16 through -- and bf16 has no turbo pair at all, so
+// under the opt-in it was silently served by VEC/TILE, the very confound 9l-d4b9w exists to remove.
+// A plain f16 cache must still keep the selection it always had, which is why F16 stays out.
+static bool ggml_cuda_fattn_kv_needs_mma_f16_fallback(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_BF16:
+            return true;
+        default:
+            return ggml_is_quantized(type);
+    }
+}
+
+bool ggml_backend_cuda_fattn_mma_turbo_fallback_applies(const enum ggml_type type_k,
+                                                       const enum ggml_type type_v) {
+    return ggml_cuda_fattn_kv_needs_mma_f16_fallback(ggml_type(type_k)) ||
+           ggml_cuda_fattn_kv_needs_mma_f16_fallback(ggml_type(type_v));
+}
+
+bool ggml_backend_cuda_fattn_mma_turbo_pair_compiled(const enum ggml_type type_k,
+                                                     const enum ggml_type type_v) {
+    return ggml_cuda_fattn_mma_turbo_pair_compiled(ggml_type(type_k), ggml_type(type_v));
+}
+
 #define FATTN_VEC_CASE(D, type_K_case, type_V_case)                                                                                \
     if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                                                                    \
         const bool type_K_okay = type_K == GGML_TYPE_##type_K_case || (type_K == GGML_TYPE_F32 && GGML_TYPE_##type_K_case == GGML_TYPE_F16); \
@@ -3624,11 +3667,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // into the reserved f16 scratch -- instead of falling through to VEC/TILE. Falling
         // through made the A/B meaningless: the turbo kernel was compared against the vector
         // kernel, and a build that omitted the pair looked identical to a build where the turbo
-        // path was merely slower. Scoped to quantized/turbo KV so a plain f16 cache keeps the
-        // selection it already had.
+        // path was merely slower. Scoped to the decoded KV codecs so a plain f16 cache keeps the
+        // selection it already had; bf16 is one of them now (it has no turbo pair at all and
+        // reports is_quantized() == false, so it was the last one still dropped into the ladder).
+        // The scope itself lives in ggml_cuda_fattn_kv_needs_mma_f16_fallback(), which the
+        // exported ggml_backend_cuda_fattn_mma_turbo_fallback_applies() also reads, so the
+        // dispatch and anything asserting on the scope cannot drift apart.
         if (ggml_cuda_flash_attn_ext_mma_turbo_enabled() &&
-                (is_turbo_kv(K->type) || is_turbo_kv(V->type) ||
-                 ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
+                (ggml_cuda_fattn_kv_needs_mma_f16_fallback(K->type) ||
+                 ggml_cuda_fattn_kv_needs_mma_f16_fallback(V->type))) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
@@ -3759,9 +3806,39 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// fork 9l-d4b9w: per-family dispatch counters. The turbo counter above counts ONE family, so a
+// delta of 0 around a compute cannot distinguish "9l-d4b9w routed the pair to the f16 tensor-core
+// kernel" from "the pair was dropped into the VEC/TILE ladder" -- both are 0, and both decode
+// within tolerance, so no numeric assertion separates them either. These counters are the
+// observable that makes the routing claim falsifiable, and they are recorded at the single point
+// where the selection is turned into a launch, so they name the kernel that actually ran rather
+// than the one that was merely considered.
+static std::atomic<uint64_t> g_fattn_kernel_invocations[GGML_CUDA_FATTN_KERNEL_COUNT];
+
+static int ggml_cuda_fattn_kernel_family(const best_fattn_kernel k) {
+    switch (k) {
+        case BEST_FATTN_KERNEL_NONE:        return GGML_CUDA_FATTN_KERNEL_NONE;
+        case BEST_FATTN_KERNEL_VEC:         return GGML_CUDA_FATTN_KERNEL_VEC;
+        case BEST_FATTN_KERNEL_TILE:        return GGML_CUDA_FATTN_KERNEL_TILE;
+        case BEST_FATTN_KERNEL_MMA_F16:     return GGML_CUDA_FATTN_KERNEL_MMA_F16;
+        case BEST_FATTN_KERNEL_MMA_TURBO:   return GGML_CUDA_FATTN_KERNEL_MMA_TURBO;
+        case BEST_FATTN_KERNEL_VOLTA_Q8_W4: return GGML_CUDA_FATTN_KERNEL_VOLTA_Q8_W4;
+    }
+    return GGML_CUDA_FATTN_KERNEL_NONE;
+}
+
+uint64_t ggml_backend_cuda_get_fattn_kernel_invocations(const int kernel) {
+    if (kernel < 0 || kernel >= GGML_CUDA_FATTN_KERNEL_COUNT) {
+        return 0;
+    }
+    return g_fattn_kernel_invocations[kernel].load(std::memory_order_relaxed);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    g_fattn_kernel_invocations[ggml_cuda_fattn_kernel_family(best)].fetch_add(1, std::memory_order_relaxed);
+    switch (best) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
