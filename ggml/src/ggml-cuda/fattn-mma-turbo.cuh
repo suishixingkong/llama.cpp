@@ -201,6 +201,13 @@ static bool ggml_cuda_fattn_mma_turbo_pair_compiled(ggml_type type_k, ggml_type 
 #if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO4_0, TURBO4_0)
 #endif
+// fork 9l-d4b9y: t4 x TCQ. The VBR ladder reaches this when the K side has bottomed out at
+// t4 (4.125 bpv) while the V side keeps degrading; K staying the finer side is what makes the
+// pair reachable at all under the K>=V rule. No instance existed in either tree, so no
+// GGML_CUDA_FA_QUANTS list could select it.
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
+    TURBO_MMA_PAIR_TEST(TURBO4_0, TURBO3_TCQ)
+#endif
 #if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_TEST(TURBO3_0, TURBO3_0)
 #endif
@@ -296,6 +303,9 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_typed(ggml_backend_cuda_cont
 #if defined(GGML_CUDA_FA_TURBO4_0_TURBO4_0) && GGML_CUDA_FA_TURBO4_0_TURBO4_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO4_0, TURBO4_0)
 #endif
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
+    TURBO_MMA_PAIR_CALL(TURBO4_0, TURBO3_TCQ)
+#endif
 #if defined(GGML_CUDA_FA_TURBO3_0_TURBO3_0) && GGML_CUDA_FA_TURBO3_0_TURBO3_0 && GGML_CUDA_FA_MMA
     TURBO_MMA_PAIR_CALL(TURBO3_0, TURBO3_0)
 #endif
@@ -378,6 +388,9 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_case_typed(
 #if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO3_TCQ, TURBO3_TCQ)
 #endif
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
+    TURBO_MMA_PARTIAL_CALL(TURBO4_0, TURBO3_TCQ)
+#endif
 #if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_CALL(TURBO2_TCQ, TURBO2_TCQ)
 #endif
@@ -423,6 +436,9 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_partial_available(ggml_type type_
 #endif
 #if defined(GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ) && GGML_CUDA_FA_TURBO3_TCQ_TURBO3_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO3_TCQ, TURBO3_TCQ)
+#endif
+#if defined(GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ) && GGML_CUDA_FA_TURBO4_0_TURBO3_TCQ && GGML_CUDA_FA_MMA
+    TURBO_MMA_PARTIAL_TEST(TURBO4_0, TURBO3_TCQ)
 #endif
 #if defined(GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ) && GGML_CUDA_FA_TURBO2_TCQ_TURBO2_TCQ && GGML_CUDA_FA_MMA
     TURBO_MMA_PARTIAL_TEST(TURBO2_TCQ, TURBO2_TCQ)
