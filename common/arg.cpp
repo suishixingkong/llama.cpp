@@ -444,6 +444,8 @@ static bool common_vbr_digit_rung(
         {"5",  GGML_TYPE_Q5_1,       "q5_1"},
         {"4",  GGML_TYPE_TURBO4_0,   "t4"},
         {"3",  GGML_TYPE_TURBO3_TCQ, "t3tcq"},
+        {"2",  GGML_TYPE_TURBO2_TCQ, "t2tcq"},
+        {"1",  GGML_TYPE_TURBO1_TCQ, "t1tcq"},
     };
     const digit_alias * table = nullptr;
     size_t n = 0;
@@ -3392,7 +3394,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--vbr-entry"}, "TIER",
         "dynamic VBR entry tier: f16 (quality-first default), or any rung of the selected "
-        "--vbr-codec ladder (turbo: t8/t4/t3/t2/t1; auto: t8/q5_1/q4_1/t4/t3; "
+        "--vbr-codec ladder (turbo: t8/t4/t3/t2/t1; auto: t8/q5_1/q4_1/t4/t3/t2/t1; "
         "classic: q8_0/q5_1/q4_1). "
         "Starting below F16 is an explicit quality-for-bandwidth trade; tensors still degrade "
         "toward --vbr-floor as the KV VRAM budget fills",

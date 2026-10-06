@@ -27,7 +27,7 @@ inline const llama_vbr_codec_ladder & llama_vbr_ladder(llama_vbr_codec codec) {
     // that fit later rewrites into turbo or classic. It interleaves the two standard-quant rungs
     // between the turbo ones so a descent step buys the cheapest representation that is still
     // strictly better than the one above it, instead of dropping straight from turbo8 to turbo4.
-    // Descending bpv: 16 / 8.125 / 6 / 5 / 4.125 / 3.25.
+    // Descending bpv: 16 / 8.125 / 6 / 5 / 4.125 / 3.25 / 2.25 / 1.25.
     static constexpr ggml_type auto_rungs[] = {
         GGML_TYPE_F16,
         GGML_TYPE_TURBO8_0,
@@ -35,6 +35,8 @@ inline const llama_vbr_codec_ladder & llama_vbr_ladder(llama_vbr_codec codec) {
         GGML_TYPE_Q4_1,
         GGML_TYPE_TURBO4_0,
         GGML_TYPE_TURBO3_TCQ,
+        GGML_TYPE_TURBO2_TCQ,
+        GGML_TYPE_TURBO1_TCQ,
     };
     // fork 9l-vbr-classic-ladder: q5_1/q4_1 instead of q4_0 gives classic three bands
     // (16 -> 8.5 -> 6 -> 5) rather than two, so its bottom is 5.0 bpv instead of 4.5.
@@ -54,7 +56,7 @@ inline const llama_vbr_codec_ladder & llama_vbr_ladder(llama_vbr_codec codec) {
     };
     static const llama_vbr_codec_ladder auto_l = {
         "auto", auto_rungs,
-        sizeof(auto_rungs) / sizeof(auto_rungs[0]), GGML_TYPE_TURBO3_TCQ, true,
+        sizeof(auto_rungs) / sizeof(auto_rungs[0]), GGML_TYPE_TURBO1_TCQ, true,
     };
     switch (codec) {
         case LLAMA_VBR_CODEC_TURBO:   return turbo;

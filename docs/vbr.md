@@ -1,7 +1,7 @@
 # VBR: variable-bit-rate KV cache
 
 VBR changes KV representations **at runtime**. The default ladder is `auto`: f16 → turbo8 → q5_1 →
-q4_1 → turbo4 → turbo3_tcq (16 → 3.25 effective bits/value), which interleaves the two
+q4_1 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq (16 → 1.25 effective bits/value), which interleaves the two
 standard-quant rungs between the turbo ones so each descent step buys the cheapest representation
 still better than the one above it. It is a ladder in its own right, not a preference order over
 the other two. For BailingMoE3/Ling geometry that cannot host turbo KV rows at all, `auto` is
@@ -22,7 +22,7 @@ That single flag is the complete product:
 - a KV VRAM budget is derived automatically from the memory left after weights/compute
   (the fit pass), or falls back to the floor-layout cost of the full context;
 - when `-c` is unset, the advertised context is the budget's capacity at the **floor**
-  tier (the selected ladder's own endpoint: t3tcq for `auto`, t1 for `turbo`, q4_1 for
+  tier (the selected ladder's own endpoint: t1 for `auto` and `turbo`, q4_1 for
   `classic`), capped at the model's training context;
 - as mapped KV approaches the budget, the runtime controller degrades tensors down the
   price order, cheapest quality-per-byte first. With `-v` you can watch the
@@ -37,9 +37,9 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 |---|---|
 | no cache flags | common CLI tools default to dynamic VBR on both sides with a t4 quality floor; the tensors still enter at F16 and degrade only under pressure. |
 | `-ctk vbr` / `-ctv vbr` / `-ct vbr` | explicitly select VBR and, without `--vbr-floor`, open the selected codec's complete ladder. An explicitly non-VBR side (`-ctv q8_0`) is pinned — it never degrades and counts in the aggregate at its fixed bits/value. |
-| `--vbr-codec <auto\|turbo\|classic>` | representation ladder. `auto` is the default: f16 → turbo8 → q5_1 → q4_1 → turbo4 → turbo3_tcq. It is only downgraded, to classic, when the model's KV geometry cannot host turbo rows. `turbo` (f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq) is the pure turbo ladder and the only one that may read the measured turbo orders and policies; it also reaches deeper (1.25 vs 3.25). Explicit families are strict. |
+| `--vbr-codec <auto\|turbo\|classic>` | representation ladder. `auto` is the default: f16 → turbo8 → q5_1 → q4_1 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq. It is only downgraded, to classic, when the model's KV geometry cannot host turbo rows. `turbo` (f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq) is the pure turbo ladder and the only one that may read the measured turbo orders and policies. Explicit families are strict. |
 | `--vbr-budget <tier\|number>` (`--vbr-bits`) | `dynamic` (default) = runtime controller. A tier (`t8/t4/t3/t2/t1`) or a number selects a **fixed** static tier instead — no runtime degrades. |
-| `--vbr-entry <tier>` | dynamic entry tier, any rung of the selected ladder: `auto` accepts `f16`, `t8`, `q5_1`, `q4_1`, `t4`, `t3`; `turbo` accepts `f16`, `t8`, `t4`, `t3`, `t2`, `t1`; `classic` accepts `f16`, `q8_0`, `q5_1`, `q4_1`. A lower entry is an explicit quality-for-bandwidth trade. |
+| `--vbr-entry <tier>` | dynamic entry tier, any rung of the selected ladder: `auto` accepts `f16`, `t8`, `q5_1`, `q4_1`, `t4`, `t3`, `t2`, `t1`; `turbo` accepts `f16`, `t8`, `t4`, `t3`, `t2`, `t1`; `classic` accepts `f16`, `q8_0`, `q5_1`, `q4_1`. A lower entry is an explicit quality-for-bandwidth trade. |
 | `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate K+V bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the reachable range of the selected ladder — minimum 3.25 for `auto`, 1.25 for `turbo`, 5.0 for `classic`; maximum depends on the selected entry and any pinned side. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses the ladder's own endpoint (`auto` t3tcq = 3.25, `turbo` t1 = 1.25, `classic` q4_1 = 5.0). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
 | `--vbr-policy <json>` | fixed mode only: a measured policy ladder; the best rung ≤ the fixed budget (and ≥ the floor) is selected and its per-layer schedule applied. |
