@@ -492,7 +492,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
-    printf("  --vbr-codec <turbo|classic>                        dynamic VBR codec ladder (default: turbo)\n");
+    printf("  --vbr-codec <auto|turbo|classic>                   dynamic VBR codec ladder (default: turbo)\n");
     printf("  --vbr-entry <tier>                                  dynamic VBR entry tier (default: f16)\n");
     printf("  --vbr-floor <tier|bits|auto>                        arm dynamic VBR (both sides), aggregate floor\n");
     printf("                                                    (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
@@ -756,6 +756,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     params.vbr_codec = LLAMA_VBR_CODEC_TURBO;
                 } else if (codec == "classic") {
                     params.vbr_codec = LLAMA_VBR_CODEC_CLASSIC;
+                } else if (codec == "auto") {
+                    // fork 9l-vbr-auto-ladder: `auto` is a ladder of its own -- it interleaves
+                    // q5_1/q4_1 between the turbo rungs -- not a parse-time alias for turbo. The
+                    // common parser has accepted it all along; llama-bench rejected it, so the
+                    // ladder the fork defaults to elsewhere was the one this tool could not name.
+                    params.vbr_codec = LLAMA_VBR_CODEC_AUTO;
                 } else {
                     invalid_param = true;
                     break;
@@ -1730,7 +1736,10 @@ struct test {
         vbr            = inst.vbr;
         vbr_k          = inst.vbr_k;
         vbr_v          = inst.vbr_v;
-        vbr_codec      = inst.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo";
+        // fork 9l-vbr-auto-ladder: the enum has three values, so name all three. The old two-way
+        // ternary reported `auto` as "turbo" -- the ladder the fork defaults to, mislabelled.
+        vbr_codec      = inst.vbr_codec == LLAMA_VBR_CODEC_AUTO    ? "auto" :
+                         inst.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo";
         vbr_entry      = inst.vbr_entry;
         vbr_floor      = inst.vbr_min_bits;
         vbr_floor_explicit = inst.vbr_min_bits_explicit;

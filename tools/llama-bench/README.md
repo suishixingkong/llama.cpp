@@ -56,7 +56,7 @@ test parameters:
   -ub, --ubatch-size <n>                    (default: 512)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
-  --vbr-codec <turbo|classic>               dynamic VBR codec ladder (default: turbo)
+  --vbr-codec <auto|turbo|classic>          dynamic VBR codec ladder (default: turbo)
   --vbr-entry <tier>                        dynamic VBR entry tier (default: f16)
   --vbr-floor <tier|bits|auto>
                                             arm dynamic VBR and set its aggregate floor
@@ -213,7 +213,7 @@ If any test in the matrix uses a VBR cache side, the Markdown table gains these 
 | ----- | ---- | ------- |
 | `type_k` / `type_v` | string | `vbr` only for the movable side; pinned sides retain their concrete cache type |
 | `vbr_entry` | string | resolved dynamic entry tier, or `none` for a non-VBR matrix row |
-| `vbr_codec` | string | resolved dynamic codec ladder (`turbo` or `classic`) |
+| `vbr_codec` | string | resolved dynamic codec ladder (`auto`, `turbo` or `classic`) |
 | `vbr_floor` / `vbr_floor_explicit` | number / boolean | resolved aggregate floor and whether it was explicitly supplied |
 | `vbr_vram_bytes` / `vbr_vram_explicit` | integer / boolean | resolved KV VRAM budget (`0` means auto) and whether the option was explicitly supplied |
 
