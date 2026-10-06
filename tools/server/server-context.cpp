@@ -19191,7 +19191,7 @@ server_context_meta server_context::get_meta() const {
         /* vbr_dynamic            */ impl->params_base.vbr_dynamic(),
         /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
         /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
-        /* vbr_codec              */ impl->params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo",
+        /* vbr_codec              */ impl->params_base.vbr_codec == LLAMA_VBR_CODEC_AUTO ? "auto" : impl->params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo", // fork 9l-vbr-auto-ladder: `auto` is a ladder of its own -- name it instead of folding it into "turbo"
         /* vbr_entry_type_k       */ ggml_type_name(impl->params_base.cache_type_k),
         /* vbr_entry_type_v       */ ggml_type_name(impl->params_base.cache_type_v),
         /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
