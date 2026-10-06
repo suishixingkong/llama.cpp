@@ -130,7 +130,17 @@ void llama_memory_vbr_budget_partition(
     }
 }
 
-// Dynamic-VBR degrade tier ladder and measured price order (generated table).
+// Band indices of the TURBO ladder, as emitted by the generated baked-order registry
+// (scripts/make-vbr-pricing-tables.py -> llama-vbr-degrade-orders.inc). Value k means "the step
+// landing on turbo rung k+1": T8=0 is f16->turbo8, T4=1 is turbo8->turbo4, and so on.
+//
+// fork 9l-vbr-auto-ladder: these names are no longer used as generic band aliases anywhere in the
+// controller. On a ladder that is not the turbo one band 1 is not "T4" -- on auto it is t8->q5_1 --
+// so the controller now asks the ladder instead: vbr_tier_type() resolves band -> rung,
+// llama_vbr_codec_hard_seal_tier() finds the turbo4 crossing, and vbr_tier_aliases() builds the
+// order-file names from the rungs. The enum survives only because the generated registry names its
+// literal band numbers with it, and that registry is a turbo artefact: llama_vbr_codec_uses_turbo_
+// artifacts() is what keeps any other ladder from reading it.
 enum vbr_tier : uint8_t {
     VBR_TIER_T8,
     VBR_TIER_T4,
@@ -140,12 +150,19 @@ enum vbr_tier : uint8_t {
 };
 bool llama_kv_cache::vbr_hard_seal_classify(
         vbr_hard_seal_classification & out) const noexcept {
-    if (vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC) {
+    // The seal boundary is the band that lands on turbo4 -- "crossing from the restorable t8 band
+    // into t4" -- and it is derived from the ladder rather than taken as the literal VBR_TIER_T4.
+    // On the mixed auto ladder turbo4 is band 3, not band 1, so a fixed number would have sealed
+    // from q5_1 down and protected two bands that need no protection. A ladder with no turbo4 rung
+    // (classic) returns n_rungs, i.e. no step is ever >= it: every classic representation stays
+    // full-domain, which is what this case used to hardcode.
+    const size_t seal_tier = llama_vbr_codec_hard_seal_tier(vbr_params_.codec);
+    if (seal_tier >= llama_vbr_ladder(vbr_params_.codec).n_rungs) {
         out = {};
-        return true; // every classic representation remains full-domain
+        return true;
     }
     return vbr_classify_hard_seal(
-        vbr_degrade_order_, VBR_TIER_T4, out);
+        vbr_degrade_order_, (uint8_t) seal_tier, out);
 }
 
 void llama_kv_cache::vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) {
@@ -294,6 +311,42 @@ static ggml_type vbr_tier_type(llama_vbr_codec codec, uint8_t tier) {
         GGML_ABORT("invalid %s VBR tier %d", ladder.name, (int) tier);
     }
     return ladder.rungs[rung];
+}
+
+// Order-file tier spellings for a codec, derived from that codec's ladder: band i is rungs[i+1],
+// so every accepted spelling of a rung maps to its band. Deriving rather than listing is what
+// removes the whole "band number drift" failure mode. The classic ladder gaining q5_1 between q8_0
+// and its bottom is the worked example: a hand-written {"q4", 1} would have kept parsing and
+// silently started naming q5_1 instead of the 4-bit rung, with no warning anywhere.
+static const std::map<std::string, uint8_t> & vbr_tier_aliases(llama_vbr_codec codec) {
+    static const std::map<llama_vbr_codec, std::map<std::string, uint8_t>> tables = [] {
+        std::map<llama_vbr_codec, std::map<std::string, uint8_t>> built;
+        const llama_vbr_codec codecs[] = {
+            LLAMA_VBR_CODEC_TURBO, LLAMA_VBR_CODEC_CLASSIC, LLAMA_VBR_CODEC_AUTO,
+        };
+        for (llama_vbr_codec c : codecs) {
+            const auto & ladder = llama_vbr_ladder(c);
+            auto & table = built[c];
+            for (size_t i = 1; i < ladder.n_rungs; ++i) {
+                const ggml_type t = ladder.rungs[i];
+                const uint8_t band = (uint8_t) (i - 1);
+                table[ggml_type_name(t)] = band;  // canonical name, e.g. "q5_1"
+                switch (t) {                      // the short spelling the tier tables always used
+                    case GGML_TYPE_TURBO8_0:   table["t8"] = band; break;
+                    case GGML_TYPE_TURBO4_0:   table["t4"] = band; break;
+                    case GGML_TYPE_TURBO3_TCQ: table["t3"] = band; break;
+                    case GGML_TYPE_TURBO2_TCQ: table["t2"] = band; break;
+                    case GGML_TYPE_TURBO1_TCQ: table["t1"] = band; break;
+                    case GGML_TYPE_Q8_0:       table["q8"] = band; break;
+                    case GGML_TYPE_Q5_1:       table["q5"] = band; break;
+                    case GGML_TYPE_Q4_1:       table["q4"] = band; break;
+                    default: break;
+                }
+            }
+        }
+        return built;
+    }();
+    return tables.at(codec);
 }
 
 struct llama_kv_cache::vbr_shared_scratch_registry {
@@ -1091,8 +1144,14 @@ llama_kv_cache::llama_kv_cache(
 
     turbo_vbr_layer_policy vbr_layer_policy =
         turbo_vbr_layer_policy_from_env(hparams.n_layer_all, type_k, type_v, kv_size);
-    if (vbr_params_.dynamic && vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC && vbr_layer_policy.enabled) {
-        throw std::runtime_error("VBR_LAYER_SCHEDULE is Turbo-specific and cannot be used with classic VBR");
+    // VBR_LAYER_SCHEDULE is a per-layer type assignment measured on the turbo ladder only, so it is
+    // valid for that ladder alone. The auto ladder is not a superset of it: its bands mean
+    // different things and it has no t2/t1 rungs, so a schedule written for turbo would be partly
+    // inapplicable and partly misread. Refuse it rather than half-apply it.
+    if (vbr_params_.dynamic && !llama_vbr_codec_uses_turbo_artifacts(vbr_params_.codec) &&
+            vbr_layer_policy.enabled) {
+        throw std::runtime_error("VBR_LAYER_SCHEDULE is Turbo-specific and cannot be used with the " +
+                std::string(llama_vbr_ladder(vbr_params_.codec).name) + " VBR codec");
     }
     if (vbr_layer_policy.enabled && turbo_vbr_layer_strict_enabled() && vbr_layer_policy.ignored_bands > 0) {
         throw std::runtime_error(format(
@@ -2175,14 +2234,16 @@ llama_kv_cache::llama_kv_cache(
             vbr_capture_unit_attempt_boundary_.assign(
                 layers.size() * 2, UINT64_MAX);
             // Co-tenancy band cap: demand-driven sheds may only spend the leading
-            // entry-to-first-rung band of the price order. For Turbo this is the one
-            // cheap AND domain-reversible F16->T8 rung; classic representations all
-            // remain full-domain. A custom VBR_DEGRADE_ORDER carries no band guarantee,
-            // so it disables demand shedding.
+            // entry-to-first-rung band of the price order -- band 0, which every ladder begins
+            // with (f16->t8 on turbo and on auto, f16->q8_0 on classic). It is the one cheap AND
+            // domain-reversible rung: both rungs straddle the full/tapped boundary at or above it,
+            // so shedding into it cannot lose representable range. Reading it as "the T8 band" was
+            // only ever true of the turbo ladder. A custom VBR_DEGRADE_ORDER carries no band
+            // guarantee, so it disables demand shedding.
             first_band_end_ = 0;
             if (getenv("VBR_DEGRADE_ORDER") == nullptr) {
                 while (first_band_end_ < vbr_degrade_order_.size() &&
-                       vbr_degrade_order_[first_band_end_].tier == VBR_TIER_T8) {
+                       vbr_degrade_order_[first_band_end_].tier == 0) {
                     first_band_end_++;
                 }
             }
@@ -2318,8 +2379,12 @@ llama_kv_cache::llama_kv_cache(
             // — erases sink-row requant accumulation across any hop count for ~8 MiB + µs per
             // degrade. VBR_STASH_ROWS overrides (0 disables).
             const char * stash_env = getenv("VBR_STASH_ROWS");
-            vbr_stash_rows_ = vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC
-                ? 0 : (stash_env ? (uint32_t) atoi(stash_env) : 128);
+            // Keyed on the LAYOUT, not on the codec name: the stash exists because turbo-row
+            // transcoding accumulates requant error at the sink, so any cache laid out for turbo
+            // rows wants it -- including the mixed auto ladder. A classic cache has no turbo rows
+            // and gets none.
+            vbr_stash_rows_ = needs_turbo_layout
+                ? (stash_env ? (uint32_t) atoi(stash_env) : 128) : 0;
             if (vbr_stash_rows_ > 0) {
                 LLAMA_LOG_INFO("%s: VBR f16 sink-stash: %u rows per (layer,side)\n",
                         __func__, vbr_stash_rows_);
@@ -2441,8 +2506,10 @@ llama_kv_cache::llama_kv_cache(
         // turbo types have their own FWHT rotation — skip upstream Hadamard rotation
         const bool is_turbo_k = ggml_type_is_turbo(type_k) || vbr_layer_policy.has_turbo_k;
         const bool is_turbo_v = ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo_v;
-        const bool classic_dynamic = vbr_params_.dynamic &&
-            vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC;
+        // Layout-keyed, like the stash: a cache that can hold turbo rows must never also apply the
+        // upstream Hadamard rotation, because the turbo rungs decode through their own FWHT and
+        // would be rotated twice. The dynamic auto ladder is such a cache even at an f16 entry.
+        const bool classic_dynamic = vbr_params_.dynamic && !needs_turbo_layout;
 
         attn_rot_k =
             !attn_rot_disable &&
@@ -5191,8 +5258,12 @@ void llama_kv_cache::vbr_invalidate_dirty_stash() {
 // maximally protected in EVERY band, front V cheapest at the bottom rungs, K positionally
 // flat. Sub-t8 mid-band shapes disagree across models (deviation ~0.2) — the mean is a
 // hedge, not a truth; a measured per-model order is always better.
-// Classic deliberately reuses only the first two positional bands for F16->Q8_0->Q4_0; it never
-// interprets a baked Turbo price table as classic pricing.
+// The generic curve is keyed by BAND POSITION, not by the transition it happens to describe on the
+// turbo ladder. Every non-turbo ladder reuses it positionally: classic's three bands (f16->q8_0,
+// q8_0->q5_1, q5_1->q4_1) take rows 0..2, and the auto ladder's five (f16->t8, t8->q5_1,
+// q5_1->q4_1, q4_1->t4, t4->t3tcq) take rows 0..4 -- row 0 happens to be the same f16->t8 step,
+// the rest are the same hedge classic already makes. A baked Turbo price table is never read this
+// way; those are band-keyed measurements and only the turbo ladder may consume them.
 // [band][is_v][grid p=0..1 step 1/16]; lower value = degrade earlier.
 static const float vbr_generic_rank[5][2][17] = {
     { // fp16-t8
@@ -5226,17 +5297,11 @@ void llama_kv_cache::vbr_load_degrade_order() {
         return;
     }
     if (const char * path = getenv("VBR_DEGRADE_ORDER")) {
-        static const std::map<std::string, uint8_t> turbo_tiers = {
-            {"t8", VBR_TIER_T8}, {"t4", VBR_TIER_T4}, {"t3", VBR_TIER_T3_TCQ},
-            {"t2", VBR_TIER_T2_TCQ}, {"t1", VBR_TIER_T1_TCQ},
-        };
-        static const std::map<std::string, uint8_t> classic_tiers = {
-            {"q8", 0}, {"q8_0", 0}, {"q4", 1}, {"q4_0", 1},
-        };
+        const auto & tiers = vbr_tier_aliases(vbr_params_.codec);
         std::ifstream f(path);
         std::string tok;
         bool ok = (bool) f;
-        // tokens "<il><k|v>:<t8|t4|t3|t2|t1>", whitespace-separated
+        // tokens "<il><k|v>:<tier>", whitespace-separated; the tier names are this codec's rungs
         while (ok && f >> tok) {
             const size_t colon = tok.find(':');
             ok = colon != std::string::npos && colon >= 2;
@@ -5245,8 +5310,6 @@ void llama_kv_cache::vbr_load_degrade_order() {
             }
             const char side = tok[colon - 1];
             const std::string tier = tok.substr(colon + 1);
-            const auto & tiers = vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC
-                ? classic_tiers : turbo_tiers;
             const auto it = tiers.find(tier);
             // the layer id must be the ENTIRE prefix and a valid layer (atoi silently accepted
             // garbage as layer 0 and >255 truncated through the uint8 cast)
@@ -5280,10 +5343,11 @@ void llama_kv_cache::vbr_load_degrade_order() {
                 __func__, path, tok.c_str());
         vbr_degrade_order_.clear();
     }
-    // Measured tables are Turbo-specific. Classic deliberately uses the
-    // conservative generic curves; a model popular enough to justify a full
-    // measured sweep is expected to use the full Turbo ladder instead.
-    if (vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC) {
+    // The measured baked orders are Turbo-specific AND band-keyed, so only the turbo ladder may
+    // read them. Every other ladder -- classic, and the mixed auto ladder, whose band 1 is
+    // t8->q5_1 rather than turbo's t8->t4 -- uses the conservative generic curves. A model popular
+    // enough to justify a full measured sweep is expected to select the turbo ladder for it.
+    if (!llama_vbr_codec_uses_turbo_artifacts(vbr_params_.codec)) {
         vbr_synth_generic_order();
         return;
     }
@@ -6241,7 +6305,9 @@ bool llama_kv_cache::vbr_downward_policy_input(
         int demanded_device,
         vbr_downward_policy_child & output) const noexcept {
     output = {};
-    if (vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC) {
+    // The downward-policy child plan is part of the turbo artefact set (it feeds the measured
+    // policy), so only the turbo ladder may build it.
+    if (!llama_vbr_codec_uses_turbo_artifacts(vbr_params_.codec)) {
         return false;
     }
     try {
@@ -7086,10 +7152,11 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
 // checkpoint admission; the isolation gate strips only this bounded region.
 bool llama_kv_cache::vbr_capture_policy_snapshot(
         vbr_capture_stability_token & output) const noexcept {
-    // Portable classic artifact recipes are not part of the initial live
-    // ladder delivery. Refuse capture rather than labeling Q8/Q4 rows with
-    // Turbo codebook, rotation and tapped-domain identity.
-    if (vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC) {
+    // A capture recipe records turbo codebook, rotation and tapped-domain identity. Only the turbo
+    // ladder's rungs all carry that identity; the standard-quant rungs of the classic ladder and of
+    // the mixed auto ladder do not, so capturing them would label q8/q5/q4 rows with a turbo
+    // identity. Refuse instead.
+    if (!llama_vbr_codec_uses_turbo_artifacts(vbr_params_.codec)) {
         return false;
     }
     const auto * tracker = vbr_generation_tracker_get();

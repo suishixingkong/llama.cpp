@@ -633,8 +633,12 @@ struct common_params {
     bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
     bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
-    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO; // concrete/provisional family; never AUTO at runtime
-    bool vbr_codec_auto = true;     // resolve from model KV geometry before fit/context creation
+    // fork 9l-vbr-auto-ladder: AUTO is a real codec, so this default is the ladder the CLI actually
+    // runs -- f16 -> turbo8 -> q5_1 -> q4_1 -> turbo4 -> turbo3_tcq -- not a placeholder that fit
+    // rewrites. Resolution is now a one-way downgrade: only a model that cannot run a ladder
+    // containing turbo rungs changes it (to classic, or to a static f16 cache).
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_AUTO;
+    bool vbr_codec_auto = true;     // the family was not pinned by the user; may be downgraded before fit
     bool vbr_codec_explicit = false;
     std::string vbr_entry = "f16";       // dynamic VBR entry tier; quality-first default remains F16
     std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
@@ -686,7 +690,10 @@ struct common_params {
     }
     void reset_vbr_runtime_state() {
         vbr_budget = "dynamic";
-        vbr_codec = LLAMA_VBR_CODEC_TURBO;
+        // fork 9l-vbr-auto-ladder: the reset default tracks the member default above -- AUTO is the
+        // ladder the CLI runs, not a placeholder that fit rewrites. The two must agree or a reuse of
+        // common_params would silently start on a different ladder than a fresh one.
+        vbr_codec = LLAMA_VBR_CODEC_AUTO;
         vbr_codec_auto = true;
         vbr_entry = "f16";
         vbr_min_bits = "auto";

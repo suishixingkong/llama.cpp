@@ -2972,6 +2972,9 @@ bool llama_model_supports_vbr_codec(const llama_model * model, llama_vbr_codec c
     switch (codec) {
         case LLAMA_VBR_CODEC_TURBO:   return model->supports_turbo_vbr();
         case LLAMA_VBR_CODEC_CLASSIC: return model->supports_classic_vbr();
+        // The auto ladder contains turbo rungs, so it needs the turbo padded/rotated layout and is
+        // exactly as demanding as the turbo ladder is.
+        case LLAMA_VBR_CODEC_AUTO:    return model->supports_turbo_vbr();
     }
     return false;
 }

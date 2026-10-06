@@ -44,8 +44,11 @@ inline llama_bench_vbr_plan llama_bench_vbr_make_plan(
     plan.entry = ggml_type_name(plan.entry_type);
     plan.floor_explicit = floor_explicit;
     plan.explicit_floor_bits = floor_explicit ? common_vbr_floor_bits(floor, codec) : 0.0;
+    // classic names its own implicit floor; the ladders that contain a turbo4 rung both use t4.
+    // Keyed on CLASSIC rather than on "not turbo" because this is about the floor the ladder can
+    // reach, not about which measured artefacts it may read.
     plan.implicit_option_floor_bits = common_vbr_floor_bits(
-        codec == LLAMA_VBR_CODEC_CLASSIC ? "q4_0" : "t4", codec);
+        codec == LLAMA_VBR_CODEC_CLASSIC ? "q4_1" : "t4", codec);
     plan.budget_bytes = common_vbr_vram_bytes(vram);
     plan.budget_explicit = vram_explicit;
     return plan;

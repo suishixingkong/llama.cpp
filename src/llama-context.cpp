@@ -4905,32 +4905,43 @@ llama_context * llama_init_from_model(
 
     const bool vbr_active = params.vbr_dynamic ||
         params.vbr_vram_budget_bytes > 0 || params.vbr_min_bits > 0.0;
-    if (vbr_active &&
-        params.vbr_codec != LLAMA_VBR_CODEC_TURBO &&
-        params.vbr_codec != LLAMA_VBR_CODEC_CLASSIC) {
+    if (vbr_active && !llama_vbr_codec_valid(params.vbr_codec)) {
         LLAMA_LOG_ERROR("%s: invalid VBR codec %d\n", __func__, int(params.vbr_codec));
         return nullptr;
     }
 
-    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+    if (params.vbr_dynamic && !llama_model_supports_vbr_codec(model, params.vbr_codec)) {
         // Classic live retiering is currently implemented and validated for the
         // BailingMoE3/Ling coupled cache. DSV4 retains its separate q8_0-capped
         // policy; ordinary DSA does not thread VBR into its child caches yet.
-        if (!model->supports_classic_vbr()) {
+        if (params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
             LLAMA_LOG_ERROR("%s: classic VBR currently supports BailingMoE3/Ling models only\n", __func__);
-            return nullptr;
+        } else {
+            // The auto ladder contains turbo rungs, so it is exactly as demanding as turbo.
+            LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete %s VBR ladder\n",
+                    __func__, llama_vbr_ladder(params.vbr_codec).name);
         }
-        if (!llama_vbr_codec_contains(params.vbr_codec, params.type_k) ||
-            !llama_vbr_codec_contains(params.vbr_codec, params.type_v)) {
-            LLAMA_LOG_ERROR("%s: classic VBR entry must be f16, q8_0 or q4_0\n", __func__);
-            return nullptr;
-        }
+        return nullptr;
     }
 
-    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_TURBO &&
-            !model->supports_turbo_vbr()) {
-        LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete Turbo VBR ladder\n", __func__);
-        return nullptr;
+    // Every ladder owns its entry: a side whose entry type is not one of its rungs could never
+    // move, so it is a configuration error, not a pin. Classic has always been checked here; the
+    // auto ladder is just as capable of being handed a q8_0 entry, which is not one of its rungs.
+    // The turbo ladder is deliberately exempt -- its pinned-side handling accepts a concrete
+    // non-ladder type as an intended pin.
+    if (params.vbr_dynamic && !llama_vbr_codec_uses_turbo_artifacts(params.vbr_codec)) {
+        if (!llama_vbr_codec_contains(params.vbr_codec, params.type_k) ||
+            !llama_vbr_codec_contains(params.vbr_codec, params.type_v)) {
+            const auto & ladder = llama_vbr_ladder(params.vbr_codec);
+            std::string rungs;
+            for (size_t i = 0; i < ladder.n_rungs; ++i) {
+                rungs += i > 0 ? ", " : "";
+                rungs += ggml_type_name(ladder.rungs[i]);
+            }
+            LLAMA_LOG_ERROR("%s: %s VBR entry must be one of: %s\n",
+                    __func__, ladder.name, rungs.c_str());
+            return nullptr;
+        }
     }
 
     // TurboQuant TCQ KV types (turbo1_tcq / turbo2_tcq / turbo3_tcq) are enabled. Both

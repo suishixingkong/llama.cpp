@@ -376,9 +376,12 @@ static bool common_vbr_budget_is_dynamic(const std::string & raw) {
 static llama_vbr_codec common_vbr_codec_from_str(const std::string & raw, bool & auto_select) {
     const std::string value = common_vbr_lower(raw);
     if (value == "auto") {
+        // fork 9l-vbr-auto-ladder: `auto` is a ladder, not a parse-time placeholder. It is a real
+        // codec from here on; the only thing left to resolve is whether the model can run it at
+        // all (it contains turbo rungs, so it needs the turbo layout), and that is a downgrade,
+        // never a reinterpretation.
         auto_select = true;
-        // Provisional parse-time family. Model-aware resolution happens before fit.
-        return LLAMA_VBR_CODEC_TURBO;
+        return LLAMA_VBR_CODEC_AUTO;
     }
     auto_select = false;
     if (value == "turbo") {
@@ -390,61 +393,109 @@ static llama_vbr_codec common_vbr_codec_from_str(const std::string & raw, bool &
     throw std::invalid_argument("unsupported VBR codec: " + raw + " (expected auto, turbo or classic)");
 }
 
+// Rung spellings, shared by every codec. Whether a codec accepts one is decided by that codec's
+// own ladder (llama_vbr_codec_contains), so a type outside the selected ladder is rejected here
+// rather than reinterpreted later. Bare digits cannot be shared this way -- "8" is t8 under turbo
+// but q8_0 under classic -- so they are listed per codec in common_vbr_digit_rung below.
+static bool common_vbr_named_rung(const std::string & s, ggml_type & out, const char *& schedule_name) {
+    if (s == "f16" || s == "fp16") { out = GGML_TYPE_F16;      schedule_name = "f16";   return true; }
+    if (s == "q8"  || s == "q8_0") { out = GGML_TYPE_Q8_0;     schedule_name = "q8_0";  return true; }
+    if (s == "q5"  || s == "q5_1") { out = GGML_TYPE_Q5_1;     schedule_name = "q5_1";  return true; }
+    if (s == "q4"  || s == "q4_1") { out = GGML_TYPE_Q4_1;     schedule_name = "q4_1";  return true; }
+    if (s == "t8" || s == "turbo8" || s == "turbo8_0") { out = GGML_TYPE_TURBO8_0; schedule_name = "t8"; return true; }
+    if (s == "t4" || s == "turbo4" || s == "turbo4_0") { out = GGML_TYPE_TURBO4_0; schedule_name = "t4"; return true; }
+    if (s == "t3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
+        out = GGML_TYPE_TURBO3_TCQ; schedule_name = "t3tcq"; return true;
+    }
+    if (s == "t2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
+        out = GGML_TYPE_TURBO2_TCQ; schedule_name = "t2tcq"; return true;
+    }
+    if (s == "t1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
+        out = GGML_TYPE_TURBO1_TCQ; schedule_name = "t1tcq"; return true;
+    }
+    return false;
+}
+
+// Bare digits name "the rung at that nominal width" *inside one ladder*, so they have to be listed
+// per codec. The mixed auto ladder takes the turbo digit for its turbo rungs ("8" -> t8, "4" -> t4,
+// "3" -> t3tcq) and "5" for q5_1, its only rung near that width; its standard-quant 4-bit rung is
+// spelled q4/q4_1. Every one of these is pinned by test_vbr_ladder_guards.py so the mapping is a
+// reviewed decision rather than an accident.
+static bool common_vbr_digit_rung(
+        const std::string & s, llama_vbr_codec codec, ggml_type & out, const char *& schedule_name) {
+    struct digit_alias { const char * digit; ggml_type type; const char * name; };
+    static const digit_alias turbo_digits[] = {
+        {"16", GGML_TYPE_F16,        "f16"},
+        {"8",  GGML_TYPE_TURBO8_0,   "t8"},
+        {"4",  GGML_TYPE_TURBO4_0,   "t4"},
+        {"3",  GGML_TYPE_TURBO3_TCQ, "t3tcq"},
+        {"2",  GGML_TYPE_TURBO2_TCQ, "t2tcq"},
+        {"1",  GGML_TYPE_TURBO1_TCQ, "t1tcq"},
+    };
+    static const digit_alias classic_digits[] = {
+        {"16", GGML_TYPE_F16,  "f16"},
+        {"8",  GGML_TYPE_Q8_0, "q8_0"},
+        {"5",  GGML_TYPE_Q5_1, "q5_1"},
+        {"4",  GGML_TYPE_Q4_1, "q4_1"},
+    };
+    static const digit_alias auto_digits[] = {
+        {"16", GGML_TYPE_F16,        "f16"},
+        {"8",  GGML_TYPE_TURBO8_0,   "t8"},
+        {"5",  GGML_TYPE_Q5_1,       "q5_1"},
+        {"4",  GGML_TYPE_TURBO4_0,   "t4"},
+        {"3",  GGML_TYPE_TURBO3_TCQ, "t3tcq"},
+    };
+    const digit_alias * table = nullptr;
+    size_t n = 0;
+    switch (codec) {
+        case LLAMA_VBR_CODEC_TURBO:   table = turbo_digits;   n = sizeof(turbo_digits)   / sizeof(*table); break;
+        case LLAMA_VBR_CODEC_CLASSIC: table = classic_digits; n = sizeof(classic_digits) / sizeof(*table); break;
+        case LLAMA_VBR_CODEC_AUTO:    table = auto_digits;    n = sizeof(auto_digits)    / sizeof(*table); break;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (s == table[i].digit) {
+            out = table[i].type;
+            schedule_name = table[i].name;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The rung names of a ladder, for error messages that cannot go stale.
+static std::string common_vbr_ladder_rungs(llama_vbr_codec codec) {
+    const auto & ladder = llama_vbr_ladder(codec);
+    std::string out;
+    for (size_t i = 0; i < ladder.n_rungs; ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += ggml_type_name(ladder.rungs[i]);
+    }
+    return out;
+}
+
 static bool common_vbr_budget_to_type(
         const std::string & raw, llama_vbr_codec codec,
         ggml_type & out, const char *& schedule_name) {
     const std::string s = common_vbr_lower(raw);
-    if (s == "f16" || s == "fp16" || s == "16") {
-        out = GGML_TYPE_F16;
-        schedule_name = "f16";
-        return true;
-    }
-    if (codec == LLAMA_VBR_CODEC_CLASSIC) {
-        if (s == "q8" || s == "q8_0" || s == "8") {
-            out = GGML_TYPE_Q8_0;
-            schedule_name = "q8_0";
-            return true;
-        }
-        if (s == "q4" || s == "q4_0" || s == "4") {
-            out = GGML_TYPE_Q4_0;
-            schedule_name = "q4_0";
-            return true;
-        }
+    if (!common_vbr_named_rung(s, out, schedule_name) &&
+        !common_vbr_digit_rung(s, codec, out, schedule_name)) {
         return false;
     }
-    if (s == "t8" || s == "turbo8" || s == "turbo8_0" || s == "8") {
-        out = GGML_TYPE_TURBO8_0;
-        schedule_name = "t8";
-        return true;
-    }
-    if (s == "t4" || s == "turbo4" || s == "turbo4_0" || s == "4") {
-        out = GGML_TYPE_TURBO4_0;
-        schedule_name = "t4";
-        return true;
-    }
-    if (s == "t3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq" || s == "3") {
-        out = GGML_TYPE_TURBO3_TCQ;
-        schedule_name = "t3tcq";
-        return true;
-    }
-    if (s == "t2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq" || s == "2") {
-        out = GGML_TYPE_TURBO2_TCQ;
-        schedule_name = "t2tcq";
-        return true;
-    }
-    if (s == "t1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq" || s == "1") {
-        out = GGML_TYPE_TURBO1_TCQ;
-        schedule_name = "t1tcq";
-        return true;
-    }
-    return false;
+    // The ladder is the authority on what this codec can represent: a spelling that is valid for
+    // another codec is not valid for this one, and must not be silently mapped.
+    return llama_vbr_codec_contains(codec, out);
 }
 
 ggml_type common_vbr_entry_type(const std::string & entry, llama_vbr_codec codec) {
     ggml_type type = GGML_TYPE_COUNT;
     const char * name = nullptr;
     if (!common_vbr_budget_to_type(entry, codec, type, name)) {
-        throw std::invalid_argument("unsupported VBR entry tier: " + entry);
+        throw std::invalid_argument(
+            "unsupported VBR entry tier \"" + entry + "\" for the " +
+            llama_vbr_ladder(codec).name + " ladder (rungs: " +
+            common_vbr_ladder_rungs(codec) + ")");
     }
     return type;
 }
@@ -489,7 +540,7 @@ static bool common_vbr_floor_to_bits(
         return true;
     }
     // Bare numbers are literal aggregate bits/value. Named aliases select the exact
-    // physical rung (notably q8_0 is 8.5 bpv and q4_0 is 4.5 bpv).
+    // physical rung (notably q8_0 is 8.5 bpv and q4_1 is 5.0 bpv).
     char * end = nullptr;
     const double parsed = std::strtod(s.c_str(), &end);
     if (end != s.c_str() && end && *end == '\0') {
@@ -852,28 +903,36 @@ void common_params_postprocess_vbr(common_params & params) {
     params.vbr_budget = budget;
     const auto & ladder = llama_vbr_ladder(params.vbr_codec);
 
-    if (params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+    // VBR_LAYER_SCHEDULE and --vbr-policy are measured turbo artefacts. They are keyed by band
+    // number, and a band means something else on another ladder, so they are refused for every
+    // codec that is not the turbo one -- classic, and the mixed auto ladder. The message names the
+    // ladder so the fix (add --vbr-codec turbo) is obvious.
+    if (!llama_vbr_codec_uses_turbo_artifacts(params.vbr_codec)) {
+        const char * codec_name = ladder.name;
         if (common_env_present("VBR_LAYER_SCHEDULE")) {
             throw std::invalid_argument(
-                "VBR_LAYER_SCHEDULE is Turbo-specific and cannot be used with --vbr-codec classic");
+                "VBR_LAYER_SCHEDULE is Turbo-specific and cannot be used with --vbr-codec " +
+                std::string(codec_name) + "; use --vbr-codec turbo");
         }
         bool explicit_policy = false;
         if (!common_vbr_policy_arg(params, explicit_policy).empty()) {
             throw std::invalid_argument(
-                "--vbr-policy/VBR_POLICY_LADDER is Turbo-specific and cannot be used with --vbr-codec classic");
+                "--vbr-policy/VBR_POLICY_LADDER is Turbo-specific and cannot be used with "
+                "--vbr-codec " + std::string(codec_name) + "; use --vbr-codec turbo");
         }
     }
 
-    // Auto uses Turbo provisionally until model metadata is available. The common CLI uses
-    // a conservative t4 quality floor for Turbo; classic uses its q4_0 endpoint. Typing a Turbo VBR cache alias is an
-    // intentional opt-in to the complete Turbo ladder, so preserve the historical t1 floor
-    // unless --vbr-floor was also typed. Fixed-tier --vbr-budget modes inherit no floor.
+    // The common CLI uses a conservative t4 quality floor for the ladders that contain a turbo4
+    // rung (turbo and auto); classic names its own q4_1 endpoint instead. Typing a turbo-family VBR
+    // cache alias is an intentional opt-in to the complete ladder, so preserve the historical
+    // deepest-floor behaviour unless --vbr-floor was also typed. Fixed-tier --vbr-budget modes
+    // inherit no floor.
     if (!params.vbr_min_bits_explicit) {
         const bool explicit_vbr_alias =
             (params.vbr_cache_type_k && params.vbr_cache_type_k_explicit) ||
             (params.vbr_cache_type_v && params.vbr_cache_type_v_explicit);
         params.vbr_min_bits = params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC
-            ? "q4_0"
+            ? "q4_1"
             : (common_vbr_budget_is_dynamic(budget) && !explicit_vbr_alias ? "t4" : "auto");
     }
 
@@ -1024,7 +1083,8 @@ void common_params_postprocess_vbr(common_params & params) {
             params.cache_type_v = entry_type;
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
-        // computed at (implicit Turbo default t4; explicit Turbo -ct vbr uses t1; classic uses q4_0)
+        // computed at (an implicit floor is t4; an explicit -ct vbr with no floor falls to the
+        // ladder's own endpoint, which is t1 for turbo but t3tcq for the auto ladder)
         params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
             : llama_vbr_type_bits_per_value(ladder.default_floor);
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
@@ -3319,9 +3379,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_BUDGET").set_hidden());
     add_opt(common_arg(
         {"--vbr-codec"}, "CODEC",
-        "dynamic VBR codec ladder: auto = prefer Turbo when every KV layer supports it, otherwise "
-        "use classic when supported (default); turbo = F16 -> T8 -> T4 -> T3/T2/T1; "
-        "classic = F16 -> Q8_0 -> Q4_0 (currently for BailingMoE3/Ling)",
+        "dynamic VBR codec ladder (default: auto). auto = F16 -> T8 -> Q5_1 -> Q4_1 -> T4 -> "
+        "T3_TCQ, a ladder of its own; it is only downgraded to classic when the model's KV "
+        "geometry cannot host turbo rows. turbo = F16 -> T8 -> T4 -> T3/T2/T1, the pure turbo "
+        "ladder, and the only one that may read the measured turbo orders and policies. "
+        "classic = F16 -> Q8_0 -> Q5_1 -> Q4_1 (currently for BailingMoE3/Ling)",
         [](common_params & params, const std::string & value) {
             params.vbr_codec = common_vbr_codec_from_str(value, params.vbr_codec_auto);
             params.vbr_codec_explicit = true;
@@ -3329,8 +3391,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_CODEC"));
     add_opt(common_arg(
         {"--vbr-entry"}, "TIER",
-        "dynamic VBR entry tier: f16 (quality-first default), a Turbo tier, or q8_0/q4_0 "
-        "with --vbr-codec classic. "
+        "dynamic VBR entry tier: f16 (quality-first default), or any rung of the selected "
+        "--vbr-codec ladder (turbo: t8/t4/t3/t2/t1; auto: t8/q5_1/q4_1/t4/t3; "
+        "classic: q8_0/q5_1/q4_1). "
         "Starting below F16 is an explicit quality-for-bandwidth trade; tensors still degrade "
         "toward --vbr-floor as the KV VRAM budget fills",
         [](common_params & params, const std::string & value) {
@@ -3343,8 +3406,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "aggregate VBR bits/value floor; accepts decimal bits or aliases from the selected codec ladder. "
         "Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate "
         "stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and "
-        "the advertised context capacity is computed at this floor (implicit Turbo default: t4 = 4.125; "
-        "explicit Turbo -ct vbr: t1 = 1.25; classic: q4_0 = 4.5)",
+        "the advertised context capacity is computed at this floor (implicit default: t4 = 4.125; "
+        "explicit -ct vbr with no floor uses the ladder's own endpoint -- turbo t1 = 1.25, "
+        "auto t3tcq = 3.25, classic q4_1 = 5.0)",
         [](common_params & params, const std::string & value) {
             params.vbr_min_bits = value;
             params.vbr_min_bits_explicit = true;

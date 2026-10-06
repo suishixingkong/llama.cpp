@@ -1,7 +1,7 @@
 #pragma once
 
-// Backend interface for dynamically retiered KV caches (TurboQuant and classic
-// F16/Q8_0/Q4_0 representation ladders).
+// Backend interface for dynamically retiered KV caches (TurboQuant and the classic
+// F16/Q8_0/Q5_1/Q4_1 representation ladder).
 //
 // libllama links NO backend symbols for this feature. At KV-cache init it resolves this
 // vtable through the backend registry:

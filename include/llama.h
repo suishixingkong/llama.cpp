@@ -229,9 +229,13 @@ extern "C" {
 
     // VBR (variable bit-rate dynamic KV) representation ladder selector.
     // Ported from buun-llama-cpp; consumed by src/llama-vbr-codec.h.
+    // AUTO is a ladder of its own (f16 -> turbo8 -> q5_1 -> q4_1 -> turbo4 -> turbo3_tcq); it is
+    // not a placeholder that fit rewrites into one of the other two. The CLI only downgrades it
+    // when the model cannot run a ladder that contains turbo rungs at all.
     enum llama_vbr_codec {
         LLAMA_VBR_CODEC_TURBO   = 0,
         LLAMA_VBR_CODEC_CLASSIC = 1,
+        LLAMA_VBR_CODEC_AUTO    = 2,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)

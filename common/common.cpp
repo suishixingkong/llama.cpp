@@ -12,6 +12,7 @@
 
 #include "../src/llama-ext.h" // staging API: llama_vram_load_begin/end/complete
 #include "../src/llama-sha256.h" // fork 9l-d4b7j: the control-vector applied digest (fork common.cpp 10)
+#include "../src/llama-vbr-codec.h" // fork 9l-vbr-auto-ladder: name the resolved ladder in the log
 
 #include <algorithm>
 #include <cinttypes>
@@ -1378,14 +1379,21 @@ static void common_params_resolve_vbr_codec_auto_from_model(
     }
 
     llama_vbr_codec resolved;
-    if (llama_model_supports_vbr_codec(model, LLAMA_VBR_CODEC_TURBO)) {
-        resolved = LLAMA_VBR_CODEC_TURBO;
+    if (llama_model_supports_vbr_codec(model, params.vbr_codec)) {
+        // fork 9l-vbr-auto-ladder: the requested ladder is runnable as asked, so it is not
+        // substituted. `auto` is a ladder of its own now; "auto" resolving to "turbo" was the old
+        // placeholder behaviour, and resolving it here would silently drop its q5_1/q4_1 rungs.
+        resolved = params.vbr_codec;
     } else if (llama_model_supports_vbr_codec(model, LLAMA_VBR_CODEC_CLASSIC)) {
+        // The auto ladder contains turbo rungs, so it needs the turbo padded/rotated layout, and
+        // this model's KV geometry cannot serve it. Classic is the capability fallback -- a
+        // different ladder, chosen because it is the only one left, never a reinterpretation of
+        // the one that was asked for.
         resolved = LLAMA_VBR_CODEC_CLASSIC;
     } else {
         if (params.vbr_explicitly_selected()) {
             throw std::runtime_error(
-                "model supports neither the Turbo nor classic dynamic VBR codec; "
+                "model supports neither the auto/turbo nor the classic dynamic VBR codec; "
                 "select a static KV cache type");
         }
         COM_WRN("%s", "VBR codec auto: model has no supported dynamic codec; using static f16 KV cache\n");
@@ -1403,10 +1411,10 @@ static void common_params_resolve_vbr_codec_auto_from_model(
     params.vbr_codec = resolved;
     params.vbr_codec_auto = false;
     // Re-resolve entry/floor/telemetry from the chosen ladder. This also emits the sole
-    // controller summary now that the parser-time placeholder is no longer provisional.
+    // controller summary now that the parse-time default is settled.
     common_params_postprocess_vbr(params);
-    COM_INF("VBR codec auto: selected %s from model KV geometry\n",
-            resolved == LLAMA_VBR_CODEC_TURBO ? "turbo" : "classic");
+    COM_INF("VBR codec auto: selected the %s ladder from model KV geometry\n",
+            llama_vbr_ladder(resolved).name);
 }
 
 void common_params_resolve_vbr_codec_auto(common_params & params) {

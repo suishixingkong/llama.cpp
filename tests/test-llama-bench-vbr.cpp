@@ -94,7 +94,7 @@ int main() {
     row = llama_bench_vbr_resolve_row(plan, unset, unset);
     assert(row.active && row.codec == LLAMA_VBR_CODEC_CLASSIC);
     assert(row.type_k == GGML_TYPE_Q8_0 && row.type_v == GGML_TYPE_Q8_0);
-    assert(row.floor_bits == 4.5);
+    assert(row.floor_bits == 5.0); // classic's 4-bit rung is q4_1 (5.0 bpv), not q4_0 (4.5)
     cparams = llama_context_default_params();
     llama_bench_vbr_apply_row(row, cparams);
     assert(cparams.vbr_dynamic && cparams.vbr_codec == LLAMA_VBR_CODEC_CLASSIC);
@@ -106,7 +106,7 @@ int main() {
     row = llama_bench_vbr_resolve_row(plan, unset, unset);
     assert(row.active && row.k && row.v && row.codec == LLAMA_VBR_CODEC_CLASSIC);
     assert(row.type_k == GGML_TYPE_F16 && row.type_v == GGML_TYPE_F16);
-    assert(row.floor_bits == 4.5);
+    assert(row.floor_bits == 5.0); // the classic ladder's own endpoint, q4_1 = 5.0 bpv
 
     return 0;
 }
