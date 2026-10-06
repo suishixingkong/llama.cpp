@@ -39,10 +39,12 @@
 //              defect, and the counter-only assertion used to report it as 184 failures.
 //   nopair     sets the env var AND requires the stronger premise that this build compiled NO
 //              pair. That is the only cell where the fallback is the sole thing that can serve the
-//              pair, so the "the op ran on the f16 tensor-core kernel, and on neither VEC nor
-//              TILE" assertion is 9l-d4b9w's proof rather than a restatement of "nothing ran".
-//              A pair that turns out to be compiled makes the mode void for it -- reported as a
-//              void premise, never as a kernel bug.
+//              pair, so "the op ran on the f16 tensor-core kernel, and on neither VEC nor TILE"
+//              is 9l-d4b9w's proof rather than a restatement of "nothing ran".
+//              A pair that turns out to be compiled makes this mode void for it: that case is
+//              reported [SKIP] instead of failed -- a build fact, never a kernel bug. This mode
+//              therefore belongs on an FA_MMA=OFF build; on an ON build every compiled pair is
+//              skipped rather than counted as a routing defect.
 //   fallback   leaves the env var off and REQUIRES that it really is off, by reading it back. An
 //              exported GGML_CUDA_FA_MMA would otherwise turn this mode into a silent duplicate
 //              of nopair while every one of its `== 0` assertions still reported PASS.
@@ -309,7 +311,8 @@ int main(int argc, char ** argv) {
         printf("  expecting: this build compiled NO turbo MMA pair, so the opt-in must report each\n"
                "  one uncompiled and 9l-d4b9w must route it to the f16 tensor-core kernel -- which\n"
                "  is asserted by name below. A pair that turns out to be compiled makes this mode\n"
-               "  void for that pair (reported as such, not as a kernel bug).\n");
+               "  void for it: that case is SKIPPED, never failed (a fact about the build, not a\n"
+               "  routing defect). Run this mode on an FA_MMA=OFF build.\n");
     }
 
     ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(0));
@@ -488,33 +491,45 @@ int main(int argc, char ** argv) {
                     // proof, and it is only available in this mode because only here is the
                     // fallback the sole candidate.
                     //
-                    // A counter advance here is not a kernel bug, it means the premise is false
-                    // (this pair IS compiled in this build), so say that instead of leaving the
-                    // reader to guess from a bare "expected 0, got 1".
-                    tt.assert_true(
-                        "opt-in with an uncompiled pair does NOT reach the turbo MMA kernel",
-                        inv_delta == 0);
-                    if (inv_delta != 0) {
+                    // This mode's premise -- "no pair was compiled" -- is a fact about the BUILD,
+                    // so it is asked of the backend and not read off the counter: a compiled pair
+                    // makes the mode void for it regardless of what the dispatch then did. Void is
+                    // reported as a SKIP, not as a failure. Reporting it as a failure is how an
+                    // ordinary ON build produced 144 FAILs that read like 144 kernel defects,
+                    // while the same build's default mode ran the identical routing green.
+                    //
+                    // Skipping cannot hide a defect: the routing claim this mode is not in a
+                    // position to make ("a compiled pair DOES reach the turbo kernel") is the
+                    // default mode's arm, and a case that skips here still runs its checks below
+                    // -- `was_skipped` needs zero failures, so any failed assertion re-reports
+                    // this case as [FAIL].
+                    if (pair_compiled) {
+                        tt.skip("nopair mode is void: this build compiled the pair");
                         printf("    (nopair mode is void for this pair: \"%s-%s\" has a compiled "
-                               "MMA instance in this build -- counter advanced. Use the default "
+                               "MMA instance in this build -- skipped, not failed. Use the default "
                                "mode to test the turbo kernel.)\n", name_k, name_v);
-                    } else if (in_scope) {
-                        tt.assert_true("9l-d4b9w: the uncompiled pair IS routed to the f16 tensor-core kernel",
-                                       ran == GGML_CUDA_FATTN_KERNEL_MMA_F16);
-                        tt.assert_true("9l-d4b9w: the uncompiled pair is NOT dropped into VEC/TILE",
-                                       kc.by_family[GGML_CUDA_FATTN_KERNEL_VEC] == 0 &&
-                                       kc.by_family[GGML_CUDA_FATTN_KERNEL_TILE] == 0);
-                        if (ran != GGML_CUDA_FATTN_KERNEL_MMA_F16) {
-                            printf("    (9l-d4b9w: \"%s-%s\" is uncompiled and in the fallback's scope, "
-                                   "so the f16 tensor-core kernel was required -- but %s served it. "
-                                   "Before 9l-d4b9w this is exactly what the VEC/TILE ladder did.)\n",
+                    } else {
+                        tt.assert_true(
+                            "opt-in with an uncompiled pair does NOT reach the turbo MMA kernel",
+                            inv_delta == 0);
+                        if (in_scope) {
+                            tt.assert_true("9l-d4b9w: the uncompiled pair IS routed to the f16 tensor-core kernel",
+                                           ran == GGML_CUDA_FATTN_KERNEL_MMA_F16);
+                            tt.assert_true("9l-d4b9w: the uncompiled pair is NOT dropped into VEC/TILE",
+                                           kc.by_family[GGML_CUDA_FATTN_KERNEL_VEC] == 0 &&
+                                           kc.by_family[GGML_CUDA_FATTN_KERNEL_TILE] == 0);
+                            if (ran != GGML_CUDA_FATTN_KERNEL_MMA_F16) {
+                                printf("    (9l-d4b9w: \"%s-%s\" is uncompiled and in the fallback's scope, "
+                                       "so the f16 tensor-core kernel was required -- but %s served it. "
+                                       "Before 9l-d4b9w this is exactly what the VEC/TILE ladder did.)\n",
+                                       name_k, name_v, fattn_kernel_name(ran));
+                            }
+                        } else {
+                            printf("    (control: \"%s-%s\" is outside the opt-in's fallback scope "
+                                   "(plain f16 KV) and has no turbo instance to begin with, so this pair "
+                                   "cannot witness the fallback; the ordinary selection stands -- %s)\n",
                                    name_k, name_v, fattn_kernel_name(ran));
                         }
-                    } else {
-                        printf("    (control: \"%s-%s\" is outside the opt-in's fallback scope "
-                               "(plain f16 KV) and has no turbo instance to begin with, so this pair "
-                               "cannot witness the fallback; the ordinary selection stands -- %s)\n",
-                               name_k, name_v, fattn_kernel_name(ran));
                     }
                 } else {
                     tt.assert_true("MMA dispatch counter stayed at 0 without the env var",
