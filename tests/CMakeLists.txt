@@ -432,7 +432,7 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     # Differential test of the opt-in TurboQuant MMA FlashAttention path (GGML_CUDA_FA_MMA=1).
     # Run twice on the device: default = mma mode (counter must advance), "fallback" = env off
     # (counter must stay 0). See BUUN_MERGE_PLAN.md section 10.9.
-    llama_build_and_test(test-turbo-mma-fa.cpp LABEL cuda)
+    llama_build_and_test(test-mma-fa.cpp LABEL cuda)
     # fork 9l-d4b9j: the VBR CUDA VMM test (fork tests/test-vbr-vmm.cpp:1-402), landed
     # VERBATIM. It drives the CUDA VBR backend interface directly -- ggml_backend_cuda_vbr_iface()
     # then vmm_pool_{init,map,unmap,mapped,mapped_in_range,residency_epoch,clear} + kv_transcode --

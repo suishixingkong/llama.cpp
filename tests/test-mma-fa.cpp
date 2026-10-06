@@ -19,11 +19,18 @@
 //
 // The pairs cover every non-f16 MMA instantiation set (turbo scalar/TCQ, standard quantized,
 // bf16; plus the mixed pairs) and all 17 combinations in the default GGML_CUDA_FA_QUANTS
-// selection. The shapes cover every tile the Volta dispatch ladder can select for D in {128, 256}:
+// selection. The shapes cover every rung the Volta dispatch ladder can select for D in {128, 256}:
 // gqa 8/4/2/1 -> ncols2 8/4/2/1, small and large nq -> 32-column and 64-column rungs, and a
 // no-mask case -> the ncols2=1 non-GQA path. No model file needed.
 //
-// Usage: test-turbo-mma-fa [fallback|nopair] [--only <substr>]
+// One shape deliberately reaches the VECTOR rung (fattn.cu: `nq * gqa_ratio_eff <= 2`): without
+// it, every shape here has nq * gqa_ratio_eff >= 16, the ladder never selects VEC, and the
+// "the opt-in must not drop this pair into VEC" half of the routing assertion is true by
+// construction instead of by measurement. That is the whole confound 9l-d4b9w removes -- a turbo
+// pair that is missing its MMA instance used to be served by the vector kernel on exactly these
+// small-query shapes -- so the assertion has to be able to see them.
+//
+// Usage: test-mma-fa [fallback|nopair] [--only <substr>]
 //   (default)  sets GGML_CUDA_FA_MMA=1, then holds each pair to the contract its build state
 //              implies: a pair this build compiled must be dispatched to the turbo kernel, and a
 //              pair it did not compile must NOT be claimed by the opt-in -- 9l-d4b9w has to land
@@ -85,6 +92,11 @@ const fa_shape shapes[] = {
     {128,  8, 8, 2, true,  "D=128 gqa=4 nq=8  tile(8,4)"},
     {128, 16, 4, 2, true,  "D=128 gqa=2 nq=16 tile(16,2)"},
     {128, 16, 2, 2, true,  "D=128 gqa=1 nq=16 tile(32,1)"},
+    // The VEC rung: nq * gqa_ratio_eff == 2 is the ladder's only VEC gate (fattn.cu's
+    // `can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2`), so this is the one shape on
+    // which "opt-in on" and "opt-in off" differ by VEC vs MMA_F16 rather than TILE vs MMA_F16.
+    // It is what keeps the VEC half of the routing assertion from being vacuous.
+    {128,  2, 2, 2, true,  "D=128 gqa=1 nq=2  vec"},
     // no mask -> use_gqa_opt=false -> ncols2=1 path
     {128,  4, 8, 1, false, "D=128 gqa=8 nq=4  no-mask tile(32,1)"},
     // D=256 (two 128-element rotation groups per row)
