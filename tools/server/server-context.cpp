@@ -9377,7 +9377,13 @@ private:
                                                 // the exact anchor we just restored.
                                                 it->id_task = slot.task->id;
 
-                                                SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                                // fork 9l-ckpt-loglevel: trace, not warning -- same fix as the
+                                                // creation log. A successful restore is the normal path
+                                                // (this fires once per task that hits a checkpoint
+                                                // prefix), so at warning level it crowds the same
+                                                // channel as the retention anomalies. Upstream and v1.0
+                                                // both log the restore at trace.
+                                                SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                                 slot.cache_status = "restored context checkpoint";
                                                 // Transport the shipped
                                                 // restore's own values into the observer row.
