@@ -1649,6 +1649,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // fork 9l-mtp-draft-trim: everything we wrote below is a GUESS at the positions we
+        // drafted, and the target accepts only the prefix it agreed with -- often none. The next
+        // call's pos0 is the target's next position, so a partially rejected guess leaves this
+        // context's head at or past pos0, and llama_batch_allocr() then rejects every decode
+        // (M-RoPE requires X < Y). That is not a recoverable draft, it is an error loop: each
+        // retry fails the same way while the target keeps advancing. Trim the guess once per
+        // call, before the loop -- the growing-KV path below rebuilds positions >= pos0 itself,
+        // and the prompt KV (< pos0) stays. chain_heads already trims per step, for the
+        // unrelated reason that each step runs a different MTP head, so this is a no-op there.
+        // draft_eagle3() has always done exactly this before its first decode.
+        {
+            auto * mem_dft_trim = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    llama_memory_seq_rm(mem_dft_trim, seq_id, dparams[seq_id].pos0, -1);
+                }
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
