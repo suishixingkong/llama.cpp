@@ -1370,6 +1370,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
+    // fork 9l-mtp-carry-state: whether pending_h is a LIVE carry (target_process filled it
+    // and no sequence event invalidated it) or not. pending_h is an activation, not part of
+    // either serialized sequence image, so a checkpoint taken at a nonzero frontier is only
+    // restorable if the carry comes with it -- hence the codec below gates on exactly this
+    // flag. Without it get_state() cannot answer, and the server's checkpoint companion
+    // declines every capture ("MTP checkpoint companion skipped ... state-ready=0").
+    // The second-round fix (the target_only fast path in process()) reads the same flag.
+    std::vector<common_speculative_mtp_carry_lifecycle> pending_h_lifecycle;
+
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
@@ -1452,6 +1461,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_h_lifecycle.assign(n_seq, common_speculative_mtp_carry_lifecycle());
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1612,6 +1622,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            // the carry is now backed by a row this process() actually saw, so it is
+            // restorable: arm the lifecycle bit that common_speculative_mtp_carry_state_save
+            // gates on. Any sequence event that invalidates the carry clears it again
+            // (see common_speculative_impl::sequence_transition).
+            pending_h_lifecycle[seq_id].target_process_refreshed();
         }
 
         return true;
@@ -1800,6 +1815,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    // fork 9l-mtp-carry-state: fork common/speculative.cpp:3098/3106. Without these the base
+    // class returns false, the server reads mtp_state_ready=0, and EVERY context checkpoint
+    // is declined with "MTP checkpoint companion skipped: ... state-ready=0" -- measured on
+    // the V100 (Qwen3.5-2B MTP, --spec-type draft-mtp --kv-stream-stage-mib 2024), two
+    // per task. The codec gates on pending_h_lifecycle, so this only succeeds once
+    // process() has armed the carry.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        return common_speculative_mtp_carry_state_save(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        // The fork also clears proposals[] and resets adaptive[] here. Neither exists in
+        // this tree's draft_mtp (no proposal cache, no adaptive draft-size backoff), so
+        // there is nothing to invalidate; the restored carry is the whole state.
+        return common_speculative_mtp_carry_state_load(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
+    }
+
+    // fork 9l-mtp-carry-state: the fork overrides this to drop the carry bit on every
+    // sequence event (fork common/speculative.cpp:3115). The base class default is a no-op,
+    // which would leave a stale `ready` set across a rewind/restore and let a checkpoint
+    // publish a carry that no longer matches the live draft sequence.
+    void sequence_transition(
+            llama_seq_id seq_id,
+            common_speculative_sequence_event event) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        pending_h_lifecycle[seq_id].sequence_transition(event);
     }
 };
 
