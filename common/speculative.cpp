@@ -1543,6 +1543,54 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // fork 9l-mtp-preflight: pending_h is an ACTIVATION, not part of either serialized
+        // sequence image. After a restored / rewound nonzero frontier the predecessor
+        // target-hidden row is gone, so this target batch CANNOT be replayed into the draft
+        // model -- doing it anyway is what makes the draft context's positions meaningless.
+        // The fork resolves that once for the whole batch and, in target_only mode, drops the
+        // stale draft sequence, keeps only the newest target-hidden row, and re-arms the carry.
+        // No draft decode happens on that path, which is the whole point: this tree used to
+        // run a catch-up llama_decode(ctx_dft) over EVERY target batch, and that per-step
+        // decode is the measured throughput regression (73 t/s with MTP against 170 t/s
+        // without it, acceptance 0.519 with per-position rate 0.000 for draft slot 0).
+        if (!is_mem_shared) {
+            const auto preflight = common_speculative_mtp_process_preflight_resolve(
+                pending_h_lifecycle, i_batch_beg, batch_in.pos);
+            if (preflight == common_speculative_mtp_process_preflight::target_only) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    if (!mem_dft || !llama_memory_seq_rm(mem_dft, seq_id, -1, -1)) {
+                        return false;
+                    }
+                    const float * h_tgt = llama_get_embeddings_nextn_ith(
+                        ctx_tgt, i_batch_end[seq_id]);
+                    if (!h_tgt) {
+                        return false;
+                    }
+                    std::memcpy(pending_h[seq_id].data(), h_tgt, row_bytes);
+                    pending_h_lifecycle[seq_id].target_process_refreshed();
+                    verify_h_rows[seq_id] = 0;
+                }
+                return true;
+            }
+        }
+
+        // draft() may have advanced the MTP KV beyond this target batch. Rewind to the
+        // verified frontier before replaying target hidden rows; M-RoPE requires the stored
+        // position to be no greater than the incoming one. Without this the decode below
+        // either fails or (worse) reads cells another head wrote.
+        if (!is_mem_shared) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
+                        batch_in.pos[i_batch_beg[seq_id]], -1);
+                }
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1571,6 +1619,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // fork 9l-mtp-preflight: a cold start (position 0 with no live carry) has no
+                // predecessor hidden row to pair with, so feed zeros rather than whatever
+                // pending_h held from an earlier lifecycle. target_only is impossible here --
+                // the preflight above returned early for it -- and the assert pins that
+                // invariant instead of silently reinterpreting the mode.
+                const auto mode = pending_h_lifecycle[seq_id].target_process_mode(
+                    batch_in.pos[i_batch_beg[seq_id]]);
+                if (mode == common_speculative_mtp_carry_lifecycle::process_mode::cold_zero) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
+                GGML_ASSERT(mode != common_speculative_mtp_carry_lifecycle::process_mode::target_only);
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
