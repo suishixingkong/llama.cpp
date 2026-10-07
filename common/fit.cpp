@@ -1374,6 +1374,17 @@ enum common_params_fit_status common_fit_params(
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
+
+    // Unconditionally hand the ENTRY types back to the caller. common_fit_params mutates the
+    // caller's cparams in place, and common_init_result forwards that very object to
+    // llama_init_from_model -- so without this restore the real cache is built at the PRICE
+    // (floor) tier instead of the entry tier, and dynamic VBR never runs: it starts pinned at
+    // the floor with nothing to degrade toward. The restore must be outside the try/catch so a
+    // fit failure cannot leave the caller holding price types, and outside the vbr_dynamic
+    // branch so a non-dynamic fit still gets its own types back unchanged.
+    cparams->type_k = type_k_entry;
+    cparams->type_v = type_v_entry;
+
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
