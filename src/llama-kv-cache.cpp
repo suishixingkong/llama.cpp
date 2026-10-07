@@ -5276,8 +5276,16 @@ void llama_kv_cache::vbr_invalidate_dirty_stash() {
 // q5_1->q4_1, q4_1->t4, t4->t3tcq) take rows 0..4 -- row 0 happens to be the same f16->t8 step,
 // the rest are the same hedge classic already makes. A baked Turbo price table is never read this
 // way; those are band-keyed measurements and only the turbo ladder may consume them.
+//
+// Row count is therefore not free: it must cover the deepest ladder's transition count, which
+// vbr_synth_generic_order() asserts against (and test_vbr_ladder_guards.py re-checks). When
+// auto grew past turbo by taking the t3tcq->t2tcq and t2tcq->t1tcq rungs, the assert fired at
+// load. Rows 5 and 6 below are the one thing that can be said without a measurement: bands are
+// positional, and the deepest band we DID measure (t2tcq->t1tcq) already has the shape a
+// deeper transition wants -- front V cheapest, final V maximally protected -- so it is reused
+// verbatim rather than invented. A ladder deeper than that trips the assert on purpose.
 // [band][is_v][grid p=0..1 step 1/16]; lower value = degrade earlier.
-static const float vbr_generic_rank[5][2][17] = {
+static const float vbr_generic_rank[7][2][17] = {
     { // fp16-t8
         { 0.95f, 0.82f, 0.83f, 0.82f, 0.78f, 0.71f, 0.63f, 0.55f, 0.52f, 0.51f, 0.39f, 0.32f, 0.26f, 0.19f, 0.13f, 0.08f, 0.00f },
         { 0.92f, 0.94f, 0.83f, 0.80f, 0.79f, 0.71f, 0.62f, 0.54f, 0.48f, 0.45f, 0.39f, 0.32f, 0.24f, 0.21f, 0.14f, 0.08f, 0.02f },
@@ -5295,6 +5303,14 @@ static const float vbr_generic_rank[5][2][17] = {
         { 0.16f, 0.14f, 0.19f, 0.46f, 0.51f, 0.53f, 0.47f, 0.57f, 0.41f, 0.44f, 0.44f, 0.45f, 0.48f, 0.57f, 0.47f, 0.69f, 1.00f },
     },
     { // t2tcq-t1tcq
+        { 0.46f, 0.32f, 0.36f, 0.36f, 0.62f, 0.48f, 0.49f, 0.58f, 0.64f, 0.57f, 0.58f, 0.67f, 0.54f, 0.56f, 0.63f, 0.63f, 0.73f },
+        { 0.12f, 0.18f, 0.24f, 0.36f, 0.33f, 0.40f, 0.39f, 0.32f, 0.45f, 0.39f, 0.48f, 0.56f, 0.55f, 0.46f, 0.62f, 0.73f, 0.99f },
+    },
+    { // one band deeper than any measurement reaches: row 4 reused verbatim
+        { 0.46f, 0.32f, 0.36f, 0.36f, 0.62f, 0.48f, 0.49f, 0.58f, 0.64f, 0.57f, 0.58f, 0.67f, 0.54f, 0.56f, 0.63f, 0.63f, 0.73f },
+        { 0.12f, 0.18f, 0.24f, 0.36f, 0.33f, 0.40f, 0.39f, 0.32f, 0.45f, 0.39f, 0.48f, 0.56f, 0.55f, 0.46f, 0.62f, 0.73f, 0.99f },
+    },
+    { // and one band deeper still: same reuse, same reason
         { 0.46f, 0.32f, 0.36f, 0.36f, 0.62f, 0.48f, 0.49f, 0.58f, 0.64f, 0.57f, 0.58f, 0.67f, 0.54f, 0.56f, 0.63f, 0.63f, 0.73f },
         { 0.12f, 0.18f, 0.24f, 0.36f, 0.33f, 0.40f, 0.39f, 0.32f, 0.45f, 0.39f, 0.48f, 0.56f, 0.55f, 0.46f, 0.62f, 0.73f, 0.99f },
     },
@@ -5427,9 +5443,18 @@ void llama_kv_cache::vbr_synth_generic_order() {
     if (n == 0) {
         return;
     }
-    const int n_bands = (int) llama_vbr_ladder(vbr_params_.codec).n_rungs - 1;
-    GGML_ASSERT(n_bands > 0 &&
-        (size_t) n_bands <= sizeof(vbr_generic_rank) / sizeof(vbr_generic_rank[0]));
+    const int    n_bands = (int) llama_vbr_ladder(vbr_params_.codec).n_rungs - 1;
+    const size_t n_rows  = sizeof(vbr_generic_rank) / sizeof(vbr_generic_rank[0]);
+    // A bare GGML_ASSERT here gave the V100 run nothing to act on. Name both counts and the
+    // remedy instead: the row count is a property of the ladder, so whoever deepens a ladder
+    // has to extend this table in the same change.
+    if (n_bands <= 0 || (size_t) n_bands > n_rows) {
+        throw std::runtime_error(
+            "the generic VBR degrade order has " + std::to_string(n_rows) + " band(s) but the " +
+            llama_vbr_ladder(vbr_params_.codec).name + " ladder needs " + std::to_string(n_bands) +
+            " (n_rungs - 1): extend vbr_generic_rank in llama-kv-cache.cpp -- rows are "
+            "positional, and a depth with no measurement reuses the deepest measured hedge");
+    }
     for (int band = 0; band < n_bands; ++band) {
         std::vector<std::pair<float, uint16_t>> cells; // rank, (i<<1)|is_v
         cells.reserve(n * 2);
