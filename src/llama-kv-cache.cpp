@@ -1564,7 +1564,13 @@ llama_kv_cache::llama_kv_cache(
             // fully offloaded turbo/F16 side was pinned to q8_0 anyway. Symptom: -ctk/-ctv turbo*
             // silently ran q8_0 (kv_bpv stuck at 8.5), and block KV streaming aborted because the
             // runtime was sized for the declared turbo type while every layer had become q8_0.
-            const bool cpu_bound_kv = ggml_backend_buft_is_host(buft);
+            //
+            // The block KV streaming buffer is the one host buffer that must NOT be downgraded:/n            // it is write-combined host memory (cudaHostAllocWriteCombined) purely so the pages
+            // can be handed to the streaming engine, which serves them with device kernels and
+            // already declared this K/V pair supported -- TURBO4_0 is in its direct_attention set,
+            // which is why the runtime above was sized for turbo4 in the first place. Downgrading
+            // here contradicted the runtime's own geometry, and the uniformity check rejected it.
+            const bool cpu_bound_kv = ggml_backend_buft_is_host(buft) && buft != kv_stream_buft;
             if (cpu_bound_kv) {
                 const auto cpu_type = [&](ggml_type type, bool pinned) {
                     const bool needs_q8 = ggml_type_is_turbo(type) ||
