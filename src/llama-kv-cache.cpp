@@ -1984,6 +1984,26 @@ llama_kv_cache::llama_kv_cache(
         if (!is_vmm_buf) {
             ggml_backend_buffer_clear(buf, 0); // VMM pages are zeroed at map time instead
         }
+
+        // InnerQ scale_inv must be the IDENTITY on every construction, including the no_alloc
+        // dry one. It is created whenever type_k is turbo (see the aux-tensor block above), and
+        // Q's forward WHT multiplies by it unconditionally -- an uninitialised tensor therefore
+        // scales every Q row by garbage and corrupts the attention scores. Only the K side reads
+        // it (V-turbo never pre-rotates Q), which is why this showed up as "K turbo is incoherent,
+        // V turbo is fine" and nothing else.
+        //
+        // This used to be filled inside the rotation-matrix block below, which is gated on
+        // !hparams.no_alloc; the dry context then carried an uninitialised tensor, and the no_alloc
+        // gate was added to this path in 64a2a3d32. Hence: fill HERE, right after the buffer clear
+        // that the block below depends on, and gate on nothing but "the tensor exists". The
+        // rotation matrices are not initialised this way because nothing reads them before the
+        // !no_alloc path writes them; this one is read by the graph.
+        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+            std::vector<float> ones(INNERQ_MAX_CHANNELS, 1.0f);
+            ggml_backend_tensor_set(turbo_innerq_scale_inv, ones.data(), 0,
+                                    INNERQ_MAX_CHANNELS * sizeof(float));
+        }
+
         if (kv_stream_stage_bytes == 0 && getenv("GGML_CUDA_PREFER_KV_HOST") != nullptr && ggml_backend_buffer_get_size(buf) > 0) {
             ggml_backend_dev_t dev_kv = ggml_backend_buft_get_device(buft);
             if (dev_kv != nullptr) {
@@ -2791,6 +2811,18 @@ void llama_kv_cache::clear(bool data) {
             #include "turbo-rotation-data.h"
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
+        }
+
+        // The aux buffer (ctx_aux) is NOT one of ctxs_bufs -- it is reached only through
+        // ctx_for_buft(aux_buft) -- so the clears above do not touch it, and after a clear its
+        // contents are whatever the allocator left. Re-assert the InnerQ identity here for the
+        // same reason as the constructor: Q's forward WHT multiplies by it unconditionally, so a
+        // cleared-and-refilled cache must not hand the graph a scaled-garbage tensor. Ungated on
+        // no_alloc, because a dry context can be cleared too (the fit path clears between probes).
+        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+            std::vector<float> ones(INNERQ_MAX_CHANNELS, 1.0f);
+            ggml_backend_tensor_set(turbo_innerq_scale_inv, ones.data(), 0,
+                                    INNERQ_MAX_CHANNELS * sizeof(float));
         }
     }
 
