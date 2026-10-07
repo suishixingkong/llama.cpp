@@ -10662,7 +10662,12 @@ private:
                                 }
                             }
 
-                            SLT_WRN(slot,
+                            // Trace, not warning: this fires once per decode step on the normal
+                            // path (a single-token boundary checkpoint per step), so at warning
+                            // level it drowns out the real retention warnings below -- e.g.
+                            // "[frontier-validity] skipping context checkpoint", which is the
+                            // actual anomaly. Upstream also logs the creation at trace.
+                            SLT_TRC(slot,
                                     "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
                                     ", size = %.3f MiB)\n",
                                     (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
