@@ -645,9 +645,9 @@ static void test(void) {
         assert(vbr_params.vbr_budget == "dynamic");
         assert(vbr_params.vbr_dynamic());
         assert(vbr_params.vbr_min_bits_value == 0.0);
-        // capacity is advertised at the ladder's own endpoint: 3.25 (t3tcq) for the default auto
-        // ladder, not the turbo ladder's 1.25 (t1)
-        assert(vbr_params.vbr_capacity_bits == 3.25);
+        // capacity is advertised at the ladder's own endpoint: 1.25 (t1tcq) for the default auto
+        // ladder, which now reaches as deep as turbo
+        assert(vbr_params.vbr_capacity_bits == 1.25);
         common_params explicit_cpu = vbr_params;
         assert(common_params_apply_vbr_cpu_fallback(explicit_cpu, false) ==
                common_vbr_cpu_fallback_result::explicit_vbr);
@@ -662,8 +662,8 @@ static void test(void) {
 #endif
 
         // --vbr-floor is a LITERAL aggregate floor (no snap-up to the next tier); the default
-        // entry type remains F16. Pinned to turbo because 2.25 is below the auto ladder's 3.25
-        // endpoint (the auto clamp is covered by vbr_auto_floor_clamp below).
+        // entry type remains F16. Pinned to turbo so the literal-floor family is exercised on the
+        // pure turbo ladder (the auto ladder reaches t2tcq, so 2.25 is legal there too).
         common_params vbr_t2_floor;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "turbo",
                 "-ctk", "vbr", "-ctv", "vbr", "--vbr-min-bits", "2.25"};
@@ -685,7 +685,8 @@ static void test(void) {
         assert(vbr_t8_entry.cache_type_v == GGML_TYPE_TURBO8_0);
         assert(vbr_t8_entry.vbr_min_bits_value == 4.125);
 
-        // A low entry bounds the implicit floor to the entry. t2 is a turbo rung only.
+        // A low entry bounds the implicit floor to the entry. Pinned to turbo so the case
+        // stays on the pure turbo ladder.
         common_params vbr_t2_entry_default_floor;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "turbo", "--vbr-entry", "t2"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_entry_default_floor, LLAMA_EXAMPLE_COMMON));
@@ -716,8 +717,8 @@ static void test(void) {
         assert(vbr_mixed_floor.vbr_pin_v());
         assert(vbr_mixed_floor.vbr_min_bits_value == 8.0);
 
-        // t2/t1 are rungs of the turbo ladder only: the default (auto) ladder stops at t3tcq, so an
-        // explicit --vbr-codec turbo is what makes them reachable.
+        // t2/t1 are rungs of both turbo and the extended auto ladder; turbo is pinned here because
+        // this case also asserts the uppercase --vbr-codec spelling survives parsing.
         common_params vbr_uppercase_dynamic;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "turbo",
                 "--vbr-budget", "DYNAMIC", "--vbr-entry", "t2"};
@@ -726,10 +727,13 @@ static void test(void) {
         assert(vbr_uppercase_dynamic.vbr_codec == LLAMA_VBR_CODEC_TURBO);
         assert(vbr_uppercase_dynamic.vbr_min_bits_value == 2.25);
 
-        // ... and the same entry is refused on the default auto ladder, before anything is built.
+        // ... and the same entry is accepted on the default auto ladder, which now shares the
+        // turbo rungs; it must land on the same type.
         common_params vbr_t2_under_auto;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "t2"};
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_under_auto, LLAMA_EXAMPLE_COMMON));
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_under_auto, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_t2_under_auto.cache_type_k == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_t2_under_auto.cache_type_v == GGML_TYPE_TURBO2_TCQ);
 
         common_params vbr_bad_entry;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-entry", "q8_0"};
@@ -759,7 +763,7 @@ static void test(void) {
         assert(vbr_auto.vbr_codec == LLAMA_VBR_CODEC_AUTO);
         assert(vbr_auto.vbr_codec_auto);
         assert(vbr_auto.vbr_codec_explicit);
-        // its ladder is f16/t8/q5_1/q4_1/t4/t3tcq, so the implicit t4 floor is reachable ...
+        // its ladder is f16/t8/q5_1/q4_1/t4/t3tcq/t2tcq/t1tcq, so the implicit t4 floor is reachable ...
         assert(vbr_auto.vbr_min_bits_value == 4.125);
         // ... and a q5_1 entry is legal here even though it is not a turbo rung
         assert(common_vbr_entry_type("q5_1", LLAMA_VBR_CODEC_AUTO) == GGML_TYPE_Q5_1);
@@ -840,20 +844,19 @@ static void test(void) {
         assert(vbr_fractional_floor.vbr_capacity_bits == 2.75);
 
         // A floor below the ladder clamps to that ladder's own endpoint. Which endpoint depends on
-        // the codec: turbo bottoms out at t1 = 1.25, the default auto ladder at t3tcq = 3.25.
+        // the codec: turbo and auto bottom out at t1tcq = 1.25, classic at q4_1 = 5.0.
         common_params vbr_low_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "0.5"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_low_floor, LLAMA_EXAMPLE_COMMON));
-        assert(vbr_low_floor.vbr_min_bits_value == 3.25); // auto's endpoint, not turbo's 1.25
-        assert(vbr_low_floor.vbr_capacity_bits == 3.25);
+        assert(vbr_low_floor.vbr_min_bits_value == 1.25); // the endpoint the clamp snaps up to
+        assert(vbr_low_floor.vbr_capacity_bits == 1.25);
 
-        // The same literal is inside one ladder's range and below the other's: 2.0 is legal on turbo
-        // (see vbr_literal_floor above) and clamps on auto. The floor is literal; the range is the
-        // ladder's.
-        common_params vbr_auto_floor_clamp;
-        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "2"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_auto_floor_clamp, LLAMA_EXAMPLE_COMMON));
-        assert(vbr_auto_floor_clamp.vbr_min_bits_value == 3.25);
+        // The clamp follows the selected ladder, not the literal: the same 2.0 that is legal on the
+        // auto/turbo ladders is below every classic rung, so it snaps up to q4_1 = 5.0 there.
+        common_params vbr_classic_floor_clamp;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "classic", "--vbr-floor", "2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_classic_floor_clamp, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_classic_floor_clamp.vbr_min_bits_value == 5.0);
 
         common_params vbr_high_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "f16"};
@@ -970,7 +973,7 @@ static void test(void) {
         assert(!vbr_ct_partial.vbr_cache_type_k);
         assert(vbr_ct_partial.vbr_cache_type_v);
 
-        // a floor above the fixed budget is contradictory (t2/t3 are turbo rungs)
+        // a floor above the fixed budget is contradictory (t2/t3, pinned to the turbo ladder)
         common_params vbr_floor_over_budget;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-codec", "turbo",
                 "-ctk", "vbr", "--vbr-budget", "t2", "--vbr-floor", "t3"};

@@ -1086,7 +1086,8 @@ void common_params_postprocess_vbr(common_params & params) {
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
         // computed at (an implicit floor is t4; an explicit -ct vbr with no floor falls to the
-        // ladder's own endpoint, which is t1 for turbo but t3tcq for the auto ladder)
+        // ladder's own endpoint, which is t1tcq = 1.25 for turbo and for auto, q4_1 = 5.0 for
+        // classic)
         params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
             : llama_vbr_type_bits_per_value(ladder.default_floor);
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
@@ -3410,7 +3411,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and "
         "the advertised context capacity is computed at this floor (implicit default: t4 = 4.125; "
         "explicit -ct vbr with no floor uses the ladder's own endpoint -- turbo t1 = 1.25, "
-        "auto t3tcq = 3.25, classic q4_1 = 5.0)",
+        "auto t1tcq = 1.25, classic q4_1 = 5.0)",
         [](common_params & params, const std::string & value) {
             params.vbr_min_bits = value;
             params.vbr_min_bits_explicit = true;
