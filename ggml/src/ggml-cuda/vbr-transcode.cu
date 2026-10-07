@@ -522,10 +522,19 @@ static void ggml_cuda_vbr_kv_transcode_impl(
         dstB->ne[1] = Te; dstB->nb[2] = dstB->nb[1]*Te; dstB->nb[3] = dstB->nb[2];
     };
 
+    // Stage 1 needs a dequant for the SOURCE type only; the destination tier is written by
+    // set_rows in Stage 2 from f32. So the predicate must classify src_A alone, and it must
+    // cover every rung the selected ladder can hand us -- the `auto` and `classic` ladders
+    // both carry q5_1 and q4_1, and a q5_1 -> q4_1 edge is a normal downward step.
+    // Leaving them out routed the edge into vbr_dequant_turbo_to_f32, which ABORTs on a
+    // non-turbo, non-f16 src_type (see ggml_backend_cuda_kv_stash_capture's comment for the
+    // measured abort). Q4_0 is retained: it is a rung of no ladder here, but it costs nothing
+    // and keeps this predicate true for any stock-quant source a future ladder adds.
     const auto is_classic_type = [](ggml_type type) {
-        return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+        return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ||
+               type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_1;
     };
-    const bool classic_edge = is_classic_type(src_A->type) && is_classic_type(type_B);
+    const bool classic_edge = is_classic_type(src_A->type);
     const auto classic_to_f32 = classic_edge ? ggml_get_to_fp32_cuda(src_A->type) : nullptr;
 
     const int64_t n_tiles = (n_cells + TILE - 1) / TILE;
@@ -623,6 +632,20 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
 // Capture the f16 sink stash: dequant the first n_rows of src (original/stored domain, same
 // convention as the transcode's Stage 1) and pack to f16 at stash_f16. ASYNC (S5): stream-ordered
 // ahead of the same-stream transcode that consumes/overwrites the source rows.
+//
+// The src type is the DEGRADE RECIPE'S source_type, i.e. whatever tier the extent currently
+// holds -- not necessarily a turbo one. The `auto` ladder interleaves standard-quant rungs
+// (q5_1/q4_1) between turbo ones, so a downward edge can legitimately read a q5_1/q4_1 extent.
+// vbr_dequant_turbo_to_f32 only implements the turbo tiers plus f16 and ABORTS on anything
+// else, so dispatch the stock convert for those exactly as ggml_cuda_vbr_kv_transcode_impl's
+// `classic_edge` does. Same list, same reason: these are the tiers the stock CUDA convert
+// helpers cover.
+//
+// Measured on the V100 box (Qwen3.5-0.8B, -ctk vbr -ctv vbr --vbr-vram 40M --vbr-floor t1
+// -c 8192): degrade #24 `cache_v_l23 L23 -> q5_1` died in
+// `vbr_dequant_turbo_to_f32: unsupported src_type 7` (7 == GGML_TYPE_Q5_1). Steps #13-#23 of
+// the same turbo8->q5_1 wave completed, so this is not a q5_1 decode gap: it is the first
+// wave whose SOURCE extent was itself already a standard-quant type.
 extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
                                                    void * stash_f16, int64_t n_rows, bool is_v) {
     ggml_backend_cuda_context & ctx = *(ggml_backend_cuda_context *) backend->context;
@@ -634,8 +657,20 @@ extern "C" void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const
     uint8_t * workspace = vbr_workspace_get(ctx, layout.bytes);
     half *  s16 = (half *)  (workspace + layout.f16_off);
     float * s32 = (float *) (workspace + layout.f32_off);
-    vbr_dequant_turbo_to_f32((const char *) src->data, src->type, src->type,
-                             s16, s32, n_rows, ne0, src->nb[1], is_v, ctx.device, stream);
+    // the same predicate ggml_cuda_vbr_kv_transcode_impl uses to pick its Stage-1 path
+    const bool classic_src = src->type == GGML_TYPE_F16 ||
+                             src->type == GGML_TYPE_Q8_0 ||
+                             src->type == GGML_TYPE_Q4_0 ||
+                             src->type == GGML_TYPE_Q5_1 ||
+                             src->type == GGML_TYPE_Q4_1;
+    if (classic_src) {
+        const to_fp32_cuda_t to_f32 = ggml_get_to_fp32_cuda(src->type);
+        GGML_ASSERT(to_f32 != nullptr);
+        to_f32((const char *) src->data, s32, n_rows * ne0, stream);
+    } else {
+        vbr_dequant_turbo_to_f32((const char *) src->data, src->type, src->type,
+                                 s16, s32, n_rows, ne0, src->nb[1], is_v, ctx.device, stream);
+    }
     ggml_get_to_fp16_cuda(GGML_TYPE_F32)(s32, (half *) stash_f16, n_rows * ne0, stream);
 }
 
