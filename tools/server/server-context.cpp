@@ -10662,10 +10662,10 @@ private:
                                 }
                             }
 
-                            // Trace, not warning: this fires once per decode step on the normal
-                            // path (a single-token boundary checkpoint per step), so at warning
-                            // level it drowns out the real retention warnings below -- e.g.
-                            // "[frontier-validity] skipping context checkpoint", which is the
+                            // fork 9l-ckpt-loglevel: trace, not warning. This fires once per
+                            // decode step on the normal path (a single-token boundary checkpoint
+                            // per step), so at warning level it drowns out the real retention
+                            // warnings below -- e.g. the [frontier-validity] skip, which is the
                             // actual anomaly. Upstream also logs the creation at trace.
                             SLT_TRC(slot,
                                     "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
