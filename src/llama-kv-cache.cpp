@@ -1985,20 +1985,19 @@ llama_kv_cache::llama_kv_cache(
             ggml_backend_buffer_clear(buf, 0); // VMM pages are zeroed at map time instead
         }
 
-        // InnerQ scale_inv must be the IDENTITY on every construction, including the no_alloc
-        // dry one. It is created whenever type_k is turbo (see the aux-tensor block above), and
-        // Q's forward WHT multiplies by it unconditionally -- an uninitialised tensor therefore
-        // scales every Q row by garbage and corrupts the attention scores. Only the K side reads
-        // it (V-turbo never pre-rotates Q), which is why this showed up as "K turbo is incoherent,
-        // V turbo is fine" and nothing else.
+        // `->data`, not `->buffer`: under no_alloc the buffer is a SIZE-0 DUMMY
+        // (`alloc_buffer(buft, 0)`, assigned to t->buffer so the scheduler will not try to
+        // allocate it) and its `data` is NULL. `ggml_backend_tensor_set` asserts
+        // `tensor->data != NULL`, so gating on `->buffer` aborts at startup for every
+        // `-ctk turboN` build that goes through a dry context -- which is exactly why this
+        // only ever fired for turbo4/3/2 and never for f16.
         //
-        // This used to be filled inside the rotation-matrix block below, which is gated on
-        // !hparams.no_alloc; the dry context then carried an uninitialised tensor, and the no_alloc
-        // gate was added to this path in 64a2a3d32. Hence: fill HERE, right after the buffer clear
-        // that the block below depends on, and gate on nothing but "the tensor exists". The
-        // rotation matrices are not initialised this way because nothing reads them before the
-        // !no_alloc path writes them; this one is read by the graph.
-        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+        // Note what this means for the original diagnosis: a dry context has NO storage for
+        // this tensor at all, so there is no "uninitialised memory" to poison Q there. The
+        // real fill site is the !no_alloc path below; these two exist so the identity is
+        // re-asserted wherever real storage exists and might have been zeroed (constructor
+        // after the buffer clear, and after a KV clear).
+        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->data != nullptr) {
             std::vector<float> ones(INNERQ_MAX_CHANNELS, 1.0f);
             ggml_backend_tensor_set(turbo_innerq_scale_inv, ones.data(), 0,
                                     INNERQ_MAX_CHANNELS * sizeof(float));
@@ -2813,13 +2812,12 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
         }
 
-        // The aux buffer (ctx_aux) is NOT one of ctxs_bufs -- it is reached only through
-        // ctx_for_buft(aux_buft) -- so the clears above do not touch it, and after a clear its
-        // contents are whatever the allocator left. Re-assert the InnerQ identity here for the
-        // same reason as the constructor: Q's forward WHT multiplies by it unconditionally, so a
-        // cleared-and-refilled cache must not hand the graph a scaled-garbage tensor. Ungated on
-        // no_alloc, because a dry context can be cleared too (the fit path clears between probes).
-        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+        // Same `->data` gate as the constructor, for the same reason: under no_alloc the
+        // buffer exists as a size-0 dummy with NULL data, and writing to it aborts. This site
+        // additionally sits inside `if (data)`, as it did in v1.0, so the gate is belt-and-
+        // braces rather than the load-bearing one -- but a dummy buffer survives a clear, so
+        // `if (data)` alone is not a proof that the tensor has storage.
+        if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->data != nullptr) {
             std::vector<float> ones(INNERQ_MAX_CHANNELS, 1.0f);
             ggml_backend_tensor_set(turbo_innerq_scale_inv, ones.data(), 0,
                                     INNERQ_MAX_CHANNELS * sizeof(float));
