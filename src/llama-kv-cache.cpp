@@ -1315,8 +1315,6 @@ llama_kv_cache::llama_kv_cache(
         // the aux tensors stay in the same buffer as the KV cache (device memory anyway).
         ggml_backend_buffer_type_t aux_buft = nullptr;
 
-        const bool cpu_bound_kv = ggml_backend_buft_is_host(buft);
-
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
@@ -1559,6 +1557,14 @@ llama_kv_cache::llama_kv_cache(
             // at q8_0; preserve an explicitly pinned f16/bf16/q8_0 side in a mixed -ct config.
             // The no-alloc fit construction takes this same path, so its host-memory price and
             // the real allocation stay identical.
+            //
+            // fork 9l-kvc-host-pin: read the FINAL buffer type. It used to be sampled before
+            // `if (offload)` and before the streaming branch overwrote buft, i.e. while it was
+            // still ggml_backend_cpu_buffer_type() -- so this was true for every layer and a
+            // fully offloaded turbo/F16 side was pinned to q8_0 anyway. Symptom: -ctk/-ctv turbo*
+            // silently ran q8_0 (kv_bpv stuck at 8.5), and block KV streaming aborted because the
+            // runtime was sized for the declared turbo type while every layer had become q8_0.
+            const bool cpu_bound_kv = ggml_backend_buft_is_host(buft);
             if (cpu_bound_kv) {
                 const auto cpu_type = [&](ggml_type type, bool pinned) {
                     const bool needs_q8 = ggml_type_is_turbo(type) ||
@@ -1574,7 +1580,7 @@ llama_kv_cache::llama_kv_cache(
                     static bool warned = false;
                     if (!warned) {
                         LLAMA_LOG_WARN("llama_kv_cache: CPU-bound movable KV sides pinned at q8_0 "
-                                "(partial offload; excluded from the VBR degrade ladder)\n");
+                                "(host KV buffer; excluded from the VBR degrade ladder)\n");
                         warned = true;
                     }
                 }
