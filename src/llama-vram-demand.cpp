@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -151,10 +152,31 @@ void publish_claims(demander & d, llama_vram_claim_phase phase) {
 
 // ---- the hold loop, decomposed ----
 
-// no substrate: honor SHORT patience with plain backoff — the grace for a resident that
-// cannot be seen is pointless, but a clean bounded wait keeps behavior uniform (design:
-// clean fail + SHORT patience)
+// no substrate: the grace for a resident that cannot be seen is pointless. With no ledger
+// directory there is no claim/marker channel, so nothing can report that this device's free VRAM
+// is about to change and the identical allocation cannot start succeeding for a reason we would
+// have learned about. Honoring SHORT patience anyway turns one immediate cudaMalloc failure into
+// SHORT/BEAT + 1 of them - 5 at the current constants, one 2 s beat apart - each printing the same
+// line. On Windows the substrate is compiled out and armed() is therefore always false, so every
+// VRAM shortfall there used to pay the full 8 s and then report the error it already had. Single
+// attempt by default, matching the pre-VBR behaviour. LLAMA_VRAM_HOLD_BARE_WAIT=1 restores the
+// uniform bounded wait; an armed ledger still waits regardless of it, because there the peers
+// genuinely are observable.
 bool hold_bare() {
+    static const bool bare_wait = []() {
+        const char * value = getenv("LLAMA_VRAM_HOLD_BARE_WAIT");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    if (!bare_wait) {
+        // Make the behaviour change visible: the old path's only trace was the repeated
+        // cudaMalloc failure, which reads like a retry storm rather than a decision.
+        LLAMA_LOG_INFO("%s: no VRAM ledger substrate - failing immediately instead of waiting "
+                "%d ms for a resident that cannot be observed "
+                "(set LLAMA_VRAM_HOLD_BARE_WAIT=1 to restore the bounded wait)\n",
+                __func__, (int) LLAMA_VRAM_LEDGER_SHORT_MS);
+        return false;
+    }
+
     static thread_local uint64_t bare_deadline = 0;
     const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
