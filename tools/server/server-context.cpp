@@ -10387,6 +10387,14 @@ private:
                                 slot.id, &cur);
                         bool prepared = slot.retention_obs &&
                             !slot.retention_geometry_failed;
+                        // fork 9l-ckpt-prep-diag: this block folds six fallible
+                        // sub-steps into one boolean, and only the shared
+                        // payload transaction ever logged its own refusal. Every
+                        // other step returned false silently, so the combined
+                        // warning below could not name a cause. Name the step
+                        // instead; the warning keeps its original text so
+                        // existing greps keep working.
+                        const char * prepared_refused_at = "none";
                         const bool frontier_valid =
                             cur.computation_frontier.valid() &&
                             cur.computation_frontier.token_count == cur.n_tokens &&
@@ -10422,28 +10430,68 @@ private:
                                 slot.retention_destination.valid()
                                     ? &slot.retention_destination : nullptr,
                                 true);
+                            // fork 9l-ckpt-prep-diag: name the refusing step
+                            if (!prepared) {
+                                prepared_refused_at = "publish";
+                            }
+                        } else {
+                            // fork 9l-ckpt-prep-diag: the observation or a prior
+                            // failure in this same lineage both land here
+                            prepared_refused_at = slot.retention_obs
+                                ? "geometry_already_failed"
+                                : "no_retention_observer";
                         }
                         llama_cache_acct_artifact_id artifact;
                         std::vector<llama_cache_acct_op_id> ops;
                         if (prepared) {
-                            prepared = slot.retention_obs->
-                                checkpoint_admission_artifact(
-                                    staged_checkpoint_key, artifact) &&
+                            // fork 9l-ckpt-prep-diag: the compound && chain was
+                            // folded into named steps so the log can report
+                            // which one refused. attach_release_ops consumes
+                            // `ops` by move, so the flags have to be captured
+                            // before the chain rather than re-derived after it.
+                            const bool artifact_ready =
+                                slot.retention_obs->
+                                    checkpoint_admission_artifact(
+                                        staged_checkpoint_key, artifact);
+                            const bool admitted = artifact_ready &&
                                 slot.lifecycle_authority->admit_live_checkpoint(
-                                    artifact, cur, ops) &&
+                                    artifact, cur, ops);
+                            const bool ops_attached = admitted &&
                                 slot.retention_obs->attach_release_ops(
                                     staged_checkpoint_key, std::move(ops));
+                            prepared = ops_attached;
+                            if (!prepared) {
+                                prepared_refused_at = !artifact_ready
+                                    ? "checkpoint_admission_artifact"
+                                    : (!admitted
+                                        ? "admit_live_checkpoint"
+                                        : "attach_release_ops");
+                            }
                         }
                         if (prepared && !slot.retention_destination.valid()) {
                             prepared = slot.retention_obs->acquire_lineage_ticket(
                                 staged_checkpoint_key,
                                 slot.retention_destination);
                             staged_checkpoint_acquired_destination = prepared;
+                            // fork 9l-ckpt-prep-diag: name the refusing step
+                            if (!prepared) {
+                                prepared_refused_at = "acquire_lineage_ticket";
+                            }
                         }
                         if (prepared && !slot.retention_branch_pending) {
                             prepared = slot.retention_destination.valid() &&
                                 slot.retention_obs->activate_lineage_ticket(
                                     slot.retention_destination);
+                            // fork 9l-ckpt-prep-diag: distinguishes "no
+                            // destination ticket to activate" (only reachable
+                            // when the branch was pending) from a refused
+                            // activation of a ticket we do hold
+                            if (!prepared) {
+                                prepared_refused_at =
+                                    slot.retention_destination.valid()
+                                        ? "activate_lineage_ticket"
+                                        : "no_destination_ticket";
+                            }
                         }
                         if (!prepared) {
                             if (slot.retention_obs) {
@@ -10458,8 +10506,21 @@ private:
                             slot.retention_geometry_failed = true;
                             staged.clear();
                             do_checkpoint = false;
-                            SLT_WRN(slot, "%s\n",
-                                "checkpoint publication/accounting preparation failed; retained ring is unchanged");
+                            // fork 9l-ckpt-prep-diag: keep the original
+                            // sentence intact (existing greps depend on it) and
+                            // append the refusing step plus the geometry the
+                            // accounting transaction priced against. Without
+                            // this the warning named none of its six causes.
+                            SLT_WRN(slot,
+                                "checkpoint publication/accounting preparation "
+                                "failed at step=%s (n_tokens=%" PRId64
+                                ", checkpoint_bytes=%zu, lineage_valid=%d, "
+                                "destination_valid=%d, branch_pending=%d); "
+                                "retained ring is unchanged\n",
+                                prepared_refused_at, cur.n_tokens,
+                                cur.size(), (int) frontier_valid,
+                                (int) slot.retention_destination.valid(),
+                                (int) slot.retention_branch_pending);
                         } else {
                             staged_checkpoint_published = true;
                         }
