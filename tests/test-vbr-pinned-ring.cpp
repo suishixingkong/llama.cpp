@@ -17,7 +17,7 @@
 //
 // Deliberately not covered, because reaching them requires a real ggml device: duplicate lane
 // detection (only reached for lanes with a non-null device), every host_buffer_* code,
-// lane_underprovisioned and accounting_charge_failed. They are listed in BUUN_MERGE_PLAN §10.33 so
+// lane_underprovisioned and accounting_charge_failed. They are listed in MERGE_BUUN_PLAN §10.33 so
 // the gap is visible rather than assumed.
 //
 // Self-reporting (status from main plus explicit PASS lines), so NDEBUG cannot hollow it out and it

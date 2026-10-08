@@ -10,7 +10,7 @@
 //
 // It was originally hand-written and deliberately narrow because the codec itself
 // (llama-vbr-artifact.cpp) did NOT link: it needs vbr_generation_production_covered_set(), which only
-// llama-vbr-generation.cpp defines. That was the third closure criterion in BUUN_MERGE_PLAN §10.35 --
+// llama-vbr-generation.cpp defines. That was the third closure criterion in MERGE_BUUN_PLAN §10.35 --
 // include closure is not enough, LINK closure is a separate measurement. The codec links now and the
 // fork's test covers it; what survives here is exactly what the fork does not.
 //

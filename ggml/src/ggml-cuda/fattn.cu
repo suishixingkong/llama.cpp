@@ -3212,7 +3212,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-// Opt-in gate for the TurboQuant tensor-core FA path (B+ Stage 1c L1, BUUN_MERGE_PLAN.md
+// Opt-in gate for the TurboQuant tensor-core FA path (B+ Stage 1c L1, MERGE_BUUN_PLAN.md
 // section 1.4a). Enabled via GGML_CUDA_FA_MMA=1 (value-based, 0 = off) for A/B benchmarking
 // against the regular kernel selection below. Returns true only for shapes that have compiled
 // instances per the pair table in fattn-mma-turbo.cuh (13 symmetric pairs across turbo and
@@ -3238,7 +3238,7 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_selectable(const ggml_tensor * ds
     return ggml_cuda_fattn_mma_turbo_pair_compiled(K->type, V->type);
 }
 
-// Opt-in TurboQuant MMA FA dispatch counter (BUUN_MERGE_PLAN.md section 10.9). Exported via
+// Opt-in TurboQuant MMA FA dispatch counter (MERGE_BUUN_PLAN.md section 10.9). Exported via
 // ggml_backend_cuda_get_turbo_mma_fa_invocations() so tests and A/B runs can verify this path
 // was actually taken: a delta of 0 around a compute means the regular kernels served the op.
 static std::atomic<uint64_t> g_turbo_mma_fa_invocations{0};

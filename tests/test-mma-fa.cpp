@@ -1,5 +1,5 @@
 // Differential test for the opt-in TurboQuant MMA FlashAttention path (Stage 1c L1,
-// BUUN_MERGE_PLAN.md sections 1.4a / 10.9).
+// MERGE_BUUN_PLAN.md sections 1.4a / 10.9).
 //
 // What it verifies, per (K/V type pair, shape):
 //   1. Routing: WHICH kernel family served the op -- read as a delta of

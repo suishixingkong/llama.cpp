@@ -6,7 +6,7 @@
 // header-only leaves of the subsystem; without a TU that includes them the build never
 // checks them. No runtime behaviour is added here - nothing calls the anchor yet.
 //
-// Staging (BUUN_MERGE_PLAN.md section 3, feature 2 "VBR 动态 KV 量化"):
+// Staging (MERGE_BUUN_PLAN.md section 3, feature 2 "VBR 动态 KV 量化"):
 //   stage 2.1  leaves: bit-ops, sha256, codec ladder                      <- this commit
 //   stage 2.2  cache accounting + cache authority + memory tree
 //   stage 2.3  artifact core (writer/reader/validate)

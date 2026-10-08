@@ -1,5 +1,5 @@
 // TurboQuant / general quantized KV-cache tensor-core FlashAttention launcher
-// (BUUN_MERGE_PLAN.md sections 1.4a / 10.9 / 10.10).
+// (MERGE_BUUN_PLAN.md sections 1.4a / 10.9 / 10.10).
 //
 // Stage 1c L1: the MMA FA kernel body (fattn-mma-f16.cuh) was made type-generic (type_K/type_V
 // threaded through flash_attn_ext_f16/_process_tile/_iter, with flash_attn_ext_turbo_load_tile

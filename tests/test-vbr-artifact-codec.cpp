@@ -1,6 +1,6 @@
 // Tests for the artifact codec's admission gates, now that the whole artifact strongly-connected
 // component (llama-vbr-artifact.cpp, -generation.cpp, -occupied-replacement.cpp, -catalog.cpp,
-// -validate.cpp) is in the tree together. See BUUN_MERGE_PLAN §10.37-§10.38: these five TUs are
+// -validate.cpp) is in the tree together. See MERGE_BUUN_PLAN §10.37-§10.38: these five TUs are
 // mutually link-dependent, so they could only land as one commit.
 //
 // Hand-written: upstream has no test for these files. The scope here is the *admission* half of the
@@ -17,7 +17,7 @@
 //   - vbr_artifact_prepare()'s first three admission layers, exercised with deliberately broken
 //     packages so each gate is seen refusing rather than assumed to exist.
 //
-// The full round trip is NOT covered and is listed as a gap in BUUN_MERGE_PLAN §10.38.
+// The full round trip is NOT covered and is listed as a gap in MERGE_BUUN_PLAN §10.38.
 //
 // Self-reporting (status from main plus explicit PASS lines), so NDEBUG cannot hollow it out and it
 // needs no /UNDEBUG.

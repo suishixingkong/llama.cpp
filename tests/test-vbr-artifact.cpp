@@ -63,7 +63,7 @@ static_assert(std::is_trivially_copyable<
 // unaffected. Those six are therefore re-derived for this port. Forcing GGML_TYPE_TURBO4_0 to 44
 // in a scratch build (nothing else changed) makes all nine goldens match the fork and the suite
 // report PASS, which is the measurement that proves the ordinal is the ONLY difference -- the
-// codec itself is byte-identical to the fork's. Slice 9l-d4b9m, BUUN_MERGE_PLAN §9l-d4b9m.
+// codec itself is byte-identical to the fork's. Slice 9l-d4b9m, MERGE_BUUN_PLAN §9l-d4b9m.
 static_assert((int) GGML_TYPE_TURBO4_0 == 45,
               "GGML_TYPE_TURBO4_0 moved: re-derive the six enum-dependent goldens in "
               "test_golden_and_native_lineage and test_v1_decode_and_v2_restore_metadata");

@@ -1150,7 +1150,7 @@ size_t quantize_turbo8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
  * uses strictly-less comparisons, i.e. ties resolve to the lowest predecessor and the
  * lowest final state; the CUDA kernels' shuffle reductions resolve ties the same way.
  *
- * Known deviations from buun (see BUUN_MERGE_PLAN.md): buun ships separately trained K/V
+ * Known deviations from buun (see MERGE_BUUN_PLAN.md): buun ships separately trained K/V
  * codebooks (numerically within ~2% of each other) and a decode-side V gain
  * (TURBO_TCQ_ALPHA_V_* = 1.02/1.06 for t3/t2). Neither is taken: this codec is exactly
  * self-consistent (encode norm == decode norm), and the tuning needs a GPU to validate. */

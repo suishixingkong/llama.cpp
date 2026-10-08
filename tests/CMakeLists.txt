@@ -436,7 +436,7 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-turbo-cuda-parity.cpp LABEL cuda)
     # Differential test of the opt-in TurboQuant MMA FlashAttention path (GGML_CUDA_FA_MMA=1).
     # Run twice on the device: default = mma mode (counter must advance), "fallback" = env off
-    # (counter must stay 0). See BUUN_MERGE_PLAN.md section 10.9.
+    # (counter must stay 0). See MERGE_BUUN_PLAN.md section 10.9.
     llama_build_and_test(test-mma-fa.cpp LABEL cuda)
     # fork 9l-d4b9j: the VBR CUDA VMM test (fork tests/test-vbr-vmm.cpp:1-402), landed
     # VERBATIM. It drives the CUDA VBR backend interface directly -- ggml_backend_cuda_vbr_iface()
@@ -608,14 +608,14 @@ target_include_directories(test-vbr-extent PRIVATE ${PROJECT_SOURCE_DIR}/src)
 # Pinned transport ring. Self-reporting, so no /UNDEBUG. Its backend-dependent pump cannot run
 # without ggml, so this test covers the creation contract only: geometry, accounting binding, lane
 # binding, the process-wide capacity ceiling and move-only token ownership. The failure codes that
-# need a real device are listed in BUUN_MERGE_PLAN §10.33.
+# need a real device are listed in MERGE_BUUN_PLAN §10.33.
 llama_build_and_test(test-vbr-pinned-ring.cpp)
 target_include_directories(test-vbr-pinned-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # The artifact codec / catalog / validator / staging test: the fork's
 # tests/test-vbr-artifact.cpp, ported whole (fork 9l-d4b9m). Self-reporting (a failure counter and
 # an explicit PASS line), so no /UNDEBUG. This is the full prepare/encode/decode round trip that
-# BUUN_MERGE_PLAN §10.38 recorded as the outstanding gap.
+# MERGE_BUUN_PLAN §10.38 recorded as the outstanding gap.
 #
 # The fork splits this file in two with `#ifdef VBR_PROMPT_CACHE_PUBLICATION_TEST`. That half
 # reaches the live server (it includes server-context.h / server-task.h and the server module adds
@@ -687,7 +687,7 @@ target_include_directories(test-vbr-artifact-adopt PRIVATE ${PROJECT_SOURCE_DIR}
 # Artifact codec admission gates, the first test that reaches the whole artifact strongly-connected
 # component (artifact + generation + occupied-replacement + catalog + validate). Self-reporting, so
 # no /UNDEBUG. Scope is admission plus the two shared helpers; a full encode/decode round trip needs
-# a complete unit-artifact package and is still open (BUUN_MERGE_PLAN §10.38).
+# a complete unit-artifact package and is still open (MERGE_BUUN_PLAN §10.38).
 llama_build_and_test(test-vbr-artifact-codec.cpp)
 target_include_directories(test-vbr-artifact-codec PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

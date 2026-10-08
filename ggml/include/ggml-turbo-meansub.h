@@ -2,7 +2,7 @@
 
 // TurboQuant affine-tap ("mean-sub") tables: per-(layer, channel) KV means that the CUDA encode
 // path subtracts before the WHT rotation, and that the graph restores for V after attention.
-// See MERGE_TURBO234_UPSTREAM.md sections 3-5 and BUUN_MERGE_PLAN.md section 10.20.
+// See MERGE_TURBO234_UPSTREAM.md sections 3-5 and MERGE_BUUN_PLAN.md section 10.20.
 //
 // Why:
 //   * K: logits use <q, k - mu_k> = <q, k> - <q, mu_k>, so centring K shifts every real-token

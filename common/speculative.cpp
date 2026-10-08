@@ -188,7 +188,7 @@ struct common_speculative_impl {
     // (ring_state_reset()). This tree's draft_dflash / draft_mtp have none of that
     // state and it has no common_speculative_impl_dflash at all, so no port
     // implementation overrides this yet and every event takes the no-op default
-    // below. Overrides belong with the speculative.cpp port - BUUN_MERGE_PLAN.md.
+    // below. Overrides belong with the speculative.cpp port - MERGE_BUUN_PLAN.md.
     virtual void sequence_transition(
             llama_seq_id /*seq_id*/,
             common_speculative_sequence_event /*event*/) {}

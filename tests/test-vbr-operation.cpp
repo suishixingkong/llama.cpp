@@ -3,7 +3,7 @@
 // Hand-written rather than ported: upstream's test-vbr-representation-epoch.cpp covers the
 // operation CPU sub-mode inside one 765-line function that also reaches llama-kv-cache.h, so it
 // cannot be cut along function boundaries and its file-level includes pull in explicit-capture and
-// artifact-capture types that only exist from stage 2.6f onwards. See BUUN_MERGE_PLAN §10.33.
+// artifact-capture types that only exist from stage 2.6f onwards. See MERGE_BUUN_PLAN §10.33.
 //
 // What is covered here is everything that decides whether an operation may exist at all:
 //   1. the closed vocabularies (names, registries, bit helpers, kind->family and kind->registrant

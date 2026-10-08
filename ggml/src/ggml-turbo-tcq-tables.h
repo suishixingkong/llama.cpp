@@ -17,7 +17,7 @@
 //
 // NOTE: only the K-side (encode+decode) codebook is taken. buun also ships K/V-split
 // variants (d_turbo*_tcq_codebook_v) and a decode-side V gain (TURBO_TCQ_ALPHA_V_*), both
-// of which are accuracy tuning that must be validated on a real GPU; see BUUN_MERGE_PLAN.md.
+// of which are accuracy tuning that must be validated on a real GPU; see MERGE_BUUN_PLAN.md.
 
 #ifndef TURBO_TCQ_TABLE
 #error "define TURBO_TCQ_TABLE before including ggml-turbo-tcq-tables.h"

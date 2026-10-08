@@ -4,7 +4,7 @@
 // VBR tests are hard-seal, physical, policy, transaction, downward, representation-identity,
 // representation-epoch, artifact*, swa-window and vmm), and the epoch test is the nearest thing to
 // a consumer of the ownership index - but it reaches llama-kv-cache.h inside a single 765-line
-// function. See BUUN_MERGE_PLAN §10.33.
+// function. See MERGE_BUUN_PLAN §10.33.
 //
 // Two independent oracles are used, because a test that re-derives its expectation from the code
 // under test proves nothing:
@@ -427,7 +427,7 @@ int main() {
             // (n_stream == 1, which armed VBR forces) the out-of-domain index is out of the slot
             // array, so the attempt cannot silently land in a real view - which is the invariant
             // asserted here. The multi-stream aliasing hazard this asymmetry implies is recorded in
-            // BUUN_MERGE_PLAN §10.33 rather than encoded as expected behaviour.
+            // MERGE_BUUN_PLAN §10.33 rather than encoded as expected behaviour.
             bool accepted = false;
             bool threw = false;
             try {
