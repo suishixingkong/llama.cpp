@@ -1,4 +1,6 @@
 #include "speculative.h"
+// fork 9l-mtp-adaptive: the fork's reversible MTP draft-depth controller.
+#include "speculative-mtp-adaptive.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1390,6 +1392,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // fork 9l-mtp-adaptive: reversible per-request depth control. Never grow the reserved
+    // depth, and keep independently trained heads and shared-KV assistants out: with
+    // chain_heads each step already runs a different head (the depth is not a free knob
+    // there), and a shared-KV assistant has no separate draft decode to save.
+    bool                                    adaptive_recursive_depth = false;
+    std::vector<common_speculative_mtp_adaptive> adaptive;
+    std::vector<int32_t>                    adaptive_last_draft_size;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1450,6 +1460,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        // fork 9l-mtp-adaptive: arm the depth controller only for the exact configuration the
+        // fork tuned it on -- a single trained MTP head, its own (non-shared) KV, and the
+        // default depth of 3. Anything else keeps the upstream always-full-depth behaviour,
+        // and GGML_MTP_DRAFT_ADAPTIVE=0 is the opt-out for A/B runs.
+        {
+            const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
+            adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && this->params.n_max == 3 &&
+                                       !(adaptive_env && atoi(adaptive_env) == 0);
+            adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min));
+            adaptive_last_draft_size.assign(n_seq, 0);
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -1492,6 +1514,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // fork 9l-mtp-adaptive: a new request may recover the learned depth.
+        adaptive[seq_id].begin();
+        adaptive_last_draft_size[seq_id] = 0;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1808,7 +1834,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // fork 9l-mtp-adaptive: the per-request depth, never above the reserved one,
+                // and never above what this caller asked for.
+                int32_t n_max_eff = adaptive_recursive_depth
+                    ? std::min(params.n_max, adaptive[seq_id].depth())
+                    : params.n_max;
+                if (dp.n_max > 0) {
+                    n_max_eff = std::min(n_max_eff, dp.n_max);
+                }
+                if (n_max_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1858,12 +1892,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            // fork 9l-mtp-adaptive: hand the delivered width to accept(), which is the only
+            // place that knows how much of it the target agreed with. Recorded after the
+            // n_min clamp, so a clipped draft measures as a clipped draft.
+            if (adaptive_recursive_depth) {
+                adaptive_last_draft_size[seq_id] = (int32_t) dp.result->size();
+            }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        // fork 9l-mtp-adaptive: observe the outcome of the last draft *before* the
+        // verify-row guard below, so a step that produced no hidden rows still counts as
+        // a measured miss rather than disappearing from the controller's statistics.
+        if (adaptive_recursive_depth) {
+            const int previous = adaptive[seq_id].depth();
+            const int drafted  = adaptive_last_draft_size[seq_id];
+            // CopySpec can append a suffix while MTP still owns acceptance.
+            // Count only acceptance of MTP's own prefix for depth selection.
+            adaptive[seq_id].accept(drafted, std::min<int>(n_accepted, drafted), is_other);
+            adaptive_last_draft_size[seq_id] = 0;
+            if (previous != adaptive[seq_id].depth()) {
+                SPC_DBG("MTP seq %d adaptive draft cap %d -> %d\n",
+                        (int) seq_id, previous, adaptive[seq_id].depth());
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -1894,9 +1950,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
-        // The fork also clears proposals[] and resets adaptive[] here. Neither exists in
-        // this tree's draft_mtp (no proposal cache, no adaptive draft-size backoff), so
-        // there is nothing to invalidate; the restored carry is the whole state.
+        // fork 9l-mtp-adaptive: the fork also clears proposals[] here. This tree's draft_mtp
+        // still has no proposal cache, so the adaptive depth is the only extra state that a
+        // restored checkpoint must invalidate -- the learned depth survives (adaptive.begin(),
+        // not reset()), but the request-local counters must not span the restore.
+        adaptive[seq_id].begin();
         return common_speculative_mtp_carry_state_load(
             pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
@@ -1912,6 +1970,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         pending_h_lifecycle[seq_id].sequence_transition(event);
+        // fork 9l-mtp-adaptive: the fork resets the depth controller on every sequence event
+        // (its sequence_transition also clears proposals[] / chain_h / i_last). A pending
+        // draft width that no longer belongs to the live sequence must not be measured.
+        adaptive_last_draft_size[seq_id] = 0;
+        adaptive[seq_id].begin();
     }
 };
 
