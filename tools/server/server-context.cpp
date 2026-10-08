@@ -10395,6 +10395,9 @@ private:
                         // instead; the warning keeps its original text so
                         // existing greps keep working.
                         const char * prepared_refused_at = "none";
+                        // fork 9l-ckpt-prep-diag: narrows a refusing step to its
+                        // own silent branch; empty means "no finer detail".
+                        const char * prepared_detail = "";
                         const bool frontier_valid =
                             cur.computation_frontier.valid() &&
                             cur.computation_frontier.token_count == cur.n_tokens &&
@@ -10461,11 +10464,25 @@ private:
                                     staged_checkpoint_key, std::move(ops));
                             prepared = ops_attached;
                             if (!prepared) {
-                                prepared_refused_at = !artifact_ready
-                                    ? "checkpoint_admission_artifact"
-                                    : (!admitted
-                                        ? "admit_live_checkpoint"
-                                        : "attach_release_ops");
+                                // fork 9l-ckpt-prep-diag: name the failing flag
+                                // directly rather than via nested conditionals --
+                                // the first false flag in call order is the one
+                                // that reported the refusal.
+                                if (!artifact_ready) {
+                                    prepared_refused_at =
+                                        "checkpoint_admission_artifact";
+                                } else if (!admitted) {
+                                    // fork 9l-ckpt-prep-diag: the admission door
+                                    // has silent branches of its own; forward the
+                                    // one that fired instead of a flat step name.
+                                    prepared_refused_at = "admit_live_checkpoint";
+                                    prepared_detail = slot.lifecycle_authority
+                                        ? slot.lifecycle_authority
+                                              ->admission_refusal()
+                                        : "no_lifecycle_authority";
+                                } else {
+                                    prepared_refused_at = "attach_release_ops";
+                                }
                             }
                         }
                         if (prepared && !slot.retention_destination.valid()) {
@@ -10494,6 +10511,15 @@ private:
                             }
                         }
                         if (!prepared) {
+                            // fork 9l-ckpt-prep-diag: snapshot the geometry we
+                            // are about to report BEFORE the staged list is
+                            // cleared. `cur` is a reference into `staged`, so
+                            // reading it after staged.clear() touches a
+                            // destroyed node -- that reported a bogus
+                            // n_tokens/bytes. Capturing here keeps the original
+                            // wording while making the numbers real.
+                            const int64_t refused_n_tokens = cur.n_tokens;
+                            const size_t  refused_bytes      = cur.size();
                             if (slot.retention_obs) {
                                 slot.retention_obs->retire(
                                     staged_checkpoint_key);
@@ -10511,14 +10537,20 @@ private:
                             // append the refusing step plus the geometry the
                             // accounting transaction priced against. Without
                             // this the warning named none of its six causes.
+                            // `detail` narrows the admission step to its own
+                            // silent branch, so "admit_live_checkpoint" no
+                            // longer stands in for six different refusals.
                             SLT_WRN(slot,
                                 "checkpoint publication/accounting preparation "
-                                "failed at step=%s (n_tokens=%" PRId64
+                                "failed at step=%s%s%s (n_tokens=%" PRId64
                                 ", checkpoint_bytes=%zu, lineage_valid=%d, "
                                 "destination_valid=%d, branch_pending=%d); "
                                 "retained ring is unchanged\n",
-                                prepared_refused_at, cur.n_tokens,
-                                cur.size(), (int) frontier_valid,
+                                prepared_refused_at,
+                                prepared_detail[0] ? " detail=" : "",
+                                prepared_detail[0] ? prepared_detail : "",
+                                refused_n_tokens,
+                                refused_bytes, (int) frontier_valid,
                                 (int) slot.retention_destination.valid(),
                                 (int) slot.retention_branch_pending);
                         } else {

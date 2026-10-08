@@ -596,16 +596,22 @@ bool server_cache_authority::admit_host_entry(
 bool server_cache_authority::admit_live_checkpoints(
         std::vector<server_cache_live_checkpoint_admission> & batch) noexcept {
     const uint64_t refusal_count = std::max<size_t>(batch.size(), 1);
-    const auto refuse = [&]() noexcept {
+    // fork 9l-ckpt-prep-diag: name the refusing sub-step. Every branch below
+    // used to return false silently, so the caller's combined warning could
+    // not tell an unconfigured authority from a missing payload or a refused
+    // accounting transaction.
+    const char * refused_at = "none";
+    const auto refuse = [&](const char * why) noexcept {
         for (auto & member : batch) {
             member.committed.clear();
         }
         admission_refusals += refusal_count;
+        refused_at = why;
         return false;
     };
 
     if (!configured || batch.empty()) {
-        return refuse();
+        return refuse(configured ? "empty_batch" : "authority_not_configured");
     }
     std::vector<server_shared_payload_claim> claims;
     std::vector<std::pair<size_t, size_t>> ranges;
@@ -615,14 +621,20 @@ bool server_cache_authority::admit_live_checkpoints(
             member.committed.clear();
             if (member.artifact.v == 0 || !member.checkpoint ||
                 member.checkpoint->data_tgt.empty()) {
-                return refuse();
+                return refuse("no_target_payload");
             }
             std::vector<server_shared_payload_claim> member_claims;
             member_claims.reserve(4);
             if (!add_checkpoint_payload_claims(
-                    ledger, *member.checkpoint, member_claims) ||
-                member_claims.empty()) {
-                return refuse();
+                    ledger, *member.checkpoint, member_claims)) {
+                return refuse("payload_claim_rejected");
+            }
+            if (member_claims.empty()) {
+                // Distinguish "the checkpoint carries no device-visible payload"
+                // from "its payload could not be claimed": an unbacked buffer
+                // reaches the accounting stage as zero claims, which used to be
+                // indistinguishable from a real refusal.
+                return refuse("no_accountable_payload");
             }
             const size_t first = claims.size();
             for (auto & claim : member_claims) {
@@ -632,7 +644,7 @@ bool server_cache_authority::admit_live_checkpoints(
             ranges.push_back({ first, claims.size() });
         }
     } catch (...) {
-        return refuse();
+        return refuse("claim_construction_threw");
     }
     std::vector<llama_cache_acct_op_id> committed;
     if (!execute_shared_payload_claims(
@@ -640,7 +652,10 @@ bool server_cache_authority::admit_live_checkpoints(
         SRV_WRN(
             "%s\n",
             "CACHE_AUTHORITY checkpoint ownership refused: shared payload transaction failed");
-        return refuse();
+        // fork 9l-ckpt-prep-diag: this branch does log (SRV_WRN above), but the
+        // name is forwarded too so one reader can tell every refusal cause from
+        // the same field.
+        return refuse("payload_transaction_failed");
     }
     try {
         for (size_t i = 0; i < batch.size(); ++i) {
@@ -660,7 +675,8 @@ bool server_cache_authority::admit_live_checkpoints(
             (void) ledger.release(op);
         }
         admission_rollbacks += committed.size();
-        return refuse();
+        // fork 9l-ckpt-prep-diag
+        return refuse("committed_slice_assignment_threw");
     }
     // Preserve the established per-checkpoint admission counter semantics
     // even though the accounting terminal is now one batch transaction.
@@ -678,12 +694,26 @@ bool server_cache_authority::admit_live_checkpoint(
         batch[0].artifact = artifact;
         batch[0].checkpoint = &checkpoint;
         if (!admit_live_checkpoints(batch)) {
+            // fork 9l-ckpt-prep-diag: publish the sub-step to the caller so its
+            // combined warning can name the refusal instead of only that some
+            // admission failed. last_refused_at is written by refuse().
+            set_admission_refusal(last_refused_at);
             return false;
         }
         committed = std::move(batch[0].committed);
-        return !committed.empty();
+        if (committed.empty()) {
+            // fork 9l-ckpt-prep-diag: a committed-but-empty batch satisfies the
+            // transaction yet leaves the caller nothing to attach, so it is a
+            // refusal the caller's "!committed.empty()" test would hide.
+            set_admission_refusal("committed_empty");
+            admission_refusals++;
+            return false;
+        }
+        return true;
     } catch (...) {
         admission_refusals++;
+        // fork 9l-ckpt-prep-diag
+        set_admission_refusal("admission_threw");
         return false;
     }
 }

@@ -234,6 +234,35 @@ struct server_cache_authority {
     bool configured = true;
     bool summary_emitted = false;
 
+    // fork 9l-ckpt-prep-diag: name of the sub-step that refused the most recent
+    // admit_live_checkpoint(). Every one of those branches returned false
+    // silently, so the caller's combined warning could not name a cause.
+    // A bounded char array rather than std::string keeps this header free of a
+    // new <string> include: every value is a string literal assigned in-tree.
+    static constexpr size_t ADMISSION_REFUSAL_MAX = 48;
+    char last_admission_refusal_[ADMISSION_REFUSAL_MAX] = "none";
+    // fork 9l-ckpt-prep-diag: set by admit_live_checkpoints()' refuse() lambda so
+    // admit_live_checkpoint() can forward it to last_admission_refusal_.
+    const char * last_refused_at = "none";
+
+    // fork 9l-ckpt-prep-diag: copy a literal refusal name into the bounded slot.
+    // Truncation is fine here: the value exists to disambiguate log lines, and
+    // every in-tree name is far shorter than the bound.
+    void set_admission_refusal(const char * why) noexcept {
+        if (!why) {
+            why = "unspecified";
+        }
+        size_t i = 0;
+        for (; i + 1 < ADMISSION_REFUSAL_MAX && why[i]; ++i) {
+            last_admission_refusal_[i] = why[i];
+        }
+        last_admission_refusal_[i] = '\0';
+    }
+
+    const char * admission_refusal() const noexcept {
+        return last_admission_refusal_;
+    }
+
     // Construct a point-in-time budget input. pending_host_bytes are already allocated in the
     // detached host-cache node, so they are added back to the sampled CPU free-memory headroom.
     bool sample_budget(
