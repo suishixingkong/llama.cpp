@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 uint64_t llama_memory_vbr_budget_bytes_resolve(const llama_memory_vbr_params & params) {
@@ -1265,6 +1266,19 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // fork 9l-kvc-demote-warn: dedupe state for the downgrade warning emitted per layer below. It
+    // must live OUTSIDE that loop: declared inside it, the set is rebuilt on every layer and a
+    // cache-wide downgrade prints once per layer (24 lines for a 24-layer model) -- i.e. the set
+    // would not dedupe anything, which is the entire point. Deliberately NOT function-static
+    // either: the no-alloc (fit) construction and the real one both run this loop, and a static
+    // would be populated by the fit pass and swallow the message for the allocation the user
+    // actually gets (same trap as the one-shot `static bool warned` flags further down, which are
+    // a known hazard here rather than a pattern to copy). Net effect: one line per distinct
+    // (requested, actual) TYPE PAIR per construction. The layer index stays out of the key and is
+    // reported in the message text instead.
+    using demote_key_t = std::pair<std::pair<ggml_type, ggml_type>, std::pair<ggml_type, ggml_type>>;
+    std::set<demote_key_t> demote_warn_seen;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -1682,6 +1696,26 @@ llama_kv_cache::llama_kv_cache(
                             (int) il, head_v_fb);
                     logged_v = true;
                 }
+            }
+        }
+
+        // fork 9l-kvc-demote-warn: a -ctk/-ctv request that does not survive into the allocated
+        // tensor is a silent downgrade unless it is said out loud. Four mechanisms rewrite
+        // layer_type_* away from type_k/type_v -- the layer-adaptive modes, the VBR layer schedule,
+        // the host-buffer pin above, and the head_dim>512 turbo FA limit -- and until now only the
+        // last two had any log line, and none of them named the requested type or said which layer
+        // the deviation appeared on. Placed after every rewrite so it reports the final decision.
+        // demote_warn_seen is declared just above the layer loop (see the comment there for why it
+        // must not be local to this block or function-static).
+        if (layer_type_k != type_k || layer_type_v != type_v) {
+            const auto key = std::make_pair(std::make_pair(type_k, layer_type_k),
+                                            std::make_pair(type_v, layer_type_v));
+            if (demote_warn_seen.insert(key).second) {
+                LLAMA_LOG_WARN("llama_kv_cache: KV type request downgraded: K %s -> %s, V %s -> %s "
+                        "(first seen at layer %d of %d; requested types come from -ctk/-ctv)\n",
+                        ggml_type_name(type_k), ggml_type_name(layer_type_k),
+                        ggml_type_name(type_v), ggml_type_name(layer_type_v),
+                        (int) il, (int) hparams.n_layer());
             }
         }
 
