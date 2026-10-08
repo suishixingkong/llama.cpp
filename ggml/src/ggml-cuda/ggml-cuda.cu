@@ -3883,10 +3883,48 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// The kv-stream CUDA-graph gate below bakes the resident page set, the SET_ROWS staging range and
+// the streamed attention span into the captured graph. Those addresses are only stable because a
+// decode step writes a single token: dirty_rows.size() == 1 and Q->ne[1] == 1 are that assumption
+// written out. Speculative decoding (MTP) verifies n_draft + 1 tokens in one ubatch, so both
+// conditions fail and the whole decode graph silently loses CUDA-graph replay. On a V100 with a
+// 2B model that is the difference between ~220 t/s (graph replay) and ~140 t/s (kernel launches).
+//
+// GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 admits multi-row kv-stream batches. It stays sound only
+// while every attention layer is served entirely from the resident cache - the all_layers_fit
+// requirement, which the relaxation keeps - because then no runtime-chosen page address ends up in
+// the graph. EXPERIMENTAL: an unsound configuration here produces wrong logits rather than an
+// error, so compare generated tokens, not only t/s, before trusting it.
+static bool kv_stream_multireq_graph_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_MULTIROW_GRAPH");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Batches this small are decode-sized, which is what the one-shot warning below is for; the
+// prefill ubatch legitimately never uses the captured graph and must not consume the warning.
+static constexpr size_t KV_STREAM_MULTIROW_GRAPH_PROBE_ROWS = 16;
+
+static void kv_stream_graph_note_disabled(const char * why, const char * op, size_t rows) {
+    static bool warned = false;
+    if (warned || rows == 0 || rows > KV_STREAM_MULTIROW_GRAPH_PROBE_ROWS) {
+        return;
+    }
+    warned = true;
+    GGML_LOG_WARN("kv-stream: disabling CUDA graphs for this graph: %s (%s, %zu row%s) - this "
+            "graph runs without CUDA-graph replay; set GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 to "
+            "admit multi-row batches (e.g. speculative verification)\n",
+            why, op, rows, rows == 1 ? "" : "s");
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
+
+    const bool multireq_allowed = kv_stream_multireq_graph_enabled();
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -3898,8 +3936,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         auto * node_runtime = ggml_cuda_kv_stream_runtime_from_tensor(node);
         bool mirrorable_set_rows = false;
         if (node_runtime != nullptr) {
+            const bool single_row = node_runtime->dirty_rows.size() == 1;
+            const bool multi_row  = multireq_allowed && !node_runtime->dirty_rows.empty();
             mirrorable_set_rows = node->op == GGML_OP_SET_ROWS &&
-                node_runtime->dirty_rows.size() == 1 && node_runtime->dirty_rows[0] >= 0 &&
+                (single_row || multi_row) && node_runtime->dirty_rows[0] >= 0 &&
                 node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_F32 &&
                 node->src[1] != nullptr && node->src[1]->type == GGML_TYPE_I64 &&
                 ggml_backend_cuda_kv_stream_get_type_capabilities(
@@ -3909,6 +3949,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 ggml_cuda_kv_stream_resident_cache_get_mirror(
                     node_runtime->resident_cache, node, &mirror_data);
             if (!mirrorable_set_rows) {
+                kv_stream_graph_note_disabled(node->op == GGML_OP_SET_ROWS ?
+                        "the kv-stream write is not mirrorable for this row count" :
+                        "a kv-stream tensor feeds a node the graph cannot capture",
+                    ggml_op_name(node->op), node_runtime->dirty_rows.size());
                 use_cuda_graph = false;
             }
         }
@@ -3918,13 +3962,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             if (runtime == nullptr) {
                 continue;
             }
+            const bool multi_query = multireq_allowed && node->src[0] != nullptr &&
+                node->src[0]->ne[1] > 1;
             const bool resident_attention = mirrorable_set_rows ||
                 (node->op == GGML_OP_FLASH_ATTN_EXT &&
-                node->src[0]->ne[1] == 1 && ggml_cuda_kv_stream_fattn_fits(node) &&
+                (node->src[0]->ne[1] == 1 || multi_query) &&
+                ggml_cuda_kv_stream_fattn_fits(node) &&
                 ggml_cuda_kv_stream_resident_cache_all_layers_fit(
                     runtime->resident_cache,
                     uint32_t((node->src[1]->ne[1] + 255)/256)));
             if (!resident_attention) {
+                kv_stream_graph_note_disabled(
+                    "kv-stream attention is not fully resident for this query batch",
+                    ggml_op_name(node->op), node->src[0] != nullptr ?
+                        size_t(node->src[0]->ne[1]) : 0);
                 use_cuda_graph = false;
             }
         }
