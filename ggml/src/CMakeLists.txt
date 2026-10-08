@@ -634,3 +634,33 @@ if (BUILD_SHARED_LIBS)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
     endforeach()
 endif()
+
+# MSVC 19.40 /O2 mis-compiles the high-level optimiser entry point.  With a partial
+# idata_split the eval loop of ggml_opt_epoch() (ggml-opt.cpp) never iterates, so
+# tests/test-opt's `test_idata_split(high_level=yes, ..., results_forward)` fails for
+# every epoch of every optimizer:
+#
+#   test_idata_split(high_level=yes, epoch=N, subtest=results_forward, optimizer=adamw): FAIL  (N=1..4)
+#   ... everything else OK
+#
+# Probes show the defect is real control flow, not a value drift: right before the loop
+# `ibatch == 4` and `nbatches == 6`, yet the body is never entered, and the enclosing
+# `result_eval` keeps ndata == 0 (ggml_opt_result_loss's `nbatches == 0` branch).
+# It is layout sensitive -- adding a single fprintf inside ggml_opt_epoch() flips the
+# result to OK -- which is the signature of a codegen defect rather than a logic error.
+#
+# Evidence that it is not this fork's code:
+#   * tests/test-opt.cpp and ggml/src/ggml-opt.cpp are byte-identical to the upstream
+#     `llama` branch (git diff llama -- <file> is empty);
+#   * reverting ggml/, src/, common/, tests/, tools/, examples/, include/ and the root
+#     CMakeLists.txt to upstream and rebuilding in Release still reproduces the failure;
+#   * the same tree built with CMAKE_BUILD_TYPE=Debug (/Od) passes 46/46 for both
+#     optimizers;
+#   * /Od on ggml-opt.cpp alone is sufficient to make it pass in Release.
+#
+# ggml_opt is the training/optimiser API; it is never used on the inference path, so
+# losing /O2 for this single translation unit costs nothing at runtime.  Revisit once
+# the codegen defect is fixed upstream (then delete this block).
+if (MSVC)
+    set_source_files_properties(ggml-opt.cpp PROPERTIES COMPILE_OPTIONS "/Od")
+endif()
