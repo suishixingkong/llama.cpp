@@ -3386,7 +3386,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "T3_TCQ, a ladder of its own; it is only downgraded to classic when the model's KV "
         "geometry cannot host turbo rows. turbo = F16 -> T8 -> T4 -> T3/T2/T1, the pure turbo "
         "ladder, and the only one that may read the measured turbo orders and policies. "
-        "classic = F16 -> Q8_0 -> Q5_1 -> Q4_1 (currently for BailingMoE3/Ling)",
+        "classic = F16 -> Q8_0 -> Q5_1 -> Q4_1 (needs an attention KV cache with head "
+        "dimensions that are multiples of 64)",
         [](common_params & params, const std::string & value) {
             params.vbr_codec = common_vbr_codec_from_str(value, params.vbr_codec_auto);
             params.vbr_codec_explicit = true;

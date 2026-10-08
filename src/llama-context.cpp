@@ -4911,15 +4911,31 @@ llama_context * llama_init_from_model(
     }
 
     if (params.vbr_dynamic && !llama_model_supports_vbr_codec(model, params.vbr_codec)) {
-        // Classic live retiering is currently implemented and validated for the
-        // BailingMoE3/Ling coupled cache. DSV4 retains its separate q8_0-capped
-        // policy; ordinary DSA does not thread VBR into its child caches yet.
+        // The same rejection is reached twice in a normal server start: once
+        // through common_fit_params' pricing probe and once for the real
+        // context. A configuration error is a property of the parameters, not
+        // of the attempt, so report it once and let the second attempt be
+        // silent -- otherwise one misconfiguration reads as two failures.
+        static bool reported_unsupported_codec = false;
+        const bool report = !reported_unsupported_codec;
+        reported_unsupported_codec = true;
+
         if (params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
-            LLAMA_LOG_ERROR("%s: classic VBR currently supports BailingMoE3/Ling models only\n", __func__);
+            // fork: classic VBR is no longer BailingMoE3-only, so this must
+            // name the geometry that actually gates it instead of an
+            // architecture the gate no longer has.
+            if (report) {
+                LLAMA_LOG_ERROR(
+                        "%s: classic VBR requires an attention KV cache whose head "
+                        "dimensions are multiples of 64 (Hadamard rotation), and a "
+                        "model without attention-backed layers\n", __func__);
+            }
         } else {
             // The auto ladder contains turbo rungs, so it is exactly as demanding as turbo.
-            LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete %s VBR ladder\n",
-                    __func__, llama_vbr_ladder(params.vbr_codec).name);
+            if (report) {
+                LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete %s VBR ladder\n",
+                        __func__, llama_vbr_ladder(params.vbr_codec).name);
+            }
         }
         return nullptr;
     }

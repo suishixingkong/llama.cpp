@@ -1665,7 +1665,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        // fork: no COM_ERR here. The common_init_result constructor already
+        // reported the failed llama_init_from_model with the model path
+        // (common.cpp:1584), and repeating the identical line only made one
+        // failure look like two. The caller below reports the same condition
+        // through load_succeeded, so nothing is lost by staying silent.
         return res;
     }
 

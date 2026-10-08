@@ -63,8 +63,9 @@ Notes:
   (`ggml-vbr.h`) — currently CUDA (and ROCm for the VMM pool). KV on other backends is
   refused at init; layers whose KV lands on the CPU (partial offload, `--no-kv-offload`)
   fall back to q8_0 per layer with a warning.
-- **Classic ladder**: currently limited to BailingMoE3/Ling on a VMM-capable CUDA/ROCm
-  device. It keeps the native head width, uses no Turbo rotation/mean/tap/stash state, and uses
+- **Classic ladder**: available to any model whose attention KV cache has head dimensions that
+  are multiples of 64 (the classic dynamic path enables a Hadamard rotation), on a VMM-capable
+  CUDA/ROCm device. It keeps the native head width, uses no Turbo rotation/mean/tap/stash state, and uses
   the generic banded order by default: all movable layers reach q8_0 before any advances to q5_1,
   and all reach q5_1 before any advances to q4_1. `VBR_DEGRADE_ORDER` may supply an explicit
   classic order.

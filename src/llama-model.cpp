@@ -2293,7 +2293,55 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 bool llama_model::supports_classic_vbr() const {
-    return arch == LLM_ARCH_BAILINGMOE3;
+    // fork: classic VBR is NOT BailingMoE3-specific. The classic ladder is
+    // f16 -> q8_0 -> q5_1 -> q4_1, i.e. plain standard-quant rungs, and the
+    // dynamic machinery it drives -- shared VMM/extent allocation, the
+    // retier ladder, ggml_vbr_transcode -- has no architecture coupling
+    // (ggml/src/ggml-cuda/vbr-transcode.cu names no arch). The old gate was a
+    // one-line architecture allowlist, so "validated on BailingMoE3" was
+    // enforced as "only BailingMoE3".
+    //
+    // What the classic dynamic path genuinely requires is checked here rather
+    // than assumed, because it is geometry, not architecture:
+    //   - classic_dynamic forces a Hadamard rotation (llama-kv-cache.cpp:2618,
+    //     :2631), which needs n_embd_head_{k,v} % 64 == 0;
+    //   - a layer that is attention-backed (has_kv) must actually reach a
+    //     cache, since a recurrent-only layer cannot be retiered.
+    // Architectures with their own specialized cache owners that do not consume
+    // the ordinary VBR parameters keep the same exemption turbo applies,
+    // because advertising a ladder their caches never read would be a lie.
+    switch (arch) {
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_LLADA:
+        case LLM_ARCH_LLADA_MOE:
+        case LLM_ARCH_RND1:
+            return false;
+        default:
+            break;
+    }
+
+    bool has_attention_kv = false;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (!hparams.has_kv(il) || hparams.n_head_kv(il) == 0) {
+            continue;
+        }
+        has_attention_kv = true;
+
+        // The Hadamard rotation classic_dynamic enables is built per K/V head
+        // dimension, and its kernels are the 64-wide ones.
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        if (head_k % 64 != 0 || head_v % 64 != 0) {
+            return false;
+        }
+    }
+
+    // A model with no attention-backed layer has no KV cache to retier.
+    return has_attention_kv;
 }
 
 bool llama_model::supports_turbo_vbr() const {
