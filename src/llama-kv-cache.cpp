@@ -522,6 +522,29 @@ static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_b
     return ret;
 }
 
+// fork 9l-cpu-turbo-kv: can a KV buffer type's backend host turbo-typed KV tensors?
+//
+//   - A backend that exports the VBR interface (ggml-vbr.h) can: it owns the codecs and the
+//     page pool.
+//   - Otherwise a HOST buffer is served by the CPU backend, whose generic ggml path supports
+//     turbo-typed KV even though it exports no VBR interface (no VMM pool, no degrade
+//     controller): type_traits_cpu (ggml-cpu.c) registers from_float + vec_dot for every
+//     turbo type, ggml.c registers to_float, GGML_OP_TURBO_WHT is implemented in
+//     ggml-cpu/ops.cpp, and the CPU flash attention is type-generic -- it reads exactly
+//     type_traits_cpu[K].vec_dot and type_traits[V].to_float.  Deciding this on "exports the
+//     VBR interface" alone rejected the CPU backend and made -ctk/-ctv turbo* silently run
+//     q8_0 on host.
+//
+// Do NOT test the CPU case with ggml_backend_dev_type(ggml_backend_buft_get_device(buft)):
+// the CPU buffer type carries .device == NULL (ggml-backend.cpp, carrying its own FIXME), so
+// a device lookup returns NULL for exactly the buffer this predicate is about.
+static bool llama_buft_supports_turbo_kv(ggml_backend_buffer_type_t buft) {
+    if (!llama_vbr_backend_devs_for_buft(buft).empty()) {
+        return true;
+    }
+    return ggml_backend_buft_is_host(buft);
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -1552,11 +1575,15 @@ llama_kv_cache::llama_kv_cache(
                 layer_type_k = vbr_layer_policy.k[il];
                 layer_type_v = vbr_layer_policy.v[il];
             }
-            // Turbo types have no CPU vec_dot kernel. A movable dynamic-VBR side also cannot
-            // degrade on the host because host buffers have no VMM pool. Pin only those sides
-            // at q8_0; preserve an explicitly pinned f16/bf16/q8_0 side in a mixed -ct config.
-            // The no-alloc fit construction takes this same path, so its host-memory price and
-            // the real allocation stay identical.
+            // fork 9l-cpu-turbo-kv: turbo-typed KV IS hostable on the CPU backend (see
+            // llama_buft_supports_turbo_kv) -- the old "Turbo types have no CPU vec_dot
+            // kernel" clause was contradicted by ggml-cpu.c's own type_traits_cpu table.
+            // What really cannot work on the host is a movable dynamic-VBR side: host
+            // buffers have no VMM pool, so such a side cannot degrade. Demote that case, and
+            // demote turbo only for backends that genuinely lack the kernels. Preserve an
+            // explicitly pinned f16/bf16/q8_0 side in a mixed -ct config. The no-alloc fit
+            // construction takes this same path, so its host-memory price and the real
+            // allocation stay identical.
             //
             // fork 9l-kvc-host-pin: read the FINAL buffer type. It used to be sampled before
             // `if (offload)` and before the streaming branch overwrote buft, i.e. while it was
@@ -1573,7 +1600,7 @@ llama_kv_cache::llama_kv_cache(
             const bool cpu_bound_kv = ggml_backend_buft_is_host(buft) && buft != kv_stream_buft;
             if (cpu_bound_kv) {
                 const auto cpu_type = [&](ggml_type type, bool pinned) {
-                    const bool needs_q8 = ggml_type_is_turbo(type) ||
+                    const bool needs_q8 = (ggml_type_is_turbo(type) && !llama_buft_supports_turbo_kv(buft)) ||
                         (vbr_params_.dynamic && !pinned && type == GGML_TYPE_F16);
                     return needs_q8 ? GGML_TYPE_Q8_0 : type;
                 };
@@ -1600,9 +1627,13 @@ llama_kv_cache::llama_kv_cache(
                     " V=" + ggml_type_name(type_v));
             }
         }
-        // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
+        // fork 9l-cpu-turbo-kv: pad K head_dim for EVERY turbo type, not just turbo2/3/4.
+        // build_attn pads Q to the same 128 multiple for all seven types, so any type the
+        // cache leaves unpadded makes ggml_flash_attn_ext assert ggml_can_mul_mat(k, q) on a
+        // model whose head_dim is not already a multiple of 128. That is the entire reason
+        // turbo8/TCQ could not be used off-GPU even after the backend gate was lifted.
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
-        const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
+        const bool k_is_turbo = ggml_type_is_turbo(layer_type_k);
         if (k_is_turbo && n_embd_head_k % 128 != 0) {
             const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
@@ -1613,10 +1644,12 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // For turbo types, pad V head_dim to next multiple of 128 if needed
+        // fork 9l-cpu-turbo-kv: pad V for every turbo type too, so the cache geometry stays in
+        // step with K. The graph drops the padded tail by comparing v->ne[0] against the model
+        // head_dim (llama-graph.cpp), so a padded V is handled either way.
         const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
         uint32_t n_embd_v_gqa_eff = n_embd_v_gqa;
-        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO2_0);
+        const bool v_is_turbo = ggml_type_is_turbo(layer_type_v);
         if (v_is_turbo && !is_mla && n_embd_head_v % 128 != 0) {
             const uint32_t padded_head_v = ((n_embd_head_v + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_v_gqa / n_embd_head_v;
@@ -1938,12 +1971,15 @@ llama_kv_cache::llama_kv_cache(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        // Turbo-typed KV requires a backend exporting the VBR interface (ggml-vbr.h): the codecs
-        // have no CPU decode path (CPU set_rows would call a null from_float; CPU attention can't
-        // read turbo bits). Refuse at init instead of crashing at the first decode. no_alloc
-        // (externally managed KV) is exempt. Under --split-mode tensor the buffer type is the
-        // meta buft: turbo KV is fine there as long as every device underneath supports it.
-        if (!hparams.no_alloc && llama_vbr_backend_devs_for_buft(buft).empty()) {
+        // fork 9l-cpu-turbo-kv: refuse turbo-typed KV only on backends that really cannot host
+        // it (see llama_buft_supports_turbo_kv). The previous test -- "the buft does not export
+        // the VBR interface" -- also rejected the CPU backend, whose generic ggml path does
+        // support these types; together with the host pin that is what made -ctk turbo8 on a
+        // CPU-only run end up as q8_0 with no way out. Refuse at init instead of crashing at
+        // the first decode. no_alloc (externally managed KV) is exempt. Under --split-mode
+        // tensor the buffer type is the meta buft: turbo KV is fine there as long as every
+        // device underneath supports it.
+        if (!hparams.no_alloc && !llama_buft_supports_turbo_kv(buft)) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (ggml_is_turbo_kv_type(t->type)) {
                     LLAMA_LOG_ERROR("%s: KV cache type %s (tensor %s) needs a backend with TurboQuant support "
@@ -12772,7 +12808,12 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t n_head_kv     = hparams.n_head_kv(il);
     const uint32_t n_embd_head_k = n_embd_k_gqa / n_head_kv;
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+    // fork 9l-cpu-turbo-kv: every turbo type, not just turbo2/3/4. The constructor pads the
+    // cache head_dim for all seven (see the k_is_turbo/v_is_turbo there), so a narrower test
+    // here left turbo8/TCQ caches padded while this view was cut back to the model's head_dim
+    // -- and ggml_flash_attn_ext then asserted ggml_can_mul_mat(k, q) because Q had been padded
+    // to the 128 multiple while k had not. Both sides must agree on which types are padded.
+    const bool k_is_turbo = ggml_type_is_turbo(k->type);
     if (k_is_turbo) {
         assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
     } else {
@@ -12807,7 +12848,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+    // fork 9l-cpu-turbo-kv: all seven types (see get_k above).
+    const bool v_is_turbo = ggml_type_is_turbo(v->type);
     const uint32_t head_v = hparams.n_embd_head_v(il);
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
@@ -12904,7 +12946,8 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_tokens    = v_cur->ne[2];
 
     // Turbo zero-padding: pad V head_dim to next multiple of 128
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+    // fork 9l-cpu-turbo-kv: all seven types (see get_k above).
+    const bool v_is_turbo = ggml_type_is_turbo(v->type);
     const bool v_needs_pad = v_is_turbo && (n_embd_head % 128 != 0);
     if (v_needs_pad) {
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
