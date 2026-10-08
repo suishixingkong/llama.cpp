@@ -3894,12 +3894,16 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 // of the all_layers_fit check alone. MEASURED WRONG on 2026-10-08 (V100, Qwen3.5-2B, MTP with
 // n_max=3 + kv-stream, --batch-size 1024 --ubatch-size 512): the run produced garbled output at
 // ~66 t/s -- slower than the ~140 t/s of simply not capturing graphs, and wrong in a way no log
-// reports. Mechanism: capturing SET_ROWS bakes the destination address (resident base + row *
-// row_size) into the kernel parameters, and MTP's verification batch moves the token slot every
-// step, so replay writes K/V to the wrong rows. all_layers_fit says every page is resident; it
-// says nothing about WHICH rows this graph will touch on the next replay. The staged path has
-// always required dirty_rows to be contiguous, but that check lives at capture time
-// (ggml_cuda_kv_stream_staged_set_rows_range), not in the compatibility gate.
+// reports. Mechanism, read from set-rows.cu after the fact: capturing the staged SET_ROWS freezes
+// the *host-side* destination of its mirror copies -- cudaMemcpyAsync(dst->data + first_row *
+// row_bytes, …) with a host dst->data, so the address is computed once and reused by every replay.
+// The device kernel itself is not affected: it reads its row indices from the src1 tensor at run
+// time (dst_row = *(src1 + …) - dst_row_base, and dst_row_base is 0 on the plain path), which is
+// why only the staged path -- the one MTP's multi-row verification batch takes -- misbehaves.
+// all_layers_fit says every page is resident; it says nothing about WHICH rows this graph will
+// touch on the next replay. The staged path has always required dirty_rows to be contiguous, but
+// that check lives at capture time (ggml_cuda_kv_stream_staged_set_rows_range), not in the
+// compatibility gate.
 //
 // So the relaxation is refused outright. The sound fix is upstream of this gate: make the decode
 // ubatch's row numbers identical every step (the same n_kv padding that already exists for the
