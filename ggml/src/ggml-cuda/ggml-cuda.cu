@@ -3890,17 +3890,35 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 // conditions fail and the whole decode graph silently loses CUDA-graph replay. On a V100 with a
 // 2B model that is the difference between ~220 t/s (graph replay) and ~140 t/s (kernel launches).
 //
-// GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 admits multi-row kv-stream batches. It stays sound only
-// while every attention layer is served entirely from the resident cache - the all_layers_fit
-// requirement, which the relaxation keeps - because then no runtime-chosen page address ends up in
-// the graph. EXPERIMENTAL: an unsound configuration here produces wrong logits rather than an
-// error, so compare generated tokens, not only t/s, before trusting it.
+// GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 used to admit multi-row kv-stream batches on the strength
+// of the all_layers_fit check alone. MEASURED WRONG on 2026-10-08 (V100, Qwen3.5-2B, MTP with
+// n_max=3 + kv-stream, --batch-size 1024 --ubatch-size 512): the run produced garbled output at
+// ~66 t/s -- slower than the ~140 t/s of simply not capturing graphs, and wrong in a way no log
+// reports. Mechanism: capturing SET_ROWS bakes the destination address (resident base + row *
+// row_size) into the kernel parameters, and MTP's verification batch moves the token slot every
+// step, so replay writes K/V to the wrong rows. all_layers_fit says every page is resident; it
+// says nothing about WHICH rows this graph will touch on the next replay. The staged path has
+// always required dirty_rows to be contiguous, but that check lives at capture time
+// (ggml_cuda_kv_stream_staged_set_rows_range), not in the compatibility gate.
+//
+// So the relaxation is refused outright. The sound fix is upstream of this gate: make the decode
+// ubatch's row numbers identical every step (the same n_kv padding that already exists for the
+// non-streaming path, so a graph stays reusable across batches), which keeps dirty_rows predictable
+// and lets the single-row gate stay exact. Until that lands there is deliberately no way to turn
+// this on.
 static bool kv_stream_multireq_graph_enabled() {
-    static const bool enabled = []() {
+    static const bool refused = []() {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MULTIROW_GRAPH");
-        return value != nullptr && atoi(value) != 0;
+        if (value == nullptr || atoi(value) == 0) {
+            return false;
+        }
+        GGML_LOG_ERROR("kv-stream: %s is refused: admitting multi-row batches makes CUDA-graph "
+                "replay write K/V to the wrong rows (measured: garbled output, no error). The "
+                "single-row gate stays in place; see the comment above for the sound fix.\n",
+                "GGML_CUDA_KV_STREAM_MULTIROW_GRAPH");
+        return false;
     }();
-    return enabled;
+    return refused;
 }
 
 // Batches this small are decode-sized, which is what the one-shot warning below is for; the
@@ -3913,9 +3931,13 @@ static void kv_stream_graph_note_disabled(const char * why, const char * op, siz
         return;
     }
     warned = true;
+    // The remedy is deliberately NOT an env knob: the obvious one was measured to produce garbled
+    // output (see kv_stream_multireq_graph_enabled above). Naming a flag here is what made it look
+    // like a supported speed-up, so this line states the cause and stops.
     GGML_LOG_WARN("kv-stream: disabling CUDA graphs for this graph: %s (%s, %zu row%s) - this "
-            "graph runs without CUDA-graph replay; set GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 to "
-            "admit multi-row batches (e.g. speculative verification)\n",
+            "graph runs without CUDA-graph replay. Replay is only sound for a single-row decode "
+            "write, because the row offset is baked into the captured kernel; speculative "
+            "verification moves it every step.\n",
             why, op, rows, rows == 1 ? "" : "s");
 }
 
