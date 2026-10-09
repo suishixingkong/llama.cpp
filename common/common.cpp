@@ -1438,15 +1438,23 @@ void common_params_resolve_vbr_codec_auto(common_params & params) {
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
-    if (params.fit_params) {
+    // fork 9l-vbr-codec-probe-gate: gate the metadata-only probe on whether fit
+    // will actually run, not on params.fit_params alone. A shared KV/compute
+    // arena (kv_stream_arena_mib != 0) turns fitting off while fit_params stays
+    // true, and the probe's only consumer is the fit pricing step -- so under an
+    // arena the probe loaded the model a second time for nothing. The non-fit
+    // branch below already resolves the codec from the fully loaded model, so
+    // deferring to it is the same answer without the extra load.
+    const bool fit_runs = common_params_should_fit_device_memory(params);
+    if (fit_runs) {
         common_params_resolve_vbr_codec_auto(params);
     }
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params && !common_params_should_fit_device_memory(params)) {
+    if (params.fit_params && !fit_runs) {
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
-    if (common_params_should_fit_device_memory(params)) {
+    if (fit_runs) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1505,7 +1513,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     // Without fit, reuse the fully loaded model for codec selection instead of doing a
     // second metadata-only load. Fit needs the answer earlier because it prices the floor.
-    if (!params.fit_params) {
+    // fork 9l-vbr-codec-probe-gate: the condition is fit_runs, not params.fit_params --
+    // they used to coincide, but an arena suppresses fit while leaving fit_params true,
+    // so keying on the latter would have skipped codec resolution entirely under an
+    // arena (params.vbr_codec would stay AUTO and llama_init_from_model would reject
+    // the geometry outright instead of falling back to the classic ladder).
+    if (!fit_runs) {
         common_params_resolve_vbr_codec_auto_from_model(params, model);
         cparams = common_context_params_to_llama(params);
     }
