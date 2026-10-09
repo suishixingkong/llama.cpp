@@ -15903,7 +15903,29 @@ private:
                             return input.backend_device == device;
                         });
                     if (it == cache_authority->budget_devices.end()) {
-                        complete = false;
+                        // fork 9l-unattributed-device-compute: a compute buffer with no
+                        // accounting domain is unattributed memory, not an accounting
+                        // error. Domains are built from the -ngl gate above, but the
+                        // scheduler's backend set is not -ngl-gated at all: op_offload
+                        // hands weight matmuls to an idle GPU even under -ngl 0
+                        // (ggml-backend.cpp:1450-1457), so CUDA0 gets a real buffer
+                        // while n_domains == 0. Refusing here latched the authority off
+                        // for the whole process (one-shot, never reset) and every later
+                        // checkpoint then reported authority_not_configured -- the cache
+                        // authority silently disabling itself over a GPU buffer the
+                        // operator never asked for.
+                        //
+                        // Refusing was also pointless here: with an empty domain set the
+                        // loop below has nothing to mark unavailable, so `complete=false`
+                        // carried no accounting information at all. It only destroyed the
+                        // host-cache path. So report the gap and keep going; the memory
+                        // stays unaccounted and visible instead of silently vetoing.
+                        SRV_WRN(
+                            "%s: compute buffer %.2f MiB on %s has no accounting domain "
+                            "(live_device_domains is %zu); leaving it unaccounted\n",
+                            __func__, double(row.compute) / (1024.0*1024.0),
+                            ggml_backend_buft_name(raw_buft),
+                            cache_authority->live_device_domains.size());
                         continue;
                     }
                     add_checked(it->current_compute_allocated, row.compute);
