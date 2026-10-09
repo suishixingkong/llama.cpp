@@ -7288,14 +7288,23 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
 // generations to prove a byte capture stayed exact. They never perform
 // checkpoint admission; the isolation gate strips only this bounded region.
 bool llama_kv_cache::vbr_capture_policy_snapshot(
-        vbr_capture_stability_token & output) const noexcept {
-    // A capture recipe records turbo codebook, rotation and tapped-domain identity. Only the turbo
-    // ladder's rungs all carry that identity; the standard-quant rungs of the classic ladder and of
-    // the mixed auto ladder do not, so capturing them would label q8/q5/q4 rows with a turbo
-    // identity. Refuse instead.
-    if (!llama_vbr_codec_uses_turbo_artifacts(vbr_params_.codec)) {
-        return false;
-    }
+    vbr_capture_stability_token & output) const noexcept {
+    // fork 9l-classic-host-cache: this snapshot is codec-parameterised, so the
+    // classic ladder must not be refused here. Every field below is either
+    // codec-parameterised or codec-independent, so it is well defined on the
+    // classic ladder too. The turbo-only artefacts that genuinely cannot cross a
+    // ladder -- the measured baked degrade orders, VBR_LAYER_SCHEDULE and the
+    // downward-policy child plan -- are gated at their own producers
+    // (vbr_synth_generic_order, the layer-policy loader and
+    // vbr_downward_policy_child), not here.
+    //
+    // The per-unit representation identity that a capture recipe does record
+    // is derived from the unit's own ggml_type by
+    // vbr_explicit_capture_representation_identity (codec_id = type + 1, with
+    // codebook/rotation/meansub digests taken per type), and the rung's domain
+    // is validated per extent by vbr_explicit_capture_validate_extent_generation
+    // (F16 and turbo8 are full; the tapped rungs are not). So a standard-quant
+    // classic row is labelled with its own identity, never a turbo one.
     const auto * tracker = vbr_generation_tracker_get();
     if (tracker == nullptr || !tracker->stable()) {
         return false;
