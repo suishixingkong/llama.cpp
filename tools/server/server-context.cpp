@@ -4005,6 +4005,29 @@ private:
         // is built (fork 7498-7533).  The port's only other classification site
         // is the store-failure one at :4426, which cannot speak for a codec that
         // can never produce a host-cache artifact in the first place.
+        //
+        // fork 9l-classic-host-cache: the codec used to be classified
+        // `codec_unsupported` outright.  The stated reason was that projected
+        // prompt artifacts are portable only for Turbo, but nothing in the
+        // artifact path depends on the codec:
+        //   - server-vbr-artifact-store.cpp's "codec" is the COMPANION state
+        //     encoder (draft-state / accelerator-ring / frontier-logits / qsa
+        //     index), unrelated to --vbr-codec; the file has no `vbr_codec`.
+        //   - server artifact capture names no turbo type; it keys identity on
+        //     `vbr_type_vector_digest` (src/llama-vbr-identity-digest.h:33),
+        //     a SHA-256 over the ggml_type vector, so it is codec-agnostic by
+        //     construction and already covers whatever classic produces.
+        //   - server-side, --vbr-codec had no consumer other than this ternary.
+        // So the restriction was a policy gate on a capability that was never
+        // missing, and its cost was real: the live_only fallback below sets
+        // cache_ram_mib = 0, which starves the authority budget and denies
+        // checkpoint admission for the whole run.
+        //
+        // Classify by what can actually fail instead: the model's own codec
+        // support.  llama_model_supports_vbr_codec() is the authority the
+        // loader already consults (llama-context.cpp:4913), and it downgrades
+        // geometries that cannot host the ladder, so BailingMoE3/Ling-style
+        // heads are still refused -- by capability rather than by name.
         if (params_base.vbr_prompt_cache) {
             const bool all_slots_speculative = !slots.empty() &&
                 std::all_of(
@@ -4012,12 +4035,17 @@ private:
                     [](const server_slot & slot) {
                         return slot.can_speculate();
                     });
-            vbr_prompt_cache_support =
-                params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC
-                    ? server_vbr_prompt_cache_support_status::codec_unsupported
-                    : server_vbr_prompt_cache_support_for(
+            const bool codec_supported =
+                llama_model_supports_vbr_codec(model_tgt, params_base.vbr_codec);
+            if (!codec_supported) {
+                vbr_prompt_cache_support =
+                    server_vbr_prompt_cache_support_status::codec_unsupported;
+            } else {
+                vbr_prompt_cache_support =
+                    server_vbr_prompt_cache_support_for(
                         ctx_dft != nullptr, all_slots_speculative,
                         false, false);
+            }
             const auto fallback =
                 server_vbr_prompt_cache_fallback_action_for(
                     vbr_prompt_cache_automatic,
