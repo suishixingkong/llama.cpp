@@ -4405,7 +4405,9 @@ private:
                                 topology,
                                 llama_cache_acct_device_ordinal{ uint16_t(i) },
                                 domain)) {
-                            cache_authority_config_failed(true);
+                            // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                            // latch can report which of the ten sites refused.
+                            cache_authority_config_failed_named(true, "make_device_domain");
                             cache_authority->live_device_domains.clear();
                             break;
                         }
@@ -4425,7 +4427,9 @@ private:
                         resolved_count == gpu_identities.size()
                             ? "invalid_resolved_split"
                             : "resolved_split_device_mismatch";
-                    cache_authority_config_failed(true);
+                    // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                    // latch can report which of the ten sites refused.
+                    cache_authority_config_failed_named(true, "shard_topology_build");
                 }
             } else {
                 capture_topology_failure = ngl_eff <= 0
@@ -4541,7 +4545,9 @@ private:
             }
             if (!cache_authority->ledger.configure_required_producers(
                     required.data(), required.size())) {
-                cache_authority_config_failed(false);
+                // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                // latch can report which of the ten sites refused.
+                cache_authority_config_failed_named(false, "configure_required_producers");
             }
             if (capture_manifest_enabled) {
                 // Capture reservations span pageable metadata/companions and
@@ -4555,19 +4561,25 @@ private:
                 // so this co-init is load-bearing but behavior-neutral.
                 if (!server_vbr_artifact_store_observe_empty_accounting(
                         cache_authority->ledger, host_domain)) {
-                    cache_authority_config_failed(true);
+                    // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                    // latch can report which of the ten sites refused.
+                    cache_authority_config_failed_named(true, "observe_empty_accounting_host");
                 }
                 for (const auto & binding :
                         cache_authority->live_device_domains) {
                     if (!server_vbr_artifact_store_observe_empty_accounting(
                             cache_authority->ledger,
                             binding.domain)) {
-                        cache_authority_config_failed(true);
+                        // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                        // latch can report which of the ten sites refused.
+                        cache_authority_config_failed_named(true, "observe_empty_accounting_device");
                     }
                 }
                 if (!server_vbr_artifact_store_configure_pinned_accounting(
                         cache_authority->ledger, pinned_domain)) {
-                    cache_authority_config_failed(true);
+                    // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                    // latch can report which of the ten sites refused.
+                    cache_authority_config_failed_named(true, "configure_pinned_accounting");
                 }
             }
             cache_authority->retention.configure(
@@ -4651,10 +4663,14 @@ private:
             // attribution leaves every affected domain unavailable; a measured zero is
             // valid (e.g. no recurrent layers on an attention-only target).
             if (!cache_plan_observe_live_memory(true)) {
-                cache_authority_config_failed(true);
+                // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                // latch can report which of the ten sites refused.
+                cache_authority_config_failed_named(true, "observe_live_memory");
             }
             if (!cache_plan_configure_budget()) {
-                cache_authority_config_failed(true);
+                // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                // latch can report which of the ten sites refused.
+                cache_authority_config_failed_named(true, "configure_budget");
             }
             if (capture_manifest_enabled) {
                 std::vector<llama_cache_acct_resource_domain>
@@ -4671,7 +4687,9 @@ private:
                 if (!server_vbr_artifact_store_verify_accounting(
                         cache_authority->ledger,
                         capture_accounting_domains)) {
-                    cache_authority_config_failed(true);
+                    // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                    // latch can report which of the ten sites refused.
+                    cache_authority_config_failed_named(true, "verify_accounting");
                 }
             }
 
@@ -4682,7 +4700,9 @@ private:
                 !cache_authority->budget.reset(
                     cache_authority->ledger.snapshot(),
                     cache_authority->budget_config)) {
-                cache_authority_config_failed(false);
+                // fork 9l-cache-authority-origin: this call site now names itself so the one-shot
+                // latch can report which of the ten sites refused.
+                cache_authority_config_failed_named(false, "sample_budget");
             }
 
             if (capture_manifest_enabled &&
@@ -13022,6 +13042,29 @@ private:
         }
     }
     std::thread::id cache_plan_preflight_scheduler_thread;
+    // fork 9l-cache-authority-origin: ten call sites set the latch above and none of
+    // them says which one fired. The latch never resets, so a single silent refusal
+    // makes admit_live_checkpoints() report `authority_not_configured` for the rest
+    // of the process lifetime -- a symptom that names neither the failing step nor its
+    // geometry, so record the first origin and announce it. These members sit AFTER the
+    // preflight thread id because the d3e guard pins the fork hook and its marker as one
+    // contiguous run followed immediately by that member; inserting between them splits
+    // the run. A fixed char array rather than std::string: the origin is always a literal
+    // and this header does not include <string>.
+    static constexpr size_t AUTHORITY_ORIGIN_MAX = 64;
+    char authority_config_failure_origin[AUTHORITY_ORIGIN_MAX] = "none";
+    bool authority_config_failed_latched = false;
+    void cache_authority_config_failed_named(
+            bool mirror_to_shadow, const char * origin) noexcept {
+        if (!authority_config_failed_latched) {
+            authority_config_failed_latched = true;
+            snprintf(authority_config_failure_origin, AUTHORITY_ORIGIN_MAX, "%s", origin);
+            SRV_WRN("CACHE_AUTHORITY configuration refused at origin=%s "
+                    "(one-shot latch; every later checkpoint will report "
+                    "authority_not_configured)\n", authority_config_failure_origin);
+        }
+        cache_authority_config_failed(mirror_to_shadow);
+    }
     std::vector<server_live_retention_candidate> vbr_retention_candidates;
     std::vector<int32_t> vbr_retention_candidate_by_seq;
     std::vector<uint8_t> vbr_retention_seen_by_seq;
