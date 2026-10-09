@@ -10233,25 +10233,42 @@ private:
                                 : 0;
                             const uint64_t exact_capture_limit =
                                 vbr_automatic_exact_capture_max_bytes();
+                            // fork 9l-mtp-budget: the MTP accelerator image is sized
+                            // against its own budget. It used to inherit the host
+                            // cache's, and to require qsa_vbr_fits -- but qsa_required
+                            // is itself gated on vbr_prompt_cache (:10200), so with host
+                            // caching off the QSA companion is not even part of this
+                            // checkpoint while still vetoing the draft half through
+                            // that conjunction. See mtp_companion_max_bytes().
+                            const uint64_t mtp_limit =
+                                mtp_companion_max_bytes();
                             const bool qsa_vbr_fits = qsa_size_ready &&
                                 uint64_t(checkpoint_size) <=
                                     exact_capture_limit &&
                                 qsa_size <= exact_capture_limit-
                                     uint64_t(checkpoint_size);
+                            // fork 9l-mtp-budget: when the QSA companion is not
+                            // required, the draft half is measured on its own budget
+                            // and no longer inherits qsa_vbr_fits. Otherwise the two
+                            // stay coupled exactly as before.
+                            const bool mtp_fits = qsa_required
+                                ? draft_size != 0 && qsa_vbr_fits
+                                : draft_size != 0;
                             const bool draft_vbr_fits =
-                                draft_size != 0 && qsa_vbr_fits &&
+                                mtp_fits &&
+                                uint64_t(checkpoint_size) <= mtp_limit &&
                                 (!capture_dflash || llama_memory_seq_pos_max(
                                     llama_get_memory(ctx_dft), slot.id) == pos_max) &&
                                 mtp_state_ready &&
                                 uint64_t(ring_size) <=
-                                    exact_capture_limit-
+                                    mtp_limit-
                                         uint64_t(checkpoint_size)-qsa_size &&
                                 uint64_t(spec_state.size()) <=
-                                    exact_capture_limit-
+                                    mtp_limit-
                                         uint64_t(checkpoint_size)-qsa_size-
                                         uint64_t(ring_size) &&
                                 uint64_t(draft_size) <=
-                                    exact_capture_limit-
+                                    mtp_limit-
                                         uint64_t(checkpoint_size)-
                                         qsa_size-
                                         uint64_t(ring_size)-
@@ -13132,6 +13149,29 @@ private:
         uint64_t selected_tokens = 0;
         server_prompt_cache_vbr_publication_metadata publication;
     };
+
+    // fork 9l-mtp-budget: the MTP accelerator image is not a projected artifact.
+    // data_dft_full_sequence is the draft's complete sequence plus its pending hidden
+    // carry, validated on restore independently of the artifact store (which names no
+    // codec at all -- server-vbr-artifact-store.cpp has zero `vbr_codec` references).
+    // It used to be sized against the HOST CACHE budget anyway, so every path that
+    // disabled host caching also silently disabled the MTP companion -- and the
+    // refusal is terminal: an MTP restore without both halves "permanently disables
+    // drafting" (:10365). The host-cache budget is zero on those paths for a reason
+    // that does not apply here, since cache_ram_mib == 0 also means "no prompt cache
+    // object exists at all" (:4144), not "refuse the accelerator image".
+    // So the accelerator is bounded by the same absolute ceiling the <0 (=no limit)
+    // branch already used, and only when host caching is genuinely off. With host
+    // caching on, both budgets stay coupled to cache_ram_mib exactly as before.
+    // Declared BEFORE the fork block it consults: the d4b3 guard pins fragments C
+    // (3601-3629) and D (3632-3642) as one contiguous run, so anything inserted
+    // between them splits the pair.
+    uint64_t mtp_companion_max_bytes() const noexcept {
+        if (!params_base.vbr_prompt_cache) {
+            return VBR_AUTOMATIC_EXACT_CAPTURE_MAX_BYTES;
+        }
+        return vbr_automatic_exact_capture_max_bytes();
+    }
 
     // fork 9l-d4b3 (fork server-context.cpp 3601-3629)
     uint64_t vbr_automatic_exact_capture_max_bytes() const noexcept {
