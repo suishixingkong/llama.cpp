@@ -600,13 +600,19 @@ bool server_cache_authority::admit_live_checkpoints(
     // used to return false silently, so the caller's combined warning could
     // not tell an unconfigured authority from a missing payload or a refused
     // accounting transaction.
-    const char * refused_at = "none";
+    //
+    // The name has to land in the MEMBER slot, not a local: the single-checkpoint
+    // wrapper is a different function and can only read what persisted here.
+    // An earlier revision of this diagnostic kept the name in a local and
+    // forwarded a never-written member instead, so every run reported
+    // detail=none no matter which branch fired -- the sub-step was being named
+    // nowhere. refuse() therefore writes straight to last_admission_refusal_.
     const auto refuse = [&](const char * why) noexcept {
         for (auto & member : batch) {
             member.committed.clear();
         }
         admission_refusals += refusal_count;
-        refused_at = why;
+        set_admission_refusal(why);
         return false;
     };
 
@@ -694,10 +700,10 @@ bool server_cache_authority::admit_live_checkpoint(
         batch[0].artifact = artifact;
         batch[0].checkpoint = &checkpoint;
         if (!admit_live_checkpoints(batch)) {
-            // fork 9l-ckpt-prep-diag: publish the sub-step to the caller so its
-            // combined warning can name the refusal instead of only that some
-            // admission failed. last_refused_at is written by refuse().
-            set_admission_refusal(last_refused_at);
+            // fork 9l-ckpt-prep-diag: refuse() already recorded the refusing
+            // sub-step in last_admission_refusal_, so there is nothing to
+            // forward here -- just report the failure. The caller's combined
+            // warning reads that member to name the cause.
             return false;
         }
         committed = std::move(batch[0].committed);

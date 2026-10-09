@@ -241,9 +241,6 @@ struct server_cache_authority {
     // new <string> include: every value is a string literal assigned in-tree.
     static constexpr size_t ADMISSION_REFUSAL_MAX = 48;
     char last_admission_refusal_[ADMISSION_REFUSAL_MAX] = "none";
-    // fork 9l-ckpt-prep-diag: set by admit_live_checkpoints()' refuse() lambda so
-    // admit_live_checkpoint() can forward it to last_admission_refusal_.
-    const char * last_refused_at = "none";
 
     // fork 9l-ckpt-prep-diag: copy a literal refusal name into the bounded slot.
     // Truncation is fine here: the value exists to disambiguate log lines, and
