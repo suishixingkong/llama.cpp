@@ -95,7 +95,12 @@ Notes:
   carry tier-typed KV. If artifact construction is unavailable for a topology, startup
   reports the typed refusal and continues live-only. Context checkpoints stay enabled on
   hybrid models (recurrent state only) but are disabled on SWA models.
-  Classic projected artifacts are not yet portable and fail closed to this live-only behavior.
+  The artifact path is codec-agnostic — it keys identity on a digest over the KV type
+  vector — so `classic` and `auto` keep the host cache whenever the model can host that
+  codec's ladder; only a model that cannot is refused, by capability rather than by codec
+  name. An occupied slot whose incoming prefix has no exact authenticated host entry logs
+  `automatic occupied VBR restore refused: no exact host candidate`; that launch keeps the
+  live KV's common prefix instead of importing the artifact, and the output is unaffected.
 - **Exact continuation**: complete-frontier artifacts also authenticate the terminal raw
   vocabulary-logit row. Restoring an exact prompt therefore reports `prompt_n = 0`
   instead of replaying its last token solely to regenerate logits. With MTP or DFlash2,
@@ -125,7 +130,7 @@ The following automatic cases are typed live-only fallbacks today:
 | --- | --- | --- |
 | media prompt/projector state | `media_prompt_unsupported` | that live slot is neither captured nor displaced |
 | aLoRA invocation boundary | `alora_invocation_unsupported` | that live slot is neither captured nor displaced |
-| classic codec projected artifacts | `codec_unsupported` | automatic startup continues with live classic KV only |
+| model cannot host the requested codec's ladder | `codec_unsupported` | automatic startup continues live-only (`--cache-ram` disabled) |
 | missing portable topology or pool/lane binding | `artifact_topology_unavailable` | automatic startup continues live-only |
 | incomplete accounting or budget evidence | `accounting_unavailable` | automatic startup continues live-only |
 | pinned-ring/store construction refusal | `artifact_store_unavailable` plus the store failure/status | automatic startup continues live-only |
