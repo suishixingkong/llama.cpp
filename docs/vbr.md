@@ -101,6 +101,8 @@ Notes:
   name. An occupied slot whose incoming prefix has no exact authenticated host entry logs
   `automatic occupied VBR restore refused: no exact host candidate`; that launch keeps the
   live KV's common prefix instead of importing the artifact, and the output is unaffected.
+  Publication is not the same as consumption: see *Which restore route can actually fire*
+  below for which routes accept which artifacts.
 - **Exact continuation**: complete-frontier artifacts also authenticate the terminal raw
   vocabulary-logit row. Restoring an exact prompt therefore reports `prompt_n = 0`
   instead of replaying its last token solely to regenerate logits. With MTP or DFlash2,
@@ -141,6 +143,27 @@ request is strict instead: an unsupported global topology or unavailable store f
 startup with the same typed reason. Transient capture/admission failures retain the live
 source and retry; permanent per-artifact incompatibilities are terminal only for that
 unchanged frontier.
+
+#### Which restore route can actually fire
+
+Publication and restoration are asymmetric on purpose. Publication may shorten an
+attention prefix to fit the host budget (`longest_attention_stem`), while restoration
+must be able to prove it can roll back whatever it displaces. The automatic routes
+therefore have different admission rules, and not every published artifact is consumable
+by every route:
+
+| Route | Admission | Consequence |
+| --- | --- | --- |
+| empty-slot handoff (whole-artifact import) | `slot_count == 1`, no hard lease, no deferred task, incumbent supported, and the candidate prefix is longer than the live incumbent's common prefix | the only route that can consume an artifact carrying fixed-layout companions. Multi-slot unified KV cannot clear one sequence out of a shared tree, so this route is closed for `-np > 1`. |
+| occupied-slot replacement | requires a **durable host copy of the live incumbent at the same token count** — that copy is the rollback witness — plus a candidate prefix longer than the live common prefix | fails closed whenever no equal-length sealed copy of the live frontier exists. A shortened stem is shorter than the live frontier by construction, so it can never serve as its own rollback witness. |
+| prefix projection (shortened stem) | attention-only: refuses any artifact whose package carries a companion descriptor | hybrid/recurrent targets always carry a recurrent companion, so their artifacts can only be imported whole. |
+
+Two practical consequences follow. First, with `-np > 1` the empty-slot route is closed
+and hybrid artifacts cannot be projected, so automatic host restore has no usable path
+(`--cache-ram` still publishes); with `-np 1` the empty-slot route works and is the route
+to rely on. Second, a confirmed import is a fixed-cost operation — dominated by the
+device-to-host transfer and adoption of the artifact rather than by its token count — so
+it only beats a cold prefill on long prompts; short prompts are cheaper replayed.
 
 ### Host-cache control-plane payloads
 
