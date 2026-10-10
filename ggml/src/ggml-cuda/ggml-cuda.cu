@@ -3963,28 +3963,34 @@ static bool kv_stream_multireq_graph_enabled() {
     return enabled;
 }
 
-// One warning per distinct (op, row-count) shape, capped.  A single `warned` flag looked right
-// and was wrong: the server's startup pass writes KV for a 2-token micro-ubatch, which consumed
-// the one-shot before the first decode step -- so the warning an operator read pointed at
-// startup instead of at the decode graph this relaxation is about. Keying on the shape also puts
-// the refused row count into the log, which is the field that says whether the bound is set right.
-static constexpr size_t KV_STREAM_MULTIROW_GRAPH_MAX_WARNINGS = 12;
+// The reason a kv-stream node kept the graph from being captured, for the cases where the row
+// count is NOT the blocker.  One helper so the wording -- and the setting it names -- cannot drift
+// between the two nodes that consult it.
+static const char * kv_stream_refusal_reason(bool multireq_allowed) {
+    return multireq_allowed ?
+        "this kv-stream batch is not one the graph can capture" :
+        "multi-row graph admission is disabled (GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=0)";
+}
 
-static void kv_stream_graph_note_disabled(const char * why, const char * op, size_t rows) {
-    static std::unordered_set<std::string> warned;
-    if (rows == 0 || rows > kv_stream_multireq_graph_max_rows() ||
-            warned.size() >= KV_STREAM_MULTIROW_GRAPH_MAX_WARNINGS) {
+// Announced once per process.  The setting is process-wide, so when admission is off EVERY
+// multi-row kv-stream batch misses the graph: keying the one-shot on the batch shape (an earlier
+// version) printed one line per distinct row count -- 2, 3, 4 and 7 rows in the measured run --
+// which reads as four separate problems instead of one setting.
+//
+// The row count is still what the guard below filters on, but it is deliberately NOT part of the
+// message: with admission enabled the only refusals that reach here are structural, so naming a
+// row count would name a quantity that is not the cause.  Batches above the bound return without
+// latching, so the prefill-sized batches that open a run do not consume the one-shot.
+static void kv_stream_graph_note_disabled(const char * why, size_t rows) {
+    static bool warned = false;
+    if (warned || rows == 0 || rows > kv_stream_multireq_graph_max_rows()) {
         return;
     }
-    if (!warned.insert(std::string(op) + ':' + std::to_string(rows)).second) {
-        return;
-    }
-    GGML_LOG_WARN("kv-stream: disabling CUDA graphs for this graph: %s (%s, %zu row%s) - this "
-            "graph runs without CUDA-graph replay. Replay is only sound where the row index is "
-            "read on the device, i.e. the plain mirrored SET_ROWS path; the staged path bakes the "
-            "row offset into its copies, and speculative verification moves that offset every "
-            "step.\n",
-            why, op, rows, rows == 1 ? "" : "s");
+    warned = true;
+    GGML_LOG_WARN("kv-stream: multi-row batches run without CUDA-graph replay: %s.  Replay is only "
+            "sound where the row index is read on the device, i.e. the plain mirrored SET_ROWS "
+            "path; the staged path bakes the row offset into its copies, and speculative "
+            "verification moves that offset every step.  Reported once.\n", why);
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
@@ -4036,10 +4042,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     node_runtime->resident_cache, node, &mirror_data);
             if (!mirrorable_set_rows) {
                 if (!row_count_ok) {
-                    kv_stream_graph_note_disabled(node->op == GGML_OP_SET_ROWS ?
-                            "the kv-stream write is not mirrorable for this row count" :
-                            "a kv-stream tensor feeds a node the graph cannot capture",
-                        ggml_op_name(node->op), node_runtime->dirty_rows.size());
+                    // Name the blocker that is actually reachable.  `row_count_ok` bundles the
+                    // row-count test with the structural ones, and with admission enabled the
+                    // row-count test cannot be the failing one here -- a batch above the bound was
+                    // already dropped by the guard inside note_disabled.  So a refusal with a small
+                    // row count means the setting is off, and blaming "this row count" would name a
+                    // quantity that is not the cause.
+                    kv_stream_graph_note_disabled(node->op != GGML_OP_SET_ROWS ?
+                            "a kv-stream tensor feeds a node the graph cannot capture" :
+                            kv_stream_refusal_reason(multireq_allowed),
+                        node_runtime->dirty_rows.size());
                 }
                 use_cuda_graph = false;
             }
@@ -4061,10 +4073,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     runtime->resident_cache,
                     uint32_t((node->src[1]->ne[1] + 255)/256)));
             if (!resident_attention) {
+                // Normally unreachable when admission is off: the SET_ROWS node precedes
+                // attention, turns the graph off and breaks the loop before this node is reached.
+                // Kept honest anyway -- for a multi-query batch with admission off it is the
+                // setting that is the cause, not residency.
+                const bool admission_blocked = !multireq_allowed &&
+                    node->src[0] != nullptr && node->src[0]->ne[1] > 1;
                 kv_stream_graph_note_disabled(
-                    "kv-stream attention is not fully resident for this query batch",
-                    ggml_op_name(node->op), node->src[0] != nullptr ?
-                        size_t(node->src[0]->ne[1]) : 0);
+                    admission_blocked ? kv_stream_refusal_reason(false) :
+                        "kv-stream attention is not fully resident for this query batch",
+                    node->src[0] != nullptr ? size_t(node->src[0]->ne[1]) : 0);
                 use_cuda_graph = false;
             }
         }
