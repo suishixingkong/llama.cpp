@@ -1004,17 +1004,29 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        assert(model_and_ctx_cpu.first->supports_classic_vbr() ==
-                               (arch == LLM_ARCH_BAILINGMOE3));
+                        // fork 9l-vbr-classic-geometry: the classic codec gate is geometry-based in
+                        // this tree, not the BailingMoE3 allowlist the fork pinned, so the
+                        // equivalence asserted here before -- `supports_classic_vbr() ==
+                        // (arch == LLM_ARCH_BAILINGMOE3)` -- no longer describes the function and
+                        // cannot be kept. What is pinned instead is what the widening did NOT
+                        // change: BailingMoE3, the architecture the codec was validated on, still
+                        // advertises it, and the specialized cache owners stay refused by both. The
+                        // geometry rule itself is asserted where the geometry is consumed, not
+                        // re-derived here (a second copy of the gate's switch would drift).
                         if (arch == LLM_ARCH_BAILINGMOE3) {
+                            assert(model_and_ctx_cpu.first->supports_classic_vbr());
                             assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
                         }
                         if (arch == LLM_ARCH_QWEN4EXP) {
                             assert(model_and_ctx_cpu.first->supports_turbo_vbr());
                         }
+                        // These four own caches that consume neither codec's parameters, so both
+                        // predicates must refuse them: the exemption list is the one part of the
+                        // classic gate the widening kept verbatim from the turbo gate.
                         if (arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_GLM_DSA ||
                                 arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_DOTS3NOTE) {
-                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr() &&
+                                   !model_and_ctx_cpu.first->supports_classic_vbr());
                         }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
