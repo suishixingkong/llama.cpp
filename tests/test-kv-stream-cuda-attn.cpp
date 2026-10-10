@@ -1359,6 +1359,13 @@ int main() {
     t.test("resident staged writes support every exposed KV-cache format", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 1;
+        // A staged write is only taken above the CUDA-graph admission bound: at or below it the
+        // graph gate admits the batch, so SET_ROWS must take the replay-safe plain mirrored path
+        // instead (the staged path bakes the row offset into its copies and cannot be replayed).
+        // The batch here therefore has to stay ABOVE that bound, or this test silently stops
+        // covering staging - which is the whole point of this case. 40 is above the 32-row bound
+        // and below one 256-token page, so the page accounting below is unchanged.
+        constexpr int64_t update_rows = 40;
         const ggml_type kv_types[] = {
             GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
@@ -1400,7 +1407,7 @@ int main() {
             const std::vector<float> expected = run_attention(
                 backend.get(), inputs,
                 ggml_backend_cuda_kv_stream_buffer_type(baseline_runtime),
-                n_kv, n_batch, 5, 3, true, GGML_TYPE_I64, false, nullptr, true);
+                n_kv, n_batch, 5, update_rows, true, GGML_TYPE_I64, false, nullptr, true);
             ggml_backend_cuda_kv_stream_runtime_free(baseline_runtime);
 
             ggml_backend_cuda_kv_stream_params resident_params{};
@@ -1418,7 +1425,7 @@ int main() {
             const std::vector<float> actual = run_attention(
                 backend.get(), inputs,
                 ggml_backend_cuda_kv_stream_buffer_type(resident_runtime),
-                n_kv, n_batch, 5, 3, true, GGML_TYPE_I64, false,
+                n_kv, n_batch, 5, update_rows, true, GGML_TYPE_I64, false,
                 resident_runtime, true);
             const auto stats = ggml_backend_cuda_kv_stream_get_stats(resident_runtime);
             ggml_backend_cuda_kv_stream_runtime_free(resident_runtime);
@@ -1437,9 +1444,10 @@ int main() {
                 return;
             }
             t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
+            // 5 repeats x 2 SET_ROWS nodes (K and V), every one of them staged.
             t.assert_equal(uint64_t(10), stats.staged_set_rows);
             t.assert_equal(
-                uint64_t(10*3*ggml_row_size(type, HEAD_DIM*N_KV_HEAD)),
+                uint64_t(10*update_rows*ggml_row_size(type, HEAD_DIM*N_KV_HEAD)),
                 stats.staged_set_rows_bytes);
         }
     });
@@ -1700,6 +1708,9 @@ int main() {
 
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 83;
+        // Above the CUDA-graph admission bound, so SET_ROWS takes the staged path (see the note
+        // in "resident staged writes support every exposed KV-cache format").
+        constexpr int64_t update_rows = 40;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
@@ -1713,7 +1724,7 @@ int main() {
         }
         const std::vector<float> expected = run_attention_layers(
             backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
-            n_kv, n_batch, 1, 2, GGML_TYPE_I64);
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1732,12 +1743,13 @@ int main() {
 
         const std::vector<float> actual = run_attention_layers(
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            n_kv, n_batch, 1, 2, GGML_TYPE_I64, runtime);
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64, runtime);
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        // 16 layers x 2 SET_ROWS nodes (K and V), every one of them staged.
         t.assert_equal(uint64_t(32), stats.staged_set_rows);
         t.assert_equal(
-            uint64_t(16*(2*ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD) +
-                         2*ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD))),
+            uint64_t(16*(update_rows*ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD) +
+                         update_rows*ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD))),
             stats.staged_set_rows_bytes);
         t.assert_equal(uint64_t(48), stats.asynchronous_page_uploads);
         t.assert_equal(uint64_t(48), stats.compute_stream_waits);
