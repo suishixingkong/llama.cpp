@@ -2596,6 +2596,7 @@ llama_kv_cache::llama_kv_cache(
         n_embd_head_v_all = other->n_embd_head_v_all;
 
         attn_rot_k = other->attn_rot_k;
+        attn_rot_k_whole_head = other->attn_rot_k_whole_head;   // fork 9l-dsa-indexer-rot
         attn_rot_v = other->attn_rot_v;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -2623,6 +2624,21 @@ llama_kv_cache::llama_kv_cache(
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
+
+            // fork 9l-dsa-indexer-rot: deepseek32, glm-dsa and dots3note multiply by this matrix
+            // themselves -- ggml_mul_mat(ctx0, self_k_rot_lid, indexer_q) at deepseek32.cpp:252,
+            // glm-dsa.cpp:290 and dots3note.cpp:233 -- and ggml_mul_mat needs its first operand's
+            // ne[0] to equal the other's, i.e. the tile has to be the whole indexer head. The
+            // 64-tile default in build_input_k_rot() (the LLAMA_ATTN_ROT_K_NROT experiment)
+            // therefore aborts those three as soon as indexer_head_size != 64, which is what both
+            // the converter writes (conversion/deepseek.py: add_indexer_key_length -> index_head_dim)
+            // and what the test fixture uses (128). deepseek4 is deliberately NOT in this set: it
+            // goes through llama_mul_mat_hadamard (deepseek4.cpp:620), which rotates in tiles of
+            // rot->ne[0] and stays valid at 64.
+            attn_rot_k_whole_head =
+                model.arch == LLM_ARCH_DEEPSEEK32 ||
+                model.arch == LLM_ARCH_GLM_DSA ||
+                model.arch == LLM_ARCH_DOTS3NOTE;
         }
 
         attn_rot_v =
@@ -13110,7 +13126,14 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
 
         // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
-        if (nrot == 0) {
+        // fork 9l-dsa-indexer-rot: this is also the only size a cache can use when the MODEL
+        // multiplies by the matrix itself, because ggml_mul_mat needs the tile to equal the rotated
+        // head. Those caches are the ones the DSA lightning-indexer block in the constructor marks
+        // with attn_rot_k_whole_head, and they take this branch whether or not the experiment is
+        // on: for them the tile is a shape, not a tuning choice. (n_embd_head_k_all is not a power
+        // of two in general -- 576 for MLA -- and the Hadamard tables are only pre-computed for
+        // powers of two, which is why the largest such divisor is the right answer here.)
+        if (nrot == 0 || attn_rot_k_whole_head) {
             nrot = 64;
             do {
                 nrot *= 2;

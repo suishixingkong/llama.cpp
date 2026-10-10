@@ -1598,6 +1598,13 @@ private:
     bool attn_rot_k = false;
     bool attn_rot_v = false;
 
+    // fork 9l-dsa-indexer-rot: true when the K rotation of this cache is applied by the MODEL
+    // itself with a plain ggml_mul_mat rather than through llama_mul_mat_hadamard. ggml_mul_mat
+    // requires its first operand's ne[0] to equal the other's, so the tile has to BE the rotated
+    // head and build_input_k_rot() may not shrink it. See the DSA lightning-indexer block that
+    // sets it.
+    bool attn_rot_k_whole_head = false;
+
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
     int32_t n_embd_head_k_all = 0;
