@@ -149,7 +149,7 @@ GGML_CUDA_FA_QUANTS  →  FA_COMBINATIONS = {k-v, ...}
 | 5 | **EXL3 量化**                              | `ggml-cuda/exl3.cu`、`exl3-dq.cuh`、python 转换                                                                                                                                                                                                                            | `ggml/src/ggml.c`、`ggml-common.h`、`ggml-cuda/*`、`gguf-py/*`                                                                                                                                                                                                    | —                           | 高  |
 | 6 | **原生 `.safetensors` 直接加载**               | `src/`(需确认文件名)、`tools/`                                                                                                                                                                                                                                                | `src/llama-model*`、`common/arg.cpp`                                                                                                                                                                                                                            | —                           | 中高 |
 | 7 | **Bonsai（Prism 三元编解码 + 优化 Hadamard 推理）** | 见 commit `ecfeb94fb`(/`docs/bonsai.md`)                                                                                                                                                                                                                                | ggml + src + server                                                                                                                                                                                                                                            | 与 DFlash 共享张量有关（HEAD 提交即修此） | 中高 |
-| 8 | **VBR 投影式提示词缓存**                         | 见 2（`llama-vbr-artifact*`）                                                                                                                                                                                                                                             | `common/arg.cpp`、`tools/server/*`                                                                                                                                                                                                                              | 依赖 2                        | 高  |
+| 8 | **VBR 投影式提示词缓存**                         | 见 2（`llama-vbr-artifact*`）                                                                                                                                                                                                                                             | `common/arg.cpp`、`tools/server/*`                                                                                                                                                                                                                              | 依赖 2                        | ✅ 已合入（§10.90） |
 
 
 
@@ -14272,3 +14272,29 @@ port 的副本对 `vbr_controller_active|vbr_dynamic` **0 命中** ⇒ fork 的 
 ① 任一尺子自检报 `unbalanced > 0` 或 `known classes found: False`；② `show 4f0be29f9 -- src/llama-memory-hybrid-idx.h`
 不再含 `llama_memory_vbr_params`；③ 出现**新的含 vbr 的 fork 独有测试文件**（候选 > 18）；
 ④ **有了一块 VBR 能力设备** ⇒ R1–R4 全部可达，本终审的「设备门控」理由随之失效。
+
+### §10.90 功能 #8 VBR 投影式提示词缓存已落地（2026-10-11 核对，补记）
+
+清单第 8 项（改动面 `common/arg.cpp` + `tools/server/*`，依赖 #2）的代码面与本树一致。核对依据是
+**文件级 sha256 与生产调用点**，不是"看起来在"：
+
+| 面 | 核对结果 |
+|---|---|
+| 文件 | server 侧 14 个 + src 侧 45 个两侧同名；本树多一个 `src/llama-vbr-codec.cpp` |
+| 内容 | **58 / 59 个文件 sha256 与 fork 逐字节相同** —— 含 5629 行的 `src/llama-vbr-artifact-catalog.cpp`、5397 行 `src/llama-vbr-explicit-capture.cpp`、3784 行 `tools/server/server-vbr-artifact-store.cpp`、3130 行 `server-retention-sidecar.cpp`、515 行 `server-cache-lease.h` |
+| 接线（生产调用点，非测试） | `publish_idle_vbr_batch` `server-context.cpp:4956`/`:10882`；`capture_projected_host_batch` `:15203`；`try_automatic_vbr_restore` 定义 `:5379` + 调用 `:6113`；`prepare_host_prefix_projection` `:5479`/`:5760`；`prepare_vbr_occupied_replacement` `:5580`/`:5628` |
+| CLI | `--cache-ram`/`-cram`（`common/arg.cpp:2574`）、`--vbr-prompt-cache`/`--no-vbr-prompt-cache`（`:2598`）、`--vbr-anchor-cache-mib` |
+| 运行痕迹（用户实测） | `publish_idle: VBR_IDLE_CAPTURE manifests=1 published=1 … transfers=12`；`gate4 OK: candidate prefix=… projected=1`；`automatic VBR host restore … status=ok … total=7/7` |
+
+**唯一与 fork 不同的文件是 `src/llama-vbr-codec.h`（外加本树新增的 `llama-vbr-codec.cpp`），差异在
+codec 阶梯、不在提示词缓存**：本树新增 `auto` 阶梯（`auto_rungs` / `LLAMA_VBR_CODEC_AUTO` /
+`llama_vbr_codec_valid()`），并把 classic 由 `f16→q8_0→q4_0` 改为 `f16→q8_0→q5_1→q4_1`（底部 5.0 bpv）。
+⇒ 本树在这一步**领先** fork。§5.1 的参数表描述的是 **fork 现状**（`turbo` 默认、classic 用 `q4_0`），
+故仍准确，不改。
+
+⚠️ **已知使用限制**（2026-10-11 探针实测，权威描述见 `docs/vbr.md` 的 *Which restore route can actually
+fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交接被 `slot_count == 1` 硬门限制，`-np > 1` 关闭；
+② 占用替换要求**存活前沿的等长 durable 副本**作回滚见证（发布被缩短时永不成立）；
+③ 前缀投影是 attention-only，拒绝一切带伴随件（recurrent）的工件 ⇒ hybrid 目标只能走整件导入。
+⇒ 当前部署下**只有 `-np 1` 可用**；且导入成本近似固定（与 token 数无关）⇒ 仅在长 prompt 上划算
+（交叉点约 7k token；8k 省 ~12%、12k 省 ~40%）。
