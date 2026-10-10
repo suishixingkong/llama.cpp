@@ -3272,13 +3272,45 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// The largest row count a multi-row batch may have and still be admitted into a captured CUDA
+// graph.  TWO sites must agree on this number, which is why it is one constant plus one resolver:
+//
+//   * ggml_cuda_graph_check_compability() admits a multi-row kv-stream graph at or below it, and
+//   * ggml_cuda_kv_stream_staged_set_rows_range() refuses the STAGED path at or below it.
+//
+// That pairing is the entire safety argument for the relaxation.  The plain mirrored SET_ROWS
+// path reads its row indices out of the device `src1` tensor at run time, so it survives a graph
+// replay with the rows moving; the staged path bakes `first_row` into the destination of two
+// host-side cudaMemcpyAsync nodes (and into the kernel's dst_row_base) at capture time, so a
+// captured staged write lands on the previous step's rows.  Staging is a prefill optimisation
+// (b2ec300a2, "accelerate adaptive KV prefill staging"): prefill batches are far above this bound
+// and are never captured, so they keep it.  Override with GGML_CUDA_KV_STREAM_MULTIROW_GRAPH_MAX_ROWS.
+static constexpr size_t KV_STREAM_MULTIROW_GRAPH_MAX_ROWS = 32;
+
+static size_t kv_stream_multireq_graph_max_rows() {
+    static const size_t bound = []() {
+        const char * value = getenv("GGML_CUDA_KV_STREAM_MULTIROW_GRAPH_MAX_ROWS");
+        if (value == nullptr) {
+            return KV_STREAM_MULTIROW_GRAPH_MAX_ROWS;
+        }
+        const long parsed = atoi(value);
+        return parsed <= 0 ? KV_STREAM_MULTIROW_GRAPH_MAX_ROWS : size_t(parsed);
+    }();
+    return bound;
+}
+
 static bool ggml_cuda_kv_stream_staged_set_rows_range(
         const ggml_backend_cuda_kv_stream_runtime_t runtime, const ggml_tensor * dst,
         int64_t * first_row, int64_t * row_count) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    // `<= kv_stream_multireq_graph_max_rows()` and not `<= 1`: this path is replay-unsafe by
+    // construction (see the comment on the bound above), so it must NOT be the one that handles
+    // the batches the graph gate admits.  Batches above the bound are never captured, and those
+    // are exactly the ones staging was added for (prefill).
     if (runtime == nullptr || runtime->resident_cache == nullptr ||
-            runtime->dirty_rows_remaining == 0 || runtime->dirty_rows.size() <= 1 ||
+            runtime->dirty_rows_remaining == 0 ||
+            runtime->dirty_rows.size() <= kv_stream_multireq_graph_max_rows() ||
             src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 ||
             src1->type != GGML_TYPE_I64 ||
             !ggml_backend_cuda_kv_stream_get_type_capabilities(
@@ -3890,58 +3922,68 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 // conditions fail and the whole decode graph silently loses CUDA-graph replay. On a V100 with a
 // 2B model that is the difference between ~220 t/s (graph replay) and ~140 t/s (kernel launches).
 //
-// GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=1 used to admit multi-row kv-stream batches on the strength
-// of the all_layers_fit check alone. MEASURED WRONG on 2026-10-08 (V100, Qwen3.5-2B, MTP with
-// n_max=3 + kv-stream, --batch-size 1024 --ubatch-size 512): the run produced garbled output at
-// ~66 t/s -- slower than the ~140 t/s of simply not capturing graphs, and wrong in a way no log
-// reports. Mechanism, read from set-rows.cu after the fact: capturing the staged SET_ROWS freezes
-// the *host-side* destination of its mirror copies -- cudaMemcpyAsync(dst->data + first_row *
-// row_bytes, …) with a host dst->data, so the address is computed once and reused by every replay.
-// The device kernel itself is not affected: it reads its row indices from the src1 tensor at run
-// time (dst_row = *(src1 + …) - dst_row_base, and dst_row_base is 0 on the plain path), which is
-// why only the staged path -- the one MTP's multi-row verification batch takes -- misbehaves.
-// all_layers_fit says every page is resident; it says nothing about WHICH rows this graph will
-// touch on the next replay. The staged path has always required dirty_rows to be contiguous, but
-// that check lives at capture time (ggml_cuda_kv_stream_staged_set_rows_range), not in the
-// compatibility gate.
+// Multi-row kv-stream batches ARE admitted into the captured graph, by default and on every
+// configuration: the safety argument above is structural -- an admitted batch is routed off the
+// staged path, and the path it takes instead reads its row indices on the device -- so it does
+// not depend on this model, this batch size or this arena layout.  Admitted batches are still
+// bounded by kv_stream_multireq_graph_max_rows(); anything larger keeps running without graph
+// replay.  GGML_CUDA_KV_STREAM_MULTIROW_GRAPH=0 restores the exact single-row gate.
 //
-// So the relaxation is refused outright. The sound fix is upstream of this gate: make the decode
-// ubatch's row numbers identical every step (the same n_kv padding that already exists for the
-// non-streaming path, so a graph stays reusable across batches), which keeps dirty_rows predictable
-// and lets the single-row gate stay exact. Until that lands there is deliberately no way to turn
-// this on.
+// The first attempt at this relaxation was MEASURED WRONG on 2026-10-08 (V100, Qwen3.5-2B, MTP
+// n_max=3 + kv-stream): garbled output at ~66 t/s -- slower than the ~140 t/s of simply not
+// capturing graphs. Mechanism, read from set-rows.cu afterwards: the staged path ends in two
+// cudaMemcpyAsync calls whose destination offset `first_row * row_bytes` is a HOST-side expression
+// evaluated during capture, i.e. frozen into the memcpy node and reused by every replay. Both
+// copies are frozen, not just the one that targets host memory: the D2D one into the resident
+// mirror writes `mirror_data + first_row*row_bytes` the same way.
+//
+// ⚠️ AND BOTH COPIES MUST STAY INSIDE THE GRAPH.  Moving them out (the obvious "just publish them
+// from the host after the launch" fix) does not work, because the two destinations are consumed
+// later in the SAME step:
+//   * the resident mirror is what the streamed attention reads for these rows -- the SET_ROWS
+//     dispatch calls ggml_cuda_kv_stream_resident_cache_mark_mirrored() right after writing it,
+//     which clears `dirty[]`, and the attention chunk planner then sets `desc.upload = dirty[idx]`
+//     (fattn.cu upload()), i.e. an already-mirrored page is deliberately NOT re-read from host;
+//   * the host dst->data shadow is what a RING page's upload copies from (`upload()` reads
+//     K->data/V->data directly), so for rows that fall outside the resident set it must also be
+//     current before this step's attention runs.
+// An out-of-graph copy can satisfy neither ordering.  So the fix is not where the copies run, it
+// is WHICH path runs: the plain mirrored path is already replay-safe and already carries the
+// single-row decode graph today.
+//
+// The earlier candidate direction -- make the decode ubatch's row numbers identical every step
+// (the n_kv padding the non-streaming path uses) so a frozen offset stays valid -- was killed by
+// measurement: `first` advances by 1..4 every step and never repeats (FIX_KVSTREAM_MTP_CUDAGRAPH
+// §11), so no padding scheme makes it constant.
 static bool kv_stream_multireq_graph_enabled() {
-    static const bool refused = []() {
+    static const bool enabled = []() {
         const char * value = getenv("GGML_CUDA_KV_STREAM_MULTIROW_GRAPH");
-        if (value == nullptr || atoi(value) == 0) {
-            return false;
-        }
-        GGML_LOG_ERROR("kv-stream: %s is refused: admitting multi-row batches makes CUDA-graph "
-                "replay write K/V to the wrong rows (measured: garbled output, no error). The "
-                "single-row gate stays in place; see the comment above for the sound fix.\n",
-                "GGML_CUDA_KV_STREAM_MULTIROW_GRAPH");
-        return false;
+        return value == nullptr || atoi(value) != 0;
     }();
-    return refused;
+    return enabled;
 }
 
-// Batches this small are decode-sized, which is what the one-shot warning below is for; the
-// prefill ubatch legitimately never uses the captured graph and must not consume the warning.
-static constexpr size_t KV_STREAM_MULTIROW_GRAPH_PROBE_ROWS = 16;
+// One warning per distinct (op, row-count) shape, capped.  A single `warned` flag looked right
+// and was wrong: the server's startup pass writes KV for a 2-token micro-ubatch, which consumed
+// the one-shot before the first decode step -- so the warning an operator read pointed at
+// startup instead of at the decode graph this relaxation is about. Keying on the shape also puts
+// the refused row count into the log, which is the field that says whether the bound is set right.
+static constexpr size_t KV_STREAM_MULTIROW_GRAPH_MAX_WARNINGS = 12;
 
 static void kv_stream_graph_note_disabled(const char * why, const char * op, size_t rows) {
-    static bool warned = false;
-    if (warned || rows == 0 || rows > KV_STREAM_MULTIROW_GRAPH_PROBE_ROWS) {
+    static std::unordered_set<std::string> warned;
+    if (rows == 0 || rows > kv_stream_multireq_graph_max_rows() ||
+            warned.size() >= KV_STREAM_MULTIROW_GRAPH_MAX_WARNINGS) {
         return;
     }
-    warned = true;
-    // The remedy is deliberately NOT an env knob: the obvious one was measured to produce garbled
-    // output (see kv_stream_multireq_graph_enabled above). Naming a flag here is what made it look
-    // like a supported speed-up, so this line states the cause and stops.
+    if (!warned.insert(std::string(op) + ':' + std::to_string(rows)).second) {
+        return;
+    }
     GGML_LOG_WARN("kv-stream: disabling CUDA graphs for this graph: %s (%s, %zu row%s) - this "
-            "graph runs without CUDA-graph replay. Replay is only sound for a single-row decode "
-            "write, because the row offset is baked into the captured kernel; speculative "
-            "verification moves it every step.\n",
+            "graph runs without CUDA-graph replay. Replay is only sound where the row index is "
+            "read on the device, i.e. the plain mirrored SET_ROWS path; the staged path bakes the "
+            "row offset into its copies, and speculative verification moves that offset every "
+            "step.\n",
             why, op, rows, rows == 1 ? "" : "s");
 }
 
@@ -3963,22 +4005,42 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         bool mirrorable_set_rows = false;
         if (node_runtime != nullptr) {
             const bool single_row = node_runtime->dirty_rows.size() == 1;
-            const bool multi_row  = multireq_allowed && !node_runtime->dirty_rows.empty();
-            mirrorable_set_rows = node->op == GGML_OP_SET_ROWS &&
+            // The bound is what keeps prefill out: a prefill ubatch is hundreds of rows, and for
+            // those the staged path (which is replay-unsafe) is still the one that runs.
+            const bool multi_row  = multireq_allowed && !node_runtime->dirty_rows.empty() &&
+                node_runtime->dirty_rows.size() <= kv_stream_multireq_graph_max_rows();
+            // `row_count_ok` asks whether the row count is the thing blocking capture, and it is
+            // deliberately computed WITHOUT the mirror lookup, because the two failures want
+            // different handling:
+            //   * a row count outside the bound is a standing property of the batch -- worth a
+            //     warning, and high enough row counts (prefill) are expected to keep running
+            //     graph-less anyway;
+            //   * a missing mirror is what the FIRST step after a phase switch always sees.
+            //     layer_by_data/mirror_by_data are registered by the attention node, which runs
+            //     after this SET_ROWS node, while the decode layout is what clears them -- so a
+            //     warning there fires once per phase switch and means nothing.  The 2026-10-10
+            //     V100 log has exactly the two cold-start occurrences (2 rows at startup, 4 rows
+            //     at the first decode step) while the same run reached 220 t/s, i.e. replay in
+            //     steady state.  Not warning on it costs the diagnosability of a configuration
+            //     whose resident mirror is never available; a row-count warning would not have
+            //     covered that case either.
+            const bool row_count_ok = node->op == GGML_OP_SET_ROWS &&
                 (single_row || multi_row) && node_runtime->dirty_rows[0] >= 0 &&
                 node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_F32 &&
                 node->src[1] != nullptr && node->src[1]->type == GGML_TYPE_I64 &&
                 ggml_backend_cuda_kv_stream_get_type_capabilities(
                     node->type).online_write;
             void * mirror_data = nullptr;
-            mirrorable_set_rows = mirrorable_set_rows &&
+            mirrorable_set_rows = row_count_ok &&
                 ggml_cuda_kv_stream_resident_cache_get_mirror(
                     node_runtime->resident_cache, node, &mirror_data);
             if (!mirrorable_set_rows) {
-                kv_stream_graph_note_disabled(node->op == GGML_OP_SET_ROWS ?
-                        "the kv-stream write is not mirrorable for this row count" :
-                        "a kv-stream tensor feeds a node the graph cannot capture",
-                    ggml_op_name(node->op), node_runtime->dirty_rows.size());
+                if (!row_count_ok) {
+                    kv_stream_graph_note_disabled(node->op == GGML_OP_SET_ROWS ?
+                            "the kv-stream write is not mirrorable for this row count" :
+                            "a kv-stream tensor feeds a node the graph cannot capture",
+                        ggml_op_name(node->op), node_runtime->dirty_rows.size());
+                }
                 use_cuda_graph = false;
             }
         }
@@ -3989,7 +4051,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 continue;
             }
             const bool multi_query = multireq_allowed && node->src[0] != nullptr &&
-                node->src[0]->ne[1] > 1;
+                node->src[0]->ne[1] > 1 &&
+                uint64_t(node->src[0]->ne[1]) <= kv_stream_multireq_graph_max_rows();
             const bool resident_attention = mirrorable_set_rows ||
                 (node->op == GGML_OP_FLASH_ATTN_EXT &&
                 (node->src[0]->ne[1] == 1 || multi_query) &&
