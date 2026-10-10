@@ -600,20 +600,23 @@ static void test_qwen4_vbr_admission_scope(const size_t seed) {
         }));
     }
 
-    // CPU-bound movable Turbo sides follow the generic partial-offload policy and
-    // pin to Q8_0. This is a safe backend fallback, not an architecture refusal;
-    // the fixed QSA child remains F16 in both asymmetric cases.
-    const auto expect_cpu_turbo_fallback = [&](ggml_type type_k, ggml_type type_v) {
+    // fork 9l-kvc-cpu-turbo: CPU-bound Turbo sides now STAY Turbo. The CPU backend advertises
+    // turbo KV support (llama_buft_supports_turbo_kv), so the host-side q8_0 pin must not fire
+    // for them. It used to fire for every turbo type, which silently turned an explicit
+    // -ctk turbo* into q8_0 on a CPU-only run (1.25 bpv requested, 8.5 bpv delivered); see
+    // "llama-kv-cache: let turbo-typed KV run on the CPU backend". This pins the passthrough in
+    // both asymmetric orders. The fn's fixed QSA child stays F16 either way, and the dynamic-VBR
+    // pin on F16 sides is a separate path, covered at 8.5 bpv by
+    // test_qwen4_vbr_indexed_param_delivery.
+    const auto expect_cpu_turbo_passthrough = [&](ggml_type type_k, ggml_type type_v) {
         auto memory = make_indexed_memory(type_k, type_v, [](llama_cparams &) {});
         auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
         GGML_ASSERT(indexed_memory != nullptr);
-        GGML_ASSERT(indexed_memory->get_mem_attn()->type_k() ==
-                    (ggml_is_turbo_kv_type(type_k) ? GGML_TYPE_Q8_0 : type_k));
-        GGML_ASSERT(indexed_memory->get_mem_attn()->type_v() ==
-                    (ggml_is_turbo_kv_type(type_v) ? GGML_TYPE_Q8_0 : type_v));
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_k() == type_k);
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_v() == type_v);
     };
-    expect_cpu_turbo_fallback(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16);
-    expect_cpu_turbo_fallback(GGML_TYPE_F16, GGML_TYPE_TURBO3_TCQ);
+    expect_cpu_turbo_passthrough(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16);
+    expect_cpu_turbo_passthrough(GGML_TYPE_F16, GGML_TYPE_TURBO3_TCQ);
 
     // Controller requests are admitted and remain scoped to mem_attn. These CPU
     // construction cases deliberately do not claim that a CUDA VMM controller armed;
