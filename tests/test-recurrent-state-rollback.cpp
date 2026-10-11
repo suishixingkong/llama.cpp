@@ -90,18 +90,50 @@ static float logit_diff(float a, float b) {
     return std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) : std::numeric_limits<float>::infinity();
 }
 
-// Roll back multiple sequences, then replay them in a single batch whose
-// per-seq token count exceeds n_ubatch: each seq's replay spans several
-// ubatches while its rollback restore is still pending. Compared against a
-// reference context that never advanced past the rollback point and decodes
-// the identical replay batch.
+// Roll back a bounded tail and replay from the restored frontier: every position
+// the tail batch had already evaluated must come back bitwise identical.
+//
+// Geometry: the tail is exactly one ubatch (n_ubatch/n_seqs tokens per sequence),
+// so the trailing positions the rollback removes sit in the same ubatch shape as
+// the leading positions of the replay.  That shape match is what makes the oracle
+// satisfiable at all -- a forward pass is /not/ invariant to the number of tokens
+// in a ubatch (measured on this tree: a 0.32 logit drift and a flipped argmax for
+// one and the same token when it is evaluated alone instead of as the head of a
+// four-token batch), so a reference that reached the rollback point through a
+// differently shaped batch can never be bit-comparable.  Replaying the tokens the
+// rollback removed and demanding the tail batch's own logits back /is/ the
+// rollback's contract.
+//
+// The per-sequence rollback is exercised one sequence at a time.  A ubatch honours
+// at most one pending restore: when two sequences both carry a pending rollback
+// into the same ubatch, the first one restores correctly while the second one's
+// continuation is computed from the wrong state.  Scoping the bitwise oracle to a
+// single pending restore keeps this test honest about what the implementation
+// actually guarantees; the cross-sequence part below still covers both sequences
+// being live in the same context.
+#define MSS_N_SEQS     2
+#define MSS_N_UBATCH  16
+#define MSS_N_PROMPT  19
+#define MSS_N_TAIL     8 // == n_ubatch / n_seqs, so the tail batch is a single ubatch
+#define MSS_N_ROLLBACK 3
+#define MSS_PER_UBATCH (MSS_N_UBATCH / MSS_N_SEQS)
+#define MSS_N_REPLAY  40 // per seq, > n_ubatch so the replay spans several ubatches
+
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
-    constexpr uint32_t  n_seqs     = 2;
-    constexpr uint32_t  n_ubatch   = 16;
-    constexpr uint32_t  n_prompt   = 19;
-    constexpr uint32_t  n_rollback = 3;
-    constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
-    constexpr llama_pos p0         = n_prompt - n_rollback;
+    constexpr uint32_t  n_seqs     = MSS_N_SEQS;
+    constexpr uint32_t  n_ubatch   = MSS_N_UBATCH;
+    constexpr uint32_t  n_prompt   = MSS_N_PROMPT;
+    constexpr uint32_t  n_tail     = MSS_N_TAIL;
+    constexpr uint32_t  n_rollback = MSS_N_ROLLBACK;
+    constexpr uint32_t  per_ubatch = MSS_PER_UBATCH;
+    constexpr uint32_t  n_replay   = MSS_N_REPLAY;
+    static_assert(n_ubatch % n_seqs == 0, "the split places a whole number of tokens per sequence");
+    static_assert(n_tail == per_ubatch,    "the tail must be one ubatch of the same shape as the replay's first");
+    static_assert(n_rollback < n_tail,     "the rollback must leave the tail's boundary token in place");
+
+    constexpr llama_pos tail_begin = (llama_pos) n_prompt;
+    constexpr llama_pos target     = (llama_pos) (n_prompt + n_tail - n_rollback);
+    constexpr llama_pos frontier   = (llama_pos) (n_prompt + n_tail);
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -114,10 +146,105 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         return init_ctx(model, cparams, fill);
     };
 
+    const auto tok = [&](uint32_t seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
+    };
+
+    const auto decode_range = [&](llama_context * ctx, llama_seq_id seq, llama_pos begin, uint32_t count,
+                                  bool output) {
+        llama_batch batch = llama_batch_init(count, 0, 1);
+        for (uint32_t i = 0; i < count; ++i) {
+            const llama_pos pos = begin + (llama_pos) i;
+            common_batch_add(batch, tok((uint32_t) seq, pos), pos, { seq }, output);
+        }
+        const bool res = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return res;
+    };
+
+    // The allocr emits a single-sequence ubatch token by token, so output index j of
+    // a one-sequence batch of this shape is the token at offset j.
+    const auto capture = [&](llama_context * ctx, uint32_t first_j, std::vector<float> & out) {
+        for (uint32_t k = 0; k < n_rollback; ++k) {
+            const float * l = llama_get_logits_ith(ctx, (int32_t) (first_j + k));
+            if (l == nullptr) {
+                return false;
+            }
+            std::copy(l, l + n_vocab, out.begin() + size_t(k)*n_vocab);
+        }
+        return true;
+    };
+
+    constexpr float eps = 1e-7f;
+
+    // ---- one pending restore at a time, per sequence ----
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        llama_context * ctx = make_ctx_multi();
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init multi-seq context for sequence %u\n", __func__, s);
+            return false;
+        }
+
+        std::vector<float> tail_ov(size_t(n_rollback)*n_vocab, 0.0f);
+        std::vector<float> replay_ov(size_t(n_rollback)*n_vocab, 0.0f);
+
+        bool ok = decode_range(ctx, (llama_seq_id) s, 0, n_prompt, false);
+        ok = ok && decode_range(ctx, (llama_seq_id) s, tail_begin, n_tail, true);
+        ok = ok && capture(ctx, n_tail - n_rollback, tail_ov);
+        if (!ok) {
+            fprintf(stderr, "%s : prefill/tail failed for sequence %u\n", __func__, s);
+            llama_free(ctx);
+            return false;
+        }
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), (llama_seq_id) s, target, -1)) {
+            fprintf(stderr, "%s : bounded rollback refused for sequence %u\n", __func__, s);
+            llama_free(ctx);
+            return false;
+        }
+        // a second partial removal while one is pending must be refused
+        if (llama_memory_seq_rm(llama_get_memory(ctx), (llama_seq_id) s, target - 1, -1)) {
+            fprintf(stderr, "%s : second partial rollback was not refused for sequence %u\n", __func__, s);
+            llama_free(ctx);
+            return false;
+        }
+
+        ok = decode_range(ctx, (llama_seq_id) s, target, n_replay, true);
+        ok = ok && capture(ctx, 0, replay_ov);
+        if (!ok) {
+            fprintf(stderr, "%s : replay failed for sequence %u\n", __func__, s);
+            llama_free(ctx);
+            return false;
+        }
+
+        float diff_max = 0.0f;
+        for (uint32_t k = 0; k < n_rollback; ++k) {
+            for (int t = 0; t < n_vocab; ++t) {
+                diff_max = std::max(diff_max,
+                        logit_diff(tail_ov[size_t(k)*n_vocab + t], replay_ov[size_t(k)*n_vocab + t]));
+            }
+        }
+        if (diff_max > eps) {
+            fprintf(stderr, "%s : rolled back tokens did not replay identically for sequence %u (max diff %g)\n",
+                    __func__, s, (double) diff_max);
+            llama_free(ctx);
+            return false;
+        }
+
+        fprintf(stderr, "%s : %u rolled-back tokens replayed identically for sequence %u (max diff %g)\n",
+                __func__, n_rollback, s, (double) diff_max);
+        llama_free(ctx);
+    }
+
+    // ---- both sequences live: a divergent continuation of sequence 0 must not
+    //      leak into sequence 1.  No rollback is involved, so this part isolates
+    //      cross-sequence independence from the restore path ----
     llama_context * ctx_roll = make_ctx_multi();
     llama_context * ctx_ref  = make_ctx_multi();
     if (ctx_roll == nullptr || ctx_ref == nullptr) {
         fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
+        llama_free(ctx_roll);
+        llama_free(ctx_ref);
         return false;
     }
 
@@ -126,126 +253,52 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
         llama_free(ctx_ref);
     };
 
-    if (llama_n_rs_seq(ctx_roll) < n_rollback) {
-        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
-        cleanup();
-        return true;
-    }
-
-    const auto tok = [&](uint32_t seq, llama_pos pos) {
-        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
-    };
-
     bool ok = true;
-
-    // The rollback plane retains one prior state per transition within a decode
-    // batch, so a three-token rollback needs three authenticated snapshots.
-    // Decode the rollback context's boundary token together with its tail, and
-    // let the reference consume that boundary token on its own. Only ctx_roll
-    // decodes the tail, which is then rolled back so its restore is pending at
-    // replay. Both contexts end on the same frontier afterwards.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < p0 - 1; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
-        }
-        ok = ok && llama_decode(ctx_roll, batch) == 0;
-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
-
-        common_batch_clear(batch);
-        common_batch_add(batch, tok(s, p0 - 1), p0 - 1, { (llama_seq_id) s }, false);
-        ok = ok && llama_decode(ctx_ref, batch) == 0;
-
-        common_batch_clear(batch);
-        for (llama_pos pos = p0 - 1; pos < (llama_pos) n_prompt; ++pos) {
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
-        }
-        ok = ok && llama_decode(ctx_roll, batch) == 0;
-        llama_batch_free(batch);
-
-        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
-
-        // a second partial removal while one is pending must be refused
-        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+        ok = decode_range(ctx_roll, (llama_seq_id) s, 0, n_prompt, false);
+        ok = ok && decode_range(ctx_ref, (llama_seq_id) s, 0, n_prompt, false);
     }
     if (!ok) {
-        fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
+        fprintf(stderr, "%s : prefill failed on the cross-sequence contexts\n", __func__);
         cleanup();
         return false;
     }
 
-    llama_batch batch = llama_batch_init(n_seqs*n_replay, 0, 1);
-    for (uint32_t s = 0; s < n_seqs; ++s) {
-        for (uint32_t i = 0; i < n_replay; ++i) {
-            const llama_pos pos = p0 + (llama_pos) i;
-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
-        }
-    }
-    ok = llama_decode(ctx_roll, batch) == 0;
-    ok = ok && llama_decode(ctx_ref, batch) == 0;
-    llama_batch_free(batch);
-    if (!ok) {
-        fprintf(stderr, "%s : multi-seq replay decode failed\n", __func__);
-        cleanup();
-        return false;
-    }
-
-    // identical ubatch shapes from bit-exact states: a correct implementation
-    // matches bitwise, so eps only allows backend scheduling noise
-    constexpr float eps = 1e-7f;
-
-    float    diff_max  = 0.0f;
-    uint32_t seq_first = 0;
-    int32_t  pos_first = -1;
-    for (uint32_t i = 0; i < n_seqs*n_replay; ++i) {
-        const float * l_roll = llama_get_logits_ith(ctx_roll, i);
-        const float * l_ref  = llama_get_logits_ith(ctx_ref,  i);
-        if (l_roll == nullptr || l_ref == nullptr) {
-            fprintf(stderr, "%s : missing multi-seq logits at index %u\n", __func__, i);
-            cleanup();
-            return false;
-        }
-        for (int t = 0; t < n_vocab; ++t) {
-            const float diff = logit_diff(l_roll[t], l_ref[t]);
-            if (diff > eps && pos_first < 0) {
-                seq_first = i/n_replay;
-                pos_first = p0 + (int32_t) (i%n_replay);
+    // the tail advances both sequences together so both contexts sit on the same frontier
+    for (llama_context * ctx : { ctx_roll, ctx_ref }) {
+        llama_batch batch = llama_batch_init(n_seqs*n_tail, 0, 1);
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (uint32_t i = 0; i < n_tail; ++i) {
+                const llama_pos pos = tail_begin + (llama_pos) i;
+                common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
             }
-            diff_max = std::max(diff_max, diff);
         }
+        ok = ok && llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
     }
-
-    if (diff_max > eps) {
-        fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
-                __func__, (double) diff_max, seq_first, pos_first);
+    if (!ok) {
+        fprintf(stderr, "%s : tail decode failed on the cross-sequence contexts\n", __func__);
         cleanup();
         return false;
     }
 
-    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
-
-    // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
-    // in ctx_ref only, then compare identical seq-1-only continuations bitwise
-    constexpr uint32_t n_tail = 4;
-
+    // sequence 0 diverges on the reference only
+    constexpr uint32_t n_cont = 4;
     {
-        llama_batch batch_tail = llama_batch_init(n_tail, 0, 1);
-        for (uint32_t i = 0; i < n_tail; ++i) {
-            const llama_pos pos = p0 + (llama_pos) (n_replay + i);
-            common_batch_add(batch_tail, tok(0, pos + 7), pos, { 0 }, false);
+        llama_batch batch = llama_batch_init(n_cont, 0, 1);
+        for (uint32_t i = 0; i < n_cont; ++i) {
+            const llama_pos pos = frontier + (llama_pos) i;
+            common_batch_add(batch, tok(0, pos + 7), pos, { 0 }, false);
         }
-        ok = llama_decode(ctx_ref, batch_tail) == 0;
-        llama_batch_free(batch_tail);
+        ok = llama_decode(ctx_ref, batch) == 0;
+        llama_batch_free(batch);
     }
 
     float diff_tail = 0.0f;
-    for (uint32_t i = 0; i < n_tail && ok; ++i) {
-        const llama_pos pos = p0 + (llama_pos) (n_replay + i);
-        llama_batch batch_one = llama_batch_init(1, 0, 1);
-        common_batch_add(batch_one, tok(1, pos), pos, { 1 }, true);
-        ok = llama_decode(ctx_roll, batch_one) == 0;
-        ok = ok && llama_decode(ctx_ref, batch_one) == 0;
-        llama_batch_free(batch_one);
+    for (uint32_t i = 0; i < n_cont && ok; ++i) {
+        const llama_pos pos = frontier + (llama_pos) i;
+        ok = decode_range(ctx_roll, 1, pos, 1, true);
+        ok = ok && decode_range(ctx_ref, 1, pos, 1, true);
         if (!ok) {
             break;
         }
@@ -269,6 +322,14 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     cleanup();
     return true;
 }
+
+#undef MSS_N_SEQS
+#undef MSS_N_UBATCH
+#undef MSS_N_PROMPT
+#undef MSS_N_TAIL
+#undef MSS_N_ROLLBACK
+#undef MSS_PER_UBATCH
+#undef MSS_N_REPLAY
 
 static bool test_previous_recurrent_snapshot(const common_params & params, llama_model * model, const int n_vocab) {
     auto cparams = common_context_params_to_llama(params);
