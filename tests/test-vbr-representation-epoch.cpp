@@ -1392,13 +1392,16 @@ static bool projected_capture_batch_exact(
     // "failed". Chains whose operands dereference what an earlier operand guards are left
     // as written on purpose: splitting those would evaluate a guarded dereference.
     std::vector<const char *> unmet_fields;
-    const auto report_unmet_fields = [&]() {
+    const auto report_unmet_fields = [&](const char * block) {
         if (unmet_fields.empty()) {
             return false;
         }
-        fprintf(stderr, "VBR projected capture unmet fields (%zu):\n", unmet_fields.size());
+        // Every field line repeats a grep-able token: a pipeline that filters on "unmet"
+        // has to show the fields, not just the header that mentions them.
+        fprintf(stderr, "VBR projected capture unmet fields (%zu) in %s:\n",
+                unmet_fields.size(), block);
         for (const char * field : unmet_fields) {
-            fprintf(stderr, "    %s\n", field);
+            fprintf(stderr, "    unmet field: %s\n", field);
         }
         unmet_fields.clear();
         return true;
@@ -1599,7 +1602,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(preparation_refused.transfer.bytes != 0);
         VBR_WANT(preparation_refused.assembly);
         VBR_WANT(!preparation_refused.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("preparation-refused capture verdict")) {
             return miss("preparation-refused capture verdict");
         }
         auto admission_refused_request = request;
@@ -1629,7 +1632,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(admission_refused.transfer.bytes != 0);
         VBR_WANT(admission_refused.assembly);
         VBR_WANT(!admission_refused.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("admission-refused capture verdict")) {
             return miss("admission-refused capture verdict");
         }
         auto released_after_refusal = ring->try_begin_operation();
@@ -1664,7 +1667,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(busy.transfer.bytes != 0);
         VBR_WANT(busy.assembly);
         VBR_WANT(!busy.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("busy-ring capture verdict")) {
             return miss("busy-ring capture verdict");
         }
         held_operation = {};
@@ -1691,7 +1694,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(cancelled.transfer.bytes != 0);
         VBR_WANT(cancelled.assembly);
         VBR_WANT(!cancelled.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("cancelled capture verdict")) {
             return miss("cancelled capture verdict");
         }
         // Cancel after the companion stream has already read one quantum, so the case
@@ -1753,7 +1756,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(companion_mid_cancelled.assembly);
         VBR_WANT(!companion_mid_cancelled.publications.empty());
         VBR_WANT(companion_mid_below_reads != 0);
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("companion-mid-cancelled capture verdict")) {
             return miss("companion-mid-cancelled capture verdict");
         }
         if (admission.continuation_calls < 2) {
@@ -1784,7 +1787,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(attention_cancelled.transfer.submitted_chunks < attention_cancelled.transfer.chunks);
         VBR_WANT(attention_cancelled.assembly);
         VBR_WANT(!attention_cancelled.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("attention-cancelled capture verdict")) {
             return miss("attention-cancelled capture verdict");
         }
         auto refused_request = request;
@@ -1802,7 +1805,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(refused.unit_transfer_calls != 0);
         VBR_WANT(refused.assembly);
         VBR_WANT(!refused.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("over-cap rejected capture verdict")) {
             return miss("over-cap rejected capture verdict");
         }
         auto inflated_request = request;
@@ -1840,7 +1843,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(partial.first_available_manifest_id != 101);
         VBR_WANT(partial.planned_packed_bytes == 0);
         VBR_WANT(partial.unit_transfer_calls == 0);
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("partial four-manifest capture verdict")) {
             return miss("partial four-manifest capture verdict");
         }
         partial_request.max_packed_bytes =
@@ -1852,7 +1855,7 @@ static bool projected_capture_batch_exact(
         VBR_WANT(partial_over_cap.unit_transfer_calls != 0);
         VBR_WANT(partial_over_cap.assembly);
         VBR_WANT(!partial_over_cap.publications.empty());
-        if (report_unmet_fields()) {
+        if (report_unmet_fields("partial over-cap rejected capture verdict")) {
             return miss("partial over-cap rejected capture verdict");
         }
     }
