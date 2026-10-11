@@ -138,18 +138,26 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // The rollback plane retains one prior state per transition within a decode
+    // batch, so a three-token rollback needs three authenticated snapshots.
+    // Decode the rollback context's boundary token together with its tail, and
+    // let the reference consume that boundary token on its own. Only ctx_roll
+    // decodes the tail, which is then rolled back so its restore is pending at
+    // replay. Both contexts end on the same frontier afterwards.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+        for (llama_pos pos = 0; pos < p0 - 1; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        common_batch_add(batch, tok(s, p0 - 1), p0 - 1, { (llama_seq_id) s }, false);
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
+
+        common_batch_clear(batch);
+        for (llama_pos pos = p0 - 1; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
