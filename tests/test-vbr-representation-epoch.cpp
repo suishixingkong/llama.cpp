@@ -1252,13 +1252,13 @@ struct unmet_report {
 #define VBR_UNMET_IF(cond) unmet_fields.record(bool(cond), #cond)
 
 // The projected-capture harness models exactly ONE capture device: it interns a single
-// shard topology (LLAMA_SPLIT_MODE_NONE) and its ring owns one lane. The production
-// server builds one lane per distinct pool device (server-context.cpp, the
-// capture_lanes dedup), so a model whose attention VBR pools land on two devices -- a
-// second card taking the last layers, e.g. a 2 GB one -- is a configuration this harness
-// cannot express. It has to decline that as UNSUPPORTED, not report the resulting
-// precondition as a capture failure: the same run passes once the second device is
-// hidden, which is the signature of a harness limit rather than a capture defect.
+// shard topology (LLAMA_SPLIT_MODE_NONE) and its ring owns one lane. A model whose attention
+// VBR pools land on two devices -- a second card taking the last layers, e.g. a 2 GB one --
+// is therefore not something this harness can express, which is why run_vbr_epoch() pins the
+// whole model to one device and main() iterates the visible GPUs. This helper reports the
+// distinct devices those pools currently span, so the pin can be asserted instead of assumed.
+// It uses the same vbr_explicit_capture_runtime_pools() the capture path uses, so the two
+// cannot drift.
 static std::vector<ggml_backend_dev_t> projected_capture_devices(llama_memory_i & memory) {
     std::vector<ggml_backend_dev_t> devices;
     std::vector<vbr_explicit_capture_runtime_pool> pools;
@@ -3091,88 +3091,12 @@ static bool run_operation_cpu_tests() {
     return true;
 }
 
-int main(int argc, char ** argv) {
-    if (!unmet_report_self_check()) {
-        return 1;
-    }
-    // Every tracker in this test binary uses a deterministic process origin. Production uses
-    // the fail-closed entropy mixer; deterministic bytes keep checkpoint/artifact regressions
-    // attributable to logic rather than process entropy.
-    if (!vbr_lineage_origin_provider_set_for_tests(deterministic_lineage_origin)) {
-        fprintf(stderr, "VBR identity deterministic lineage origin setup failed\n");
-        return 1;
-    }
-    if (argc == 2 && std::string(argv[1]) == "--identity-cpu") {
-        return run_identity_cpu_tests() ? 0 : 1;
-    }
-    if (argc == 2 && std::string(argv[1]) == "--generation-cpu") {
-        return run_generation_cpu_tests() ? 0 : 1;
-    }
-    if (argc == 2 && std::string(argv[1]) == "--operation-cpu") {
-        return run_operation_cpu_tests() ? 0 : 1;
-    }
-    const bool partition_typed = argc == 3 && std::string(argv[1]) == "--iswa-budget";
-    const bool partition_env   = argc == 3 && std::string(argv[1]) == "--iswa-budget-env";
-    const bool partition_only  = partition_typed || partition_env;
-    if (argc != 2 && !partition_only) {
-        fprintf(stderr, "usage: %s MODEL | --iswa-budget MODEL | --iswa-budget-env MODEL | "
-                "--identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
-        return 1;
-    }
-    const char * model_path = partition_only ? argv[2] : argv[1];
-
-    if (!partition_only) {
-        // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
-        // completed identity is never returned by the next operation.
-        uint64_t first_registry_id = 0;
-        {
-            vbr_operation_binding binding = {};
-            binding.kind = vbr_operation_kind::state_export;
-            vbr_operation_registry_guard guard(binding);
-            if (!guard.active()) {
-                fprintf(stderr, "operation registry registry RAII guard failed to mint an operation ID\n");
-                return 1;
-            }
-            first_registry_id = guard.binding().operation_id.value;
-            if (!vbr_operation_registry_is_live(guard.binding().operation_id)) {
-                fprintf(stderr, "operation registry registry did not expose its live RAII operation\n");
-                return 1;
-            }
-        }
-        if (vbr_operation_registry_is_live({ first_registry_id })) {
-            fprintf(stderr, "operation registry registry RAII guard left a completed operation live\n");
-            return 1;
-        }
-        {
-            vbr_operation_binding binding = {};
-            binding.kind = vbr_operation_kind::state_export;
-            vbr_operation_registry_guard guard(binding);
-            if (!guard.active() ||
-                guard.binding().operation_id.value == first_registry_id) {
-                fprintf(stderr, "operation registry registry reused an operation ID\n");
-                return 1;
-            }
-        }
-
-        if (!run_generation_cpu_tests() || !run_operation_cpu_tests()) {
-            return 1;
-        }
-    }
-
-    ggml_backend_load_all();
-
-    bool have_gpu = false;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            have_gpu = true;
-            break;
-        }
-    }
-    if (!have_gpu) {
-        fprintf(stderr, "SKIP: VBR representation epoch requires a GPU VBR backend (currently CUDA)\n");
-        return 0;
-    }
-
+// One complete epoch run on one GPU. The caller pins the model to a single device and
+// iterates the visible GPUs, because the projected-capture harness models exactly one
+// capture device: a model placed on two devices splits its attention VBR pools across them.
+static int run_vbr_epoch(const char * model_path, bool partition_typed, bool partition_env,
+                         ggml_backend_dev_t pin) {
+    const bool partition_only = partition_typed || partition_env;
     // Hermetic controller inputs. The generated/real Gemma-4 fixture has iSWA children; a generic
     // order plus the friend-only force_degrade() above makes the epoch wave independent of its
     // price clamp, budget reach, free VRAM, or card size.
@@ -3199,6 +3123,11 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 99;
+    // Pin the entire model to this device: one pass = one card. The caller iterates the
+    // visible GPUs, so a two-GPU box is covered by two sequential single-device runs while
+    // every pass stays inside the projected-capture harness's single-device model.
+    ggml_backend_dev_t pin_devices[2] = { pin, nullptr };
+    mparams.devices = pin_devices;
     llama_model_ptr model(llama_model_load_from_file(model_path, mparams));
     if (!model) {
         fprintf(stderr, "failed to load model %s\n", model_path);
@@ -3269,21 +3198,21 @@ int main(int argc, char ** argv) {
             return 1;
         }
         printf("VBR per-sequence checkpoint lineage PASS\n");
-        // The only thing that can refuse the captures below is the harness's own
-        // single-device model, so decide it here, by name, before spending the run on it.
+        // Pinning the model to one device is what keeps this pass inside the harness's
+        // single-device model, so it is worth asserting rather than assuming: if the attention
+        // VBR pools still span more than one device, one pass is no longer one card and the
+        // captures below would be refused for a reason unrelated to what they test.
         {
             const auto capture_devices = projected_capture_devices(*mem);
             if (capture_devices.size() > 1) {
                 fprintf(stderr,
-                        "SKIP: the projected-capture harness models a single capture device, found %zu:",
-                        capture_devices.size());
+                        "pinned to %s but the attention VBR pools still span %zu capture devices:",
+                        ggml_backend_dev_name(pin), capture_devices.size());
                 for (auto * device : capture_devices) {
                     fprintf(stderr, " %s", ggml_backend_dev_name(device));
                 }
-                fprintf(stderr,
-                        "\n      the production server lanes one ring per device; this harness does not."
-                        " Hide all but one device (e.g. CUDA_VISIBLE_DEVICES=0) to run it.\n");
-                return 0;
+                fprintf(stderr, "\n");
+                return 1;
             }
         }
         uint32_t expected_transfers = 0;
@@ -4028,3 +3957,112 @@ int main(int argc, char ** argv) {
             "per-child representation and checkpoint-lineage epochs\n");
     return 0;
 }
+
+int main(int argc, char ** argv) {
+    if (!unmet_report_self_check()) {
+        return 1;
+    }
+    // Every tracker in this test binary uses a deterministic process origin. Production uses
+    // the fail-closed entropy mixer; deterministic bytes keep checkpoint/artifact regressions
+    // attributable to logic rather than process entropy.
+    if (!vbr_lineage_origin_provider_set_for_tests(deterministic_lineage_origin)) {
+        fprintf(stderr, "VBR identity deterministic lineage origin setup failed\n");
+        return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--identity-cpu") {
+        return run_identity_cpu_tests() ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--generation-cpu") {
+        return run_generation_cpu_tests() ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--operation-cpu") {
+        return run_operation_cpu_tests() ? 0 : 1;
+    }
+    const bool partition_typed = argc == 3 && std::string(argv[1]) == "--iswa-budget";
+    const bool partition_env   = argc == 3 && std::string(argv[1]) == "--iswa-budget-env";
+    const bool partition_only  = partition_typed || partition_env;
+    if (argc != 2 && !partition_only) {
+        fprintf(stderr, "usage: %s MODEL | --iswa-budget MODEL | --iswa-budget-env MODEL | "
+                "--identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
+        return 1;
+    }
+    const char * model_path = partition_only ? argv[2] : argv[1];
+
+    if (!partition_only) {
+        // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
+        // completed identity is never returned by the next operation.
+        uint64_t first_registry_id = 0;
+        {
+            vbr_operation_binding binding = {};
+            binding.kind = vbr_operation_kind::state_export;
+            vbr_operation_registry_guard guard(binding);
+            if (!guard.active()) {
+                fprintf(stderr, "operation registry registry RAII guard failed to mint an operation ID\n");
+                return 1;
+            }
+            first_registry_id = guard.binding().operation_id.value;
+            if (!vbr_operation_registry_is_live(guard.binding().operation_id)) {
+                fprintf(stderr, "operation registry registry did not expose its live RAII operation\n");
+                return 1;
+            }
+        }
+        if (vbr_operation_registry_is_live({ first_registry_id })) {
+            fprintf(stderr, "operation registry registry RAII guard left a completed operation live\n");
+            return 1;
+        }
+        {
+            vbr_operation_binding binding = {};
+            binding.kind = vbr_operation_kind::state_export;
+            vbr_operation_registry_guard guard(binding);
+            if (!guard.active() ||
+                guard.binding().operation_id.value == first_registry_id) {
+                fprintf(stderr, "operation registry registry reused an operation ID\n");
+                return 1;
+            }
+        }
+
+        if (!run_generation_cpu_tests() || !run_operation_cpu_tests()) {
+            return 1;
+        }
+    }
+
+    ggml_backend_load_all();
+
+    bool have_gpu = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            have_gpu = true;
+            break;
+        }
+    }
+    if (!have_gpu) {
+        fprintf(stderr, "SKIP: VBR representation epoch requires a GPU VBR backend (currently CUDA)\n");
+        return 0;
+    }
+
+    // Run the epoch once per visible GPU so both cards are exercised in turn. Pinning the
+    // model to one device is what keeps every pass inside the projected-capture harness's
+    // single-device model; with one visible GPU this is a single, unchanged pass.
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
+        }
+    }
+    int device_failures = 0;
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        if (gpus.size() > 1) {
+            printf("=== VBR representation epoch: device %zu/%zu %s ===\n",
+                   i + 1, gpus.size(), ggml_backend_dev_name(gpus[i]));
+        }
+        const int rc = run_vbr_epoch(model_path, partition_typed, partition_env, gpus[i]);
+        if (rc != 0) {
+            fprintf(stderr, "VBR representation epoch failed on device %s (rc=%d)\n",
+                    ggml_backend_dev_name(gpus[i]), rc);
+            ++device_failures;
+        }
+    }
+    return device_failures != 0 ? 1 : 0;
+}
+
