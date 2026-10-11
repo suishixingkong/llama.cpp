@@ -3013,6 +3013,13 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "VBR projected capture hybrid seed failed\n");
             return 1;
         }
+        // Reach the scheduler fence before capturing. An armed decode reserves a recovery
+        // ring slot in apply_ubatch(), decode()'s transaction hands it to
+        // vbr_awaiting_commit_, and only llama_synchronize() -> vbr_commit_submitted()
+        // releases it. Until then the slot is `reserved`, and every non-free ring state
+        // refuses re-arm, so the capture below would be declined without the decode's
+        // evidence ever being settled.
+        llama_synchronize(ctx.get());
         const auto hybrid_seeded = llama_memory_vbr_state(mem, 0, 0);
         llama_memory_seq_cp(mem, 0, 1, -1, -1);
         const auto hybrid_shared_0 = llama_memory_vbr_state(mem, 0, 0);
