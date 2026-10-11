@@ -1057,11 +1057,6 @@ struct llama_kv_cache_vbr_epoch_test {
         }
         return false;
     }
-// Name the exact reason vbr_explicit_capture_runtime_pools() turned the projected
-// capture down.  It answers with a single bool, and its five preconditions are
-// indistinguishable from the outside, so a failing run used to stop at a bare
-// "one-manifest projected capture failed".  Everything checked here is public on
-// llama_kv_cache, so no production code has to change.
         // Name the exact reason vbr_explicit_capture_runtime_pools() turned the
         // projected capture down: it answers with a single bool and its five
         // preconditions are indistinguishable from the outside, so a failing run
@@ -1255,6 +1250,29 @@ struct unmet_report {
 
 // Valid wherever a local `unmet_report unmet_fields;` is in scope.
 #define VBR_UNMET_IF(cond) unmet_fields.record(bool(cond), #cond)
+
+// The projected-capture harness models exactly ONE capture device: it interns a single
+// shard topology (LLAMA_SPLIT_MODE_NONE) and its ring owns one lane. The production
+// server builds one lane per distinct pool device (server-context.cpp, the
+// capture_lanes dedup), so a model whose attention VBR pools land on two devices -- a
+// second card taking the last layers, e.g. a 2 GB one -- is a configuration this harness
+// cannot express. It has to decline that as UNSUPPORTED, not report the resulting
+// precondition as a capture failure: the same run passes once the second device is
+// hidden, which is the signature of a harness limit rather than a capture defect.
+static std::vector<ggml_backend_dev_t> projected_capture_devices(llama_memory_i & memory) {
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<vbr_explicit_capture_runtime_pool> pools;
+    uint32_t attention_children = 0;
+    if (!vbr_explicit_capture_runtime_pools(memory, pools, attention_children)) {
+        return devices;  // nothing to judge: the capture path names its own precondition
+    }
+    for (const auto & pool : pools) {
+        if (std::find(devices.begin(), devices.end(), pool.backend_device) == devices.end()) {
+            devices.push_back(pool.backend_device);
+        }
+    }
+    return devices;
+}
 
 static bool projected_capture_batch_exact(
         llama_memory_i & memory, uint32_t manifest_count,
@@ -3251,6 +3269,23 @@ int main(int argc, char ** argv) {
             return 1;
         }
         printf("VBR per-sequence checkpoint lineage PASS\n");
+        // The only thing that can refuse the captures below is the harness's own
+        // single-device model, so decide it here, by name, before spending the run on it.
+        {
+            const auto capture_devices = projected_capture_devices(*mem);
+            if (capture_devices.size() > 1) {
+                fprintf(stderr,
+                        "SKIP: the projected-capture harness models a single capture device, found %zu:",
+                        capture_devices.size());
+                for (auto * device : capture_devices) {
+                    fprintf(stderr, " %s", ggml_backend_dev_name(device));
+                }
+                fprintf(stderr,
+                        "\n      the production server lanes one ring per device; this harness does not."
+                        " Hide all but one device (e.g. CUDA_VISIBLE_DEVICES=0) to run it.\n");
+                return 0;
+            }
+        }
         uint32_t expected_transfers = 0;
         if (!projected_capture_batch_exact(
                 *mem, 1, expected_transfers)) {
