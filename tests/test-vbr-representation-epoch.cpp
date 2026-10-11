@@ -1374,6 +1374,15 @@ static bool projected_capture_batch_exact(
                 captured.ring_operation_refusals);
         return false;
     }
+    // The checklist above only covers the capture's own verdict. Everything below is a
+    // test-side cross-check of the accounting the capture just handed back, and each one used
+    // to be a bare `return false` as well -- so a failure still stopped at "VBR one-manifest
+    // projected capture failed" with nothing naming the comparison that failed, which is the
+    // exact thing the checklist was added to remove. Route all of them through one reporter.
+    const auto miss = [](const char * what) {
+        fprintf(stderr, "VBR projected capture unmet: %s\n", what);
+        return false;
+    };
     uint64_t projected_host_bytes = 0;
     for (const auto & durable : admission.quote.durable) {
         for (const auto & row : durable.accounting) {
@@ -1381,21 +1390,21 @@ static bool projected_capture_batch_exact(
                 continue;
             }
             if (row.resident_bytes > UINT64_MAX - projected_host_bytes) {
-                return false;
+                return miss("durable host resident bytes overflow");
             }
             projected_host_bytes += row.resident_bytes;
         }
         for (const auto & row : durable.reserve_accounting) {
             if (row.role != vbr_artifact_accounting_role::unit_payload ||
                 row.resident_bytes > UINT64_MAX - projected_host_bytes) {
-                return false;
+                return miss("durable reserve resident bytes overflow or wrong role");
             }
             projected_host_bytes += row.resident_bytes;
         }
     }
     if (projected_host_bytes !=
             admission.quote.projected_host_resident_bytes) {
-        return false;
+        return miss("host resident bytes agree with the quote");
     }
     uint64_t staging_bytes = 0;
     for (const auto & row : admission.quote.staging) {
@@ -1403,33 +1412,33 @@ static bool projected_capture_batch_exact(
             row.bytes > UINT64_MAX - staging_bytes ||
             row.domain.residency ==
                 llama_cache_acct_residency::not_applicable) {
-            return false;
+            return miss("staging row carries a residency and a nonzero size");
         }
         staging_bytes += row.bytes;
     }
     if (staging_bytes != captured.planned_packed_bytes) {
-        return false;
+        return miss("staging bytes agree with the planned packed bytes");
     }
     uint32_t identity_keys = 0;
     for (const auto & type : identity_counts.calls) {
         for (const uint32_t calls : type) {
             if (calls > 1) {
-                return false;
+                return miss("representation identity asked for at most once");
             }
             identity_keys += calls != 0;
         }
     }
     if (identity_keys == 0) {
-        return false;
+        return miss("at least one representation identity was asked for");
     }
     if (expected_transfers == 0) {
         expected_transfers = captured.unit_transfer_calls;
     } else if (captured.unit_transfer_calls != expected_transfers) {
-        return false;
+        return miss("transfer count matches the earlier capture");
     }
     for (const auto & manifest : captured.assembly.manifests()) {
         if (manifest.state != vbr_capture_manifest_state::ready) {
-            return false;
+            return miss("every manifest is ready");
         }
     }
     for (const auto & target : captured.assembly.controller_targets()) {
@@ -1437,14 +1446,14 @@ static bool projected_capture_batch_exact(
             if (descriptor.meansub_model_id < 0 ||
                 descriptor.meansub_layer < 0 ||
                 !descriptor.meansub_baked) {
-                return false;
+                return miss("every unit descriptor carries a baked meansub");
             }
         }
     }
     for (const auto & publication : captured.publications) {
         if (publication.companions.size() != 1 ||
             publication.accounting.empty()) {
-            return false;
+            return miss("publication carries one companion and an accounting");
         }
         const auto quoted = std::find_if(
             admission.quote.durable.begin(), admission.quote.durable.end(),
@@ -1453,7 +1462,7 @@ static bool projected_capture_batch_exact(
             });
         if (quoted == admission.quote.durable.end() ||
             quoted->accounting.size() != publication.accounting.size()) {
-            return false;
+            return miss("publication is quoted with the same accounting width");
         }
         for (size_t row = 0; row < publication.accounting.size(); ++row) {
             const auto & lhs = quoted->accounting[row];
@@ -1462,7 +1471,7 @@ static bool projected_capture_batch_exact(
                 lhs.logical_bytes != rhs.logical_bytes ||
                 lhs.resident_bytes != rhs.resident_bytes ||
                 lhs.attribution != rhs.attribution) {
-                return false;
+                return miss("publication accounting agrees row for row");
             }
         }
     }
@@ -1538,7 +1547,7 @@ static bool projected_capture_batch_exact(
             injected_capture.union_cells != captured.union_cells ||
             injected.size_calls != 1 || injected.capture_calls != 1 ||
             injected.terminal_calls < 3) {
-            return false;
+            return miss("injected companion capture matches the accounting");
         }
 
         auto preparation_refused_request = request;
@@ -1572,7 +1581,7 @@ static bool projected_capture_batch_exact(
             preparation_refused.transfer.bytes != 0 ||
             preparation_refused.assembly ||
             !preparation_refused.publications.empty()) {
-            return false;
+            return miss("preparation-refused capture verdict");
         }
         auto admission_refused_request = request;
         projected_capture_admission refused_admission;
@@ -1603,16 +1612,16 @@ static bool projected_capture_batch_exact(
             admission_refused.transfer.bytes != 0 ||
             admission_refused.assembly ||
             !admission_refused.publications.empty()) {
-            return false;
+            return miss("admission-refused capture verdict");
         }
         auto released_after_refusal = ring->try_begin_operation();
         if (!released_after_refusal) {
-            return false;
+            return miss("ring released after the refusal");
         }
         released_after_refusal = {};
         auto held_operation = ring->try_begin_operation();
         if (!held_operation) {
-            return false;
+            return miss("ring could be held for the busy case");
         }
         projected_capture_admission busy_admission;
         busy_admission.ring = ring.get();
@@ -1637,7 +1646,7 @@ static bool projected_capture_batch_exact(
             busy.companion_d2h_reads != 0 ||
             busy.unit_transfer_calls != 0 || busy.transfer.bytes != 0 ||
             busy.assembly || !busy.publications.empty()) {
-            return false;
+            return miss("busy-ring capture verdict");
         }
         held_operation = {};
         auto cancelled_request = request;
@@ -1664,7 +1673,7 @@ static bool projected_capture_batch_exact(
             cancelled.transferred_units != 0 ||
             cancelled.transfer.bytes != 0 || cancelled.assembly ||
             !cancelled.publications.empty()) {
-            return false;
+            return miss("cancelled capture verdict");
         }
         auto companion_mid_cancelled_request = request;
         projected_capture_admission companion_mid_cancelled_admission;
@@ -1690,10 +1699,10 @@ static bool projected_capture_batch_exact(
             companion_mid_cancelled.unit_transfer_calls != 0 ||
             companion_mid_cancelled.assembly ||
             !companion_mid_cancelled.publications.empty()) {
-            return false;
+            return miss("companion-mid-cancelled capture verdict");
         }
         if (admission.continuation_calls < 2) {
-            return false;
+            return miss("the accepted capture continued at least twice");
         }
         auto attention_cancelled_request = request;
         projected_capture_admission attention_cancelled_admission;
@@ -1725,7 +1734,7 @@ static bool projected_capture_batch_exact(
                 attention_cancelled.transfer.chunks ||
             attention_cancelled.assembly ||
             !attention_cancelled.publications.empty()) {
-            return false;
+            return miss("attention-cancelled capture verdict");
         }
         auto refused_request = request;
         refused_request.max_packed_bytes =
@@ -1742,7 +1751,7 @@ static bool projected_capture_batch_exact(
             over_cap_admission.admit_calls != 0 ||
             refused.unit_transfer_calls != 0 || refused.assembly ||
             !refused.publications.empty()) {
-            return false;
+            return miss("over-cap rejected capture verdict");
         }
         auto inflated_request = request;
         inflated_request.manifests.front().identity.token_count = 2;
@@ -1763,7 +1772,7 @@ static bool projected_capture_batch_exact(
             inflated.publications.size() != 1 ||
             !inflated.publications.front().companions.empty() ||
             !inflated.publications.front().accounting.empty()) {
-            return false;
+            return miss("dependency-unavailable capture verdict");
         }
     } else if (manifest_count == 4) {
         // Retry evidence follows the dependency-available projected subset,
@@ -1779,7 +1788,7 @@ static bool projected_capture_batch_exact(
             partial.first_available_manifest_id != 101 ||
             partial.planned_packed_bytes == 0 ||
             partial.unit_transfer_calls == 0) {
-            return false;
+            return miss("partial four-manifest capture verdict");
         }
         partial_request.max_packed_bytes =
             partial.planned_packed_bytes - 1;
@@ -1791,7 +1800,7 @@ static bool projected_capture_batch_exact(
             partial_over_cap.unit_transfer_calls != 0 ||
             partial_over_cap.assembly ||
             !partial_over_cap.publications.empty()) {
-            return false;
+            return miss("partial over-cap rejected capture verdict");
         }
     }
     return true;
