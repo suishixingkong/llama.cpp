@@ -477,11 +477,24 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         return 1;
     }
 
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
+    // A partial rollback is single-use while a rollback snapshot is pending:
+    // llama_memory_recurrent::seq_rm() refuses it once rs_idx != 0. After the
+    // full replay above both contexts are in exactly that state, so the second
+    // call is *expected* to be refused. Call the two sides separately on
+    // purpose: with `||` short-circuiting the dst side would never be exercised
+    // once the src side returns false.
+    const bool refused_src = !llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1);
+    const bool refused_dst = !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1);
+    if (!refused_src || !refused_dst) {
+        // Both contexts are supposed to carry a pending rollback snapshot here.
+        // A side that still accepts a second partial rollback has diverged from
+        // that state, which is a stronger signal than the refusal itself.
+        fprintf(stderr, "%s : second partial rollback was not refused (src_refused=%d dst_refused=%d)\n",
+                __func__, (int) refused_src, (int) refused_dst);
         return 1;
     }
+    fprintf(stderr, "%s : second partial rollback refused as expected (pending snapshot is single-use)\n",
+            __func__);
 
     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     common_prompt_checkpoint ckpt_partial;
