@@ -13929,9 +13929,15 @@ const slot_info_vec_t *   sinfos_in) {
         res = res && state_read_meta(
                 io, strm, cell_count, sinfo, seq_id,
                 sinfos_in ? &(*sinfos_in)[s] : nullptr);
-        if (res && seq_id == -1 && vbr_vmm_active()) {
-            // the whole-cache branch positions cells directly (no apply_ubatch), so nothing has
-            // grown the VMM physical backing yet — state_read_data would write into unmapped VA
+        if (res && vbr_vmm_active()) {
+            // Neither branch grows the VMM physical backing on the way here, so
+            // state_read_data would write into unmapped VA. apply_ubatch() is the only other
+            // caller of vbr_vmm_ensure_mapped() and it is gated on commit: the whole-cache
+            // branch positions cells directly from 0, and the single-sequence branch goes
+            // through state_read_meta() -> apply_ubatch(sinfo, ubatch, false). Restoring a
+            // sequence into a freshly initialized context is exactly that case: the
+            // watermark is above the mapped floor and nothing else will map it before the
+            // scatter.
             vbr_vmm_ensure_mapped();
         }
 
