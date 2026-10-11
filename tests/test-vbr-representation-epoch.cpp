@@ -1221,6 +1221,41 @@ static bool projected_capture_transfer_continue(void * opaque) noexcept {
         state->continuation_calls++ < state->continuations_allowed;
 }
 
+// Test-side instrumentation for the verdict chains in projected_capture_batch_exact().
+//
+// Each chain is a list of failure predicates -- `if (p1 || p2 || ...) { return miss(tag); }`.
+// VBR_UNMET_IF(p) records p's own text when p HOLDS, and report() prints the recorded
+// predicates just before the block's miss() line, so one run names the fields instead of only
+// the block. The polarity lives here and nowhere else, which is why unmet_report_self_check()
+// runs before any model is loaded: an inverted predicate makes every block report and fail.
+struct unmet_report {
+    std::vector<const char *> fields;
+
+    void record(bool predicate, const char * text) {
+        if (predicate) {
+            fields.push_back(text);
+        }
+    }
+
+    // Prints the recorded predicates and clears them; true means the block failed.
+    bool report(const char * block) {
+        if (fields.empty()) {
+            return false;
+        }
+        // Every field line repeats a grep-able token: a pipeline that filters on "unmet"
+        // has to show the fields, not just the header that mentions them.
+        fprintf(stderr, "VBR projected capture unmet fields (%zu) in %s:\n", fields.size(), block);
+        for (const char * field : fields) {
+            fprintf(stderr, "    unmet field: %s\n", field);
+        }
+        fields.clear();
+        return true;
+    }
+};
+
+// Valid wherever a local `unmet_report unmet_fields;` is in scope.
+#define VBR_UNMET_IF(cond) unmet_fields.record(bool(cond), #cond)
+
 static bool projected_capture_batch_exact(
         llama_memory_i & memory, uint32_t manifest_count,
         uint32_t & expected_transfers) {
@@ -1384,29 +1419,13 @@ static bool projected_capture_batch_exact(
         fprintf(stderr, "VBR projected capture unmet: %s\n", what);
         return false;
     };
-    // Every verdict below is one `if (A || B || ...) { return miss(tag); }`, which names
-    // the scenario but not the comparison inside it -- so a failing run stopped at the tag
-    // and the field had to be recovered by re-reading the chain. Record each operand with
-    // its own text instead and print the failing ones together: one run then enumerates
-    // every field that is off, in every block, not just the first block that says
-    // "failed". Chains whose operands dereference what an earlier operand guards are left
-    // as written on purpose: splitting those would evaluate a guarded dereference.
-    std::vector<const char *> unmet_fields;
-    const auto report_unmet_fields = [&](const char * block) {
-        if (unmet_fields.empty()) {
-            return false;
-        }
-        // Every field line repeats a grep-able token: a pipeline that filters on "unmet"
-        // has to show the fields, not just the header that mentions them.
-        fprintf(stderr, "VBR projected capture unmet fields (%zu) in %s:\n",
-                unmet_fields.size(), block);
-        for (const char * field : unmet_fields) {
-            fprintf(stderr, "    unmet field: %s\n", field);
-        }
-        unmet_fields.clear();
-        return true;
-    };
-#define VBR_WANT(cond) do { if (!(cond)) { unmet_fields.push_back(#cond); } } while (0)
+    // Every verdict below is one `if (p1 || p2 || ...) { return miss(tag); }`, which names
+    // the scenario but not the predicate inside it. `unmet` records each predicate and
+    // prints the ones that hold, so one run enumerates every field that is off, in every
+    // block, not just the first block that says "failed". Chains whose operands dereference
+    // what an earlier operand guards are left as written on purpose: splitting those would
+    // evaluate a guarded dereference.
+    unmet_report unmet_fields;
     uint64_t projected_host_bytes = 0;
     for (const auto & durable : admission.quote.durable) {
         for (const auto & row : durable.accounting) {
@@ -1586,23 +1605,23 @@ static bool projected_capture_batch_exact(
             &preparation_refused_admission;
         const auto preparation_refused = vbr_capture_projected_batch(
             memory, preparation_refused_request);
-        VBR_WANT(preparation_refused.status != vbr_explicit_capture_status::admission_refused);
-        VBR_WANT(preparation_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
-        VBR_WANT(preparation_refused_admission.prepare_calls != 1);
-        VBR_WANT(preparation_refused_admission.prepare_accept);
-        VBR_WANT(!preparation_refused_admission.ring_available_at_prepare);
-        VBR_WANT(preparation_refused_admission.admit_calls != 0);
-        VBR_WANT(preparation_refused_admission.continuation_calls != 0);
-        VBR_WANT(preparation_refused_admission.prepare_quote.planned_packed_bytes == 0);
-        VBR_WANT(preparation_refused.ring_operation_attempts != 0);
-        VBR_WANT(preparation_refused.ring_operation_acquires != 0);
-        VBR_WANT(preparation_refused.ring_operation_refusals != 0);
-        VBR_WANT(preparation_refused.unit_transfer_calls != 0);
-        VBR_WANT(preparation_refused.transferred_units != 0);
-        VBR_WANT(preparation_refused.transfer.bytes != 0);
-        VBR_WANT(preparation_refused.assembly);
-        VBR_WANT(!preparation_refused.publications.empty());
-        if (report_unmet_fields("preparation-refused capture verdict")) {
+        VBR_UNMET_IF(preparation_refused.status != vbr_explicit_capture_status::admission_refused);
+        VBR_UNMET_IF(preparation_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_UNMET_IF(preparation_refused_admission.prepare_calls != 1);
+        VBR_UNMET_IF(preparation_refused_admission.prepare_accept);
+        VBR_UNMET_IF(!preparation_refused_admission.ring_available_at_prepare);
+        VBR_UNMET_IF(preparation_refused_admission.admit_calls != 0);
+        VBR_UNMET_IF(preparation_refused_admission.continuation_calls != 0);
+        VBR_UNMET_IF(preparation_refused_admission.prepare_quote.planned_packed_bytes == 0);
+        VBR_UNMET_IF(preparation_refused.ring_operation_attempts != 0);
+        VBR_UNMET_IF(preparation_refused.ring_operation_acquires != 0);
+        VBR_UNMET_IF(preparation_refused.ring_operation_refusals != 0);
+        VBR_UNMET_IF(preparation_refused.unit_transfer_calls != 0);
+        VBR_UNMET_IF(preparation_refused.transferred_units != 0);
+        VBR_UNMET_IF(preparation_refused.transfer.bytes != 0);
+        VBR_UNMET_IF(preparation_refused.assembly);
+        VBR_UNMET_IF(!preparation_refused.publications.empty());
+        if (unmet_fields.report("preparation-refused capture verdict")) {
             return miss("preparation-refused capture verdict");
         }
         auto admission_refused_request = request;
@@ -1615,24 +1634,24 @@ static bool projected_capture_batch_exact(
         admission_refused_request.continue_context = &refused_admission;
         const auto admission_refused = vbr_capture_projected_batch(
             memory, admission_refused_request);
-        VBR_WANT(admission_refused.status != vbr_explicit_capture_status::admission_refused);
-        VBR_WANT(admission_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
-        VBR_WANT(refused_admission.prepare_calls != 1);
-        VBR_WANT(!refused_admission.ring_available_at_prepare);
-        VBR_WANT(refused_admission.admit_calls != 1);
-        VBR_WANT(!refused_admission.prepared_before_admission);
-        VBR_WANT(refused_admission.continuation_calls != 0);
-        VBR_WANT(refused_admission.quote.planned_packed_bytes == 0);
-        VBR_WANT(!refused_admission.ring_owned_at_admission);
-        VBR_WANT(admission_refused.ring_operation_attempts != 1);
-        VBR_WANT(admission_refused.ring_operation_acquires != 1);
-        VBR_WANT(admission_refused.ring_operation_refusals != 0);
-        VBR_WANT(admission_refused.unit_transfer_calls != 0);
-        VBR_WANT(admission_refused.transferred_units != 0);
-        VBR_WANT(admission_refused.transfer.bytes != 0);
-        VBR_WANT(admission_refused.assembly);
-        VBR_WANT(!admission_refused.publications.empty());
-        if (report_unmet_fields("admission-refused capture verdict")) {
+        VBR_UNMET_IF(admission_refused.status != vbr_explicit_capture_status::admission_refused);
+        VBR_UNMET_IF(admission_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_UNMET_IF(refused_admission.prepare_calls != 1);
+        VBR_UNMET_IF(!refused_admission.ring_available_at_prepare);
+        VBR_UNMET_IF(refused_admission.admit_calls != 1);
+        VBR_UNMET_IF(!refused_admission.prepared_before_admission);
+        VBR_UNMET_IF(refused_admission.continuation_calls != 0);
+        VBR_UNMET_IF(refused_admission.quote.planned_packed_bytes == 0);
+        VBR_UNMET_IF(!refused_admission.ring_owned_at_admission);
+        VBR_UNMET_IF(admission_refused.ring_operation_attempts != 1);
+        VBR_UNMET_IF(admission_refused.ring_operation_acquires != 1);
+        VBR_UNMET_IF(admission_refused.ring_operation_refusals != 0);
+        VBR_UNMET_IF(admission_refused.unit_transfer_calls != 0);
+        VBR_UNMET_IF(admission_refused.transferred_units != 0);
+        VBR_UNMET_IF(admission_refused.transfer.bytes != 0);
+        VBR_UNMET_IF(admission_refused.assembly);
+        VBR_UNMET_IF(!admission_refused.publications.empty());
+        if (unmet_fields.report("admission-refused capture verdict")) {
             return miss("admission-refused capture verdict");
         }
         auto released_after_refusal = ring->try_begin_operation();
@@ -1651,23 +1670,23 @@ static bool projected_capture_batch_exact(
         busy_request.pretransfer_context = &busy_admission;
         busy_request.continue_context = &busy_admission;
         const auto busy = vbr_capture_projected_batch(memory, busy_request);
-        VBR_WANT(busy.status != vbr_explicit_capture_status::ring_unavailable);
-        VBR_WANT(busy.phase != vbr_explicit_capture_phase::reservation_preparation);
-        VBR_WANT(busy.inner_stream_status != vbr_capture_stream_status::ring_unavailable);
-        VBR_WANT(busy_admission.prepare_calls != 1);
-        VBR_WANT(busy_admission.ring_available_at_prepare);
-        VBR_WANT(busy_admission.admit_calls != 0);
-        VBR_WANT(busy_admission.ring_owned_at_admission);
-        VBR_WANT(busy_admission.continuation_calls != 0);
-        VBR_WANT(busy.ring_operation_attempts != 1);
-        VBR_WANT(busy.ring_operation_acquires != 0);
-        VBR_WANT(busy.ring_operation_refusals != 1);
-        VBR_WANT(busy.companion_d2h_reads != 0);
-        VBR_WANT(busy.unit_transfer_calls != 0);
-        VBR_WANT(busy.transfer.bytes != 0);
-        VBR_WANT(busy.assembly);
-        VBR_WANT(!busy.publications.empty());
-        if (report_unmet_fields("busy-ring capture verdict")) {
+        VBR_UNMET_IF(busy.status != vbr_explicit_capture_status::ring_unavailable);
+        VBR_UNMET_IF(busy.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_UNMET_IF(busy.inner_stream_status != vbr_capture_stream_status::ring_unavailable);
+        VBR_UNMET_IF(busy_admission.prepare_calls != 1);
+        VBR_UNMET_IF(busy_admission.ring_available_at_prepare);
+        VBR_UNMET_IF(busy_admission.admit_calls != 0);
+        VBR_UNMET_IF(busy_admission.ring_owned_at_admission);
+        VBR_UNMET_IF(busy_admission.continuation_calls != 0);
+        VBR_UNMET_IF(busy.ring_operation_attempts != 1);
+        VBR_UNMET_IF(busy.ring_operation_acquires != 0);
+        VBR_UNMET_IF(busy.ring_operation_refusals != 1);
+        VBR_UNMET_IF(busy.companion_d2h_reads != 0);
+        VBR_UNMET_IF(busy.unit_transfer_calls != 0);
+        VBR_UNMET_IF(busy.transfer.bytes != 0);
+        VBR_UNMET_IF(busy.assembly);
+        VBR_UNMET_IF(!busy.publications.empty());
+        if (unmet_fields.report("busy-ring capture verdict")) {
             return miss("busy-ring capture verdict");
         }
         held_operation = {};
@@ -1680,21 +1699,21 @@ static bool projected_capture_batch_exact(
         cancelled_request.continue_context = &cancelled_admission;
         const auto cancelled = vbr_capture_projected_batch(
             memory, cancelled_request);
-        VBR_WANT(cancelled.status != vbr_explicit_capture_status::cancelled);
-        VBR_WANT(cancelled.phase != vbr_explicit_capture_phase::companion_capture);
-        VBR_WANT(cancelled_admission.prepare_calls != 1);
-        VBR_WANT(!cancelled_admission.prepared_before_admission);
-        VBR_WANT(cancelled_admission.admit_calls != 1);
-        VBR_WANT(cancelled_admission.continuation_calls != 1);
-        VBR_WANT(cancelled.ring_operation_attempts != 1);
-        VBR_WANT(cancelled.ring_operation_acquires != 1);
-        VBR_WANT(cancelled.ring_operation_refusals != 0);
-        VBR_WANT(cancelled.unit_transfer_calls != 0);
-        VBR_WANT(cancelled.transferred_units != 0);
-        VBR_WANT(cancelled.transfer.bytes != 0);
-        VBR_WANT(cancelled.assembly);
-        VBR_WANT(!cancelled.publications.empty());
-        if (report_unmet_fields("cancelled capture verdict")) {
+        VBR_UNMET_IF(cancelled.status != vbr_explicit_capture_status::cancelled);
+        VBR_UNMET_IF(cancelled.phase != vbr_explicit_capture_phase::companion_capture);
+        VBR_UNMET_IF(cancelled_admission.prepare_calls != 1);
+        VBR_UNMET_IF(!cancelled_admission.prepared_before_admission);
+        VBR_UNMET_IF(cancelled_admission.admit_calls != 1);
+        VBR_UNMET_IF(cancelled_admission.continuation_calls != 1);
+        VBR_UNMET_IF(cancelled.ring_operation_attempts != 1);
+        VBR_UNMET_IF(cancelled.ring_operation_acquires != 1);
+        VBR_UNMET_IF(cancelled.ring_operation_refusals != 0);
+        VBR_UNMET_IF(cancelled.unit_transfer_calls != 0);
+        VBR_UNMET_IF(cancelled.transferred_units != 0);
+        VBR_UNMET_IF(cancelled.transfer.bytes != 0);
+        VBR_UNMET_IF(cancelled.assembly);
+        VBR_UNMET_IF(!cancelled.publications.empty());
+        if (unmet_fields.report("cancelled capture verdict")) {
             return miss("cancelled capture verdict");
         }
         // Cancel after the companion stream has already read one quantum, so the case
@@ -1741,22 +1760,22 @@ static bool projected_capture_batch_exact(
             &companion_mid_cancelled_admission;
         const auto companion_mid_cancelled = vbr_capture_projected_batch(
             memory, companion_mid_cancelled_request);
-        VBR_WANT(companion_mid_cancelled.status !=
+        VBR_UNMET_IF(companion_mid_cancelled.status !=
                  vbr_explicit_capture_status::cancelled);
-        VBR_WANT(companion_mid_cancelled.phase !=
+        VBR_UNMET_IF(companion_mid_cancelled.phase !=
                  vbr_explicit_capture_phase::companion_capture);
-        VBR_WANT(companion_mid_cancelled_admission.prepare_calls != 1);
-        VBR_WANT(!companion_mid_cancelled_admission.prepared_before_admission);
-        VBR_WANT(companion_mid_cancelled_admission.admit_calls != 1);
-        VBR_WANT(companion_mid_cancelled_admission.continuation_calls !=
+        VBR_UNMET_IF(companion_mid_cancelled_admission.prepare_calls != 1);
+        VBR_UNMET_IF(!companion_mid_cancelled_admission.prepared_before_admission);
+        VBR_UNMET_IF(companion_mid_cancelled_admission.admit_calls != 1);
+        VBR_UNMET_IF(companion_mid_cancelled_admission.continuation_calls !=
                  companion_mid_budget + 1);
-        VBR_WANT(companion_mid_cancelled.companion_d2h_reads != 1);
-        VBR_WANT(companion_mid_cancelled.companion_d2h_bytes == 0);
-        VBR_WANT(companion_mid_cancelled.unit_transfer_calls != 0);
-        VBR_WANT(companion_mid_cancelled.assembly);
-        VBR_WANT(!companion_mid_cancelled.publications.empty());
-        VBR_WANT(companion_mid_below_reads != 0);
-        if (report_unmet_fields("companion-mid-cancelled capture verdict")) {
+        VBR_UNMET_IF(companion_mid_cancelled.companion_d2h_reads != 1);
+        VBR_UNMET_IF(companion_mid_cancelled.companion_d2h_bytes == 0);
+        VBR_UNMET_IF(companion_mid_cancelled.unit_transfer_calls != 0);
+        VBR_UNMET_IF(companion_mid_cancelled.assembly);
+        VBR_UNMET_IF(!companion_mid_cancelled.publications.empty());
+        VBR_UNMET_IF(companion_mid_below_reads != 0);
+        if (unmet_fields.report("companion-mid-cancelled capture verdict")) {
             return miss("companion-mid-cancelled capture verdict");
         }
         if (admission.continuation_calls < 2) {
@@ -1774,20 +1793,20 @@ static bool projected_capture_batch_exact(
             &attention_cancelled_admission;
         const auto attention_cancelled = vbr_capture_projected_batch(
             memory, attention_cancelled_request);
-        VBR_WANT(attention_cancelled.status != vbr_explicit_capture_status::cancelled);
-        VBR_WANT(attention_cancelled.phase != vbr_explicit_capture_phase::unit_transfer);
-        VBR_WANT(attention_cancelled.inner_stream_status != vbr_capture_stream_status::cancelled);
-        VBR_WANT(attention_cancelled_admission.prepare_calls != 1);
-        VBR_WANT(!attention_cancelled_admission.prepared_before_admission);
-        VBR_WANT(attention_cancelled_admission.admit_calls != 1);
-        VBR_WANT(attention_cancelled.unit_transfer_calls == 0);
-        VBR_WANT(attention_cancelled.transfer.submitted_chunks == 0);
-        VBR_WANT(attention_cancelled.transfer.submitted_bytes == 0);
-        VBR_WANT(attention_cancelled.transfer.submitted_bytes < attention_cancelled.transfer.bytes);
-        VBR_WANT(attention_cancelled.transfer.submitted_chunks < attention_cancelled.transfer.chunks);
-        VBR_WANT(attention_cancelled.assembly);
-        VBR_WANT(!attention_cancelled.publications.empty());
-        if (report_unmet_fields("attention-cancelled capture verdict")) {
+        VBR_UNMET_IF(attention_cancelled.status != vbr_explicit_capture_status::cancelled);
+        VBR_UNMET_IF(attention_cancelled.phase != vbr_explicit_capture_phase::unit_transfer);
+        VBR_UNMET_IF(attention_cancelled.inner_stream_status != vbr_capture_stream_status::cancelled);
+        VBR_UNMET_IF(attention_cancelled_admission.prepare_calls != 1);
+        VBR_UNMET_IF(!attention_cancelled_admission.prepared_before_admission);
+        VBR_UNMET_IF(attention_cancelled_admission.admit_calls != 1);
+        VBR_UNMET_IF(attention_cancelled.unit_transfer_calls == 0);
+        VBR_UNMET_IF(attention_cancelled.transfer.submitted_chunks == 0);
+        VBR_UNMET_IF(attention_cancelled.transfer.submitted_bytes == 0);
+        VBR_UNMET_IF(attention_cancelled.transfer.submitted_bytes < attention_cancelled.transfer.bytes);
+        VBR_UNMET_IF(attention_cancelled.transfer.submitted_chunks < attention_cancelled.transfer.chunks);
+        VBR_UNMET_IF(attention_cancelled.assembly);
+        VBR_UNMET_IF(!attention_cancelled.publications.empty());
+        if (unmet_fields.report("attention-cancelled capture verdict")) {
             return miss("attention-cancelled capture verdict");
         }
         auto refused_request = request;
@@ -1799,13 +1818,13 @@ static bool projected_capture_batch_exact(
         refused_request.continue_context = &over_cap_admission;
         const auto refused = vbr_capture_projected_batch(
             memory, refused_request);
-        VBR_WANT(refused.status != vbr_explicit_capture_status::accounting_failed);
-        VBR_WANT(over_cap_admission.prepare_calls != 0);
-        VBR_WANT(over_cap_admission.admit_calls != 0);
-        VBR_WANT(refused.unit_transfer_calls != 0);
-        VBR_WANT(refused.assembly);
-        VBR_WANT(!refused.publications.empty());
-        if (report_unmet_fields("over-cap rejected capture verdict")) {
+        VBR_UNMET_IF(refused.status != vbr_explicit_capture_status::accounting_failed);
+        VBR_UNMET_IF(over_cap_admission.prepare_calls != 0);
+        VBR_UNMET_IF(over_cap_admission.admit_calls != 0);
+        VBR_UNMET_IF(refused.unit_transfer_calls != 0);
+        VBR_UNMET_IF(refused.assembly);
+        VBR_UNMET_IF(!refused.publications.empty());
+        if (unmet_fields.report("over-cap rejected capture verdict")) {
             return miss("over-cap rejected capture verdict");
         }
         auto inflated_request = request;
@@ -1839,29 +1858,51 @@ static bool projected_capture_batch_exact(
         partial_request.manifests.front().token_block = { 1, 2 };
         const auto partial = vbr_capture_projected_batch(
             memory, partial_request);
-        VBR_WANT(partial.status != vbr_explicit_capture_status::ok);
-        VBR_WANT(partial.first_available_manifest_id != 101);
-        VBR_WANT(partial.planned_packed_bytes == 0);
-        VBR_WANT(partial.unit_transfer_calls == 0);
-        if (report_unmet_fields("partial four-manifest capture verdict")) {
+        VBR_UNMET_IF(partial.status != vbr_explicit_capture_status::ok);
+        VBR_UNMET_IF(partial.first_available_manifest_id != 101);
+        VBR_UNMET_IF(partial.planned_packed_bytes == 0);
+        VBR_UNMET_IF(partial.unit_transfer_calls == 0);
+        if (unmet_fields.report("partial four-manifest capture verdict")) {
             return miss("partial four-manifest capture verdict");
         }
         partial_request.max_packed_bytes =
             partial.planned_packed_bytes - 1;
         const auto partial_over_cap = vbr_capture_projected_batch(
             memory, partial_request);
-        VBR_WANT(partial_over_cap.status != vbr_explicit_capture_status::accounting_failed);
-        VBR_WANT(partial_over_cap.first_available_manifest_id != 101);
-        VBR_WANT(partial_over_cap.unit_transfer_calls != 0);
-        VBR_WANT(partial_over_cap.assembly);
-        VBR_WANT(!partial_over_cap.publications.empty());
-        if (report_unmet_fields("partial over-cap rejected capture verdict")) {
+        VBR_UNMET_IF(partial_over_cap.status != vbr_explicit_capture_status::accounting_failed);
+        VBR_UNMET_IF(partial_over_cap.first_available_manifest_id != 101);
+        VBR_UNMET_IF(partial_over_cap.unit_transfer_calls != 0);
+        VBR_UNMET_IF(partial_over_cap.assembly);
+        VBR_UNMET_IF(!partial_over_cap.publications.empty());
+        if (unmet_fields.report("partial over-cap rejected capture verdict")) {
             return miss("partial over-cap rejected capture verdict");
         }
     }
     return true;
 }
-#undef VBR_WANT
+// The reporter is instrumentation the failure path depends on. Pin the polarity where it is
+// cheap to run, and keep the passing case next to the failing one so the check cannot pass by
+// reporting always or never.
+static bool unmet_report_self_check() {
+    unmet_report unmet_fields;
+    VBR_UNMET_IF(1 + 1 == 3); // a predicate that does not hold is not a field
+    if (!unmet_fields.fields.empty()) {
+        fprintf(stderr, "unmet report self-check: a false predicate was recorded\n");
+        return false;
+    }
+    VBR_UNMET_IF(1 + 1 == 2); // a predicate that holds is a field, with its own text
+    if (unmet_fields.fields.size() != 1 || std::string(unmet_fields.fields[0]) != "1 + 1 == 2") {
+        fprintf(stderr, "unmet report self-check: a true predicate was not recorded verbatim\n");
+        return false;
+    }
+    unmet_fields.fields.clear();
+    if (unmet_fields.report("self-check")) { // an empty report must not fire
+        fprintf(stderr, "unmet report self-check: an empty report fired\n");
+        return false;
+    }
+    return true;
+}
+#undef VBR_UNMET_IF
 
 static bool epochs_equal(
         const llama_memory_vbr_state_data & a,
@@ -3033,6 +3074,9 @@ static bool run_operation_cpu_tests() {
 }
 
 int main(int argc, char ** argv) {
+    if (!unmet_report_self_check()) {
+        return 1;
+    }
     // Every tracker in this test binary uses a deterministic process origin. Production uses
     // the fail-closed entropy mixer; deterministic bytes keep checkpoint/artifact regressions
     // attributable to logic rather than process entropy.
