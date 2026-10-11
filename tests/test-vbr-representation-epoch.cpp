@@ -3,6 +3,7 @@
 #include "llama-io.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-tree.h"
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
 #include "llama.h"
@@ -1056,6 +1057,65 @@ struct llama_kv_cache_vbr_epoch_test {
         }
         return false;
     }
+// Name the exact reason vbr_explicit_capture_runtime_pools() turned the projected
+// capture down.  It answers with a single bool, and its five preconditions are
+// indistinguishable from the outside, so a failing run used to stop at a bare
+// "one-manifest projected capture failed".  Everything checked here is public on
+// llama_kv_cache, so no production code has to change.
+        // Name the exact reason vbr_explicit_capture_runtime_pools() turned the
+        // projected capture down: it answers with a single bool and its five
+        // preconditions are indistinguishable from the outside, so a failing run
+        // stopped at a bare "one-manifest projected capture failed".
+        static void report_runtime_pool_blocker(llama_memory_i & memory) {
+        std::vector<llama_memory_tree_child> tree;
+        if (!llama_memory_tree_collect(&memory, tree)) {
+            fprintf(stderr, "VBR projected capture blocked: memory tree collection failed\n");
+            return;
+        }
+        uint32_t attention_children = 0;
+        for (const auto & node : tree) {
+            if (node.attention == nullptr) {
+                continue;
+            }
+            ++attention_children;
+            llama_kv_cache * kv = node.attention;
+            while (kv != nullptr && kv->other != nullptr) {
+                kv = kv->other;
+            }
+            if (kv == nullptr) {
+                fprintf(stderr, "VBR projected capture blocked: attention child has no cache\n");
+                continue;
+            }
+            if (!kv->vbr_operation_armed()) {
+                fprintf(stderr, "VBR projected capture blocked: operation not armed\n");
+            }
+            const auto * tracker = kv->vbr_generation_tracker_get();
+            if (tracker == nullptr) {
+                fprintf(stderr, "VBR projected capture blocked: no generation tracker\n");
+            } else if (!tracker->active()) {
+                fprintf(stderr, "VBR projected capture blocked: generation tracker inactive\n");
+            }
+            if (!vbr_controller_instance_id_is_set(kv->vbr_instance_id())) {
+                fprintf(stderr, "VBR projected capture blocked: instance id unset\n");
+            }
+            if (kv->vbr_pools_.empty()) {
+                fprintf(stderr, "VBR projected capture blocked: no VBR pools\n");
+            }
+            for (size_t i = 0; i < kv->vbr_pools_.size(); ++i) {
+                const auto & pool = kv->vbr_pools_[i];
+                if (pool.vmm == nullptr || pool.buf == nullptr ||
+                    pool.compute_backend == nullptr || pool.device < 0) {
+                    fprintf(stderr, "VBR projected capture blocked: pool %zu incomplete "
+                            "(vmm=%d buf=%d backend=%d device=%d)\n", i,
+                            pool.vmm != nullptr, pool.buf != nullptr,
+                            pool.compute_backend != nullptr, pool.device);
+                }
+            }
+        }
+        if (attention_children == 0) {
+            fprintf(stderr, "VBR projected capture blocked: no attention child in the tree\n");
+        }
+    }
 };
 
 static bool decode_one(llama_context * ctx, llama_pos pos = 0) {
@@ -1169,6 +1229,7 @@ static bool projected_capture_batch_exact(
     if (!vbr_explicit_capture_runtime_pools(
             memory, pools, attention_children) ||
         pools.empty() || attention_children == 0) {
+        llama_kv_cache_vbr_epoch_test::report_runtime_pool_blocker(memory);
         return false;
     }
     std::vector<vbr_capture_lane> lanes;
@@ -1190,6 +1251,8 @@ static bool projected_capture_batch_exact(
         });
     }
     if (devices.size() != 1 || lanes.front().backend == nullptr) {
+        fprintf(stderr, "VBR projected capture blocked: %zu capture devices, %zu lanes\n",
+                devices.size(), lanes.size());
         return false;
     }
     llama_cache_acct_shard_topology topology;
@@ -1199,6 +1262,8 @@ static bool projected_capture_batch_exact(
     if (!llama_cache_acct_build_shard_topology(
             { device_identity }, LLAMA_SPLIT_MODE_NONE, 0,
             nullptr, topology)) {
+        fprintf(stderr, "VBR projected capture blocked: shard topology rejected '%s'\n",
+                device_identity.c_str());
         return false;
     }
     vbr_capture_stream_status ring_status;
@@ -1207,6 +1272,8 @@ static bool projected_capture_batch_exact(
         lanes, uint64_t(lanes.size())*4*chunk_bytes,
         chunk_bytes, ring_status);
     if (!ring || ring_status != vbr_capture_stream_status::ok) {
+        fprintf(stderr, "VBR projected capture blocked: pinned chunk ring status=%d\n",
+                int(ring_status));
         return false;
     }
     vbr_projected_capture_batch_request request;
@@ -1240,38 +1307,71 @@ static bool projected_capture_batch_exact(
         request.manifests.push_back(std::move(manifest));
     }
     auto captured = vbr_capture_projected_batch(memory, request);
-    if (captured.status != vbr_explicit_capture_status::ok ||
-        captured.phase != vbr_explicit_capture_phase::complete ||
-        !captured.assembly ||
-        captured.assembly.manifests().size() != manifest_count ||
-        captured.publications.size() != manifest_count ||
-        captured.first_available_manifest_id != 100 ||
-        captured.size_pass_calls != attention_children ||
-        captured.projection_calls != 1 || captured.union_cells != 1 ||
-        captured.planned_packed_bytes == 0 ||
-        captured.planned_packed_bytes > request.max_packed_bytes ||
-        admission.prepare_calls != 1 || !admission.prepare_accept ||
-        !admission.ring_available_at_prepare ||
-        admission.admit_calls != 1 || !admission.accept ||
-        !admission.prepared_before_admission ||
-        !admission.ring_owned_at_admission ||
-        admission.prepare_quote.planned_packed_bytes !=
-            captured.planned_packed_bytes ||
-        admission.quote.planned_packed_bytes !=
-            captured.planned_packed_bytes ||
-        admission.quote.projected_host_resident_bytes == 0 ||
-        admission.quote.union_cells != captured.union_cells ||
-        admission.quote.manifests != manifest_count ||
-        admission.quote.durable.size() != manifest_count ||
-        admission.quote.projected_units == 0 ||
-        admission.continuation_calls == 0 ||
-        captured.ring_operation_attempts != 1 ||
-        captured.ring_operation_acquires != 1 ||
-        captured.ring_operation_refusals != 0 ||
-        captured.unit_transfer_calls == 0 ||
-        captured.transferred_units != captured.unit_transfer_calls ||
-        captured.transfer.submitted_bytes != captured.transfer.bytes ||
-        captured.transfer.submitted_chunks != captured.transfer.chunks) {
+    // One-shot, named verdict: these ~30 expectations used to collapse into a single
+    // bare failure, so a run could not say which one the capture missed.
+    std::vector<const char *> unmet;
+    const auto want = [&](bool ok, const char * what) {
+        if (!ok) {
+            unmet.push_back(what);
+        }
+    };
+    want(captured.status == vbr_explicit_capture_status::ok, "status");
+    want(captured.phase == vbr_explicit_capture_phase::complete, "phase");
+    want(bool(captured.assembly), "assembly");
+    want(bool(captured.assembly) && captured.assembly.manifests().size() == manifest_count,
+         "assembly manifest count");
+    want(captured.publications.size() == manifest_count, "publication count");
+    want(captured.first_available_manifest_id == 100, "first manifest id");
+    want(captured.size_pass_calls == attention_children, "size pass calls");
+    want(captured.projection_calls == 1, "projection calls");
+    want(captured.union_cells == 1, "union cells");
+    want(captured.planned_packed_bytes != 0, "planned packed bytes");
+    want(captured.planned_packed_bytes <= request.max_packed_bytes, "planned packed budget");
+    want(admission.prepare_calls == 1, "prepare calls");
+    want(admission.prepare_accept, "prepare accept");
+    want(admission.ring_available_at_prepare, "ring available at prepare");
+    want(admission.admit_calls == 1, "admit calls");
+    want(admission.accept, "admit accept");
+    want(admission.prepared_before_admission, "prepared before admission");
+    want(admission.ring_owned_at_admission, "ring owned at admission");
+    want(admission.prepare_quote.planned_packed_bytes == captured.planned_packed_bytes,
+         "prepare quote packed bytes");
+    want(admission.quote.planned_packed_bytes == captured.planned_packed_bytes,
+         "quote packed bytes");
+    want(admission.quote.projected_host_resident_bytes != 0, "quote host resident bytes");
+    want(admission.quote.union_cells == captured.union_cells, "quote union cells");
+    want(admission.quote.manifests == manifest_count, "quote manifests");
+    want(admission.quote.durable.size() == manifest_count, "quote durable count");
+    want(admission.quote.projected_units != 0, "quote projected units");
+    want(admission.continuation_calls != 0, "continuation calls");
+    want(captured.ring_operation_attempts == 1, "ring attempts");
+    want(captured.ring_operation_acquires == 1, "ring acquires");
+    want(captured.ring_operation_refusals == 0, "ring refusals");
+    want(captured.unit_transfer_calls != 0, "unit transfer calls");
+    want(captured.transferred_units == captured.unit_transfer_calls, "transferred units");
+    want(captured.transfer.submitted_bytes == captured.transfer.bytes, "submitted bytes");
+    want(captured.transfer.submitted_chunks == captured.transfer.chunks, "submitted chunks");
+    if (!unmet.empty()) {
+        // print the unmet names first: one run has to name the real cause, not just
+        // the first symptom of a long && chain
+        fprintf(stderr, "VBR projected capture (%u manifests) unmet:", manifest_count);
+        for (const char * what : unmet) {
+            fprintf(stderr, " %s", what);
+        }
+        fprintf(stderr, "\n  status=%d phase=%d assembly=%d manifests=%zu publications=%zu"
+                " union_cells=%u size_pass=%u/%u planned=%llu units=%llu transfers=%u/%llu"
+                " ring=%u/%u/%u\n",
+                int(captured.status), int(captured.phase),
+                bool(captured.assembly) ? 1 : 0,
+                captured.assembly.manifests().size(),
+                captured.publications.size(), captured.union_cells,
+                captured.size_pass_calls, attention_children,
+                (unsigned long long) captured.planned_packed_bytes,
+                (unsigned long long) admission.quote.projected_units,
+                captured.unit_transfer_calls,
+                (unsigned long long) captured.transferred_units,
+                captured.ring_operation_attempts, captured.ring_operation_acquires,
+                captured.ring_operation_refusals);
         return false;
     }
     uint64_t projected_host_bytes = 0;
