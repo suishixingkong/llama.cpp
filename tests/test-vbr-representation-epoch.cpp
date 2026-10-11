@@ -1359,12 +1359,13 @@ static bool projected_capture_batch_exact(
             fprintf(stderr, " %s", what);
         }
         fprintf(stderr, "\n  status=%d phase=%d assembly=%d manifests=%zu publications=%zu"
-                " union_cells=%u size_pass=%u/%u planned=%llu units=%llu transfers=%u/%llu"
+                " union_cells=%llu size_pass=%u/%u planned=%llu units=%llu transfers=%u/%llu"
                 " ring=%u/%u/%u\n",
                 int(captured.status), int(captured.phase),
                 bool(captured.assembly) ? 1 : 0,
                 captured.assembly.manifests().size(),
-                captured.publications.size(), captured.union_cells,
+                captured.publications.size(),
+                (unsigned long long) captured.union_cells,
                 captured.size_pass_calls, attention_children,
                 (unsigned long long) captured.planned_packed_bytes,
                 (unsigned long long) admission.quote.projected_units,
@@ -1383,6 +1384,26 @@ static bool projected_capture_batch_exact(
         fprintf(stderr, "VBR projected capture unmet: %s\n", what);
         return false;
     };
+    // Every verdict below is one `if (A || B || ...) { return miss(tag); }`, which names
+    // the scenario but not the comparison inside it -- so a failing run stopped at the tag
+    // and the field had to be recovered by re-reading the chain. Record each operand with
+    // its own text instead and print the failing ones together: one run then enumerates
+    // every field that is off, in every block, not just the first block that says
+    // "failed". Chains whose operands dereference what an earlier operand guards are left
+    // as written on purpose: splitting those would evaluate a guarded dereference.
+    std::vector<const char *> unmet_fields;
+    const auto report_unmet_fields = [&]() {
+        if (unmet_fields.empty()) {
+            return false;
+        }
+        fprintf(stderr, "VBR projected capture unmet fields (%zu):\n", unmet_fields.size());
+        for (const char * field : unmet_fields) {
+            fprintf(stderr, "    %s\n", field);
+        }
+        unmet_fields.clear();
+        return true;
+    };
+#define VBR_WANT(cond) do { if (!(cond)) { unmet_fields.push_back(#cond); } } while (0)
     uint64_t projected_host_bytes = 0;
     for (const auto & durable : admission.quote.durable) {
         for (const auto & row : durable.accounting) {
@@ -1562,25 +1583,23 @@ static bool projected_capture_batch_exact(
             &preparation_refused_admission;
         const auto preparation_refused = vbr_capture_projected_batch(
             memory, preparation_refused_request);
-        if (preparation_refused.status !=
-                vbr_explicit_capture_status::admission_refused ||
-            preparation_refused.phase !=
-                vbr_explicit_capture_phase::reservation_preparation ||
-            preparation_refused_admission.prepare_calls != 1 ||
-            preparation_refused_admission.prepare_accept ||
-            !preparation_refused_admission.ring_available_at_prepare ||
-            preparation_refused_admission.admit_calls != 0 ||
-            preparation_refused_admission.continuation_calls != 0 ||
-            preparation_refused_admission.prepare_quote.planned_packed_bytes ==
-                0 ||
-            preparation_refused.ring_operation_attempts != 0 ||
-            preparation_refused.ring_operation_acquires != 0 ||
-            preparation_refused.ring_operation_refusals != 0 ||
-            preparation_refused.unit_transfer_calls != 0 ||
-            preparation_refused.transferred_units != 0 ||
-            preparation_refused.transfer.bytes != 0 ||
-            preparation_refused.assembly ||
-            !preparation_refused.publications.empty()) {
+        VBR_WANT(preparation_refused.status != vbr_explicit_capture_status::admission_refused);
+        VBR_WANT(preparation_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_WANT(preparation_refused_admission.prepare_calls != 1);
+        VBR_WANT(preparation_refused_admission.prepare_accept);
+        VBR_WANT(!preparation_refused_admission.ring_available_at_prepare);
+        VBR_WANT(preparation_refused_admission.admit_calls != 0);
+        VBR_WANT(preparation_refused_admission.continuation_calls != 0);
+        VBR_WANT(preparation_refused_admission.prepare_quote.planned_packed_bytes == 0);
+        VBR_WANT(preparation_refused.ring_operation_attempts != 0);
+        VBR_WANT(preparation_refused.ring_operation_acquires != 0);
+        VBR_WANT(preparation_refused.ring_operation_refusals != 0);
+        VBR_WANT(preparation_refused.unit_transfer_calls != 0);
+        VBR_WANT(preparation_refused.transferred_units != 0);
+        VBR_WANT(preparation_refused.transfer.bytes != 0);
+        VBR_WANT(preparation_refused.assembly);
+        VBR_WANT(!preparation_refused.publications.empty());
+        if (report_unmet_fields()) {
             return miss("preparation-refused capture verdict");
         }
         auto admission_refused_request = request;
@@ -1593,25 +1612,24 @@ static bool projected_capture_batch_exact(
         admission_refused_request.continue_context = &refused_admission;
         const auto admission_refused = vbr_capture_projected_batch(
             memory, admission_refused_request);
-        if (admission_refused.status !=
-                vbr_explicit_capture_status::admission_refused ||
-            admission_refused.phase !=
-                vbr_explicit_capture_phase::reservation_preparation ||
-            refused_admission.prepare_calls != 1 ||
-            !refused_admission.ring_available_at_prepare ||
-            refused_admission.admit_calls != 1 ||
-            !refused_admission.prepared_before_admission ||
-            refused_admission.continuation_calls != 0 ||
-            refused_admission.quote.planned_packed_bytes == 0 ||
-            !refused_admission.ring_owned_at_admission ||
-            admission_refused.ring_operation_attempts != 1 ||
-            admission_refused.ring_operation_acquires != 1 ||
-            admission_refused.ring_operation_refusals != 0 ||
-            admission_refused.unit_transfer_calls != 0 ||
-            admission_refused.transferred_units != 0 ||
-            admission_refused.transfer.bytes != 0 ||
-            admission_refused.assembly ||
-            !admission_refused.publications.empty()) {
+        VBR_WANT(admission_refused.status != vbr_explicit_capture_status::admission_refused);
+        VBR_WANT(admission_refused.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_WANT(refused_admission.prepare_calls != 1);
+        VBR_WANT(!refused_admission.ring_available_at_prepare);
+        VBR_WANT(refused_admission.admit_calls != 1);
+        VBR_WANT(!refused_admission.prepared_before_admission);
+        VBR_WANT(refused_admission.continuation_calls != 0);
+        VBR_WANT(refused_admission.quote.planned_packed_bytes == 0);
+        VBR_WANT(!refused_admission.ring_owned_at_admission);
+        VBR_WANT(admission_refused.ring_operation_attempts != 1);
+        VBR_WANT(admission_refused.ring_operation_acquires != 1);
+        VBR_WANT(admission_refused.ring_operation_refusals != 0);
+        VBR_WANT(admission_refused.unit_transfer_calls != 0);
+        VBR_WANT(admission_refused.transferred_units != 0);
+        VBR_WANT(admission_refused.transfer.bytes != 0);
+        VBR_WANT(admission_refused.assembly);
+        VBR_WANT(!admission_refused.publications.empty());
+        if (report_unmet_fields()) {
             return miss("admission-refused capture verdict");
         }
         auto released_after_refusal = ring->try_begin_operation();
@@ -1630,22 +1648,23 @@ static bool projected_capture_batch_exact(
         busy_request.pretransfer_context = &busy_admission;
         busy_request.continue_context = &busy_admission;
         const auto busy = vbr_capture_projected_batch(memory, busy_request);
-        if (busy.status != vbr_explicit_capture_status::ring_unavailable ||
-            busy.phase !=
-                vbr_explicit_capture_phase::reservation_preparation ||
-            busy.inner_stream_status !=
-                vbr_capture_stream_status::ring_unavailable ||
-            busy_admission.prepare_calls != 1 ||
-            busy_admission.ring_available_at_prepare ||
-            busy_admission.admit_calls != 0 ||
-            busy_admission.ring_owned_at_admission ||
-            busy_admission.continuation_calls != 0 ||
-            busy.ring_operation_attempts != 1 ||
-            busy.ring_operation_acquires != 0 ||
-            busy.ring_operation_refusals != 1 ||
-            busy.companion_d2h_reads != 0 ||
-            busy.unit_transfer_calls != 0 || busy.transfer.bytes != 0 ||
-            busy.assembly || !busy.publications.empty()) {
+        VBR_WANT(busy.status != vbr_explicit_capture_status::ring_unavailable);
+        VBR_WANT(busy.phase != vbr_explicit_capture_phase::reservation_preparation);
+        VBR_WANT(busy.inner_stream_status != vbr_capture_stream_status::ring_unavailable);
+        VBR_WANT(busy_admission.prepare_calls != 1);
+        VBR_WANT(busy_admission.ring_available_at_prepare);
+        VBR_WANT(busy_admission.admit_calls != 0);
+        VBR_WANT(busy_admission.ring_owned_at_admission);
+        VBR_WANT(busy_admission.continuation_calls != 0);
+        VBR_WANT(busy.ring_operation_attempts != 1);
+        VBR_WANT(busy.ring_operation_acquires != 0);
+        VBR_WANT(busy.ring_operation_refusals != 1);
+        VBR_WANT(busy.companion_d2h_reads != 0);
+        VBR_WANT(busy.unit_transfer_calls != 0);
+        VBR_WANT(busy.transfer.bytes != 0);
+        VBR_WANT(busy.assembly);
+        VBR_WANT(!busy.publications.empty());
+        if (report_unmet_fields()) {
             return miss("busy-ring capture verdict");
         }
         held_operation = {};
@@ -1658,26 +1677,59 @@ static bool projected_capture_batch_exact(
         cancelled_request.continue_context = &cancelled_admission;
         const auto cancelled = vbr_capture_projected_batch(
             memory, cancelled_request);
-        if (cancelled.status !=
-                vbr_explicit_capture_status::cancelled ||
-            cancelled.phase !=
-                vbr_explicit_capture_phase::companion_capture ||
-            cancelled_admission.prepare_calls != 1 ||
-            !cancelled_admission.prepared_before_admission ||
-            cancelled_admission.admit_calls != 1 ||
-            cancelled_admission.continuation_calls != 1 ||
-            cancelled.ring_operation_attempts != 1 ||
-            cancelled.ring_operation_acquires != 1 ||
-            cancelled.ring_operation_refusals != 0 ||
-            cancelled.unit_transfer_calls != 0 ||
-            cancelled.transferred_units != 0 ||
-            cancelled.transfer.bytes != 0 || cancelled.assembly ||
-            !cancelled.publications.empty()) {
+        VBR_WANT(cancelled.status != vbr_explicit_capture_status::cancelled);
+        VBR_WANT(cancelled.phase != vbr_explicit_capture_phase::companion_capture);
+        VBR_WANT(cancelled_admission.prepare_calls != 1);
+        VBR_WANT(!cancelled_admission.prepared_before_admission);
+        VBR_WANT(cancelled_admission.admit_calls != 1);
+        VBR_WANT(cancelled_admission.continuation_calls != 1);
+        VBR_WANT(cancelled.ring_operation_attempts != 1);
+        VBR_WANT(cancelled.ring_operation_acquires != 1);
+        VBR_WANT(cancelled.ring_operation_refusals != 0);
+        VBR_WANT(cancelled.unit_transfer_calls != 0);
+        VBR_WANT(cancelled.transferred_units != 0);
+        VBR_WANT(cancelled.transfer.bytes != 0);
+        VBR_WANT(cancelled.assembly);
+        VBR_WANT(!cancelled.publications.empty());
+        if (report_unmet_fields()) {
             return miss("cancelled capture verdict");
+        }
+        // Cancel after the companion stream has already read one quantum, so the case
+        // proves that a half-read companion publishes nothing -- rather than proving that
+        // the stream's own header can be stopped. The budget cannot be a small constant:
+        // chain_io_writer::write consults the continuation gate twice per buffer boundary,
+        // and recurrent_companion_write leads with host-side writes (state magic, sequence
+        // id, cell count) followed by the per-tensor type and row-size headers, all before
+        // its first write_tensor. A budget of one is therefore spent inside that header
+        // with zero D2H bytes, so the old `continuations_allowed = 1` asserted the
+        // opposite of what the stream does. Derive the boundary instead: raise the budget
+        // until the capture is cancelled inside the companion phase having read exactly one
+        // quantum, and require the step below it to have read none. The contrast pins the
+        // cancel to the first quantum without hard-coding the writer's gate accounting.
+        uint32_t companion_mid_budget = 0;
+        uint64_t companion_mid_below_reads = 0;
+        for (uint32_t budget = 1; budget <= admission.continuation_calls + 2; ++budget) {
+            projected_capture_admission probe;
+            probe.continuations_allowed = budget;
+            auto probe_request = request;
+            probe_request.pretransfer_prepare_context = &probe;
+            probe_request.pretransfer_context = &probe;
+            probe_request.continue_context = &probe;
+            const auto tried = vbr_capture_projected_batch(memory, probe_request);
+            if (tried.status == vbr_explicit_capture_status::cancelled &&
+                tried.phase == vbr_explicit_capture_phase::companion_capture &&
+                tried.companion_d2h_reads == 1) {
+                companion_mid_budget = budget;
+                break;
+            }
+            companion_mid_below_reads = tried.companion_d2h_reads;
+        }
+        if (companion_mid_budget == 0) {
+            return miss("no continuation budget stops the companion capture mid-read");
         }
         auto companion_mid_cancelled_request = request;
         projected_capture_admission companion_mid_cancelled_admission;
-        companion_mid_cancelled_admission.continuations_allowed = 1;
+        companion_mid_cancelled_admission.continuations_allowed = companion_mid_budget;
         companion_mid_cancelled_request.pretransfer_prepare_context =
             &companion_mid_cancelled_admission;
         companion_mid_cancelled_request.pretransfer_context =
@@ -1686,19 +1738,22 @@ static bool projected_capture_batch_exact(
             &companion_mid_cancelled_admission;
         const auto companion_mid_cancelled = vbr_capture_projected_batch(
             memory, companion_mid_cancelled_request);
-        if (companion_mid_cancelled.status !=
-                vbr_explicit_capture_status::cancelled ||
-            companion_mid_cancelled.phase !=
-                vbr_explicit_capture_phase::companion_capture ||
-            companion_mid_cancelled_admission.prepare_calls != 1 ||
-            !companion_mid_cancelled_admission.prepared_before_admission ||
-            companion_mid_cancelled_admission.admit_calls != 1 ||
-            companion_mid_cancelled_admission.continuation_calls != 2 ||
-            companion_mid_cancelled.companion_d2h_reads != 1 ||
-            companion_mid_cancelled.companion_d2h_bytes == 0 ||
-            companion_mid_cancelled.unit_transfer_calls != 0 ||
-            companion_mid_cancelled.assembly ||
-            !companion_mid_cancelled.publications.empty()) {
+        VBR_WANT(companion_mid_cancelled.status !=
+                 vbr_explicit_capture_status::cancelled);
+        VBR_WANT(companion_mid_cancelled.phase !=
+                 vbr_explicit_capture_phase::companion_capture);
+        VBR_WANT(companion_mid_cancelled_admission.prepare_calls != 1);
+        VBR_WANT(!companion_mid_cancelled_admission.prepared_before_admission);
+        VBR_WANT(companion_mid_cancelled_admission.admit_calls != 1);
+        VBR_WANT(companion_mid_cancelled_admission.continuation_calls !=
+                 companion_mid_budget + 1);
+        VBR_WANT(companion_mid_cancelled.companion_d2h_reads != 1);
+        VBR_WANT(companion_mid_cancelled.companion_d2h_bytes == 0);
+        VBR_WANT(companion_mid_cancelled.unit_transfer_calls != 0);
+        VBR_WANT(companion_mid_cancelled.assembly);
+        VBR_WANT(!companion_mid_cancelled.publications.empty());
+        VBR_WANT(companion_mid_below_reads != 0);
+        if (report_unmet_fields()) {
             return miss("companion-mid-cancelled capture verdict");
         }
         if (admission.continuation_calls < 2) {
@@ -1716,24 +1771,20 @@ static bool projected_capture_batch_exact(
             &attention_cancelled_admission;
         const auto attention_cancelled = vbr_capture_projected_batch(
             memory, attention_cancelled_request);
-        if (attention_cancelled.status !=
-                vbr_explicit_capture_status::cancelled ||
-            attention_cancelled.phase !=
-                vbr_explicit_capture_phase::unit_transfer ||
-            attention_cancelled.inner_stream_status !=
-                vbr_capture_stream_status::cancelled ||
-            attention_cancelled_admission.prepare_calls != 1 ||
-            !attention_cancelled_admission.prepared_before_admission ||
-            attention_cancelled_admission.admit_calls != 1 ||
-            attention_cancelled.unit_transfer_calls == 0 ||
-            attention_cancelled.transfer.submitted_chunks == 0 ||
-            attention_cancelled.transfer.submitted_bytes == 0 ||
-            attention_cancelled.transfer.submitted_bytes <
-                attention_cancelled.transfer.bytes ||
-            attention_cancelled.transfer.submitted_chunks <
-                attention_cancelled.transfer.chunks ||
-            attention_cancelled.assembly ||
-            !attention_cancelled.publications.empty()) {
+        VBR_WANT(attention_cancelled.status != vbr_explicit_capture_status::cancelled);
+        VBR_WANT(attention_cancelled.phase != vbr_explicit_capture_phase::unit_transfer);
+        VBR_WANT(attention_cancelled.inner_stream_status != vbr_capture_stream_status::cancelled);
+        VBR_WANT(attention_cancelled_admission.prepare_calls != 1);
+        VBR_WANT(!attention_cancelled_admission.prepared_before_admission);
+        VBR_WANT(attention_cancelled_admission.admit_calls != 1);
+        VBR_WANT(attention_cancelled.unit_transfer_calls == 0);
+        VBR_WANT(attention_cancelled.transfer.submitted_chunks == 0);
+        VBR_WANT(attention_cancelled.transfer.submitted_bytes == 0);
+        VBR_WANT(attention_cancelled.transfer.submitted_bytes < attention_cancelled.transfer.bytes);
+        VBR_WANT(attention_cancelled.transfer.submitted_chunks < attention_cancelled.transfer.chunks);
+        VBR_WANT(attention_cancelled.assembly);
+        VBR_WANT(!attention_cancelled.publications.empty());
+        if (report_unmet_fields()) {
             return miss("attention-cancelled capture verdict");
         }
         auto refused_request = request;
@@ -1745,12 +1796,13 @@ static bool projected_capture_batch_exact(
         refused_request.continue_context = &over_cap_admission;
         const auto refused = vbr_capture_projected_batch(
             memory, refused_request);
-        if (refused.status !=
-                vbr_explicit_capture_status::accounting_failed ||
-            over_cap_admission.prepare_calls != 0 ||
-            over_cap_admission.admit_calls != 0 ||
-            refused.unit_transfer_calls != 0 || refused.assembly ||
-            !refused.publications.empty()) {
+        VBR_WANT(refused.status != vbr_explicit_capture_status::accounting_failed);
+        VBR_WANT(over_cap_admission.prepare_calls != 0);
+        VBR_WANT(over_cap_admission.admit_calls != 0);
+        VBR_WANT(refused.unit_transfer_calls != 0);
+        VBR_WANT(refused.assembly);
+        VBR_WANT(!refused.publications.empty());
+        if (report_unmet_fields()) {
             return miss("over-cap rejected capture verdict");
         }
         auto inflated_request = request;
@@ -1784,27 +1836,29 @@ static bool projected_capture_batch_exact(
         partial_request.manifests.front().token_block = { 1, 2 };
         const auto partial = vbr_capture_projected_batch(
             memory, partial_request);
-        if (partial.status != vbr_explicit_capture_status::ok ||
-            partial.first_available_manifest_id != 101 ||
-            partial.planned_packed_bytes == 0 ||
-            partial.unit_transfer_calls == 0) {
+        VBR_WANT(partial.status != vbr_explicit_capture_status::ok);
+        VBR_WANT(partial.first_available_manifest_id != 101);
+        VBR_WANT(partial.planned_packed_bytes == 0);
+        VBR_WANT(partial.unit_transfer_calls == 0);
+        if (report_unmet_fields()) {
             return miss("partial four-manifest capture verdict");
         }
         partial_request.max_packed_bytes =
             partial.planned_packed_bytes - 1;
         const auto partial_over_cap = vbr_capture_projected_batch(
             memory, partial_request);
-        if (partial_over_cap.status !=
-                vbr_explicit_capture_status::accounting_failed ||
-            partial_over_cap.first_available_manifest_id != 101 ||
-            partial_over_cap.unit_transfer_calls != 0 ||
-            partial_over_cap.assembly ||
-            !partial_over_cap.publications.empty()) {
+        VBR_WANT(partial_over_cap.status != vbr_explicit_capture_status::accounting_failed);
+        VBR_WANT(partial_over_cap.first_available_manifest_id != 101);
+        VBR_WANT(partial_over_cap.unit_transfer_calls != 0);
+        VBR_WANT(partial_over_cap.assembly);
+        VBR_WANT(!partial_over_cap.publications.empty());
+        if (report_unmet_fields()) {
             return miss("partial over-cap rejected capture verdict");
         }
     }
     return true;
 }
+#undef VBR_WANT
 
 static bool epochs_equal(
         const llama_memory_vbr_state_data & a,
