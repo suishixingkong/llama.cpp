@@ -10,6 +10,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <vector>
@@ -34,6 +35,7 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
 
 struct cache_buffer_collector : llama_io_write_i {
     std::set<ggml_backend_buffer_t> buffers;
+    std::set<ggml_backend_buffer_t> kv_buffers; // buffers holding attention KV cache tensors
     size_t size = 0;
 
     void write(const void *, size_t n) override {
@@ -42,6 +44,11 @@ struct cache_buffer_collector : llama_io_write_i {
 
     void write_tensor(ggml_tensor * tensor, size_t, size_t n) override {
         buffers.insert(tensor->buffer);
+        // the same prefix the allocator uses to tell a cache tensor from a mapped-up-front
+        // constant (llama-kv-cache.cpp try_vmm_alloc)
+        if (tensor->name != nullptr && strncmp(tensor->name, "cache_", 6) == 0) {
+            kv_buffers.insert(tensor->buffer);
+        }
         size += n;
     }
 
@@ -65,13 +72,38 @@ static llama_context * init_ctx(llama_model * model, llama_context_params cparam
     llama_synchronize(ctx);
     cache_buffer_collector collector;
     llama_get_memory(ctx)->state_write(collector);
+    // A dynamic-VBR attention cache is VMM-backed: it reserves VA and maps pages on demand, so
+    // the buffer is a *partially mapped* VA. Poisoning it with a whole-buffer clear writes into
+    // unmapped VA and faults (found on the V100 as a bare ggml-cuda.cu:112 abort right after
+    // the first fill). Production never does this -- llama-kv-cache.cpp:2886 routes VMM buffers
+    // to vmm_pool_clear with the comment "a full-buffer clear would memset unmapped VA", and
+    // ggml-vbr.h documents vmm_pool_clear as "the VMM-safe replacement for
+    // ggml_backend_buffer_clear on a partially-mapped VA". The poison is simply not expressible
+    // there either: VMM pages are zeroed when they are mapped, so a VMM cache can never hold
+    // stale bytes for the test to catch. Skip the KV buffer(s) and say so; the recurrent buffer
+    // is a plain allocation and is still poisoned.
+    const llama_memory_vbr_preflight_data preflight =
+        llama_memory_vbr_retier_preflight(llama_get_memory(ctx), 0);
+    const bool vmm_backed = preflight.pools != 0;
     llama_memory_clear(llama_get_memory(ctx), true);
     if (collector.buffers.empty()) {
         fprintf(stderr, "%s : no cache buffers found\n", __func__);
         llama_free(ctx);
         return nullptr;
     }
+    if (vmm_backed) {
+        fprintf(stderr, "%s : VMM-backed cache (%u pools, %u cells) - skipping the poison fill "
+                "on %zu of %zu buffers\n",
+                __func__, preflight.pools, preflight.watermark_cells,
+                collector.kv_buffers.size(), collector.buffers.size());
+    }
     for (auto * buffer : collector.buffers) {
+        if (vmm_backed && collector.kv_buffers.count(buffer) != 0) {
+            continue;
+        }
+        fprintf(stderr, "%s : cache fill 0x%02x: buffer %s size %.2f MiB\n",
+                __func__, fill, ggml_backend_buffer_name(buffer),
+                ggml_backend_buffer_get_size(buffer)/1024.0/1024.0);
         ggml_backend_buffer_clear(buffer, fill);
     }
     return ctx;
