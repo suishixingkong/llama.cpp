@@ -446,17 +446,17 @@ static int test_rollback(const common_params & params, llama_model * model, uint
 
     constexpr float eps = 1e-5f;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    const auto replay_and_compare_pair = [&](llama_context * ctx_a, llama_context * ctx_b, const char * mode) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
-            if (!decode_one(ctx_src, tokens[pos], pos) ||
-                !decode_one(ctx_dst, tokens[pos], pos)) {
+            if (!decode_one(ctx_a, tokens[pos], pos) ||
+                !decode_one(ctx_b, tokens[pos], pos)) {
                 fprintf(stderr, "%s : %s replay failed at position %d\n", __func__, mode, pos);
                 return false;
             }
 
-            const float * logits_src = llama_get_logits_ith(ctx_src, 0);
-            const float * logits_dst = llama_get_logits_ith(ctx_dst, 0);
+            const float * logits_src = llama_get_logits_ith(ctx_a, 0);
+            const float * logits_dst = llama_get_logits_ith(ctx_b, 0);
             if (logits_src == nullptr || logits_dst == nullptr) {
                 fprintf(stderr, "%s : missing %s logits at position %d\n", __func__, mode, pos);
                 return false;
@@ -473,35 +473,67 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         }
         return true;
     };
+    const auto replay_and_compare = [&](const char * mode) {
+        return replay_and_compare_pair(ctx_src, ctx_dst, mode);
+    };
     if (!replay_and_compare("full")) {
         return 1;
     }
 
-    // A partial rollback is single-use while a rollback snapshot is pending:
-    // llama_memory_recurrent::seq_rm() refuses it once rs_idx != 0. After the
-    // full replay above both contexts are in exactly that state, so the second
-    // call is *expected* to be refused. Call the two sides separately on
-    // purpose: with `||` short-circuiting the dst side would never be exercised
-    // once the src side returns false.
+    // A bounded rollback is only honorable while the per-token snapshot planes still
+    // hold the tokens being rolled back, and the replay above consumed them:
+    // llama_memory_recurrent::invalidate_rollback() zeroes rollback_valid_depth ahead of
+    // every graph, and commit_rollback() then restores only n_seq_tokens - 1, which is 0
+    // for a one-token decode. The 3-token rollback is therefore refused. Call the two
+    // sides separately on purpose: with `||` short-circuiting the dst side would never be
+    // exercised once the src side returns false.
     const bool refused_src = !llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1);
     const bool refused_dst = !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1);
     if (!refused_src || !refused_dst) {
-        // Both contexts are supposed to carry a pending rollback snapshot here.
-        // A side that still accepts a second partial rollback has diverged from
-        // that state, which is a stronger signal than the refusal itself.
+        // A side that still accepts the second rollback means the snapshot planes
+        // survived the replay, so this is no longer the state the section below was
+        // written for.
         fprintf(stderr, "%s : second partial rollback was not refused (src_refused=%d dst_refused=%d)\n",
                 __func__, (int) refused_src, (int) refused_dst);
         return 1;
     }
-    fprintf(stderr, "%s : second partial rollback refused as expected (pending snapshot is single-use)\n",
+    fprintf(stderr, "%s : second partial rollback refused as expected (snapshot planes consumed by the replay)\n",
             __func__);
 
+    // The recurrent-only round trip needs both sides back at the rollback point, so give it
+    // a fresh rollback window rather than reusing the replayed contexts: decode the same
+    // prompt and roll back once, before anything consumes the planes. Note that
+    // llama_memory_hybrid::seq_rm() tries the recurrent child first and returns before
+    // touching attention, so a refused rollback leaves the attention cells where they are
+    // (up to position 8) - trimming them directly would put the two children on split
+    // timelines the checkpoint below does not model.
     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    common_prompt_checkpoint ckpt_partial;
-    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+    llama_context * ctx_src_partial = make_ctx(params, model, fill);
+    llama_context * ctx_dst_partial = make_ctx(params, model, fill);
+    if (ctx_src_partial == nullptr || ctx_dst_partial == nullptr) {
+        fprintf(stderr, "%s : failed to init partial contexts\n", __func__);
+        return 1;
+    }
 
-    if (!replay_and_compare("partial")) {
+    const bool partial_src_ready = decode_tokens(ctx_src_partial, tokens, n_tokens) &&
+            llama_memory_seq_rm(llama_get_memory(ctx_src_partial), 0, rollback_pos, -1);
+    const bool partial_dst_ready = decode_tokens(ctx_dst_partial, tokens, n_tokens) &&
+            llama_memory_seq_rm(llama_get_memory(ctx_dst_partial), 0, rollback_pos, -1);
+    if (!partial_src_ready || !partial_dst_ready) {
+        fprintf(stderr, "%s : partial contexts did not reach the rollback point (src=%d dst=%d)\n",
+                __func__, (int) partial_src_ready, (int) partial_dst_ready);
+        return 1;
+    }
+
+    common_prompt_checkpoint ckpt_partial;
+    ckpt_partial.update_tgt(ctx_src_partial, 0, partial_flags);
+    ckpt_partial.load_tgt(ctx_dst_partial, 0, partial_flags);
+
+    const bool partial_ok = replay_and_compare_pair(ctx_src_partial, ctx_dst_partial, "partial");
+    llama_free(ctx_src_partial);
+    llama_free(ctx_dst_partial);
+
+    if (!partial_ok) {
         return 1;
     }
 
