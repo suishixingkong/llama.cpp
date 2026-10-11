@@ -93,16 +93,19 @@ static float logit_diff(float a, float b) {
 // Roll back a bounded tail and replay from the restored frontier: every position
 // the tail batch had already evaluated must come back bitwise identical.
 //
-// Geometry: the tail is exactly one ubatch (n_ubatch/n_seqs tokens per sequence),
-// so the trailing positions the rollback removes sit in the same ubatch shape as
-// the leading positions of the replay.  That shape match is what makes the oracle
-// satisfiable at all -- a forward pass is /not/ invariant to the number of tokens
-// in a ubatch (measured on this tree: a 0.32 logit drift and a flipped argmax for
-// one and the same token when it is evaluated alone instead of as the head of a
-// four-token batch), so a reference that reached the rollback point through a
-// differently shaped batch can never be bit-comparable.  Replaying the tokens the
-// rollback removed and demanding the tail batch's own logits back /is/ the
-// rollback's contract.
+// Geometry: this oracle runs one sequence at a time, so the allocr hands that
+// single sequence the whole ubatch and the tail has to be exactly n_ubatch tokens
+// to be one ubatch.  The replay's first ubatch is then n_ubatch tokens too, and the
+// positions the rollback removes are its leading ones.  That token-count match is
+// what makes the oracle satisfiable at all -- a forward pass is /not/ invariant to
+// the number of tokens in a ubatch.  Measured on this tree, one and the same token
+// at one and the same position: a 1-token vs a 4-token ubatch differ by 0.32 logits
+// and flip the argmax; an 8-token vs a 16-token block differ by 0.60 on CUDA while
+// the CPU agrees bitwise (on CUDA the quantised matmul picks its tile template from
+// the row count).  A reference that reached the rollback point through a differently
+// sized block can therefore never be bit-comparable.  Replaying the tokens the
+// rollback removed and demanding the block's own logits back /is/ the rollback's
+// contract.
 //
 // The per-sequence rollback is exercised one sequence at a time.  A ubatch honours
 // at most one pending restore: when two sequences both carry a pending rollback
@@ -114,9 +117,8 @@ static float logit_diff(float a, float b) {
 #define MSS_N_SEQS     2
 #define MSS_N_UBATCH  16
 #define MSS_N_PROMPT  19
-#define MSS_N_TAIL     8 // == n_ubatch / n_seqs, so the tail batch is a single ubatch
+#define MSS_N_TAIL    MSS_N_UBATCH // one whole ubatch: a single sequence is handed the entire ubatch
 #define MSS_N_ROLLBACK 3
-#define MSS_PER_UBATCH (MSS_N_UBATCH / MSS_N_SEQS)
 #define MSS_N_REPLAY  40 // per seq, > n_ubatch so the replay spans several ubatches
 
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
@@ -125,11 +127,10 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_prompt   = MSS_N_PROMPT;
     constexpr uint32_t  n_tail     = MSS_N_TAIL;
     constexpr uint32_t  n_rollback = MSS_N_ROLLBACK;
-    constexpr uint32_t  per_ubatch = MSS_PER_UBATCH;
     constexpr uint32_t  n_replay   = MSS_N_REPLAY;
-    static_assert(n_ubatch % n_seqs == 0, "the split places a whole number of tokens per sequence");
-    static_assert(n_tail == per_ubatch,    "the tail must be one ubatch of the same shape as the replay's first");
-    static_assert(n_rollback < n_tail,     "the rollback must leave the tail's boundary token in place");
+    static_assert(n_tail == n_ubatch,      "the tail is one whole ubatch, matching the replay's first");
+    static_assert(n_rollback < n_tail,     "the rollback must leave the block's boundary token in place");
+    static_assert(n_replay > n_ubatch,     "the replay must span several ubatches");
 
     constexpr llama_pos tail_begin = (llama_pos) n_prompt;
     constexpr llama_pos target     = (llama_pos) (n_prompt + n_tail - n_rollback);
@@ -225,8 +226,22 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             }
         }
         if (diff_max > eps) {
-            fprintf(stderr, "%s : rolled back tokens did not replay identically for sequence %u (max diff %g)\n",
-                    __func__, s, (double) diff_max);
+            // Bitwise identity is the contract, but a failing run has to say which of the two
+            // possible causes it saw: a numeric disagreement (the same token still wins, the
+            // restored state is right, only the kernel shape differs) or a state disagreement
+            // (the argmax moved, so the replay did not start from the state the rollback
+            // claims to restore).  Report the per-position argmax agreement next to the diff.
+            uint32_t top1_agree = 0;
+            for (uint32_t k = 0; k < n_rollback; ++k) {
+                const float * a = tail_ov.data() + size_t(k)*n_vocab;
+                const float * b = replay_ov.data() + size_t(k)*n_vocab;
+                if (std::max_element(a, a + n_vocab) - a == std::max_element(b, b + n_vocab) - b) {
+                    ++top1_agree;
+                }
+            }
+            fprintf(stderr, "%s : rolled back tokens did not replay identically for sequence %u "
+                    "(max diff %g, top1 %u/%u agree)\n",
+                    __func__, s, (double) diff_max, top1_agree, n_rollback);
             llama_free(ctx);
             return false;
         }
@@ -328,7 +343,6 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 #undef MSS_N_PROMPT
 #undef MSS_N_TAIL
 #undef MSS_N_ROLLBACK
-#undef MSS_PER_UBATCH
 #undef MSS_N_REPLAY
 
 static bool test_previous_recurrent_snapshot(const common_params & params, llama_model * model, const int n_vocab) {
