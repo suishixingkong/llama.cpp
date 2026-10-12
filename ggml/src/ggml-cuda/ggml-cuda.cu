@@ -6053,6 +6053,32 @@ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_
 
     ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+
+    // An event record is normally the last thing handed to a stream before a
+    // blocking wait on that event, and a stream whose last submission is an event
+    // record is not handed to the GPU until some other stream-level call happens:
+    // the blocking wait then never returns, with the device healthy, both ends of
+    // the copy valid, and nothing latched. Measured here, one env variable per arm:
+    //   nothing after the record         -> stalls (the wait tracks the observer's
+    //                                       timeout, so it never returns by itself)
+    //   cudaEventQuery / cudaGetDevice   -> stalls (neither touches the stream)
+    //   a stream query BEFORE the record -> stalls (it releases the batch queued at
+    //                                       that moment; the batch holding the
+    //                                       record is formed after it)
+    //   cudaStreamQuery after the record -> completes
+    // So the flush has to be a stream-level call made after the last submission.
+    // GGML_CUDA_NO_EVENT_RECORD_FLUSH turns it off, which reproduces the stall.
+    static const bool no_flush = getenv("GGML_CUDA_NO_EVENT_RECORD_FLUSH") != nullptr;
+    if (!no_flush) {
+        // The query also reports (and clears) an error latched by an earlier launch,
+        // so it has to be inspected rather than dropped.
+        const cudaError_t query_err = cudaStreamQuery(cuda_ctx->stream());
+        if (query_err == cudaErrorNotReady) {
+            (void) cudaGetLastError(); // not an error, but do not leave it latched
+        } else if (query_err != cudaSuccess) {
+            CUDA_CHECK(query_err);
+        }
+    }
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
