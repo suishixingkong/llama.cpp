@@ -13,6 +13,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -796,6 +797,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
 //   * make_ctx          -> make_ctx_sharing   (this port's fill=0 / no-poison convention)
 //   * llama_memory_try_seq_cp(mem, ...) -> mem->try_seq_cp(...)  (see the 9l-d4b7r deviation:
 //     the internal virtual is used so include/llama.h stays byte-identical)
+//   * the media-SWA failure message also prints the (base,swa) tier-epoch pair and points at the
+//     "-v" per-pool trace. The fork's one-liner does not say WHICH child failed or by how much,
+//     and diagnosing it costs a device run each time. Message text only; pass/fail unchanged.
 // ---------------------------------------------------------------------------
 
 static bool test_share_media_swa_prefix(const common_params & params, llama_model * model) {
@@ -902,7 +906,12 @@ static bool test_share_media_swa_prefix(const common_params & params, llama_mode
             const auto tier_after = mem->vbr_representation_identity();
             if (live && (tier_after.tier_epoch <= tier_before.tier_epoch ||
                          tier_after.tier_epoch_swa <= tier_before.tier_epoch_swa)) {
-                fprintf(stderr, "Media SWA gate requires post-sharing retiering of both children\n");
+                fprintf(stderr, "Media SWA gate requires post-sharing retiering of both children: "
+                        "(%llu,%llu)->(%llu,%llu). Each child has to cross its OWN budget share "
+                        "inside this continuation window; rerun with -v and grep \"VBR pool #\" to "
+                        "read projected vs budget per pool and boundary (docs/vbr.md)\n",
+                        (unsigned long long) tier_before.tier_epoch, (unsigned long long) tier_before.tier_epoch_swa,
+                        (unsigned long long) tier_after.tier_epoch,  (unsigned long long) tier_after.tier_epoch_swa);
                 return false;
             }
             const llama_seq_id removed = remove_source ? 0 : 1;
@@ -1176,14 +1185,26 @@ int main(int argc, char ** argv) {
                         "(e.g. -c >= 2048 with an explicit --vbr-vram budget)\n", __func__);
                 return 1;
             }
-            if (params.n_ctx < 2048 || params.vbr_vram_budget_bytes == 0) {
-                fprintf(stderr, "VBR sharing gate needs -c >= 2048 and an explicit --vbr-vram budget\n");
+            // Either channel supplies the explicit budget: the env override is what the
+            // deterministic VBR tests use, and it takes precedence over --vbr-vram outright.
+            const bool budget_explicit =
+                params.vbr_vram_budget_bytes != 0 || getenv("VBR_BUDGET_MIB") != nullptr;
+            if (params.n_ctx < 2048 || !budget_explicit) {
+                fprintf(stderr, "VBR sharing gate needs -c >= 2048 and an explicit budget "
+                        "(--vbr-vram <size>, or VBR_BUDGET_MIB=<MiB>)\n");
                 return 1;
             }
         }
         // The production MTP/VBR server uses unified KV. Its single physical stream must remain
         // distinct from the logical multi-sequence graph capacity.
         params.kv_unified = true;
+
+        // These arms assert on an actual tier retier. The full calibration record -- measured floor
+        // costs, the piecewise budget split, and why `share_media_swa_prefix`'s VBR branch cannot be
+        // satisfied in the SWA fixture -- is in docs/vbr.md ("Deterministic tier schedules"); read
+        // that before sweeping budgets. Short form: VBR_FREEZE=1 plus VBR_BUDGET_MIB=<MiB> is the
+        // deterministic channel (VBR_BUDGET_MIB overrides --vbr-vram outright), and a budget that
+        // merely makes the caches fit produces no crossing at all.
 
         auto mparams = common_model_params_to_llama(params);
         llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));

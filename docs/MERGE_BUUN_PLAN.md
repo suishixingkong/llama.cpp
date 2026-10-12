@@ -14256,6 +14256,34 @@ port 的副本对 `vbr_controller_active|vbr_dynamic` **0 命中** ⇒ fork 的 
 而「已武装」要求**活的 VMM pool** ⇒ 照搬只会得到**会 PASS 而不断言**的测试（本项目明令禁止）
 ⇒ 记录为**设备/VMM 门控**，不是可移植断言。
 
+**2026-10-12 更新（`1c8ff2e31`）：裁定改判为「落地 + 交给设备取证」。** 三条臂已按 fork 原文进入
+`tests/test-recurrent-state-rollback.cpp`（opt-in：`--media-swa-prefix-only` / `--live-swa-prefix-only` /
+`--attn-prefix-only`；仍不进 ctest）。「会 PASS 而不断言」的担心不成立：前提不满足时每条臂都 **fail-closed 且具名**
+（`n_swa < 256` / `n_swa == 0` 直接 `return false`；live 分支查 `vbr_controller_active()` 与 `tier_epoch(_swa) != 0`；
+VBR 臂查 `vbr_controller_active()` 并打印 `"VBR sharing gate requires an armed ordinary hybrid"`）。
+⇒ **代码残差 0，缺口变为「设备侧未取证」；本机无 GPU ⇒ 数值证据待 V100。**
+
+**2026-10-12（V100 实测）：三个臂的终态。** 完整标定过程见 `docs/vbr.md`「Deterministic tier schedules」；
+此处只留结论，不保留中间几次改判。
+
+- ✅ `--attn-prefix-only --vbr-vram 25M` → `share_attn_prefix_vbr` **6/6 PASS**（`tier_epoch=0->12`）⇒ VBR 臂已闭环。
+- ✅ `--live-swa-prefix-only`（`VBR_FREEZE=1 VBR_BUDGET_MIB=25`）→ **6/6 PASS** + 窗口回收拒绝 ⇒ 该臂 VBR 分支已设备验证
+  （它只要求 `tier_epoch_swa != 0`）。
+- ✅ 两条 SWA 臂 `-ctk f16 -ctv f16` 走 historical 分支**通过** ⇒ 非 VBR 分支已设备验证
+  （行集构造 / 共享 / companion 恢复 / 精确重放 / 窗口回收拒绝）。
+- ⛔ `--media-swa-prefix-only` 的 VBR 分支：**任何预算都不可满足**。根因 = `vbr_vmm_projected_bytes` 的**逐 extent 页粒度**
+  （`min(PAD(slot_bytes,gran), PAD(need,gran))`，`gran` = 2048 KiB）：SWA 池每 extent 仅 1 MiB、**小于一页**
+  ⇒ projection 对任何 tier / watermark 都是 `24 × 2 MiB = 48 MiB`（= 其 f16 数据 24 MiB 的 2 倍；日志并列打印
+  `48.00 MiB VA reserved` 与 `size = 24.00 MiB`）⇒ `vbr_over_budget` 只能恒真/恒假 ⇒ 梯子首边界走光、收益为零；
+  base 池每 extent 8 MiB（> 一页）是 12→24 MiB 台阶、台阶点落在窗口内 ⇒ **卡住的只有 SWA**
+  ⇒ **一类模型**（SWA 跨度 < VMM 页）皆然。
+- 判据更正：`vbr_tier_epoch_++` 三处自增中只有 `vbr_degrade_next()`（`:9669`）打 `VBR degrade #`
+  ⇒ 缺那行日志**不等于**没发生 retier；可靠读数 = `-v` 的 per-pool trace，**没有它 = 梯子已花光**。
+- 已声明偏差**三处**（均不改通过/失败语义）：`make_ctx` → `make_ctx_sharing`；
+  `llama_memory_try_seq_cp(mem, …)` → `mem->try_seq_cp(…)`（9l-d4b7r deviation 1，`include/llama.h` 逐字节不变）；
+  media gate 消息补打 `(base,swa)` 对（fork 的 live-SWA gate 本就在打）。
+  先试补公开 C 包装被 `test_9l_d4b7o/p/q/r` 判红 ⇒ 按既有约定改内部虚方法，**未放宽任何守卫**。
+
 ### ⛔ 残差清单（每条都是可执行归因）
 
 | # | 残差 | 量 | 归类 | 依据 |
@@ -14263,7 +14291,7 @@ port 的副本对 `vbr_controller_active|vbr_dynamic` **0 命中** ⇒ fork 的 
 | R1 | `test_qwen4_vbr_cuda` 等 95 行 | 95 | 设备 | 宿主全在 `supports_vbr_vmm`/CUDA 门后 |
 | R2 | artifact-adopt GPU 半边 | 265 | 设备 | 带状归因 |
 | R3 | artifact-adopt 驱动尾五模式 | 38 | 设备 | 五模式全 `-cuda` 结尾 |
-| R4 | `test-recurrent-state-rollback` VBR 臂 | 27 | 设备/VMM | 前置 `vbr_controller_active()` |
+| R4 | `test-recurrent-state-rollback` VBR 臂 —— **已移植 + 已设备验证**（`1c8ff2e31`，2026-10-12） | 27 → **0** | **已闭环**（1/3 臂未取证、成因已定位） | `share_attn_prefix_vbr` **6/6 PASS**（`--vbr-vram 25M`）；`share_live_prefix_swa` **6/6 PASS**；`share_media_swa_prefix` historical 分支 PASS，VBR 分支**定性不可达**（根因 = 页粒度：SWA 每 extent 1 MiB < 2048 KiB 页 ⇒ projection 恒 48 MiB；base 是 12→24 MiB 台阶、台阶点落在窗口内 ⇒ 卡住的一直是 SWA；**一类**模型皆然） |
 | R5 | **QSA 生产代码**（`qsa_selection_safe` 等） | 未量 | **非 VBR** | port 全树 **0 命中**；fork 的 `src/models/qwen4exp.cpp` 调用 **2 次** |
 | R6 | `load_impl<Observed>`/`test-moe-cache*`/DFlash/Bonsai/EXL3 | 未量 | 既定排除 | 用户裁定 |
 

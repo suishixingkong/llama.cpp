@@ -222,3 +222,196 @@ scratch), `VBR_STASH_CAPTURE_ONLY` (stash ablation).
 
 Telemetry exports for wrapper scripts (written, never read): `VBR_SELECTED_*`,
 `VBR_CAPACITY_BITS`, `VBR_VRAM_BUDGET`, `VBR_BUDGET`.
+
+## Deterministic tier schedules (test/gating only)
+
+`VBR_FREEZE=1` disables the live-VRAM clamp and the ledger, so with a fixed budget the degrade waves
+become a pure function of occupancy — "scripted" waves. It is only deterministic together with an
+explicit budget: set `VBR_BUDGET_MIB=<MiB>` as well, otherwise the auto budget keeps re-deriving from
+live free VRAM (the code warns in that case). `VBR_FREEZE_PRESERVE_EMPTY_TIERS=1` retains the current
+tier vector across empty boundaries. Both are read once per cache at construction
+(`llama-kv-cache.cpp`). For a fully hermetic schedule also pin `VBR_FORCE_GENERIC=1` (arch-independent
+degrade order), `VBR_PROMOTE=0` and `VBR_STASH_ROWS=0`, as `tests/test-vbr-representation-epoch.cpp`
+does.
+
+⚠️ Two traps when reading a `tier_epoch` of 0 back from a short run:
+
+1. `VBR_BUDGET_MIB` **overrides** `--vbr-vram` outright (`llama_memory_vbr_budget_bytes_resolve`), so
+   passing both does not mean what it looks like.
+2. `vbr_tier_epoch` only advances inside the transcode path, and the degrade trigger needs the cache
+   watermark to **cross** the budget (`vbr_vmm_active() && vbr_budget_bytes_ > 0`, then
+   `prepare_with_slots`). Any budget above the run's KV watermark — including an "explicit" but
+   generous `--vbr-vram`, and including the auto budget, which tracks live free device memory and is
+   re-derived every boundary — therefore produces **no** degrade at all and `tier_epoch` stays 0
+   forever. Anything that asserts on a retier has to be given a budget that actually binds.
+
+**Calibrate small -- and note the band is two-sided.** Measured on a V100 at `-c 8192`: a plain
+(non-SWA) hybrid model took **12** degrade steps at `--vbr-vram 25M`, but **0** at `--vbr-vram 2G`
+and at `VBR_BUDGET_MIB=160`.
+
+Both ends fail, and the log says which end you are on:
+
+| What you see | What it means | Which knob |
+|---|---|---|
+| no `VBR degrade #` at all | budget too **big**: the watermark never crossed it | shrink the budget |
+| `VBR budget X MiB exceeded with the degrade order clamped at the --vbr-floor` | budget too **small for the floor layout**: the ladder saturates at the floor on the very first boundary, so **no** step is left to take later and nothing can increase inside the assertion window | grow the budget. Lowering `--vbr-floor` alone only helps if the ladder still has steps left -- measured, it changed the message to `exhausted` and the allocation still did not fit |
+| the same line but saying `exhausted` (not `clamped at the --vbr-floor`) | the ladder itself ran out (or the floor was already at the endpoint) | only a bigger budget helps |
+
+`--vbr-floor BITS` is the second lever: the implicit default stops the ladder at **t4 = 4.125**, while
+an explicit low floor (the ladder's own endpoint -- **1.25** for turbo and auto) leaves a lot of
+headroom. It also moves the pool layout, so it changes the split: on a measured iSWA model
+`VBR_BUDGET_MIB=25` split **1/3 : 2/3** (8.33 / 16.67 MiB) at the default floor but **1/4 : 3/4**
+(5.00 / 20.00 MiB) with `--vbr-floor 1.25`. Below the floor-layout cost the reservation is refused
+instead, so the usable band is an interval, not "smaller is always better".
+
+**The binding quantity is each child's share against its own cost.** On the iSWA fixture the two
+children are asymmetric: their projections at the same watermark were **12.00 MiB** (base) and
+**48.00 MiB** (SWA) -- a 1 : 4 cost ratio -- while the scalar budget splits between them **1 : 2**
+(base : SWA; measured at both 1/3 : 2/3 and 1/4 : 3/4). Against its own cost the base child is
+over-provisioned and the SWA child under-provisioned by construction. Full sweep, `-c 8192`,
+`VBR_FREEZE=1`:
+
+| `VBR_BUDGET_MIB` | child shares (base : SWA) | `prepare_with_slots` warnings | outcome |
+|---|---|---|---|
+| 25 | 8.33 : 16.67 | 2, both `clamped at the --vbr-floor` | fail: both children saturate at once |
+| 25 + `--vbr-floor 1.25` | 5.00 : 20.00 | 2, now `exhausted` | fail: the floor stopped limiting, the ladder ran out |
+| 64 | 21.33 : 42.67 | **1** (SWA only) | fail: base now fits (21.33 > 12.00), SWA is 42.67 < 48.00 |
+| 96 | 32.00 : 64.00 | 0 | fail the other way: neither child ever exceeds its share |
+| 128 | 42.67 : 85.33 | 0 | same |
+| 160 | (same layout) | 0 | same |
+
+So watch the warning **count** as well as its wording -- but read it correctly:
+
+1. The warning is **one-shot per cache** (`vbr_budget_warned_`; only `vbr_full_reset()` clears it).
+   The count dropping 2 -> 1 -> 0 does not measure "how close you are": it says how many of the two
+   children have **already saturated at least once**. `0` means "neither child ever exceeded its
+   share", which is also a failure, just the opposite one.
+2. `vbr_tier_epoch_++` has **three** sites and only one of them logs: `vbr_degrade_next()`
+   (`llama-kv-cache.cpp:9669`, logging `VBR degrade #` at `:9659`), `vbr_promote_next()` (`:9340`) and
+   `vbr_full_reset()` (`:9088`) advance the epoch silently. The absence of a `VBR degrade #` line is
+   therefore **not** evidence that nothing retiered -- a promote bumps the same counter.
+
+The definitive instrument is already in the tree: the per-pool trace, enabled by `-v`.
+
+    VBR pool #<i> (device <d>): projected <X> / budget <Y> MiB (mapped <Z>) at <N> cells
+
+One line per pool per boundary (`LLAMA_LOG_DEBUG`). A pool retiers on a boundary exactly when
+`projected > budget`, so this line answers "does child C cross inside window W" directly, instead of
+inferring it from the budget value or from the warning count.
+
+**What actually decides reachability: where each child's cost crosses its share.** A pool retiers on
+the boundary where `projected > budget`, so an arm that asserts on `tier_epoch` is satisfiable only if
+the crossing falls inside **its own** assertion window (~1278 -> 2302 cells of watermark for the two
+SWA arms). Each child's projection grows linearly in the watermark up to its own capacity, and the two
+capacities are not comparable:
+
+| child | projection @ 256 cells | capacity |
+|---|---|---|
+| base | 12.00 MiB | `kv_size` ~= n_ctx (8192 cells) |
+| SWA | 48.00 MiB | `PAD(n_swa * n_seq_max + n_ubatch, 256)` = **2048** cells here |
+
+Do not assume `size_swa == n_swa`: the sharing arms build a **3-sequence unified** context
+(`make_ctx_sharing(..., 3)` plus `kv_unified = true`), so the SWA cache is still filling for roughly
+60% of the window and its crossing can land inside it. (An earlier revision of this section assumed
+`size_swa == n_swa` and wrongly called the arm unreachable.)
+
+Two consequences:
+
+1. **The band is two-sided** and the log says which side you are on -- but read the warning count
+   right. It is **one-shot per cache** (`vbr_budget_warned_`, cleared only by `vbr_full_reset()`), so
+   2 -> 1 -> 0 does *not* measure "how close you are": it only says which children have already
+   saturated. **Zero warnings is also a failure**, just the opposite one.
+2. **Which budget works depends on the SPLIT**, because the two children's per-cell costs differ 4x.
+   Writing the split as `s_base : s_swa`, both crossings land inside one window only when
+   `(s_swa / s_base) / 4` falls within `(ahead / advanced, advanced / ahead] = (0.56, 1.79)`. The
+   sweep above is exactly that constraint failing:
+
+| split (base : SWA) | crossing ratio | verdict |
+|---|---|---|
+| 1 : 2 (measured at 25 / 64 / 96 / 128 / 160 MiB) | 0.50 | **impossible**: below `1 / 1.79` |
+| 1 : 4 (measured at 25 MiB + `--vbr-floor 1.25`) | 1.00 | **feasible**, if the total puts both crossings in the window |
+
+**The split is piecewise, and that is what closes the arm.** `llama_memory_vbr_budget_partition` has
+three regimes (see above). Feeding it the measured floor costs (12.00 / 48.00 MiB, printed by the
+exhausted warnings) and fitting its output to the measured splits at 25 / 80 / 120 MiB identifies the
+entry costs as `(48, 48)` -- every printed pair is reproduced exactly, including `[5, 20]` at 25 and
+`[32, 48]` at 80:
+
+| `VBR_BUDGET_MIB` | regime | base share | SWA share | observed |
+|---|---|---|---|---|
+| 25 | `B < floor_total` (60) | `B/5` = 5.00 | `4B/5` = 20.00 | both ladders walked at the **first** boundary (`#1..#42`, `#1..#168`), then frozen |
+| 80 | `floor_total <= B < entry_total` (96) | `B-48` = 32.00 | **48.00** (constant -- the SWA's weight here is `entry-floor` = 0) | **zero** degradation, gate `(0,0)->(0,0)` |
+| 120 | `B >= entry_total` | 60.00 | 60.00 | **zero** degradation |
+
+So the SWA's share is `4B/5` below 60, exactly **48.00** from 60 to 96, and `B/2` above 96 -- and 48.00
+is precisely its floor cost *and* its 48 MiB VA pool, while its projection never exceeds 48 (at a
+share of 48.00 it does not degrade at all, so `projected > budget` never held during the whole run).
+
+That leaves the SWA child only two states, and neither is a crossing:
+
+* `share >= 48` -> its projection never exceeds the share -> `tier_epoch_swa` stays 0;
+* `share < 48` -> it is over from the start and the ladder cannot bring its cost below the floor ->
+  the whole order is walked immediately and the epoch jumps to 168 and freezes.
+
+Meanwhile the base needs `share >= 12` not to be pinned. Walk the regimes:
+
+| regime | base pinned? | SWA under pressure? |
+|---|---|---|
+| `B < 60` | **yes** (`B/5 < 12` for every `B < 60`) | yes |
+| `60 <= B < 96` | no | **no** (exactly 48.00) |
+| `B >= 96` | no | **no** (`>= 48`) |
+
+**No budget makes the base free and the SWA under pressure at the same time.** Under a
+floor-proportional split that is structural, not bad luck: `s_i = B * floor_i / floor_total` makes
+`s_i >= floor_i` equivalent to `B >= floor_total` for *every* pool, so all children cross from
+"pinned" to "free" on the same total. With `share_media_swa_prefix` requiring **both** children to
+retier strictly inside the window, the arm's VBR branch is **unreachable in this fixture**.
+
+That is only the *share* half of the argument -- it says no budget leaves the right combination of
+pressures. The next section says why the SWA child can never cross at all, which is independent of
+the split and is the actual root cause.
+
+**Root cause: page granularity locks the SWA pool's footprint.** The numbers above are not a
+statistical pattern, they follow from `vbr_vmm_projected_bytes`:
+
+```cpp
+const size_t need = ggml_row_size(t->type, t->ne[0]) * wm_cells;
+total += std::min(vbr_slot_span(t, p.gran), GGML_PAD(need, p.gran));   // per (layer, side)
+```
+
+`vbr_slot_span` is `GGML_PAD(slot_bytes, gran)`, and on this box `gran` is the 2048 KiB VMM page
+(the log says so). Filling in the fixture's real geometry:
+
+| child | extents | logical span per extent | page-padded | projection |
+|---|---|---|---|---|
+| base | 3 layers x (k,v) = 6 | 8.00 MiB (f16, 8192 cells, dim 512) | 8.00 MiB | `min(8, PAD(need))` -> **2 MiB/extent below wm 2048, 4 MiB above** |
+| SWA | 12 layers x (k,v) = 24 | **1.00 MiB** (f16, 2048 cells, dim 256) | **2.00 MiB** | `min(2, PAD(need))` = **2 MiB/extent always** |
+
+which reproduces both measured warnings exactly -- base `12.00 MiB` (6 x 2) and SWA `48.00 MiB`
+(24 x 2) -- and shows why they behave differently:
+
+* **SWA**: its logical per-extent span (1 MiB) is *smaller than one VMM page*, so
+  `GGML_PAD(need, gran)` is 2 MiB for **every tier and every watermark**, and so is the slot span.
+  Its projected footprint is therefore a **constant 48 MiB = 2x its f16 data size (24 MiB)** -- both
+  numbers are printed side by side by the log itself (`48.00 MiB VA reserved` vs
+  `size = 24.00 MiB (2048 cells, 12 layers)`). `vbr_over_budget` can then only be permanently true
+  (`share < 48`) or permanently false (`share >= 48`); it can never change mid-run, so the ladder is
+  walked to `exhausted` at the first boundary (`#1..#168`) and buys nothing.
+* **base**: its 8 MiB span exceeds a page, so `min(8, PAD(need))` *steps* -- 2 MiB below wm 2048,
+  4 MiB above -- i.e. its projection is a staircase `12 -> 24 MiB`, and the step at wm 2049 falls
+  **inside** the arm's window (1278 -> 2302). The base child can therefore cross inside the window;
+  the SWA child cannot, ever.
+
+⇒ `test_share_media_swa_prefix` requires a *new* retier for **both** children inside that window, so
+on any iSWA model whose SWA per-extent span is below one VMM page the assertion is unsatisfiable --
+this is a **class of models**, not one unlucky fixture. `test_share_live_prefix_swa` passes only
+because it asserts `!= 0`, which the burnout satisfies.
+
+**One run confirms it** (prediction stated so it can be refuted): `VBR_BUDGET_MIB=61` with
+`--vbr-floor 1.25` gives shares 13 / 48, so the base crosses at wm 2049 while the SWA cannot -- the
+failure message should print a **non-zero base with a zero SWA** (e.g. `(0,0)->(2,0)`). A non-zero
+SWA there, or a zero base, refutes the whole page-granularity reading.
+
+Either way the arm's historical branch (`-ctk f16 -ctv f16`, which skips the gate) passes and covers
+its real subject: row-set construction, sharing, companion recovery, exact replay and the
+expired-window refusal.
