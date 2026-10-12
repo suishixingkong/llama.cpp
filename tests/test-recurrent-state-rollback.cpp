@@ -1,9 +1,12 @@
 #include "arg.h"
 #include "common.h"
 #include "ggml-backend.h"
+#include "llama-cpp.h"
 #include "llama.h"
 
 #include "../src/llama-io.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory.h"
 
 #include <algorithm>
@@ -13,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <set>
+#include <string>
 #include <vector>
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -120,6 +124,78 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
 
 static float logit_diff(float a, float b) {
     return std::isfinite(a) && std::isfinite(b) ? std::fabs(a - b) : std::numeric_limits<float>::infinity();
+}
+
+// ---------------------------------------------------------------------------
+// Sharing-family helpers. These mirror the fork's helpers verbatim so the ported
+// bodies below stay text-comparable with buun-llama-cpp for future merges. The
+// only deliberate difference is make_ctx_sharing, which keeps this port's fill=0
+// (no cache poison) convention -- see init_ctx for the VMM rationale.
+// ---------------------------------------------------------------------------
+
+static llama_context_ptr make_ctx_sharing(const common_params & params, llama_model * model, uint32_t n_seq_max) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max = n_seq_max;
+    cparams.n_rs_seq  = 8;
+    cparams.n_batch   = std::max(cparams.n_batch,  n_seq_max * (cparams.n_rs_seq + 1));
+    cparams.n_ubatch  = std::max(cparams.n_ubatch, n_seq_max * (cparams.n_rs_seq + 1));
+    return llama_context_ptr(init_ctx(model, cparams, 0));
+}
+
+static bool decode_range(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & tokens,
+        uint32_t                         begin,
+        uint32_t                         count,
+        llama_seq_id                     seq_id = 0) {
+    llama_batch batch = llama_batch_init(count, 0, 1);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t pos = begin + i;
+        common_batch_add(batch, tokens[pos], pos, { seq_id }, i + 1 == count);
+    }
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+static std::vector<uint8_t> save_seq(
+        llama_context *       ctx,
+        llama_seq_id          seq_id,
+        llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE) {
+    std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx, seq_id, flags));
+    const size_t n = llama_state_seq_get_data_ext(ctx, state.data(), state.size(), seq_id, flags);
+    if (n != state.size()) {
+        state.clear();
+    }
+    return state;
+}
+
+static bool load_seq(llama_context * ctx, const std::vector<uint8_t> & state, llama_seq_id seq_id) {
+    return !state.empty() && llama_state_seq_set_data(ctx, state.data(), state.size(), seq_id) == state.size();
+}
+
+static std::vector<float> copy_logits(llama_context * ctx, int n_vocab, int index = 0) {
+    const float * logits = llama_get_logits_ith(ctx, index);
+    return logits == nullptr ? std::vector<float>() : std::vector<float>(logits, logits + n_vocab);
+}
+
+static bool logits_equal(
+        const std::vector<float> & lhs,
+        const std::vector<float> & rhs,
+        const char *               label,
+        float                      eps = 1e-5f) {
+    if (lhs.size() != rhs.size() || lhs.empty()) {
+        fprintf(stderr, "%s : missing or differently sized logits\n", label);
+        return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (!std::isfinite(lhs[i]) || !std::isfinite(rhs[i]) || std::fabs(lhs[i] - rhs[i]) > eps) {
+            fprintf(stderr, "%s : logits mismatch at token %zu (%g != %g)\n",
+                    label, i, (double) lhs[i], (double) rhs[i]);
+            return false;
+        }
+    }
+    return true;
 }
 
 // Roll back a bounded tail and replay from the restored frontier: every position
@@ -713,6 +789,347 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Sharing-family arms ported from buun-llama-cpp's test-recurrent-state-rollback.cpp.
+// They are opt-in (never registered in ctest) and selected by the CLI flags handled in main().
+// Bodies are kept verbatim except:
+//   * make_ctx          -> make_ctx_sharing   (this port's fill=0 / no-poison convention)
+//   * llama_memory_try_seq_cp(mem, ...) -> mem->try_seq_cp(...)  (see the 9l-d4b7r deviation:
+//     the internal virtual is used so include/llama.h stays byte-identical)
+// ---------------------------------------------------------------------------
+
+static bool test_share_media_swa_prefix(const common_params & params, llama_model * model) {
+    const uint32_t window = llama_model_n_swa(model);
+    if (window < 256) { return false; }
+    // Synthetic image-shaped rows share position256. Keep distinct positions
+    // contiguous so this also runs on non-M-RoPE SWA models. The row set lies
+    // just inside the left edge of the first continuation's window.
+    const uint32_t prefix = window + 270;
+    if (params.n_ctx <= prefix + 32) { return false; }
+    const llama_pos next_pos = prefix - 15;
+    std::vector<llama_pos> rows(params.n_ctx);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rows[i] = i < 256 ? i : i < 272 ? 256 : i - 15;
+    }
+    const std::vector<llama_pos> expected(rows.begin(), rows.begin() + prefix);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto decode = [&](llama_context * ctx, uint32_t begin, uint32_t end, llama_seq_id seq = 0) {
+        if (end > rows.size()) {
+            fprintf(stderr, "Media SWA decode exceeds test context: %u > %zu\n", end, rows.size());
+            return false;
+        }
+        for (uint32_t start = begin; start < end; start += 64) {
+            auto batch = llama_batch_init(std::min(64u, end - start), 0, 1);
+            for (uint32_t i = start; i < std::min(start + 64, end); ++i) {
+                common_batch_add(batch, llama_token(1 + i % (n_vocab - 1)), rows[i], {seq}, i + 1 == end);
+            }
+            const bool ok = llama_decode(ctx, batch) == 0;
+            llama_batch_free(batch);
+            if (!ok) { return false; }
+        }
+        llama_synchronize(ctx);
+        return true;
+    };
+    const bool live = params.vbr_dynamic();
+    for (bool remove_source : {false, true}) {
+        std::vector<uint8_t> reference_image;
+        std::vector<float> initial_reference;
+        std::vector<float> reference_logits;
+        for (int arm = 0; arm < 3; ++arm) {
+            auto ctx = make_ctx_sharing(params, model, 3);
+            if (!ctx) { return false; }
+            auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+            if (!mem || !decode(ctx.get(), 0, prefix)) {
+                fprintf(stderr, "Media SWA initial fill failed\n");
+                return false;
+            }
+            const auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            const auto companion = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 0, partial);
+            const uint32_t ahead = live ? prefix + 512 : mem->get_swa()->get_size() + window + 256;
+            if (!decode(ctx.get(), prefix, ahead) ||
+                (!live && mem->get_swa()->seq_pos_min(0) <= next_pos - llama_pos(window))) {
+                fprintf(stderr, "Media SWA window advance failed: min=%d next=%d ahead=%u\n",
+                        mem->get_swa()->seq_pos_min(0), next_pos, ahead);
+                return false;
+            }
+            // Legacy serialization deliberately rejects a retiered VBR cache.
+            // Use its source-lineage contract plus exact live continuation instead.
+            const auto source = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 0);
+            const auto lineage_before = llama_memory_vbr_state(mem, 0, 0);
+            const auto tier_before = mem->vbr_representation_identity();
+            if (arm == 0) {
+                if (live) { mem->seq_cp(0, 1, 0, next_pos); }
+                else { mem->get_base()->seq_cp(0, 1, 0, next_pos); }
+            } else {
+                const bool ok = live ? mem->try_share_live_prefix_rows(0, 1, next_pos, expected)
+                                     : mem->try_share_attn_prefix_rows(0, 1, next_pos, expected);
+                if (!ok) {
+                    fprintf(stderr, "Media SWA checked sharing refused\n");
+                    return false;
+                }
+            }
+            if (!live && (companion.empty() || llama_state_seq_set_data_ext(ctx.get(), companion.data(),
+                    companion.size(), 1, partial) != companion.size())) {
+                fprintf(stderr, "Media SWA companion restore failed\n");
+                return false;
+            }
+            const auto restored = live ? std::vector<uint8_t>() : save_seq(ctx.get(), 1);
+            const auto lineage_after = llama_memory_vbr_state(mem, 0, 0);
+            const auto tier_shared = mem->vbr_representation_identity();
+            if ((!live && (source != save_seq(ctx.get(), 0) || restored.empty())) ||
+                lineage_before.checkpoint_epoch != lineage_after.checkpoint_epoch ||
+                lineage_before.checkpoint_epoch_swa != lineage_after.checkpoint_epoch_swa ||
+                tier_before.tier_epoch != tier_shared.tier_epoch ||
+                tier_before.tier_epoch_swa != tier_shared.tier_epoch_swa ||
+                mem->try_share_live_prefix_rows(0, 1, next_pos, expected) ||
+                mem->try_share_attn_prefix_rows(0, 1, next_pos, expected)) {
+                fprintf(stderr, "Media SWA source image or occupied-destination check failed\n");
+                return false;
+            }
+            if (arm == 0) { reference_image = restored; }
+            else if (restored != reference_image) {
+                fprintf(stderr, "Media SWA shared image differs from established-copy control\n");
+                return false;
+            }
+            if (!decode(ctx.get(), prefix, prefix + 1, 1)) { return false; }
+            const auto initial = copy_logits(ctx.get(), n_vocab);
+            if (arm == 0) { initial_reference = initial; }
+            else if (!logits_equal(initial_reference, initial, "Media SWA first destination row", 0.0f)) {
+                return false;
+            }
+            const uint32_t advanced = live ? ahead + window + 512 : ahead;
+            if (!decode(ctx.get(), ahead, advanced)) { return false; }
+            const auto tier_after = mem->vbr_representation_identity();
+            if (live && (tier_after.tier_epoch <= tier_before.tier_epoch ||
+                         tier_after.tier_epoch_swa <= tier_before.tier_epoch_swa)) {
+                fprintf(stderr, "Media SWA gate requires post-sharing retiering of both children\n");
+                return false;
+            }
+            const llama_seq_id removed = remove_source ? 0 : 1;
+            const llama_seq_id survivor = 1 - removed;
+            if (!mem->seq_rm(removed, -1, -1) || !decode(ctx.get(), 0, 16, removed)) { return false; }
+            const uint32_t frontier = remove_source ? prefix + 1 : advanced;
+            std::vector<float> logits;
+            for (uint32_t i = frontier; i < frontier + 32; ++i) {
+                if (!decode(ctx.get(), i, i + 1, survivor)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) { reference_logits = std::move(logits); }
+            else if (!logits_equal(reference_logits, logits, "Media SWA exact replay", 0.0f)) { return false; }
+            fprintf(stderr, "Media SWA %s %s-first arm=%d: exact replay; tier=(%llu,%llu)->(%llu,%llu) PASS\n",
+                live ? "live" : "historical", remove_source ? "source" : "destination", arm,
+                (unsigned long long) tier_before.tier_epoch, (unsigned long long) tier_before.tier_epoch_swa,
+                (unsigned long long) tier_after.tier_epoch, (unsigned long long) tier_after.tier_epoch_swa);
+        }
+    }
+    // Recycled image rows must not be mistaken for retained-window coverage.
+    auto ctx = make_ctx_sharing(params, model, 3);
+    if (!ctx) { return false; }
+    auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    if (!mem || !decode(ctx.get(), 0, mem->get_swa()->get_size() + window + 256) ||
+        mem->can_share_live_prefix_rows(0, 1, next_pos, expected) ||
+        mem->try_share_live_prefix_rows(0, 1, next_pos, expected) ||
+        mem->get_base()->seq_pos_max(1) != -1 || mem->get_swa()->seq_pos_max(1) != -1) { return false; }
+    fprintf(stderr, "Media SWA recycled-window no-mutation refusal PASS\n");
+    return true;
+}
+
+static bool test_share_live_prefix_swa(const common_params & params, llama_model * model) {
+    const uint32_t window = llama_model_n_swa(model);
+    if (window == 0) { return false; }
+    const uint32_t prefix = window + 64;
+    const uint32_t ahead = prefix + 512;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(params.n_ctx);
+    for (size_t i = 0; i < tokens.size(); ++i) { tokens[i] = llama_token(1 + i % (n_vocab - 1)); }
+    const auto fill = [&](llama_context * ctx, uint32_t begin, uint32_t end) {
+        if (end > tokens.size()) { return false; }
+        for (uint32_t pos = begin; pos < end; pos += 64) {
+            if (!decode_range(ctx, tokens, pos, std::min(64u, end - pos))) { return false; }
+        }
+        llama_synchronize(ctx);
+        return true;
+    };
+    for (bool remove_source : { false, true }) {
+        std::vector<float> reference;
+        std::vector<float> initial_reference;
+        for (int arm = 0; arm < 3; ++arm) {
+            auto ctx = make_ctx_sharing(params, model, 3);
+            if (!ctx) { return false; }
+            auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+            const uint32_t advanced = ahead + window + 512;
+            if (!mem || advanced + 32 > tokens.size() || !fill(ctx.get(), 0, ahead)) { return false; }
+            const auto before = llama_memory_vbr_state(mem, 0, 0);
+            const auto tier = mem->vbr_representation_identity();
+            if (arm == 0) {
+                // Existing unchecked composite copy is correct here because this
+                // control deliberately retains every historical window row.
+                mem->seq_cp(0, 1, 0, prefix);
+            } else if (!mem->can_share_live_prefix(0, 1, prefix) ||
+                       !mem->try_share_live_prefix(0, 1, prefix) ||
+                       mem->try_share_live_prefix(0, 1, prefix)) {
+                return false;
+            }
+            const auto after = llama_memory_vbr_state(mem, 0, 0);
+            const auto after_tier = mem->vbr_representation_identity();
+            if (before.checkpoint_epoch != after.checkpoint_epoch ||
+                before.checkpoint_epoch_swa != after.checkpoint_epoch_swa ||
+                tier.tier_epoch != after_tier.tier_epoch || tier.tier_epoch_swa != after_tier.tier_epoch_swa) {
+                fprintf(stderr, "Live SWA sharing changed source lineage or tiers\n");
+                return false;
+            }
+            if (!decode_range(ctx.get(), tokens, prefix, 1, 1)) { return false; }
+            const auto initial = copy_logits(ctx.get(), n_vocab);
+            if (arm == 0) {
+                initial_reference = initial;
+            } else if (!logits_equal(initial_reference, initial, "Live SWA first destination row", 0.0f)) {
+                return false;
+            }
+            if (!fill(ctx.get(), ahead, advanced)) { return false; }
+            const auto advanced_tier = mem->vbr_representation_identity();
+            if (params.vbr_dynamic() && (!mem->get_swa()->vbr_controller_active() ||
+                advanced_tier.tier_epoch == 0 || advanced_tier.tier_epoch_swa == 0)) {
+                fprintf(stderr, "Live SWA gate needs actual VBR retiering: (%llu,%llu)->(%llu,%llu)\n",
+                    (unsigned long long) after_tier.tier_epoch, (unsigned long long) after_tier.tier_epoch_swa,
+                    (unsigned long long) advanced_tier.tier_epoch, (unsigned long long) advanced_tier.tier_epoch_swa);
+                return false;
+            }
+            const llama_seq_id removed = remove_source ? 0 : 1;
+            const llama_seq_id survivor = 1 - removed;
+            if (!mem->seq_rm(removed, -1, -1) || !decode_range(ctx.get(), tokens, 0, 16, removed)) {
+                return false;
+            }
+            const uint32_t frontier = remove_source ? prefix + 1 : advanced;
+            std::vector<float> logits;
+            for (uint32_t pos = frontier; pos < frontier + 32; ++pos) {
+                if (!decode_range(ctx.get(), tokens, pos, 1, survivor)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) {
+                reference = std::move(logits);
+            } else if (!logits_equal(reference, logits, "Live SWA sharing exact replay", 0.0f)) {
+                return false;
+            }
+            fprintf(stderr, "Live SWA prefix %s-first arm=%d exact replay; tier=(%llu,%llu)->(%llu,%llu)\n",
+                remove_source ? "source" : "destination", arm,
+                (unsigned long long) after_tier.tier_epoch, (unsigned long long) after_tier.tier_epoch_swa,
+                (unsigned long long) advanced_tier.tier_epoch, (unsigned long long) advanced_tier.tier_epoch_swa);
+        }
+    }
+    auto ctx = make_ctx_sharing(params, model, 3);
+    if (!ctx) { return false; }
+    auto * mem = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(ctx.get()));
+    if (!mem || !fill(ctx.get(), 0, mem->get_swa()->get_size() + window + 256) ||
+        mem->get_swa()->seq_pos_min(0) < llama_pos(prefix) ||
+        mem->can_share_live_prefix(0, 1, prefix) || mem->try_share_live_prefix(0, 1, prefix) ||
+        mem->get_base()->seq_pos_max(1) != -1 || mem->get_swa()->seq_pos_max(1) != -1) {
+        fprintf(stderr, "Live SWA expired-window refusal failed\n");
+        return false;
+    }
+    fprintf(stderr, "Live SWA expired-window no-mutation refusal passed\n");
+    return true;
+}
+
+static bool test_share_attn_prefix_vbr(const common_params & params, llama_model * model) {
+    const uint32_t checkpoint_pos = params.n_ctx / 8;
+    const uint32_t source_pos = params.n_ctx * 3 / 8;
+    constexpr uint32_t replay = 32;
+    constexpr auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> tokens(source_pos + replay);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = (llama_token) ((i * 17 + 1) % n_vocab);
+    }
+    std::vector<float> reference;
+    for (bool source_first : { false, true }) {
+        for (int arm = 0; arm < 3; ++arm) {
+            // arm 0: existing composite copy before source advances;
+            // arms 1/2: late attention share + historical RS, including a repeat.
+            auto ctx = make_ctx_sharing(params, model, 2);
+            if (!ctx) { return false; }
+            auto mem = llama_get_memory(ctx.get());
+            auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+            if (!hybrid || !hybrid->get_mem_attn()->vbr_controller_active()) {
+                fprintf(stderr, "VBR sharing gate requires an armed ordinary hybrid\n");
+                return false;
+            }
+            auto * attn = hybrid->get_mem_attn();
+            const auto prefill = [&](uint32_t begin, uint32_t end) {
+                for (uint32_t pos = begin; pos < end; pos += 64) {
+                    if (!decode_range(ctx.get(), tokens, pos, std::min(64u, end - pos))) { return false; }
+                }
+                llama_synchronize(ctx.get());
+                return true;
+            };
+            if (!prefill(0, checkpoint_pos)) { return false; }
+            const auto checkpoint = save_seq(ctx.get(), 0, partial);
+            const auto epoch = attn->vbr_checkpoint_epoch(0);
+            const auto checkpoint_tier = attn->vbr_tier_epoch();
+            // Port deviation, same one 9l-d4b7r established: call the internal virtual
+            // llama_memory_i::try_seq_cp() instead of the fork's public
+            // llama_memory_try_seq_cp() wrapper, so include/llama.h stays byte-identical and no
+            // 170-TU rebuild is needed. The wrapper is only a null check plus
+            // `mem->try_seq_cp(...)`, so the semantics are unchanged; that check stays inline.
+            if (checkpoint.empty() || (arm == 0 && (!mem || !mem->try_seq_cp(0, 1, -1, -1))) ||
+                !prefill(checkpoint_pos, source_pos)) { return false; }
+            const auto source = save_seq(ctx.get(), 0, partial);
+            const auto tier = attn->vbr_tier_epoch();
+            if (epoch != attn->vbr_checkpoint_epoch(0) || tier <= checkpoint_tier) {
+                fprintf(stderr, "VBR gate needs a retiered, unchanged source lineage: epoch=%llu -> %llu tier=%llu\n",
+                        (unsigned long long) epoch, (unsigned long long) attn->vbr_checkpoint_epoch(0),
+                        (unsigned long long) tier);
+                return false;
+            }
+            if (arm != 0) {
+                if (llama_memory_can_share_attn_prefix(mem, 0, 1, source_pos + 1) ||
+                    !llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos) ||
+                    llama_memory_try_share_attn_prefix(mem, 0, 1, checkpoint_pos) ||
+                    llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(),
+                        1, partial) != checkpoint.size()) { return false; }
+            }
+            if (source != save_seq(ctx.get(), 0, partial) ||
+                epoch != attn->vbr_checkpoint_epoch(0) || tier != attn->vbr_tier_epoch()) {
+                fprintf(stderr, "sharing changed source recurrent state, lineage or KV tiers\n");
+                return false;
+            }
+            uint32_t shared = 0;
+            const auto & cells = attn->get_cells(0);
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.seq_has(i, 1)) {
+                    if (!cells.seq_has(i, 0) || cells.pos_get(i) >= (llama_pos) checkpoint_pos) { return false; }
+                    ++shared;
+                }
+            }
+            if (shared != checkpoint_pos || (source_first && !llama_memory_seq_rm(mem, 0, -1, -1))) {
+                return false;
+            }
+            std::vector<float> logits;
+            for (uint32_t pos = checkpoint_pos; pos < checkpoint_pos + replay; ++pos) {
+                if (!decode_range(ctx.get(), tokens, pos, 1, 1)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (!llama_memory_seq_rm(mem, 1, -1, -1)) { return false; }
+            if (!source_first) {
+                if (source != save_seq(ctx.get(), 0, partial) ||
+                    !decode_range(ctx.get(), tokens, source_pos, 1)) { return false; }
+                const auto row = copy_logits(ctx.get(), n_vocab);
+                logits.insert(logits.end(), row.begin(), row.end());
+            }
+            if (arm == 0) { reference = logits; }
+            if (!logits_equal(reference, logits, "VBR historical share", 0.0f)) { return false; }
+            llama_memory_clear(mem, true);
+            if (attn->seq_pos_max(0) != -1 || attn->seq_pos_max(1) != -1) { return false; }
+            fprintf(stderr, "VBR share: source_first=%d arm=%d exact logits=%zu tier_epoch=%llu->%llu PASS\n",
+                    source_first, arm, logits.size(), (unsigned long long) checkpoint_tier,
+                    (unsigned long long) tier);
+        }
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -722,11 +1139,66 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    // The sharing-family selectors are not understood by common_params_parse, so they are
+    // stripped from argv before parsing. They mirror the fork's CLI: that family is opt-in
+    // there as well and is never registered in ctest.
+    std::vector<std::string> parser_args(argv, argv + argc);
+    const auto take_flag = [&](const char * name) {
+        const auto it = std::find(parser_args.begin(), parser_args.end(), name);
+        const bool found = it != parser_args.end();
+        if (found) {
+            parser_args.erase(it);
+        }
+        return found;
+    };
+    const bool media_swa_only   = take_flag("--media-swa-prefix-only");
+    const bool live_swa_only    = take_flag("--live-swa-prefix-only");
+    // In the fork this flag also suppresses an implicit `-ct f16` rewrite; this port has no such
+    // rewrite, so here it only selects the VBR attention-prefix arm.
+    const bool attn_prefix_only = take_flag("--attn-prefix-only");
+
+    std::vector<char *> parser_argv;
+    parser_argv.reserve(parser_args.size());
+    for (auto & arg : parser_args) {
+        parser_argv.push_back(&arg[0]);
+    }
+    if (!common_params_parse(int(parser_argv.size()), parser_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
     ggml_backend_load_all();
+
+    // ---- sharing-family arms: model-only fixtures, dispatched before the default suite ----
+    if (media_swa_only || live_swa_only || attn_prefix_only) {
+        if (attn_prefix_only && !media_swa_only && !live_swa_only) {
+            if (!params.vbr_dynamic()) {
+                fprintf(stderr, "%s : --attn-prefix-only needs a dynamic VBR configuration "
+                        "(e.g. -c >= 2048 with an explicit --vbr-vram budget)\n", __func__);
+                return 1;
+            }
+            if (params.n_ctx < 2048 || params.vbr_vram_budget_bytes == 0) {
+                fprintf(stderr, "VBR sharing gate needs -c >= 2048 and an explicit --vbr-vram budget\n");
+                return 1;
+            }
+        }
+        // The production MTP/VBR server uses unified KV. Its single physical stream must remain
+        // distinct from the logical multi-sequence graph capacity.
+        params.kv_unified = true;
+
+        auto mparams = common_model_params_to_llama(params);
+        llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
+        if (!model) {
+            fprintf(stderr, "%s : failed to load model\n", __func__);
+            return 1;
+        }
+        if (media_swa_only) {
+            return test_share_media_swa_prefix(params, model.get()) ? 0 : 1;
+        }
+        if (live_swa_only) {
+            return test_share_live_prefix_swa(params, model.get()) ? 0 : 1;
+        }
+        return test_share_attn_prefix_vbr(params, model.get()) ? 0 : 1;
+    }
 
     common_init_result_ptr llama_init = common_init_from_params(params);
     llama_model * model = llama_init->model();
