@@ -12,6 +12,16 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-moe-cache.h"
+
+// Optional MoE expert cache function table, populated by a supporting backend.
+struct ggml_moe_cache_api ggml_moe_cache = {};
+
+void ggml_moe_cache_unregister(const void * owner) {
+    if (ggml_moe_cache.owner == owner) {
+        ggml_moe_cache = {};
+    }
+}
 
 #include <assert.h>
 #include <limits.h>

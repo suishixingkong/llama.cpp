@@ -14429,3 +14429,38 @@ fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交
 | **S9** | server 3 行 + `--no-spec-dspark-gpu-assist` | **DSpark 已排除 ⇒ 天然不可达** | 断言为缺席，或与 DSpark 一并做 |
 
 ⚠️ **不要把 S1 当成「后端叶子、可以逐字照抄」**：`mmvq.cu` 是 drift 最大的文件（1,683 vs 3,100），必须按 §5g 先量再下手。
+
+#### 10.92.6 切片 S1 已落地：后端 provider（2026-10-15）
+
+**范围**：`ggml-backend-moe-cache.h`(152) + `moe-cache.cuh`(19) + `moe-cache-mmv-tuning.h`(21) + `moe-cache.cu`(4448) 新增；
+`mmvq.cuh/.cu` 加两个 dispatch 入口；`ggml-cuda.cu` 加 include / `ggml_moe_cache_register(&reg)` / **两处**分配失败 trim 重试；
+`ggml-backend.cpp` 加 provider 全局定义 + `ggml_moe_cache_unregister`；`ggml-backend-reg.cpp` 加 include + 注销调用。
+⚠️ `ggml-cuda/CMakeLists.txt` **无需改动**——该目录用 `file(GLOB "*.cu")`，落文件即入构建（但要重跑 `cmake .` 才刷新，见下）。
+
+**⚠️ 一处配对关系是链接检查才发现的**（原计划把 provider 全局划给 S2）：
+`moe-cache.cu.obj` 对 `ggml_moe_cache` 的 `UNDEF` 外部引用，加上 S1 自己新增的 `ggml_moe_cache_unregister(reg)` 调用，
+使得**全局定义必须与注册同片落地**。静态 grep 看不到这一点（声明在头里，三处都"present"）。
+
+**Route A 的三处显式闸门**（都是"拒绝而非算错"，不碰正确性）：
+1. `moe_cache_dedicated_mmv_available()` 是 `constexpr false`；`fused_begin` 见到它即返回 `nullptr`（= CPU 侧判定"不可融合"）。
+2. `modulo_activation` 为假 ⇒ **拒绝整个节点**（`return 0` ⇒ 全部行回到 stock CPU）。通用 MMV 按 `index % activation_rows` 取激活行，
+   非 modulo 的激活映射没有正确的通用实现，放过去就是**静默算错**。
+3. `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` / `…_DOWN_DEDICATED_MMV` 仍被读取并记录，但**载入时打印一条告警**说明无法满足，
+   而不是留下两个"设了没反应"的开关。
+
+**⚠️ Route A 的收益边界（实测得出，不是估算）**：`act_rows` 在 CPU 侧按 **token 主序**填充
+（`moe_cache_acts[n_hits] = src1->data + i11*nb11 + iid1*nb12`，`ggml-cpu.c:2530`），
+故多 token 节点的 `activation_indices[index] == index % activation_rows` **不成立** ⇒ fork 对多 token
+（推测验证批次）也走 dedicated kernel。⇒ **本片只有单 token 解码能加速**，多 token 节点回退 CPU。
+融合与多 token 是**同一个** dedicated kernel ⇒ 一起留给 S1b。
+
+**证据（无 GPU，全部是编译/发射级）**：
+- 5 个 TU 逐个编译通过（`RC_MOE_CACHE/RC_MMVQ/RC_CUDACU/RC_GGBACKEND/RC_BACKENDREG` 全 0，sm_70）。
+- **对象级符号核对**：`moe-cache.cu.obj` 的 moe 相关 `UNDEF` 只有 3 个（两个 MMVQ 入口 + provider 全局），
+  前两个在 `mmvq.cu.obj` 里是 `SECT6D0/6D1` 定义，第三个在 `ggml-backend.cpp.obj` 里是 `SECT6`/`SECT200` 定义 ⇒ 无悬空外部。
+- CPU 构建树一致性：`ggml-backend.cpp` + `ggml-backend-reg.cpp` 在 `D://llama-build//cpu` 编译通过。
+- 守卫 `tests/test_moe_cache_s1_guards.py`：`sheet(live) = 0`，9 个变异全部被捕获。
+  ⚠️ 该守卫第一版**自己报红 4 条**——缺席断言被我自己写的 `PORT-DEVIATION` 注释命中（注释里点名了被删的符号）。
+  修法是结构性的：缺席行改在**屏蔽注释与字符串**的文本上判定（等长屏蔽，偏移不变），并补一个"以代码形式重新引入 EXL3 调用"的变异，
+  证明屏蔽确实生效而不是把断言改松了。
+- **行为证据：没有，且本机不可得**（开发机无 GPU）。CPU 编译只证明树一致，不编译 `.cu` 里的任何东西。

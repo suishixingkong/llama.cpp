@@ -1681,3 +1681,52 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+// fork buun-llama-cpp: ggml_cuda_moe_cache_mmv, generic arm.
+// PORT-DEVIATION: the fork's `if (!act_ids_dev && !force_dedicated)` guard is
+// gone. Its dedicated arm is unavailable here, so this arm serves every call;
+// moe-cache.cu refuses any node whose activation map is not modulo before it
+// gets here, which is what made the guard safe to drop.
+ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
+        const void * pool, ggml_type type0, const char * act_q8,
+        const int32_t * ids_dev, const int32_t * act_ids_dev,
+        float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
+        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+        bool force_dedicated, cudaStream_t stream) {
+
+    GGML_UNUSED(act_ids_dev);
+    GGML_UNUSED(force_dedicated);
+
+    const int64_t ts0 = ggml_type_size(type0);
+    GGML_ASSERT(slot_stride_bytes % ts0 == 0);
+
+    const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
+    const int64_t s01 = ggml_row_size(type0, n_in) / ts0;
+    const int64_t s02 = slot_stride_bytes / ts0;
+    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s12 = act_rows * s11;
+
+    ggml_cuda_mm_fusion_args_device fusion_local{};
+    mul_mat_vec_q_switch_type(
+        pool, type0, act_q8, ids_dev, fusion_local, dst_dev, n_in,
+        n_out, 1, s01, s12, n_out,
+        n_slots, act_rows, n_hits, s02, s11, n_out,
+        1, 1, s02*n_slots, s12, n_out*n_hits, n_hits, stream);
+
+    return ggml_cuda_moe_cache_mmv_path::generic;
+}
+
+// PORT-DEVIATION: the fork dispatched this through the dedicated fused kernel.
+void ggml_cuda_moe_cache_mmv_fused(
+        const void * up_pool, const void * gate_pool, ggml_type type0,
+        const char * act_q8, const int32_t * up_ids_dev,
+        const int32_t * gate_ids_dev, const int32_t * act_ids_dev,
+        float * dst_dev, int64_t n_in, int64_t n_out,
+        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+        float up_min, float up_max, float gate_min, float gate_max,
+        cudaStream_t stream) {
+    GGML_UNUSED_VARS(up_pool, gate_pool, type0, act_q8, up_ids_dev, gate_ids_dev, act_ids_dev,
+                     dst_dev, n_in, n_out, slot_stride_bytes, n_hits, act_rows,
+                     up_min, up_max, gate_min, gate_max, stream);
+    GGML_ABORT("fused MoE expert cache matvec is not available in this build");
+}
