@@ -14818,7 +14818,8 @@ CLI/tools 面：`common/arg.cpp`（其中 `:1686` 有一条
 #### 10.92.11 切片 S5 已落地：CLI / 参数面（2026-10-15，`9l-d5b S5`）
 
 **范围（实测后收窄）**：`common/common.h` + `common/common.cpp` + `common/arg.cpp` +
-`tests/test-arg-parser.cpp` 的替换注释与新增测试块。**4 文件 / +344 −3**。
+`tests/test-arg-parser.cpp` 的替换注释与新增测试块。**4 文件 / +369 −3**（逐文件 95 / 69 / 25 / 180；
+本文件自身 +122 另计，提交总计 5 文件 +491 −3）。
 10.92.5 给 S5 列的 fit / llama-bench / fit-params / server / 5 个测试 / 文档
 **不在本片**，它们仍是 S6–S9（下表按 10.92.5 的原编号不变）。
 
