@@ -25,10 +25,12 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -1712,6 +1714,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    // fork 9l-d5b: an explicit mode=on takes the automatic budget, so the repacking
+    // transform must stand down -- and this has to run after the command line is read.
+    if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
+        LOG_INF("explicit MoE cache mode disables weight repacking\n");
+        params.no_extra_bufts = true;
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -3769,6 +3778,92 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    // fork 9l-d5b: the --moe-cache cluster (fork arg.cpp 3815-3899) + its
+    // LLAMA_ARG_MOE_CACHE* environment variables.
+    add_opt(common_arg(
+        {"--moe-cache"}, "MODE",
+        "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
+        "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
+        "soft = try spare VRAM first, evict experts only as needed; "
+        "off/0 = disabled; N = VRAM budget in MiB per device without weight repacking)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache.mode_explicit = true;
+            params.moe_cache.fit_selected = false;
+
+            if (value == "off" || value == "0") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_OFF;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "auto") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_AUTO;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "soft") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_SOFT;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "on") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
+                params.moe_cache.budget_mib = 0;
+            } else {
+                char * end = nullptr;
+                errno = 0;
+                const long long budget_mb = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    budget_mb <= 0 || budget_mb > 1024 * 1024) {
+                    throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+                }
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
+                params.moe_cache.budget_mib = (size_t)budget_mb;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile"},
+        {"--no-moe-cache-profile"},
+        "persist a versioned per-model expert heatmap in the llama.cpp cache directory "
+        "and use it for bounded expert prewarming (default: enabled)",
+        [](common_params & params, bool value) {
+            params.moe_cache.profile = value;
+            if (!value) {
+                params.moe_cache.profile_path.clear();
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-expert-parallel"}, "N",
+        "split cached MoE expert rows across devices "
+        "(default: 0 = disabled; auto = provider policy; N = device fanout)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache.expert_parallel = -1;
+                return;
+            }
+            char * end = nullptr;
+            errno = 0;
+            const long long fanout = strtoll(value.c_str(), &end, 10);
+            if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                fanout < 0 || fanout > 8) {
+                throw std::invalid_argument("expected auto or a device fanout from 0 to 8");
+            }
+            params.moe_cache.expert_parallel = (int)fanout;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_EXPERT_PARALLEL"));
+    add_opt(common_arg(
+        {"--moe-cache-cpu-overlap"}, "auto|N",
+        "CPU-assigned cached expert rows per operation: auto uses the provider's size-aware policy, "
+        "0 keeps cache hits on GPU, 1..8 forces a CPU share; uncached experts stay on CPU",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache.cpu_overlap = -1;
+                return;
+            }
+            char * end = nullptr;
+            errno = 0;
+            const long long rows = strtoll(value.c_str(), &end, 10);
+            if (errno != 0 || end == value.c_str() || *end != '\0' || rows < 0 || rows > 8) {
+                throw std::invalid_argument("expected auto or a CPU row count from 0 to 8");
+            }
+            params.moe_cache.cpu_overlap = (int)rows;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

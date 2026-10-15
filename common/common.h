@@ -475,6 +475,25 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// fork 9l-d5b: the MoE expert cache parameter surface (fork common/common.h 568-585).
+enum common_moe_cache_mode {
+    COMMON_MOE_CACHE_MODE_OFF,
+    COMMON_MOE_CACHE_MODE_AUTO,
+    COMMON_MOE_CACHE_MODE_ON,
+    COMMON_MOE_CACHE_MODE_SOFT,
+};
+
+struct common_moe_cache_params {
+    common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
+    size_t budget_mib          = 0;
+    int expert_parallel        = 0;
+    int cpu_overlap            = -2; // -2 = inherit provider, -1 = auto, 0..8 = CPU rows
+    bool mode_explicit         = false;
+    bool fit_selected          = false;
+    bool profile               = true;
+    std::string profile_path;
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -624,6 +643,8 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    // fork 9l-d5b: the MoE expert cache parameters (fork common/common.h 731).
+    common_moe_cache_params moe_cache;
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation
@@ -1148,6 +1169,10 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
+
+// fork 9l-d5b: the MoE expert heatmap cache file (fork common/common.h 1244-1246).
+// Stable, versioned cache location for a model family's learned expert heatmap.
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]);
 std::string fs_get_config_directory();
 
 struct common_file_info {

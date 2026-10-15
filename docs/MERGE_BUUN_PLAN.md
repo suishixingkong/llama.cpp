@@ -14812,3 +14812,125 @@ CLI/tools 面：`common/arg.cpp`（其中 `:1686` 有一条
 `common/common.cpp|h`、`common/fit.cpp|h`、`llama-bench`、`fit-params`、`server-context`，
 外加 5 个测试与 `docs/backend/CUDA-MOE-CACHE.md`。
 做完 S5 才谈得上 `llama-bench --moe-cache off|auto` 的端到端 A/B。
+
+---
+
+#### 10.92.11 切片 S5 已落地：CLI / 参数面（2026-10-15，`9l-d5b S5`）
+
+**范围（实测后收窄）**：`common/common.h` + `common/common.cpp` + `common/arg.cpp` +
+`tests/test-arg-parser.cpp` 的替换注释与新增测试块。**4 文件 / +344 −3**。
+10.92.5 给 S5 列的 fit / llama-bench / fit-params / server / 5 个测试 / 文档
+**不在本片**，它们仍是 S6–S9（下表按 10.92.5 的原编号不变）。
+
+##### ⚠️ 10.92.5 的口径太窄：S5 不是"一个提交的面"
+
+10.92.5 只点了 `arg.cpp` + `common.{h,cpp}`，但**逐个 `git log -S` 后发现这四类符号来自 5 个提交**，
+而且其中一个提交把本特性和三个无关特性捆在一起：
+
+| 提交 | 本片需要的部分 | 同提交里的无关内容（**一律不进**） |
+|---|---|---|
+| `092e5fe37` | `--moe-cache` / `_profile` / `_expert-parallel` 的骨架、`no_extra_bufts` 耦合、`enum`+`struct` | — |
+| `5bcf27e57` | `if (params.moe_cache.mode_explicit)` 门（**默认不覆盖 provider 自己的设置**） | — |
+| `5a343d9be` | `--moe-cache-expert-parallel`、`expert_parallel` 字段 | — |
+| `15cd7dc11` | `--moe-cache soft` ⇒ `COMMON_MOE_CACHE_MODE_SOFT`（**映射到运行时 `ON`**） | — |
+| `fd56dfcdd` | `--moe-cache-profile`、`common_moe_cache_profile_file()`、profile 解析块、ctor 侧 rebind | `mmap_prefetch`、`n_threads_explicit`、`common_cpu_get_num_moe_threads()`（host-MoE 自动线程）、`ctx_mtp` / `has_non_mtp_model_drafter` |
+
+⇒ **`fd56dfcdd` 必须逐块取**，不能按提交整体 cherry-pick。四条无关内容在守卫里各有一条 `ABSENT` 行。
+
+##### 本片实际落地的四个选项与五个字段
+
+| CLI | 值域 | 落到 `common_params::moe_cache` | env |
+|---|---|---|---|
+| `--moe-cache` | `auto` / `on` / `soft` / `off` / `0` / `N`(MiB, 1…1048576) | `mode_explicit=true`、`fit_selected=false`、`mode`、`budget_mib` | `LLAMA_ARG_MOE_CACHE` |
+| `--moe-cache-profile` / `--no-…` | bool | `profile`（false 时顺带 `profile_path.clear()`） | `LLAMA_ARG_MOE_CACHE_PROFILE` |
+| `--moe-cache-expert-parallel` | `auto` / 0…8 | `expert_parallel`（`auto` ⇒ −1） | `LLAMA_ARG_MOE_CACHE_EXPERT_PARALLEL` |
+| `--moe-cache-cpu-overlap` | `auto` / 0…8 | `cpu_overlap`（`auto` ⇒ −1，默认 −2 = 继承 provider） | `LLAMA_ARG_MOE_CACHE_CPU_OVERLAP` |
+
+另加 fork `common_init_result` 里那段**已解析模式回声**（`:1577`）：
+`if (mode_explicit || fit_selected)` ⇒ `MoE cache: mode=<off|auto|soft|on> budget=<N MiB/device|free-minus-reserve>`，
+位置在 **fit 块之后、`llama_model_load_from_file()` 之前**（fork 亦然）。
+它只用 S5 的字段 ⇒ 本片一并落地；⚠️ `placement=cache-aware-fit` 那半截由 `fit_selected` 驱动，
+**在 S6 之前恒为空** —— 这与 fork 里"没选 fit 时"的形态逐字相同，不是桩。
+
+`common_context_params_to_llama()` 的映射**整体在 `if (params.moe_cache.mode_explicit)` 之内**
+（`mode` 三项；`budget_mib` / `expert_parallel` / `cpu_overlap` / `profile_path` 四项在门**外**无条件复制）。
+⇒ 「没写 `--moe-cache`」时 `cparams.moe_cache_mode` 保持 `UNSPECIFIED`，由 provider 自己的 env/默认值决定——
+这正是 `5bcf27e57` 的语义。**这条门是 S4 那条 INV1「创建点 == 配置点」的另一半**：
+S4 保证每个 sched 都被**配置**，S5 保证默认配置是"别覆盖"而不是"关掉"。
+
+⛔ **一处声明的 delta**：`--moe-cache-cpu-overlap` 的帮助串，fork 写
+`auto uses the type-specific policy (EXL3: 0)`。port **没有 EXL3**（provider 侧已在
+`moe-cache.cu:2678` 以 `PORT-DEVIATION` 注记删掉该分支），照抄等于在 `--help` 里声明一个不存在的默认值
+⇒ 改成 `auto uses the provider's size-aware policy`。**只是删掉一句不成立的说明，不是放宽任何判据**。
+
+##### ⭐ 本片是 MoE 线**第一次拿到行为证据**（此前 S1–S4 全部只有编译/结构级）
+
+TT 结果：`common.h`/`arg.cpp`/`common.cpp`/`test-arg-parser.cpp` 单 TU 各 `RC_COMPILE=0`；
+随后在 `D:\llama-build\cpu` 全量重建 **205/205，`RC_BUILD=0`**，并**真跑**：
+
+1. `bin/test-arg-parser.exe` ⇒ `test-arg-parser: all tests OK`，`RC=0`（断言活跃：文件里有 `#undef NDEBUG`）。
+   ⚠️ **Windows 上 env 块被 `#ifdef _WIN32` 跳过**（输出 `test-arg-parser: skip on windows build`）⇒
+   测试二进制**不能**作为 `LLAMA_ARG_MOE_CACHE*` 的证据，必须换渠道（见 3）。
+2. ⭐⭐ **七档单变量反向控制**（`llama-cli -m /nonexistent.gguf -lv 4`，只看守卫自己打的那行）：
+
+   | `--moe-cache` | `on` | `512` | `auto` | `off` | `0` | `soft` | 不给 |
+   |---|---|---|---|---|---|---|---|
+   | `explicit MoE cache mode disables weight repacking` 行数 | **1** | **1** | 0 | 0 | 0 | 0 | 0 |
+
+   「没变红」也是发现：`soft` **不**触发该耦合，与 fork 逐字一致（耦合只认 `COMMON_MOE_CACHE_MODE_ON`，
+   SOFT 是 fit 层的放置策略、运行时映射为 ON）⇒ 这一格证明耦合**不是**按"非 off 即真"写的。
+3. env 通道（绕开被跳过的测试块）：`LLAMA_ARG_MOE_CACHE=on` ⇒ 同一行出现 1 次；
+   `=invalid`、`_EXPERT_PARALLEL=9`、`_CPU_OVERLAP=9` 各报**具名**错：
+   `error while handling environment variable "LLAMA_ARG_MOE_CACHE_…": …`。
+4. ⭐ **模式回声七档**（同一命令，`grep -i "MoE cache:"`）：
+
+   | `--moe-cache` | 输出 |
+   |---|---|
+   | `on` | `MoE cache: mode=on budget=free-minus-reserve; use -lv 4 for …` |
+   | `512` | `MoE cache: mode=on budget=512 MiB/device; use -lv 4 for …` |
+   | `auto` | `MoE cache: mode=auto budget=free-minus-reserve; …` |
+   | `soft` | `MoE cache: mode=soft budget=free-minus-reserve; …` |
+   | `off` / `0` | `MoE cache: mode=off`（短式，无 budget） |
+   | 不给 | **0 行** |
+
+   这一组同时钉住三件事：`explicit` 门（不给就完全不打印）、budget 两分支（`N MiB/device` vs `free-minus-reserve`）、
+   以及 `soft` **按名字**回声（不是回落到 `on`）。四条断言各配一条守卫变异。
+5. `llama-cli -h` 里四个选项（含 `--no-moe-cache-profile` 与 env 标注）齐全。
+
+⚠️ **两条环境前提，下次直接复用**：
+- 构建必须自建 `INCLUDE`/`LIB`/`PATH`（本沙箱禁 `reg.exe` ⇒ 跑不了 `vsenv.bat`）；且
+  沙箱默认**拒绝写 `D:\llama-build\cpu\bin\*.dll`** ⇒ 链接阶段要显式放行，否则只会看到
+  "编译全过、`ninja: build stopped`"。
+- **server 型 CLI 默认不打 INFO**：`common_params::verbosity` 默认是 3（`LOG_LEVEL_INFO`），
+  但不带 `-lv 4` 时那行不出现 ⇒ **判"耦合没触发"之前先确认级别**（同记忆里的 ggml/server 级别坑）。
+
+##### 守卫 `test_moe_cache_s5_guards.py`：`sheet(live)=0`，**48/48 变异被捕获**
+
+七条跨 hunk 不变式（都不是"某一块在不在"）：
+
+- **INV1** arg.cpp 里那条耦合必须**在 `parse_cli_args()` 之后**。写在前面就会读到默认 `AUTO`，
+  `--moe-cache on` 静默保留 repack —— 纯文本断言看不见，只有次序能看见。反向变异"把耦合提到解析之前"已被捕获。
+- **INV2** `cparams.moe_cache_profile_path =` **恰好 2 处**（accessor 映射 + ctor 侧 rebind）。
+- **INV3** profile 解析必须落在 `llama_model_load_from_file()` 与 `llama_init_from_model()` **之间**，
+  且 rebind 必须落在 sampler 块与 `llama_init_from_model()` 之间。⚠️ ctor 的签名后跟
+  `: pimpl(new impl{})` ⇒ **花括号匹配会先咬到 `impl{}`**，必须从那一行的 body 花括号起算（初版就踩了这个）。
+- **INV4** 映射里出现的**去重字段名** == 5，且 == `include/llama.h` 公共块里 `moe_cache_*` 声明数
+  （**两侧成对**：加字段忘了接线 ⇒ 该字段恒取默认值，mode 恰好表现为 `UNSPECIFIED`，与"没配置"不可分）。
+- **INV5** `switch (params.moe_cache.mode)` 四个 `case` 标签齐全，**且不许出现 `default:`**
+  （无 `default` 时新增枚举值是 `-Wswitch`；有 `default` 就变成静默漏配）。
+- **INV6** 测试里 `setenv("LLAMA_ARG_MOE_CACHE*")` 的**每个名字**都得能在 arg.cpp 里找到
+  `.set_env("同名")`。⚠️ 初版用 `setenv("X"` 做子串匹配，被 `unsetenv("X")` 骗过 ⇒ 必须 `\bsetenv`。
+- **INV7** `COMMON_MOE_CACHE_MODE_SOFT` 的**逐文件计数**必须是 (enum 1, parser 1, common.cpp 2 = 映射 + 回声)。
+
+`ABSENT` 行 5 条：fd56dfcdd 的三个无关特性（`common_cpu_get_num_moe_threads` /
+`llama_model_has_host_moe_weights` / `n_threads_explicit` / `mmap_prefetch`），
+外加一条**前向依赖** —— `&params.moe_cache` 出现在 `common_fit_params(` 调用里即红，
+因为那是 **S6 的改动**；S6 落地时应把该行**改成 MUST**（不是删掉）。
+
+##### ⏳ 剩余（10.92.5 的 S6–S9 原编号）
+
+`S6` = `common/fit.{h,cpp}` + `fit-params.cpp`（含 ctor 里 `moe_cache_before` 的 fit 快照/回滚、`fit_selected`）；
+`S7` = `llama-bench` 臂（做到才谈得上 `llama-bench --moe-cache off|auto` 的端到端 A/B）；
+`S8` = `test-moe-cache*` 4 个测试 + `tests/CMakeLists.txt`（CUDA 门在本机不可达 ⇒ 只能报 compile+link）；
+`S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
+

@@ -3,14 +3,14 @@
 #include "download.h"
 #include "llama.h"
 // fork 9l-d4b9p: the VBR argument-parsing tests below are the fork's, landed verbatim.
-// Five of the fork's blocks in this file are deliberately NOT landed:
+// Four of the fork's blocks in this file are deliberately NOT landed:
 //   * the common_speculative_mtp_context_* block (symbols absent)          [fork 47-77]
 //   * the base->speculative cpuparams/devices/drafter-role blocks          [fork 237-326]
 //     (n_threads_explicit / has_external_mtp_sidecar / uses_native_mtp_as_primary_drafter
 //      / common_speculative_configure_draft_model_parent are all absent here)
 //   * n_max_set / --spec-draft-temp / --spec-mtp-vocab-size                 [fork 506-536]
-//   * the --moe-cache CLI cluster and the LLAMA_ARG_MOE_CACHE_* env cluster [fork 1097-1304]
-//     (the MoE expert cache is out of scope for this port)
+// fork 9l-d5b S5: the --moe-cache CLI cluster and the LLAMA_ARG_MOE_CACHE_* env cluster
+// [fork 1097-1304] ARE landed in test() below -- the MoE expert cache is in scope for this port.
 // The kv-stream lines this file already had are preserved (see the note in test()).
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-iswa.h"
@@ -1033,6 +1033,144 @@ static void test(void) {
 #endif
     }
 
+    printf("test-arg-parser: test MoE cache and repack modes\n\n");
+
+    {
+        common_params mode_params;
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.mode_explicit == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED);
+    }
+
+    const std::vector<std::vector<std::string>> invalid_moe_cache_args = {
+        {"binary_name", "--moe-cache"},
+        {"binary_name", "--moe-cache", "invalid"},
+        {"binary_name", "--moe-cache", "-1"},
+        {"binary_name", "--moe-cache", "1048577"},
+        {"binary_name", "--moe-cache", "256x"},
+        {"binary_name", "--moe-cache", "999999999999999999999999"},
+        {"binary_name", "--moe-cache-expert-parallel", "-1"},
+        {"binary_name", "--moe-cache-expert-parallel", "9"},
+        {"binary_name", "--moe-cache-expert-parallel", "invalid"},
+        {"binary_name", "--moe-cache-cpu-overlap"},
+        {"binary_name", "--moe-cache-cpu-overlap", "-1"},
+        {"binary_name", "--moe-cache-cpu-overlap", "9"},
+        {"binary_name", "--moe-cache-cpu-overlap", "2x"},
+    };
+    for (auto invalid_argv : invalid_moe_cache_args) {
+        common_params mode_params;
+        assert(false == common_params_parse(
+                invalid_argv.size(), list_str_to_char(invalid_argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    for (const std::string value : {"auto", "0", "2", "8"}) {
+        common_params mode_params;
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == -2);
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-cpu-overlap", value};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        const int expected = value == "auto" ? -1 : std::stoi(value);
+        assert(mode_params.moe_cache.cpu_overlap == expected);
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == expected);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "auto"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == -1);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == -1);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf",
+                "--moe-cache-expert-parallel", "3"};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(),
+                mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.expert_parallel == 3);
+        assert(common_context_params_to_llama(mode_params).moe_cache_expert_parallel == 3);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == false);
+        const llama_context_params cparams = common_context_params_to_llama(mode_params);
+        assert(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO);
+        assert(cparams.moe_cache_budget_mib == 0);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "on", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == true);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--repack", "--moe-cache", "256"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 256);
+        assert(mode_params.no_extra_bufts == true);
+        const llama_context_params cparams = common_context_params_to_llama(mode_params);
+        assert(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_ON);
+        assert(cparams.moe_cache_budget_mib == 256);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "1048576"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.budget_mib == 1048576);
+        assert(mode_params.no_extra_bufts == true);
+        assert(common_context_params_to_llama(mode_params).moe_cache_budget_mib == 1048576);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "256", "--moe-cache", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "off", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.budget_mib == 0);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");
@@ -1063,6 +1201,45 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MLOCK);
+
+    unsetenv("LLAMA_ARG_LOAD_MODE");
+    setenv("LLAMA_ARG_MOE_CACHE", "invalid", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    setenv("LLAMA_ARG_MOE_CACHE", "on", true);
+    {
+        common_params mode_params;
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == true);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "--moe-cache", "off"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF);
+        assert(mode_params.moe_cache.mode_explicit == true);
+        assert(mode_params.no_extra_bufts == false);
+        assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
+    }
+    unsetenv("LLAMA_ARG_MOE_CACHE");
+
+    setenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP", "2", true);
+    for (bool explicit_auto : {false, true}) {
+        common_params overlap_params;
+        argv = {"binary_name"};
+        if (explicit_auto) {
+            argv.push_back("--moe-cache-cpu-overlap");
+            argv.push_back("auto");
+        }
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), overlap_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_context_params_to_llama(overlap_params).moe_cache_cpu_overlap == (explicit_auto ? -1 : 2));
+    }
+    unsetenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP");
 
     setenv("LLAMA_ARG_LOAD_MODE", "mmap+mlock", true);
     argv = {"binary_name"};

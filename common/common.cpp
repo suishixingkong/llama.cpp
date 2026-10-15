@@ -1435,6 +1435,19 @@ void common_params_resolve_vbr_codec_auto(common_params & params) {
     common_params_resolve_vbr_codec_auto_from_model(params, probe.get());
 }
 
+// fork 9l-d5b: the MoE expert heatmap cache file (fork common.cpp 1391-1400).
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]) {
+    if (!semantic_digest) {
+        throw std::invalid_argument("missing model semantic digest");
+    }
+    char hex[65];
+    for (size_t i = 0; i < 32; ++i) {
+        snprintf(hex + 2*i, 3, "%02x", semantic_digest[i]);
+    }
+    hex[64] = '\0';
+    return fs_get_cache_file(string_format("moe-experts-%s.v1", hex));
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1500,6 +1513,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
+    // fork 9l-d5b: echo the resolved MoE cache policy (fork common.cpp 1577-1588).
+    if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
+        const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+        const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
+        if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
+            COM_INF("%s", "MoE cache: mode=off\n");
+        } else if (params.moe_cache.budget_mib > 0) {
+            COM_INF("MoE cache: mode=%s budget=%zu MiB/device%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, params.moe_cache.budget_mib, placement);
+        } else {
+            COM_INF("MoE cache: mode=%s budget=free-minus-reserve%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, placement);
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1521,6 +1549,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (!fit_runs) {
         common_params_resolve_vbr_codec_auto_from_model(params, model);
         cparams = common_context_params_to_llama(params);
+    }
+
+    // fork 9l-d5b: name the versioned per-model heatmap file (fork common.cpp 1612-1624).
+    if (params.moe_cache.profile && params.moe_cache.profile_path.empty() &&
+            params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF) {
+        uint8_t digest[32];
+        if (llama_model_semantic_family_digest(model, digest)) {
+            try {
+                params.moe_cache.profile_path = common_moe_cache_profile_file(digest);
+            } catch (const std::exception & e) {
+                COM_WRN("MoE cache profile disabled: %s\n", e.what());
+            }
+        } else {
+            COM_WRN("%s", "MoE cache profile disabled: model has no semantic identity\n");
+        }
     }
 
     // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
@@ -1592,6 +1635,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // fork 9l-d5b: Fitting may replace params.moe_cache while restoring a recoverable
+    // fallback. Rebind the borrowed C pointer after the final policy decision.
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
@@ -2008,6 +2055,28 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.vbr_pin_k = params.vbr_pin_k();
     cparams.vbr_pin_v = params.vbr_pin_v();
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
+
+    // fork 9l-d5b: the cache parameters reach the context, but only an explicit
+    // request may override whatever the provider resolved on its own (fork 5bcf27e57).
+    if (params.moe_cache.mode_explicit) {
+        switch (params.moe_cache.mode) {
+            case COMMON_MOE_CACHE_MODE_OFF:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+                break;
+            case COMMON_MOE_CACHE_MODE_AUTO:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
+                break;
+            case COMMON_MOE_CACHE_MODE_ON:
+            case COMMON_MOE_CACHE_MODE_SOFT:
+                cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
+                break;
+        }
+    }
+    cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
+    cparams.moe_cache_cpu_overlap = params.moe_cache.cpu_overlap;
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
 
     return cparams;
 }
