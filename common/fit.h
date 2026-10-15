@@ -3,7 +3,58 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstdint>
+#include <string>
 #include <vector>
+
+// fork 9l-d5b S6: the MoE cache fit-planning surface (fork fit.h 10-55).
+
+struct common_moe_cache_params;
+
+const char * common_moe_cache_tensor_override_pattern();
+
+struct common_moe_cache_fit_device_input {
+    int physical_device = -1;
+    int compute_capability = 0;
+    int64_t free_bytes = 0;
+    size_t used_bytes = 0;
+    size_t reserve_bytes = 0;
+};
+
+struct common_moe_cache_fit_shape_input {
+    enum ggml_type type = GGML_TYPE_COUNT;
+    size_t expert_size = 0;
+    size_t tensor_bytes = 0;
+    size_t scratch_bytes = 0;
+    size_t pool_bytes = 0;
+    bool cacheable = false;
+};
+
+struct common_moe_cache_fit_device {
+    int physical_device = -1;
+    int compute_capability = 0;
+    int64_t free_bytes = 0;
+    int64_t used_bytes = 0;
+    size_t cache_bytes = 0;
+    size_t reserve_bytes = 0;
+};
+
+struct common_moe_cache_fit_result {
+    bool feasible = false;
+    std::string reason;
+    std::vector<common_moe_cache_fit_device> devices;
+    size_t expert_bytes = 0;
+    size_t cache_bytes = 0;
+    size_t minimum_device_bytes = 0;
+};
+
+common_moe_cache_fit_result common_moe_cache_plan_fit(
+        const std::vector<common_moe_cache_fit_device_input> & devices,
+        const std::vector<common_moe_cache_fit_shape_input> & shapes,
+        size_t reserve_bytes,
+        size_t budget_bytes,
+        int min_devices,
+        size_t minimum_slab_bytes = 0);
 
 enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit

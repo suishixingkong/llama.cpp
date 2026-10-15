@@ -6,10 +6,12 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -52,6 +54,164 @@ double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_pe
         return 1.0;
     }
     return std::max(1.0, floor_bits_per_token / price_bits_per_token);
+}
+
+// fork 9l-d5b S6: the MoE cache fit planner (fork fit.cpp 235-388). It consumes
+// only the plain fit inputs declared in fit.h; the adapter that fills them from
+// model and device facts is a later slice.
+const char * common_moe_cache_tensor_override_pattern() {
+    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+}
+
+struct common_moe_cache_fit_pool {
+    ggml_type type = GGML_TYPE_COUNT;
+    size_t expert_size = 0;
+    size_t pool_bytes = 0;
+    size_t tensor_bytes = 0;
+    size_t scratch_bytes = 0;
+};
+
+common_moe_cache_fit_result common_moe_cache_plan_fit(
+        const std::vector<common_moe_cache_fit_device_input> & device_inputs,
+        const std::vector<common_moe_cache_fit_shape_input> & shapes,
+        size_t reserve_bytes,
+        size_t budget_bytes,
+        int min_devices,
+        size_t minimum_slab_bytes) {
+    common_moe_cache_fit_result result;
+
+    for (const common_moe_cache_fit_device_input & input : device_inputs) {
+        if (input.physical_device < 0 || input.free_bytes < 0 || input.used_bytes > INT64_MAX) {
+            result.reason = "device memory accounting overflowed";
+            return result;
+        }
+
+        size_t device_index = result.devices.size();
+        for (size_t candidate = 0; candidate < result.devices.size(); candidate++) {
+            if (result.devices[candidate].physical_device == input.physical_device) {
+                device_index = candidate;
+                break;
+            }
+        }
+        if (device_index == result.devices.size()) {
+            common_moe_cache_fit_device device;
+            device.physical_device = input.physical_device;
+            device.compute_capability = input.compute_capability;
+            device.free_bytes = input.free_bytes;
+            device.reserve_bytes = input.reserve_bytes;
+            result.devices.push_back(device);
+        }
+
+        common_moe_cache_fit_device & device = result.devices[device_index];
+        device.free_bytes = std::min(device.free_bytes, input.free_bytes);
+        device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        device.reserve_bytes = std::max(device.reserve_bytes, input.reserve_bytes);
+        if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
+            result.reason = "device memory accounting overflowed";
+            return result;
+        }
+        device.used_bytes += (int64_t)input.used_bytes;
+    }
+    if (result.devices.empty()) {
+        result.reason = "no selected device satisfies the cache hardware policy";
+        return result;
+    }
+
+    for (common_moe_cache_fit_device & device : result.devices) {
+        const int64_t projected_free = device.free_bytes - device.used_bytes;
+        const size_t effective_reserve = device.reserve_bytes > 0
+            ? device.reserve_bytes : reserve_bytes;
+        if (projected_free <= 0 || (uint64_t)projected_free <= effective_reserve) {
+            continue;
+        }
+        device.cache_bytes = (size_t)projected_free - effective_reserve;
+        if (budget_bytes > 0) {
+            device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
+        }
+    }
+
+    std::vector<common_moe_cache_fit_pool> pools;
+    for (const common_moe_cache_fit_shape_input & shape : shapes) {
+        if (shape.tensor_bytes == 0 || shape.tensor_bytes > SIZE_MAX - result.expert_bytes) {
+            result.reason = "the routed expert tensor inventory overflowed";
+            return result;
+        }
+        result.expert_bytes += shape.tensor_bytes;
+        if (!shape.cacheable) {
+            continue;
+        }
+        bool found = false;
+        for (common_moe_cache_fit_pool & pool : pools) {
+            if (pool.type == shape.type && pool.expert_size == shape.expert_size) {
+                pool.pool_bytes = std::max(pool.pool_bytes, shape.pool_bytes);
+                pool.tensor_bytes += shape.tensor_bytes;
+                pool.scratch_bytes = std::max(pool.scratch_bytes, shape.scratch_bytes);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            pools.push_back({shape.type, shape.expert_size, shape.pool_bytes,
+                    shape.tensor_bytes, shape.scratch_bytes});
+        }
+    }
+
+    size_t scratch_bytes = 0;
+    size_t supported_bytes = 0;
+    for (const common_moe_cache_fit_pool & pool : pools) {
+        if (pool.tensor_bytes < pool.pool_bytes) {
+            continue;
+        }
+        supported_bytes += pool.tensor_bytes;
+        scratch_bytes = std::max(scratch_bytes, pool.scratch_bytes);
+    }
+    if (supported_bytes == 0) {
+        result.reason = "no routed expert shape is cacheable";
+        return result;
+    }
+    if (supported_bytes != result.expert_bytes) {
+        result.reason = "some routed expert weights would remain permanently uncached";
+        return result;
+    }
+
+    size_t minimum_pool_bytes = 0;
+    for (const common_moe_cache_fit_pool & pool : pools) {
+        if (pool.tensor_bytes < pool.pool_bytes) {
+            continue;
+        }
+        if (pool.pool_bytes > SIZE_MAX - minimum_pool_bytes) {
+            result.reason = "the minimum cache pool inventory overflowed";
+            return result;
+        }
+        minimum_pool_bytes += pool.pool_bytes;
+    }
+    minimum_pool_bytes = std::max(minimum_pool_bytes, minimum_slab_bytes);
+    if (minimum_pool_bytes > SIZE_MAX - scratch_bytes) {
+        result.reason = "the minimum cache pool inventory overflowed";
+        return result;
+    }
+    result.minimum_device_bytes = scratch_bytes + minimum_pool_bytes;
+
+    int useful_devices = 0;
+    for (const common_moe_cache_fit_device & device : result.devices) {
+        if (device.cache_bytes < result.minimum_device_bytes) {
+            continue;
+        }
+        useful_devices++;
+        if (device.cache_bytes > SIZE_MAX - result.cache_bytes) {
+            result.cache_bytes = SIZE_MAX;
+        } else {
+            result.cache_bytes += device.cache_bytes;
+        }
+    }
+    if (useful_devices < min_devices) {
+        result.reason = "too few devices can hold the minimum expert pools";
+        return result;
+    }
+
+    result.feasible = true;
+    result.reason = "cache pools are feasible";
+    return result;
 }
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
