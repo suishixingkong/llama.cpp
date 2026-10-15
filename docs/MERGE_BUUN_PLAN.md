@@ -14293,7 +14293,8 @@ VBR 臂查 `vbr_controller_active()` 并打印 `"VBR sharing gate requires an ar
 | R3 | artifact-adopt 驱动尾五模式 | 38 | 设备 | 五模式全 `-cuda` 结尾 |
 | R4 | `test-recurrent-state-rollback` VBR 臂 —— **已移植 + 已设备验证**（`1c8ff2e31`，2026-10-12） | 27 → **0** | **已闭环**（1/3 臂未取证、成因已定位） | `share_attn_prefix_vbr` **6/6 PASS**（`--vbr-vram 25M`）；`share_live_prefix_swa` **6/6 PASS**；`share_media_swa_prefix` historical 分支 PASS，VBR 分支**定性不可达**（根因 = 页粒度：SWA 每 extent 1 MiB < 2048 KiB 页 ⇒ projection 恒 48 MiB；base 是 12→24 MiB 台阶、台阶点落在窗口内 ⇒ 卡住的一直是 SWA；**一类**模型皆然） |
 | R5 | **QSA 生产代码**（`qsa_selection_safe` 等） | 未量 | **非 VBR** | port 全树 **0 命中**；fork 的 `src/models/qwen4exp.cpp` 调用 **2 次** |
-| R6 | `load_impl<Observed>`/`test-moe-cache*`/DFlash/Bonsai/EXL3 | 未量 | 既定排除 | 用户裁定 |
+| ~~R6~~ | `load_impl<Observed>`/DFlash/Bonsai/EXL3 | 未量 | 既定排除 | 用户裁定 |
+| **R6b** | `test-moe-cache*`（MoE 专家缓存） | **已量，见 §10.92** | **2026-10-15 改判：纳入移植**，不再是残差 | 用户改判（VBR 完成后继续下一个特性） |
 
 ### 什么会推翻本终审
 
@@ -14326,3 +14327,105 @@ fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交
 ③ 前缀投影是 attention-only，拒绝一切带伴随件（recurrent）的工件 ⇒ hybrid 目标只能走整件导入。
 ⇒ 当前部署下**只有 `-np 1` 可用**；且导入成本近似固定（与 token 数无关）⇒ 仅在长 prompt 上划算
 （交叉点约 7k token；8k 省 ~12%、12k 省 ~40%）。
+
+### §10.92 功能 #4 MoE 专家缓存：**改判为纳入移植** + 工作量评估（2026-10-15）
+
+> ⚠️ **节号说明**：`:5711` 有一处指向 `§10.91 lease_obs` 的散文引用，但树里**没有** §10.91 标题 ⇒ 本节取 §10.92，不占用该号。
+
+> **决策变更（覆盖旧记录）**：2026-10-15 用户裁定把 MoE 专家缓存从「既定排除」改为**纳入移植范围**。
+> 下列旧结论**作废**，以本节为准：`§三` 清单第 4 行的排除标注、`:2562` `common_moe_cache_evaluate_fit`「不移植（按设计排除）」、
+> `:2640` fit-params「按设计排除」、`:2263`「port 完全没有 moe-cache 特征，故刻意不引入」（**该句的测量仍成立**——它描述的是
+> 2026-09-27 那一刻的树；**决策**不再成立）、`:13352`/`:13361` 的「非 VBR ⇒ 排除」裁定（**归属裁定仍成立**：它确实不是 VBR 的一部分，
+> 现在是独立的一条移植线）、`:13730` 的「全 0 ⇒ 既定排除」、以及残差表 **R6**（`:14296`）中的 `test-moe-cache*` 一项。
+> ⚠️ R6 的其余项（`load_impl<Observed>` / DFlash / Bonsai / EXL3 / `.safetensors`）**维持排除不变**。
+> ⚠️ `tests/test-arg-parser.cpp` 顶部「the MoE expert cache is out of scope for this port」这句**随第 5 片落地一并替换**（§50.1）。
+
+**特性是什么**：让「放不进显存、只能驻留 host 的 MoE 路由专家权重」在解码时也用 GPU 算——VRAM 里按张量形状建 LRU 专家池，
+命中行走 CUDA 量化 matvec，未命中行留在 CPU，后台低优先级流异步填充。权威描述见 fork 的 `docs/backend/CUDA-MOE-CACHE.md`。
+与 VBR **零耦合**（`test-moe-cache.cpp` 对 `vbr` 的命中数为 **0**）⇒ 独立切片线。
+
+#### 10.92.1 移植面（实测，非清单摘抄）
+
+| 类别 | 文件 | 行数 |
+|---|---|---:|
+| **新增·生产** | `ggml/src/ggml-cuda/moe-cache.cu` | 4,448 |
+| | `ggml/src/ggml-backend-moe-cache.h`（provider API 抽象） | 152 |
+| | `ggml/src/ggml-cuda/moe-cache.cuh`（注册入口声明） | 19 |
+| | `ggml/src/ggml-cuda/moe-cache-mmv-tuning.h`（flat-hits 选择器） | 21 |
+| | **小计** | **4,640** |
+| **新增·测试** | `test-moe-cache.cpp`（无模型，4,313）/ `test-moe-cache-fit.cpp`（274）/ `test-cuda-moe-cache-flat-hits.cpp`（210）/ `…-selector.cpp`（38） | **4,835** |
+| **新增·文档** | `docs/backend/CUDA-MOE-CACHE.md` | 305 |
+| **改·共享文件** | 19 个文件 / 131 个 diff 块 / **567 行**落在 fork-port 改动区（等值文本命中 **0**） | 567 |
+
+共享文件侧逐项（`提及行`= 该文件里命中 moe-cache token 的行数）：
+
+| 文件 | fork/port 行数 | 提及行 | 归属 |
+|---|---:|---:|---|
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 5,337 / 4,216 | 89 | **51 行在 `mul_mat_id` 内** + 5 个新函数：`weight_is_eligible`(12)、`struct fusion`(12)、**`can_fuse`(166)**、`swiglu_masked`(46)、`try_fuse_moe_cache` |
+| `ggml/src/ggml-cuda/mmvq.cu` / `.cuh` | 3,100 / 1,683 · 157 / 18 | 83 / 6 | 新 CUDA kernel `mul_mat_vec_q_moe`(1918) + `ggml_cuda_moe_cache_mmv`(2952) + `…_fused`(3053) |
+| `common/fit.cpp` / `.h` | 2,518 / 1,600 | 71 / 11 | `common_moe_cache_tensor_override_pattern` + `common_moe_cache_evaluate_fit` |
+| `tools/llama-bench/llama-bench.cpp` | 3,128 / 2,769 | 87 | bench 臂（模式解析/强制 canonical 权重/统计字段） |
+| `src/llama-context.cpp` | 8,858 / 5,849 | 54 | `sched_reserve`(28) + `resolve_fused_ops`(14) + 默认参数(5) |
+| `common/common.cpp` / `.h` | 2,919·1,766 / 2,812·1,682 | 32 / 12 | profile 文件名、params 解析、context 参数转换、`llm_ffn_exps_cpu_override` |
+| `common/arg.cpp` | 6,041 / 5,810 | 32 | `--moe-cache*` CLI 簇 + `LLAMA_ARG_MOE_CACHE*` env 簇 |
+| `ggml/src/ggml-backend.cpp` | 2,650 / 2,545 | 46 | **14 处**：`sched_compute_splits` session enter/leave(22)、`sched_free`(3)、`ggml_moe_cache_unregister`(3)、**12 个 buffer/tensor API 各 1 行 invalidate** |
+| `include/llama.h` / `src/llama-cparams.h` | 2,112·170 / 1,844·86 | 10 / 5 | 公开 cparams 字段 + setter（⚠️ `include/llama.h` 有 170 个 includer） |
+| `tools/server/server-context.cpp` | 22,995 / 21,214 | **3** | 仅 DSpark GPU-assist 一处（`dspark_gpu_assist`，含 `moe_cache.mode != OFF` 合取项） |
+| `ggml-cuda.cu` / `ggml-backend-reg.cpp` / `ggml-cuda/CMakeLists.txt` / `tests/CMakeLists.txt` | — | 9 / 2 / 3 / 18 | 注册、trim、proc address、构建与测试注册 |
+
+#### 10.92.2 依赖链裁定（逐条实测）
+
+| # | 依赖 | 裁定 | 依据 |
+|---|---|---|---|
+| D1 | **核心 TU 的闭包** | ✅ **自足**，可整文件落地 | `moe-cache.cu` 1,033 标识符 / port 缺失 429 / 其中 **390 是局部或参数** / 真缺失候选 **39**；复核后真外部仅 4 类（D2–D4） |
+| D2 | `GGML_TYPE_Q8_0_G128` | ⚠️ **删 1 个 case 标签 + 记录** | 它是 fork-only quant 块（Bonsai/EXL3 同族）；全文件只出现在 `moe_cache_type_supported` 的 `case` 列表里（`:1135`）。**不把整个 quant 块拖进来** |
+| D3 | `MOVEFILE_REPLACE_EXISTING` / `std::multiset` | ✅ 无需动作 | Win32 API / 标准库 |
+| D4 | 18 个 `GGML_CUDA_MOE_CACHE_*` | ✅ 自足 | 全部是文件内 `getenv` |
+| D5 | **`ggml_mmid_window_lo/n_local/expert_index`** | ⛔ **不是前置** | 它是另一个 fork 特性（`ggml_mul_mat_id_set_expert_window`，写 `op_params[4]/[5]`）。**实测 fork 自己的生产代码也没有调用方**——只有 `ggml-cuda.cu:3403` 的 shadow 清零与 5 个测试文件 ⇒ hook 用中性值 `(lo=0, n_local=0)` 即可，**不构成阻塞** |
+| D6 | `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` / `ggml_backend_buffer_is_host` / `get_usage` | ✅ port 已有 | 分别 7 / 8 / 8 个文件命中 |
+| D7 | **EXL3 耦合** | ⚠️ 逐点裁定 | `type_supported` 的 EXL3 case、`ggml_moe_cache_effective_min_expert_bytes` 的 128 KiB 门限、`ggml_type_is_exl3()`、`ggml_cuda_moe_cache_mmv` 的 EXL3 专用 kernel。port 无 EXL3 ⇒ 逐处删除或留桩并记录，**不引入 EXL3** |
+| D8 | `mmvq.cu` 的 MoE MMV | ⚠️⚠️ **拆成两半，见 10.92.3** | `moe-cache.cu:3122/3132/3155/3174` 调用 `ggml_cuda_moe_cache_mmv{,_fused}` ⇒ 缺它**链接不过**。但实测两个入口的依赖完全不同（下一节） |
+| D9 | `--fit` cache-aware 布局 | ⚠️ 可后置 | `common/fit.cpp` 的 71 行是**布局建议**层；不开 fit 时缓存仍可用（`--moe-cache on` / 固定预算 + canonical CPU 权重） |
+| D10 | server 侧 | ✅ **只有 3 行** | `dspark_gpu_assist` 一处，且以 DSpark 为合取项 ⇒ **DSpark 既定排除 ⇒ 这 3 行在本树天然不可达**，可最后处理或直接断言为缺席 |
+
+#### 10.92.3 ⚠️ `mmvq.cu` 的两个入口依赖完全不同 —— 这是本特性唯一的真实设计岔路
+
+初评写的是「`mmvq.cu` drift 巨大（1,683 vs 3,100），按 §5g 选方法」。**逐函数读完后这个说法不成立**，必须拆开：
+
+| 入口 | fork 侧实现 | 依赖 | 裁定 |
+|---|---|---|---|
+| `ggml_cuda_moe_cache_mmv`（**非融合**dispatch） | 有**两条**路：`!act_ids_dev && !force_dedicated` ⇒ 调**已有的** `mul_mat_vec_q_switch_type`（modulo-index 路径，fork 文档称其为默认）；否则 ⇒ `mul_mat_vec_q_moe_cache_launch<type>` | **generic 路只需 port 已有的 MMVQ**。两侧 `mul_mat_vec_q_switch_type` 的参数表**逐项相同**，只差 fusion 参数类型（port `ggml_cuda_mm_fusion_args_device` / fork `ggml_cuda_mmvq_fusion_args_device`，后者**继承**前者）与 fork 多一个默认值参数 `bool allow_small_k = true` | ✅ **可移植**，适配点是**一个类型名**（generic 路只用默认构造的空 fusion 结构 ⇒ 切片到基类**语义等价**） |
+| `ggml_cuda_moe_cache_mmv_fused`（**融合** up×GLU(gate) dispatch） | **只有** dedicated 路：`mul_mat_vec_q_moe_cache_launch<type, true, has_clamp>` | 需要 fork 演进的 MoE kernel（多 `has_clamp` / `flat_hits` / gate 融合 / clamp 参数）、`ggml_cuda_mmvq_fusion_args_device`、`mmvq_has_existing_fusion`、launch 辅助 |⛔ **连带 fork 的 MMVQ 演进** |
+
+专用/融合路径的 delta 实测（fork `mmvq.cu`）：struct `51-60`(10) + kernel `1918-2105`(188，port 同名函数 `936-1081` 只有 146，是**演进关系不是替换**) +
+`mmvq_has_existing_fusion` `2119-2122`(4) + launch 辅助 `2126-2153`(28)/`2159-2189`(31)/`2192-~2330`(~140) ≈ **460–480 行，全在一个 drift 最大的文件里**。
+⚠️ 最危险的不是这480 行，而是**把 port 的 `mul_mat_vec_q_switch_type` 签名改成 fork 那个**（多一个 `allow_small_k`、换fusion 类型）
+—— 那会波及 port 里**每一个** MMVQ 调用点。
+
+⇒ 由此产生本特性唯一的范围决策：**S1 先只做 generic 路（融合留空），还是一次做全**。
+融合留空是**安全的**：`fused_begin` 是 CPU 侧 `ggml_cpu_try_fuse_moe_cache` 调的 vtable 槽，返回 `nullptr` 即「本节点不融合、走 stock CPU 路径」，
+**不触碰正确性**，代价是丢掉 fork 实测的融合增益（DeepSeek-V4 +2.18%、GLM-5.2 MTP +7.96%）。
+
+#### 10.92.4 设备可行性（V100 / sm_70）
+
+- 门是 `GGML_CUDA_MOE_CACHE_MIN_CC`，默认 **700** ⇒ **V100 恰好过线**（fork 文档写「compute capability 7.0 or newer」）。
+- ⚠️ `moe-cache-mmv-tuning.h` 的 flat-hits 选择器**只对 `cc == 860`（RTX 3090）调优** ⇒ V100 恒走 `factor_1`。
+- ⚠️ **fork 的全部性能数字来自 4× / 2× RTX 3090**（decode +18%~+80%）。**V100 上没有任何可引用的基线**，必须自测；
+  V100 16 GiB 下 auto 预算 ≈ `free − reserve`（reserve 默认 6% → 128 MiB 下取整、夹到 1024–3072 MiB），池容量需实测。
+- ⚠️ 与本项目既有结论一致：本机 CPU 树（`D:/llama-build/cpu`）**跑不了这条路径**（无 GPU），CPU 编译只是树一致性检查。
+
+#### 10.92.5 切片计划（按依赖顺序，先 inert 后行为）
+
+| 片 | 内容 | 行为 | 证据级别（无 GPU 时） |
+|---|---|---|---|
+| **S1** | `ggml-backend-moe-cache.h` + `moe-cache.cuh` + `moe-cache.cu` + `moe-cache-mmv-tuning.h` + `mmvq.cu/cuh` 的 MoE 块 + `ggml-cuda.cu` 注册 + `ggml-cuda/CMakeLists.txt` | inert（无消费者） | 编译 + 链接 + **obj 探针（mangled 名）** + 逐字节保真守卫 + 被删的 fork-only 类型 case 断言为缺席 |
+| **S2** | `ggml-backend.cpp`：session enter/leave/destroy + `sched_free` + 12 处 invalidate + `ggml_backend_sched_set_moe_cache` | inert | 编译 + 探针；断言 12 个 API 各自那一行 |
+| **S3** | `ggml-cpu.c`：`mul_mat_id` hook + `can_fuse` / `swiglu_masked` / `try_fuse` | ✅ **第一个行为切片** | 编译 + 探针 + **区域级三方合并的逐块守卫**（port 的函数名/结构与 fork 不同：port 无 `_impl` 拆分、另有 IQP 路径） |
+| **S4** | `llama-cparams.h` + `include/llama.h` + `llama-context.cpp`（`sched_reserve` / `resolve_fused_ops`） | ✅ 接线 | 编译 + 全树 includer 回归（⚠️ 公共头） |
+| **S5** | `arg.cpp` + `common.{h,cpp}` + 替换 `test-arg-parser.cpp` 的过期注释 | ✅ 用户可见 | `--help` 出现该簇 + 反向控制 |
+| **S6** | `fit.{h,cpp}` + `fit-params.cpp` | 布局建议 | 编译 + CLI |
+| **S7** | `llama-bench.cpp` 臂 | ✅ 可测 | 编译 + 参数解析 |
+| **S8** | `test-moe-cache.cpp` 等 4 个测试 + `tests/CMakeLists.txt` | — | 编译 + **CUDA 门在此机不可达 ⇒ 只报 compile+link** |
+| **S9** | server 3 行 + `--no-spec-dspark-gpu-assist` | **DSpark 已排除 ⇒ 天然不可达** | 断言为缺席，或与 DSpark 一并做 |
+
+⚠️ **不要把 S1 当成「后端叶子、可以逐字照抄」**：`mmvq.cu` 是 drift 最大的文件（1,683 vs 3,100），必须按 §5g 先量再下手。

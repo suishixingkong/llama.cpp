@@ -248,7 +248,8 @@ port 的副本对 `vbr_controller_active|vbr_dynamic` **0 命中** ⇒ fork 的 
 | **R3** | artifact-adopt 驱动尾 `--vbr-*-cuda` 五模式 | 38 行 | **设备** | 五模式全 `-cuda` 结尾（§6.3） |
 | **R4** | `test-recurrent-state-rollback` 的 VBR 臂 —— **已移植 + 已设备验证**（`1c8ff2e31`，2026-10-12） | 27 行 → **0** | **已闭环**（1/3 臂未取证，成因已定位，见 §6.4） | `share_attn_prefix_vbr` **6/6 PASS**（`--vbr-vram 25M`）；`share_live_prefix_swa` **6/6 PASS**（`VBR_FREEZE=1 VBR_BUDGET_MIB=25`，只要 `tier_epoch_swa != 0`）；`share_media_swa_prefix`：historical 分支 **PASS**，VBR 分支 **定性不可达**（根因 = 页粒度：SWA 每 extent 逻辑 1 MiB < 2048 KiB 页 ⇒ projection 恒 48 MiB，非「不降级」即「首边界花光」；base 是 12→24 MiB 台阶、台阶点 wm2049 落在窗口内，故它本可越线；**一类** SWA 池跨度小于页的模型都不可满足） |
 | **R5** | **QSA 生产代码**：`qsa_selection_safe`、`set_input_qsa` 重写的 direct/fallback 算法、瞬态 `seq_rm_*` / `try_seq_cp`、`seq_add_raw_mrope` | 未量 | **非 VBR** | `qsa_selection_safe` 在 port **全树 0 命中**；fork 的 `src/models/qwen4exp.cpp` 调用 **2 次** |
-| **R6** | `load_impl<Observed>`、`test-moe-cache*`、DFlash、Bonsai、`.safetensors` / EXL3 | 未量 | **既定排除** | 见 `MERGE_BUUN_PLAN.md`「已定取舍」（用户裁定） |
+| **R6** | `load_impl<Observed>`、DFlash、Bonsai、`.safetensors` / EXL3 | 未量 | **既定排除** | 见 `MERGE_BUUN_PLAN.md`「已定取舍」（用户裁定） |
+| **R6b** | `test-moe-cache*`（MoE 专家缓存） | 已量（§10.92） | **2026-10-15 改判：纳入移植** | 用户改判；它与 VBR 零耦合（对 `vbr` 命中 0），是独立切片线，**不影响本审计的 VBR 残差结论** |
 
 **R1–R3 = 本机不可达（无 N 卡）；R4 已落地并在 V100 上验证（`1c8ff2e31`，2026-10-12）；R5–R6 不是 VBR。**
 
