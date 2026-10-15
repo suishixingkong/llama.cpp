@@ -14923,15 +14923,82 @@ TT 结果：`common.h`/`arg.cpp`/`common.cpp`/`test-arg-parser.cpp` 单 TU 各 `
   `.set_env("同名")`。⚠️ 初版用 `setenv("X"` 做子串匹配，被 `unsetenv("X")` 骗过 ⇒ 必须 `\bsetenv`。
 - **INV7** `COMMON_MOE_CACHE_MODE_SOFT` 的**逐文件计数**必须是 (enum 1, parser 1, common.cpp 2 = 映射 + 回声)。
 
-`ABSENT` 行 5 条：fd56dfcdd 的三个无关特性（`common_cpu_get_num_moe_threads` /
-`llama_model_has_host_moe_weights` / `n_threads_explicit` / `mmap_prefetch`），
-外加一条**前向依赖** —— `&params.moe_cache` 出现在 `common_fit_params(` 调用里即红，
-因为那是 **S6 的改动**；S6 落地时应把该行**改成 MUST**（不是删掉）。
+`ABSENT` 行 5 条：fd56dfcdd 的两个无关特性（`common_cpu_get_num_moe_threads` /
+`n_threads_explicit` / `mmap_prefetch`）加 host-MoE 线程自动解析的访问器
+`llama_model_has_host_moe_weights`，外加一条**前向依赖** —— `&params.moe_cache` 出现在
+`common_fit_params(` 调用里即红，因为那是 **S6b 的改动**（10.92.12 已把 S6 再切成 S6a/S6b）；
+S6b 落地时应把该行**改成 MUST**（不是删掉）。
 
 ##### ⏳ 剩余（10.92.5 的 S6–S9 原编号）
 
 `S6` = `common/fit.{h,cpp}` + `fit-params.cpp`（含 ctor 里 `moe_cache_before` 的 fit 快照/回滚、`fit_selected`）；
 `S7` = `llama-bench` 臂（做到才谈得上 `llama-bench --moe-cache off|auto` 的端到端 A/B）；
 `S8` = `test-moe-cache*` 4 个测试 + `tests/CMakeLists.txt`（CUDA 门在本机不可达 ⇒ 只能报 compile+link）；
+`S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
+
+---
+
+#### 10.92.12 切片 S6a 已落地：MoE 张量内省 API（2026-10-15，`9l-d5b S6a`）
+
+**范围**：`src/llama-ext.h` + `src/llama-model.cpp`，**2 文件 / +77 −0**（19 / 58）。
+**inert**：新落地的两个函数在 port 里**还没有调用者**，它们是 S6b 规划器的数据源。
+
+##### 实测：原计划的 S6 面被低估了，必须再切一刀
+
+10.92.5 / 10.92.11 把 S6 记为「`common/fit.{h,cpp}` + `fit-params.cpp`」。实测后该面还要拉进
+`src/` 侧的访问器，因为 `fit.cpp` 的规划器读的不是 `llama.h` 而是内部张量表：
+
+| 依赖 | 在 fork 的落点 | 归属 |
+|---|---|---|
+| `struct llama_moe_tensor_info` + `llama_model_get_moe_tensor_info()` | `src/llama-ext.h:143-157`、`src/llama-model.cpp:4610-4664` | **本片 S6a** |
+| `common_moe_cache_*` 规划器（override pattern / fit_pool / `plan_fit` / `evaluate_fit`） | `common/fit.h:10-55`、`common/fit.cpp:235-470` | S6b |
+| `moe_tensors` 采集 + 签名扇出 | `fit.cpp` 497 / 657-662 / 773 / 788 / 872 / 941 / 954 / 986 / 1832 / 2019 / 2123 / 2195 | S6b |
+| `common_fit_params` 的 `moe_cache` 形参 + SOFT/AUTO 放置 | `fit.h:116`、`fit.cpp:1980-2210` | S6b |
+| `common.cpp` 的 `moe_cache_before` 快照/回滚 + `fit_selected` | fork `common/common.cpp` | S6b |
+
+S6a 是这条链上**唯一**的无依赖段：只读已加载模型的张量表，不碰内存预算 ⇒ 可先行、可单编、零行为。
+⚠️ `moe_tensors` 这个新形参**只在 `common/fit.cpp` 内部**（`fit.h` 不含它），但 `common_fit_params` 的
+`moe_cache` 形参**要改头**⇒ S6b 落地时必须逐个单编受影响 TU。
+
+##### 声明 delta（1 条，非放宽）
+
+`llama_model_has_host_moe_weights()` 与 `llama_model_is_routed_expert_weight()` 在 fork 里相邻，
+**本片只取后者**。前者全仓只有两个调用点：fork `common/common.cpp:1627-1642` 的「host 常驻专家的
+CPU 线程自动解析」（需要 fork 独有的 `common_cpu_get_num_moe_threads()` 与 `cpuparams.n_threads_explicit`
+/ `mask_valid` —— 正是 10.92.11 已排除的第三个无关特性）和 `llama-bench`（S7）。
+⇒ 这是**按消费者归属切片**：S7 若需要，由 S7 自己带，不在本片留死代码。
+
+##### 守卫 `test_moe_cache_s6a_guards.py`
+
+基线 `sheet(live)=0`，**25/25 变异被捕获**。两条 verbatim 行把 port 文本钉死在 fork 的**逐字节**上；
+七条 INV 把「这段文本为什么承重」显式化 ⇒ 手工重落或部分拼接即使保住形状也会**具名**变红：
+
+- **INV1** 后缀必须是 `_exps.weight` / `_chexps.weight` 的 **if/else-if 链**。砍成一个 ⇒ 量化专家布局
+  从清单里消失，规划器算出 **0 专家字节**（数字仍然像模像样）。
+- **INV2** **两趟调用契约**：`count++` 必须在 `info && count < capacity` **之外**。挪进去 ⇒
+  `info == nullptr` 的定尺寸那趟返回 0，向量恒空，规划器看到「一个没有专家的模型」。
+- **INV3** 形状谓词的 5 个条件全在。⭐ `nb[2] != 0` 看着冗余其实不是：非连续 view 会被放进来，
+  而它那根脏 stride 会被当成 expert_size。
+- **INV4** `expert_size` 是行 stride `nb[2]`，不是元素数 `ne[2]`；且**结构体字段序 == 聚合初始化序**，
+  否则下游每个字节数都差一个元素大小。
+- **INV5** 声明与定义的三个形参一致。⚠️ **域必须收窄到访问器自身**——`size_t capacity` 在
+  `llama_model_resolved_tensor_split` 里也有，全文件搜索在真丢形参时**照样绿**（第一版就踩了这个）。
+- **INV6** 层号解析：`-1` 默认 + 「数字已被消费」检查。少了检查，`blk.x.` 会报 layer **0**，而 0 是个真层号。
+- **INV7** 两处插入都带 `fork 9l-` 标记（冻结重建型守卫靠它归因偏离）。
+
+反向控制 = 「整块撤销」⇒ **15 条具名行红**。`ABSENT` 行 4 类：`llama_model_has_host_moe_weights`
+（本片明确不取）、`common_cpu_get_num_moe_threads` / `n_threads_explicit` / `mmap_prefetch`（既有排除项），
+外加 **`llama_moe_tensor_info` 不得出现在 `include/llama.h`**（它属内部 staging 头）。
+
+##### ⏳ 剩余
+
+`S6b` = `common/fit.{h,cpp}` 规划器 + `moe_tensors` 采集扇出 + `common_fit_params` 的 `moe_cache` 形参 +
+SOFT/AUTO 放置 + `common/common.cpp` 快照/回滚/`fit_selected` + `tools/fit-params/fit-params.cpp`；
+`S7` = `llama-bench` 臂（含 `llama_model_has_host_moe_weights`，如它需要）；
+`S8` = `test-moe-cache*` 测试 + `tests/CMakeLists.txt`；
+⚠️⚠️ **`tests/test-moe-cache-fit.cpp` 不能整体拿**（274 行）：它**混装了两个特性** ——
+除了 `common_moe_cache_plan_fit`，还测 `common_fit_extra_context_size` / **9 字段版**
+`common_fit_extra_model` / `common_fit_extra_cache_probe`，而 port 的 `common_fit_extra_model`
+只有 4 个字段、另两个符号**根本不存在** ⇒ 只能逐段取其 `plan_fit` 部分，其余留给那条特性自己的切片；
 `S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
 

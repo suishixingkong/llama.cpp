@@ -102,6 +102,25 @@ LLAMA_API size_t llama_model_resolved_tensor_split(
         float * weights,
         size_t capacity);
 
+// fork 9l-d5b S6: the routed-expert tensor inventory the fit planner consumes
+// (fork llama-ext.h 143-157). The host-residency accessor declared next to it in the
+// fork stays out: its only caller is the excluded host-MoE thread auto-resolver.
+struct llama_moe_tensor_info {
+    enum ggml_type type;
+    size_t expert_size;
+    int64_t n_input;
+    int64_t n_output;
+    int64_t n_expert;
+    // Transformer block index parsed from the tensor name ("blk.<N>..."),
+    // or -1 when the layer cannot be determined.
+    int64_t layer;
+};
+
+LLAMA_API size_t llama_model_get_moe_tensor_info(
+        const struct llama_model * model,
+        struct llama_moe_tensor_info * info,
+        size_t capacity);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
