@@ -15130,10 +15130,91 @@ CPU 线程自动解析」（需要 fork 独有的 `common_cpu_get_num_moe_thread
 全量 sweep（163 个守卫）：`total failing checks: 2` —— **只剩既存债务 `test_9l_d4b9a_guards.py`**，
 与 S6a / S6b1 时相同（本片同样**无需任何守卫声明 delta**，理由见 10.92.13）。
 
-##### ⏳ 剩余（S7 起）
+#### 10.92.15 切片 S7 已落地：llama-bench 的 MoE 臂（2026-10-15，`9l-d5b S7`）
 
-`S7` = `llama-bench` 臂：`common_moe_cache_from_bench_mode()` + `CacheFitSelected` 列，并去掉本片
-留在 `:2577` 的 `nullptr` 与 `fork 9l-d5b S6b2` 标记（届时 INV7 的那条「不得获得权柄」判据要同一片翻转）；
+**范围按消费者归属切。** `llama-bench.cpp` 是本仓与 fork 分叉最大的工具（port 2772 vs fork 3128，
+裸 diff **1292 行 / 78 hunk**），其中只有 37 个 hunk 提到 moe 字样，而这 37 个里还有一半是
+**名字里带 moe 但不属本特性**的东西。判定原则：**一个符号若在 fork 里的消费者只服务于别的特性，
+就不进来**；反过来，本片要用的每一行都必须有 MoE 消费者。
+
+**不取的五类邻居特性**（各自带自己的消费者，属别的切片）：
+
+| 邻居 | fork 里的证据 | 不取的理由 |
+|---|---|---|
+| repack | `parse_repack_mode` / `get_effective_repack` / `--repack` / `-nr` / `mparams.use_extra_bufts` | 独立的权重重打包开关；它在 `--moe-cache on` 时的冲突检查是它的约束，不是缓存的前置 |
+| mmap prefetch | `mmap_prefetch_mode_str` / `--mmap-prefetch` / `llama_mmap_prefetch_mode` 列 | 与 MoE 无交集 |
+| `n_gen_warmup` | `--no-warmup` / `n_gen_warmup_explicit` / `test_prompt(..., seed)` / `bench_random_token` | warmup 语义 |
+| host-expert 自动线程 | `llama_model_has_host_moe_weights` + `common_cpu_get_num_moe_threads` + `n_threads_explicit` | ⚠️ **名字里带 moe 但不是缓存**：它在 `inst.cpu_mask == "0x0"` 时按「有专家驻内存」自动改线程数，是 n_cpu_moe 的配套；且它牵出 `src/llama-model.cpp` 一个新 API + `common/` 一个新函数 + `tests/test-auto-memory-policy.cpp`，是一个完整切片 |
+| 「显示实际生效值」 | `n_gpu_layers = mparams.n_gpu_layers` / `split_mode = mparams.split_mode` 等 6 处 | 让 bench 打印 fit 后的**解析值**而非请求值；这需要把 `mparams` 穿进 `test`，属显示家族 |
+
+**⚠️ 由此产生一个真问题**：`moe_cache_mode_forces_canonical_weights()` 在 fork 里的**全部**消费者
+都是 repack（`get_effective_repack` + `get_fields()` 里只为 repack 列服务的
+`cache_forces_canonical_weights`）⇒ 不取 repack 后它**没有消费者**，取进来就是死代码（且
+`-Wunused-function`）。⇒ **不取**。同理 `--moe-cache` 的 usage 第 2 行
+（`on and fixed budgets disable weight repacking`）也不取。
+
+**落点**（`tools/llama-bench/llama-bench.cpp`，**+185 / −12**，2772 → 2945）：
+
+| 面 | 内容 |
+|---|---|
+| 模式解析 | `parse_moe_cache_mode`（`off\|0`、`auto\|on\|soft`、正整数 MiB ≤ 1 GiB，经 `strtoll` + `errno` 校验）/ `common_moe_cache_from_bench_mode`（→ `common_moe_cache_params`，`mode_explicit = true`）/ `apply_moe_cache_mode`（→ `llama_context_params`；⚠️ `soft` 走 `LLAMA_MOE_CACHE_MODE_ON` + 0 预算，**不是**独立枚举值）/ `get_moe_cache_mode_from_env`（读 `LLAMA_ARG_MOE_CACHE`） |
+| 参数面 | `--moe-cache <auto\|on\|soft\|off\|0\|MiB>` / `--[no-]moe-cache-profile` + `moe_cache` / `moe_cache_explicit` / `moe_cache_profile` 三个字段 + 三处默认值 + 解析后的默认拷贝 |
+| 展开 | `cmd_params_instance.moe_cache` + 笛卡尔积多一层 + **3 个实例构造点各传 `mc`** |
+| 列 | `test.moe_cache` / `moe_cache_fit` / `moe_cache_profile` + `get_fields()`/`to_values()` 同步 + 列宽（`-9` / `5`）+ 简称（`moe-cache` / `fit`）+ 类型（后两者 BOOL）+ 出现条件 |
+| fit 交接 | `common_moe_cache_params fit_moe_cache = common_moe_cache_from_bench_mode(inst.moe_cache);` → `&fit_moe_cache,` → **`fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS` 时 `continue`** → `cache_fit_selected = fit_moe_cache.fit_selected;` |
+| 热力图 | `moe_profile_path` 块：`moe_cache_profile && mode != off/0` 时才取 `llama_model_semantic_family_digest` → `common_moe_cache_profile_file` → `cparams.moe_cache_profile_path` |
+| 深度状态复用 | `ctx_state` 加 `instance` + `moe_cache` 两个键，命中条件与存储点同步加键 |
+
+**声明 delta 4 条**（前 3 条进守卫常量，第 4 条是结构性）：
+
+| # | 名称 | fork | port | 理由 |
+|---|---|---|---|---|
+| 1 | `D_TEST_SIG` | `test(inst, mparams, cache_fit_selected, profile_enabled, lmodel, ctx)` | `test(inst, cache_fit_selected, profile_enabled, lmodel, ctx)` | `mparams` 是「显示实际生效值」家族的载体；本片只要两个 bool，去掉后其余参数**保持 fork 顺序** |
+| 2 | `D_FIELDS_SPLIT` | `"moe_cache_fit",  "repack",         "split_mode",` | `"moe_cache_fit",  "split_mode",` | 不取 `repack` ⇒ 该组重排；第一行仍**逐字取自 fork**（`"n_cpu_moe",    "moe_cache",`，4 空格对齐，⚠️ 手抄时曾错成 6 空格，见下） |
+| 3 | `D_FIELDS_PACK` | `"mmap_prefetch",  "moe_cache_profile",` | `"moe_cache_profile",` | 同上 |
+| 4 | cstate 键 | `is_cached = instance == &inst && depth == cstate.depth && moe_cache == cstate.moe_cache && repack == cstate.repack` | 同前三条，**去掉 `repack`** | 不取 repack |
+
+**守卫**（`test_moe_cache_s7_guards.py`，生成器嵌入 18 段 fork 原文）：基线 green，**36/36 变异全捕获**。
+
+- **INV1** 参数面在**四处**必须同时齐备（usage / parser / 字段 / 默认值）+ 两处拷贝。缺任一处 ⇒
+  只给 `--moe-cache` 一个参数时被静默忽略。逐条**计数**，不靠「某处出现过」。
+- **INV2** 笛卡尔积的**每个**实例构造点都带 `mc`（恰 **3** 处）。漏一处 ⇒ 该组合按默认模式跑，
+  报出**不存在**的差异。
+- **INV3** ⭐⭐ **`get_fields()` 与 `to_values()` 必须索引配对**（`get_map()` 按下标配对）。
+  判据 = ① 字段名数（`fl.count('"')//2`）== 值项数（`tv.count(',')+1`）；
+  ② `"n_cpu_moe"` 与 `"split_mode"` 之间同时含 `"moe_cache"` 与 `"moe_cache_fit"`（值侧同构）。
+  **只加一边 ⇒ 其后所有列错位，表头与数字不一致且无任何诊断。**
+- **INV4** fit 交接的三动作缺一不可（构造策略 / 传址 / **查返回状态**）+ 失败时 `continue`。
+  不查状态 ⇒ 对一个**从未分配成功**的配置报 PP/TG 数字。
+- **INV5** 显式 `off`/`0` 时**不写热力图**（否则把不同放置下的热度教给下一次运行）。
+- **INV6** `apply_moe_cache_mode` 必须在 `test` 对象构造**之前**（对象记录的是本次**实际请求**的模式）。
+- **INV7** 深度状态复用的键：`cstate.instance` 与 `cstate.moe_cache` 各出现 3 次（声明/比较/存储）。
+  键不全会把**不同放置**下的 KV 快照当成命中 —— 那不是 cache hit，是**错答案**。
+- **INV8** 环境回填只在没给参数时生效，且**走同一个 parser**（坏值必须让运行失败）。
+- **BOUNDARY** = §10.92.14 那两条的**翻转**：「必须有 `&fit_moe_cache,`」（S6b2 断言缺席）+
+  「`// fork 9l-d5b S6b2:` 标记必须消失」+「`test` 签名不得长出 `const llama_model_params & mparams,`」。
+- **ABSENT** 8 个邻居符号 0 次：`repack` / `mmap_prefetch` / `n_gen_warmup` / `resolved_threads` /
+  `n_threads_explicit` / `llama_model_has_host_moe_weights` / `common_cpu_get_num_moe_threads` /
+  `moe_cache_mode_forces_canonical_weights`（+ `parse_repack_mode` / `get_effective_repack`）。
+
+**⚠️ S6b2 守卫的两处翻转**（同一提交）：INV7 的「llama-bench 不得有权柄」（`&params.moe_cache`
+出现即红）翻成「**必须**有 `&fit_moe_cache,`」+「标记必须消失」；**退役**两条随场景消失的变异
+（`llama-bench acquires MoE authority` / `the llama-bench marker dropped` —— 它们的 needle 是
+本片删掉的标记行，留着必然报 identity），代之以一条 `llama-bench loses the MoE authority again`。
+⚠️ INV8 的 `fork 9l-` 判据**不动**：llama-bench 里另有 2 处 `fork 9l-vbr-auto-ladder` 属于 VBR 线。
+
+**⚠️⚠️ 本片踩到的两个新判据陷阱**：
+1. **`literal()` 出来的块已经是「一个多行字符串」，不能再 `'\n'.join(...)`。**
+   生成器里 `BLOCK = ('a\n' 'b\n')` 经隐式拼接就是 `'a\nb\n'`；对它再 `join` 会**逐字符**迭代，
+   得到 `a\n\nb\n\n`。本片 16 处 `'\n'.join(BLOCK)` 全属此类（MUST 会假红、变异会假 identity）。
+   ⇒ 判据：**块级常量一旦由 `literal()` 生成，只可直接使用**。
+2. **块级移除变异的 `old`/`new` 方向会写反。** 「让 repack 混进来」这类变异要的是
+   `old = 现状`、`new = 注入后`；写反后 `str.replace` 静默不命中 ⇒ 同样报 identity。
+   ⚠️ 且 needle 的**缩进必须与 port 实测一致**：本片 `continue;` 在 port 是 **16** 空格，按 fork
+   目测写 20 空格 ⇒ identity。⇒ 变异 needle 也要**从文件里量**，不靠肉眼。
+
+##### ⏳ 剩余（S8 起）
+
 `S8` = 四个 `test-moe-cache*` 测试 + `tests/CMakeLists.txt`（⚠️⚠️ `tests/test-moe-cache-fit.cpp` **不能整体拿**：
 它混装 `common_fit_extra_context_size` / **9 字段版** `common_fit_extra_model` / `common_fit_extra_cache_probe`，
 而 port 只有 4 字段、另两个符号根本不存在 ⇒ 只取 `plan_fit` 段）；
