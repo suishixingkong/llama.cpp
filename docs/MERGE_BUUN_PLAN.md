@@ -14539,3 +14539,78 @@ fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交
 - 守卫 `test_moe_cache_s2_guards.py`：`sheet(live) = 0`，**23 个变异全部被捕获**（12 个"逐站点删除" + 7 个结构删除 + 2 个反向控制 + CR + 括号失衡）。
 - 全量 `guard_sweep` 报告 **2 failing**，均为既存 `test_9l_d4b9a_guards.py` 冻结重建债务，不触及本片任何文件。
 - **行为证据：没有，且本机不可得**（开发机无 GPU）。
+
+#### 10.92.8 切片 S3a 已落地：`mul_mat_id` 的 CPU 侧 hook（2026-10-15）
+
+**范围**：`ggml/src/ggml-cpu/ggml-cpu.c` 一个文件，**+96 −0**（纯插入，无删除、无改写）。
+
+| # | 落点 | 内容 |
+|---|---|---|
+| 1 | include 区（`:58`） | `#include "../ggml-backend-moe-cache.h"` |
+| 2 | `MMID_MATRIX_ROW` 之后 | `#define MOE_CACHE_MAX_TOPK 64`（每个节点缓存数组的行上限） |
+| 3 | `mul_mat_id` 的 row groups 之后 | 11 个 `moe_cache_*` 局部状态（16 行，仅线程 0 使用） |
+| 4 | `if (ith == 0)` 块开头 | `begin()` + `plan()`（含准入谓词与"行数超限则退订"） |
+| 5 | 分组循环内 | 命中短路：驻留行记入 `moe_cache_*` 并 `continue`，**不进 `matrix_rows`** |
+| 6 | 分组循环之后 | `dispatch()`（失败则回填 `matrix_rows` 并退订）与兜底 `end()` |
+| 7 | 函数末尾（主 chunk 循环之后） | `collect()`：失败则逐行走 `ggml_compute_forward_mul_mat_id_one_chunk` 兜底，然后 `end()` |
+
+##### ⭐⭐⭐ 为什么 CPU-only 构建下这 96 行是零行为
+
+这是"无回归"的全部依据，且是**结构可证**的（本机无 GPU，拿不到运行证据）：
+
+- `struct ggml_moe_cache_api ggml_moe_cache = {};`（`ggml-backend.cpp:18`）**零初始化**。
+- 全仓**唯一的写入点**是 `ggml-cuda/moe-cache.cu:4465` 起的 `ggml_moe_cache_register()`，
+  而它**只被 `ggml-cuda/ggml-cuda.cu:7737` 调用**。
+- ⇒ 不含 CUDA 的构建里 `begin/plan/dispatch/collect/end` **五个指针全为 NULL**，
+  准入谓词的第一个合取项就短路 ⇒ 每个节点只是多做几次指针比较。
+
+⚠️ 反过来说：**这 96 行只有在 CUDA 后端注册成功时才可能有行为**，所以它的
+"功能正常"证据**只能来自 V100**，不能由本机编译结果代言。
+
+##### ⭐⭐ 八条降级（fork 的依赖本树没有，逐条给出等价性判据）
+
+fork 的这段 hook 依赖三样本树没有的东西。没有**连带移植**它们，而是**降级**，
+每条都有判据，且每条都被守卫钉成 **ABSENT**（缺席断言走屏蔽文本，否则会被
+说明降级理由的注释自己命中）：
+
+| # | fork 原文 | 本树做法 | 等价性判据 |
+|---|---|---|---|
+| 1 | `ggml_mmid_expert_index(id, mmid_lo, mmid_n_local)` | 直接用裸 `id` | fork 的 `index()` 在 **`n_local == 0` 时直接 `return id`**；本树无该 op_params 字段 ⇒ `ggml_get_op_params_i32` 恒返回 0 ⇒ 恒等 |
+| 2 | `mmid_n_local == 0` 作为准入条件之一 | 整项删除 | 同上，恒为 0 ⇒ 条件恒真 |
+| 3 | `if (i02 < 0) { 行置零; continue; }` | 不移植 | 由 #1，`i02` 恒等于 `id` ≥ 0 ⇒ **该分支不可达** |
+| 4 | `use_row_mask` / `row_mask` | 不移植 | 本树**无 row_mask 调用方**；fork 的 wrapper 也恒传 `false` |
+| 5 | `convert_src1` | 不引入 | fork 唯一调用点恒传 `true` ⇒ 保留本树原本的 `if (src1->type != vec_dot_type)` |
+| 6 | `allow_moe_cache` 参数 | 不引入 | 同上，恒传 `true` |
+| 7 | 拆成 `_impl` + wrapper | **不拆** | fork 拆分**只为了 EXL3 分支**（`if (ggml_type_is_exl3(...))`）；本树无 EXL3 ⇒ 无拆分理由 |
+| 8 | `ggml_type_is_exl3(...)` | 不移植 | EXL3 已整体放弃；无 EXL3 ⇒ 该谓词恒假 |
+
+⛔ **连带移植 expert-window 基础设施不是选项**：`GGML_MMID_WINDOW_N_LOCAL` /
+`ggml_mmid_window_lo` / `ggml_mmid_expert_index` 定义在 fork 的 `ggml-impl.h:185–194` 与
+`ggml.c:3828`，本树**一个都没有**，且 `tests/CMakeLists.txt:397` 早已把
+`test-mul-mat-params` / `test-expert-window-params` 记为「目标代码不在本树」。
+
+##### 编译期的两处顺带确认
+
+- `ggml_backend_buffer_is_host()` / `ggml_backend_buffer_get_usage()` 在 `ggml-cpu.c` 里
+  **可直接调用**（无需新增 include）；准入谓词里的 `src0->view_src ? ... : ...` 与
+  S2 在 `ggml_backend_tensor_copy` 里采用的写法同源。
+- `moe_cache_slot_idx[iid1*n_ids + id]` 的越界风险由 `moe_cache_rows_fit`
+  （`n_rows <= MOE_CACHE_MAX_TOPK`）堵住：行数超限时 `begin` 的节点会被立即 `end` 掉。
+
+##### 证据（本机无 GPU，全部是编译/结构级）
+
+- `RC_COMPILE=0`：`ggml-cpu.c` 在 `D:/llama-build/cpu` 单 TU 编译通过（`_chk_cpu_tu.py`），
+  LF 复核 `tr -dc '\r' | wc -c` = 0，改动 **+96 −0**（纯插入）。
+- 守卫 `test_moe_cache_s3a_guards.py`：`sheet(live) = 0`，**18/18 变异被捕获**
+  （10 个结构删除 + 4 个"逐路径删 `end()`"（按**绝对偏移**，因为 4 处同文本）
+  + 3 个反向控制（撤销 expert-window / EXL3 / S3b 提前落地）+ CR）。
+- S1、S2 守卫仍绿；`grep -rl "ggml-cpu.c" test_*guards.py` 显示**没有其他守卫读这个文件**。
+- **行为证据：没有，且本机不可得。**
+
+##### ⏳ S3b（下一片，未开始）
+
+fork 的融合路径，约 **+420 行**：`struct moe_cache_fused_state`、
+`MOE_CACHE_FUSED_WORK_SIZE`、`ggml_moe_cache_weight_is_eligible()`、
+`ggml_moe_cache_can_fuse()`、`ggml_cpu_try_fuse_moe_cache()`，
+以及 `work_size += MOE_CACHE_FUSED_WORK_SIZE` 和 `ggml_graph_compute` 里的融合尝试调用点。
+⚠️ 它同样带 EXL3 依赖，按本节的同一套判据降级。
