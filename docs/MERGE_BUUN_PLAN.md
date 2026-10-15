@@ -15304,7 +15304,63 @@ CPU 线程自动解析」（需要 fork 独有的 `common_cpu_get_num_moe_thread
 ⚠️ 另注：`bin/test-moe-cache.exe` 在 CPU 树上末行是 `SKIP: CUDA/HIP backend unavailable`
 —— **这是 fail-closed 跳过，不是「跑过了」**；只有 `cache-pool-limits` 一段真跑。要全覆盖必须上 V100。
 
-##### ⏳ 剩余（S9）
+#### 10.92.17 切片 S9 已落地：server 面缺席 + 参照文档（2026-10-15，`9l-d5b S9`）
 
-`S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
+**server 侧那两行在本树没有落点，本片的动作是「断言缺席」而不是移植。**
+
+| fork 行 | 内容 | 本树为何没有落点 |
+|---|---|---|
+| `tools/server/server-context.cpp:6334` | `params_base.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&`（`dspark_gpu_assist` 门里的一行） | 本树 `tools/server/` **零** `dspark` 命中；`dspark_gpu_assist` 全仓 **0** 命中 ⇒ `--spec-dspark-gpu-assist` 不存在。⚠️ DSpark **模型**在库层是有的（`COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK` + `common/arg.cpp` 的下载/预设管道），缺的是 **server 侧放置** |
+| `tools/server/server-context.cpp:6643` | `&params_fit.moe_cache,`（MTP 侧 fit 调用） | 本树 `tools/server/` **零** `common_fit_params` 命中 —— server 的 fit 走 `common_init_from_params` |
+
+⭐⭐ **但策略主链是通的**（本片最重要的一条判据）：`server-context.cpp:3750` 只用
+`llama_init = common_init_from_params(params_base);`，而 `common/common.cpp:1495` 的
+`common_fit_params(...)` **第三个参数就是 `&params.moe_cache`** ⇒ **server 全程不点名 MoE，策略照样抵达 fit**。
+⇒ 守卫 **INV1**（`tools/server/**` 三个符号零命中）+ **INV2**（`common_init_from_params` 在场 且
+`&params.moe_cache,` 落在 `common_fit_params(` 调用内）。
+
+**参照文档**：`docs/backend/CUDA-MOE-CACHE.md`，fork **305** 行 → port **342** 行。
+逐条编辑由 `_gen_s9_doc.py` 机械施加（**15 处，每处断言命中恰 1 次**），不重打一个字。
+
+**声明 delta 6 条**（文档末尾有「Port deviations from the fork」表；代码侧对应 5 处 `PORT-DEVIATION:` 注释）：
+
+| # | 面 | 处理 |
+|---|---|---|
+| 1 | EXL3 | 文档里 5 处「把 EXL3 当在场类型」的句子被改写；EXL3 全文**只准出现在 port banner 与偏差表**（守卫 INV4 钉「恰 2 行」）。代码侧 `ggml-backend-moe-cache.h` / `moe-cache.cu` 早有 `PORT-DEVIATION` 标记 |
+| 2 | `llama-bench` 的 repack 开关 | ⭐ **实测**：port 的 llama-bench `repack` **0** 命中（fork **42**），且**从不写 `mparams.use_extra_bufts`** ⇒ `llama_model_default_params()` 的 `true`（`src/llama-model.cpp:2954`）对**每个臂**生效 ⇒ fork 的「三臂」配方在本树退化成**两臂**。⚠️ 但 `--repack` / `-nr, --no-repack` 是**上游**特性（`380b4c984 common: support negated args (#17919)`），common CLI **有**；`--moe-cache on` 会替你关掉它（`common/arg.cpp:1720`，带 `LOG_INF`） |
+| 3 | `--n-gen-warmup` | 未移植 ⇒ 文档两条 llama-bench 配方去掉该参数 |
+| 4 | server DSpark | 段落保留，前面加 port note（写明零命中事实） |
+| 5 | 测量数字 | **原样保留但标明未在本 port 复现**（banner + 偏差表 + 文末 `has **not** been`，守卫 INV7 三条钉住） |
+| 6 | `tools/server/README.md` | ⚠️ 它是 `llama-gen-docs` 生成物且**已陈旧**（不列 `--moe-cache*`）——⭐ 但 **fork 自己的 README 同样不列**（实测）⇒ **继承债**，非本片引入，**不重建**（该文件明写 `do NOT modify it manually`） |
+
+**守卫**（`test_moe_cache_s9_guards.py` —— 本片**无 fork 原文可嵌**，全部是结构性判据）：
+基线 green，**23/23 变异全捕获**。
+
+- **INV1** `tools/server/**/*.{cpp,h}` 对 `moe_cache` / `dspark` / `common_fit_params` **零命中**。
+  将来若有切片给 server 自己的权柄却不带 fit 参数 ⇒ 策略被静默丢掉，本行负责拦住。
+- **INV2** 策略仍抵达 fit（`common_init_from_params` 在场 + `&params.moe_cache,` 在 fit 调用内）。
+- **INV3** ⭐ **把文档的两条承重论断拿去和代码对表**：`llama-bench` 无 repack（0 命中）+ common parser
+  有 `--repack` 与 `-nr`。任一边漂移 ⇒ 文档即错，而且**不会有人发现**。
+- **INV4** EXL3 **只准出现在 2 行**（port banner + 偏差表）。
+- **INV5** 文档记录的四个 `--moe-cache*` flag + 四个 `LLAMA_ARG_MOE_CACHE*` env 都在场。
+- **INV6** 文档指向的 `PORT-DEVIATION: EXL3 is not part of this tree` 标记仍在。
+- **INV7** 出处三件套（credit / port banner / 偏差表）+「未复现」声明在场。
+- **ABSENT**：`dspark_gpu_assist` / `--spec-dspark-gpu-assist` 在**代码**文件里 0 命中
+  （⚠️ **文档除外** —— 它按设计就要点这两个名字；首版把文档一并纳入 ⇒ 基线假红 2 条）。
+- **HYGIENE**：文档无 CR + 代码围栏成对。
+
+**⚠️ 本片新增的一个判据陷阱**（接 §10.92.15 两条、§10.92.16 两条）：
+**「不得出现」的判据必须在**正确的域**上求值。** `ABSENT` 类判据若把**记录性文档**一并纳入，就会把
+「按设计写下的说明」判红；而 `INV1` 这类判据又**必须**覆盖整个 `tools/server/` **目录**（不止一个文件）
+⇒ 判据要显式区分**代码域**与**文档域**，且「零命中」要在**目录级**求值、不在文件级。
+
+**验证（运行痕迹）**：`test_moe_cache_s9_guards.py` 基线 green + **23/23**；文档 **342** 行、CR=0。
+
+##### ✅ 特性线收官（S1–S9）
+
+MoE 专家缓存的移植面在 `buun-port` 上**已齐**：provider（S1）→ 调度器 session（S2）→ `mul_mat_id`
+CPU hook（S3a/S3b）→ llama 层接线（S4）→ CLI 面（S5）→ 内省 + 规划器（S6a/S6b1）→ 适配器与全部接线
+（S6b2）→ llama-bench 臂（S7）→ 测试面（S8）→ server 缺席断言 + 文档（S9）。
+⏳ **未做**：`reuse_sched`（`5f00827b7`，留档**前向依赖**：将来必须带 `!moe_cache_eligible`）；
+V100 上的**行为覆盖**（本机 CPU 树只能跑到 `SKIP: CUDA/HIP backend unavailable`）。
 
