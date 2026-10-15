@@ -14687,3 +14687,128 @@ ggml_compute_forward_mul_mat_id_impl(&sub_params, gate, miss_mask, true, false, 
 llama 层接线：`src/llama-context.cpp:1066/1133` 调用 `ggml_backend_sched_set_moe_cache()`、
 `src/llama-cparams.h`、`include/llama.h`。⚠️ 这是**让 S1–S3b 从"装好了"变成"会点火"**的一片：
 在此之前 `set_moe_cache` 在本树**零消费者**，S2 建的 session 只能拿着默认配置。
+
+#### 10.92.10 切片 S4 已落地：llama 层接线（2026-10-15）
+
+**范围**：三个文件，**+170 −0**（纯插入，无删除、无改写）。
+
+| # | 文件 | 落点 | 内容 |
+|---|---|---|---|
+| 1 | `include/llama.h` | `llama_context_type` 之后 | `enum llama_moe_cache_mode`（4 值，UNSPECIFIED=-1） |
+| 2 | `include/llama.h` | `vbr_growth_headroom_bytes` 与 `// Abort callback` 之间 | 5 个参数（mode / budget / expert_parallel / cpu_overlap / profile_path） |
+| 3 | `src/llama-cparams.h` | include 区 + `nextn_layer_offset` 之后 | `#include <string>` + 5 个同名成员 |
+| 4 | `src/llama-context.cpp` | include 区 | `#include "../ggml/src/ggml-backend-moe-cache.h"` |
+| 5 | `src/llama-context.cpp` | ctor 的 `n_threads_batch` 之后 | 5 条 `cparams.* = params.*`（profile_path 走 `? :` 生成空串） |
+| 6 | `src/llama-context.cpp` | `resolve_fused_ops` 与 `kv_stream_switch_phase` 之间 | `static bool llama_model_has_cacheable_moe_weights()`（84 行，原样照抄） |
+| 7 | `src/llama-context.cpp` | `llama_context_default_params` | 5 条 designated initializer |
+
+⚠️ **为什么 #2 的位置是硬约束**：`llama_context_default_params` 在 `:4932` 用
+**designated initializer** 聚合初始化这个结构体，C++ 只允许按**声明顺序**书写 ⇒ 参数块与初始化块的
+相对顺序必须一致。两侧都插在 `vbr_growth_headroom_bytes` 与 `abort_callback` 之间，故成立；
+守卫把它写成一条**跨文件顺序不变式**（见下），不靠人眼。
+
+##### ⭐⭐⭐ port 有**三**个调度器创建点，fork 只有两个
+
+这是本片唯一的真正分歧，且它是"漏一半"的典型：
+
+```
+port  sched.reset(ggml_backend_sched_new(...))   1099(现)  主路径      ← fork 1063 对应
+                                                  1276       pipeline_parallel 回退   ← fork 1131 对应
+                                                  1027       共享 arena 相位路径      ← fork 无此函数
+```
+
+`kv_stream_switch_phase()`（port 独有，`kv_stream_phase_arena` 相关）会**重建整个调度器**。
+如果只在 fork 的那两处调用 `ggml_backend_sched_set_moe_cache()`，这条路径上的调度器就会
+**只带着 `sched_new()` 给的 provider 默认 session**。
+
+这**不是**"少调一次、配置不生效"那么轻：`set_moe_cache(OFF)` 的作用是
+**销毁** session（`:2061` `if (mode == OFF) { destroy; return; }`），而 `sched_new()` 建出来的是
+**默认开启**的（`moe_cache_read_config()` 的 `enabled` 默认 true，`session_create(..., nullptr)`
+在 `:2014` 只检查 `!config.enabled`）⇒ 漏掉这一处，**用户显式 `--moe-cache off` 在这条路径上会被静默忽略**。
+
+⇒ 三处全部配置，并把"**创建点数 == 配置点数**"做成守卫的**成对不变式**（INV1）。
+另加一条"新增第 4 个创建点却忘了配置"的**变异**，确认该不变式真的会红。
+
+##### ⛔ 一处**故意不移植**：fork 的 `reuse_sched`（连带一个前向依赖）
+
+fork 在 `:1048` 有一条调度器复用判据，其中含 `!moe_cache_eligible` 合取项。
+它来自 **`5f00827b7 perf(cuda): retain source-led Blackwell prefill and decode improvements`**
+——**另一个特性**，与本片无关，本树没有（`reuse_sched` / `sched_need_sampler_reserve` 在本树出现 0 次）。
+本树 `sched_reserve` 每次都新建调度器，故该合取项在本树**空真**，去掉它不改变行为。
+
+⏳ **但这是一条真正的前向依赖，必须留档**：将来若移植 `5f00827b7`，那条判据**必须带上
+`!moe_cache_eligible`**。原因是 `set_moe_cache()` 会 destroy+create session；复用路径上若照旧调用它，
+就会把已经暖起来的缓存**当场清空**。fork 的取舍是宁肯重建调度器也不清缓存。
+守卫把 `reuse_sched` 列为 **ABSENT**：它一旦出现就报红，逼移植者正面处理这个耦合，而不是顺手抄漏。
+
+##### ⭐⭐⭐ 本片推翻了 S2 文档里"代价为零"的结论（不是推翻，是**它过期了**）
+
+§10.92.7 写「S2 零显存、零线程、零 kernel、零数值路径」，理由是池与填充线程只在
+`moe_cache_begin`（`:2328`）里起，而当时 S2 **没有任何调用点**触到 `begin`。**这个理由在 S3a 之后失效**：
+
+- S3a 已经在 `ggml-cpu.c` 的 `mul_mat_id` 里落了 `ggml_moe_cache.begin(...)` 调用；
+- `moe_cache_begin` 的第一件事是取 `g_session_stack.back().active`（`:2335`）——也就是**调度器作用域里的 session**；
+- 而 S2 的 `ggml_backend_sched_new()` **无条件**建一个 session（`session_create(..., nullptr)` → 默认 config → `enabled` 默认 true ⇒ 建对象）；
+- ⇒ **S2+S3a 合起来，CUDA 构建下 `begin` 就会真的按默认配置建池**。S2 当时那句"零代价"只在"还没有 S3a"的窗口里成立。
+
+⚠️ 这是**代码级推断**（本机无 GPU，拿不到运行痕迹）。且它仍受 `begin` 自身的门约束：
+`expert_size` 要过 `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` 门槛、默认 `automatic` 模式还要过 slab 地板，
+否则 session 在 `:2435` 被判 `dormant` 并 `return nullptr`。**V100 = sm_70 ⇒ 门槛是 1024 KiB（非 sm_80+ 的 512）**
+⇒ 小 MoE 模型很可能就停在这里。所以准确的表述是：
+**S4 之前，缓存由 provider 默认值与环境变量驱动；S4 之后，`--moe-cache` 一族运行时参数才真正生效。**
+
+##### ⚠️⚠️ 一个全仓枚举型守卫的连带效应（4 条），修法是**收窄判据域**
+
+`include/llama.h` 是公共头，本片必须动它 ⇒ 立刻打红 4 条别的切片的守卫：
+
+| 守卫 | 原断言 | 实际含义 |
+|---|---|---|
+| `test_9l_d4b7o_guards` | `un_llama_h_ladders(live[API]) == base[API]` | "本片没动公共 C API" |
+| `test_9l_d4b7p_guards` | 同上（在 `sheet()` 里） | 同上 |
+| `test_9l_d4b7q_guards` | 同上 | 同上 |
+| `test_9l_d4b7r_guards` | 同上（注释写"deviation 1 的全部意义"） | 同上 |
+
+它们的实现是**冻结重建**：把 live 的 llama.h 抹掉**自己声明的** delta 后与 BASE **逐字节**比较
+（`BASE = f78313a42`，各自切片自己的 base，不是当日 HEAD）。这条机制本来就是为这种情形设计的——
+文件里写着「a later slice changed it again (declare that here too)」。
+
+⇒ 四处各追加**两条已声明 delta**（MoE 的 enum 块与参数块的反向替换），**等式强度不变**：
+`un_llama_h_ladders` 只要发现某个声明片段不再**恰好出现一次**就立刻 bail，
+所以这两块里**任何一个字符被改动仍会红**。已各补两条变异验证（改 enum 值、改参数块里一个字符），
+`d4b7o` 另加两条 → 86 checks / 0 failed；`d4b7p` 89/0；`d4b7q` 75/0；`d4b7r` 66/0。
+
+⛔ **不采用"放宽"**（如把等式改成"包含"或直接删行）：那会连"这一块被别人改了"也放过去，
+等于把守卫的域从"整个头文件"扩到"没有域"。
+
+##### ⭐⭐ 两条跨文件结构不变式
+
+守卫 `test_moe_cache_s4_guards.py` 里有两条不属于任何单个 hunk、但本片最容易漏的判据：
+
+- **INV1**：`src/llama-context.cpp` 里 `ggml_backend_sched_new(` 的出现次数
+  **必须等于** `ggml_backend_sched_set_moe_cache(` 的出现次数（都是 **3**）。
+  这条正是"漏掉 arena 路径"的唯一机械检测手段。
+- **INV2**：`llama_moe_cache_mode` 与 `ggml_moe_cache_mode` 的**四个枚举值必须两两相等**。
+  代码里用 `(ggml_moe_cache_mode) cparams.moe_cache_mode` **按值强转**，
+  两个相隔四个文件、手工维护的 enum 正是会静默漂移的东西。
+- **INV3**：参数块声明顺序 == 默认初始化器的 designated 顺序（见上）。
+
+##### 证据（本机无 GPU，全部是编译/结构级）
+
+- `RC_COMPILE=0`：`src/llama-context.cpp` 单 TU；并按"改头文件 ⇒ 受影响 TU 逐个单编"补测
+  `src/llama.cpp`、`src/llama-graph.cpp`、`src/llama-model.cpp`、`src/llama-cparams.cpp`、
+  `src/llama-vbr-operation.cpp`、`src/llama-vbr-generation.cpp`、`common/common.cpp`、
+  `tests/test-vbr-operation.cpp` —— **8/8 全部 RC_COMPILE=0**。
+- LF：三个文件 `tr -dc '\r' | wc -c` 均为 0；改动 +170 −0（纯插入）。
+- 新守卫 `test_moe_cache_s4_guards.py`：`sheet(live) = 0`，**24/24 变异被捕获**
+  （含 INV1 的反向变异"多一个创建点不配置"、INV2 的"改 ggml 侧枚举值"、INV3 的"交换两条初始化器"）。
+- 回归：S1/S2/S3a/S3b 全绿；`grep -rl` 找出的 16 个读这三文件的守卫逐个跑过，
+  其中 4 个（`d4b7o/p/q/r`）按上节收窄后全绿，其余 `d4b9s/d4b9v/kvstream_multigraph/llama_share_api/vbr_ladder` 等本就绿。
+- **行为证据：没有，且本机不可得。**
+
+##### ⏳ 下一片 S5（未开始）
+
+CLI/tools 面：`common/arg.cpp`（其中 `:1686` 有一条
+`params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts` 的耦合）、
+`common/common.cpp|h`、`common/fit.cpp|h`、`llama-bench`、`fit-params`、`server-context`，
+外加 5 个测试与 `docs/backend/CUDA-MOE-CACHE.md`。
+做完 S5 才谈得上 `llama-bench --moe-cache off|auto` 的端到端 A/B。

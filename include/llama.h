@@ -227,6 +227,18 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    // Runtime MoE expert cache mode. Ported from buun-llama-cpp; resolved by
+    // src/llama-context.cpp::sched_reserve() and handed to the scheduler via
+    // ggml_backend_sched_set_moe_cache(). UNSPECIFIED defers to the backend
+    // provider's own default, which is what a caller that never sets the field
+    // gets; it is not an alias for AUTO.
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO = 1,
+        LLAMA_MOE_CACHE_MODE_ON = 2,
+    };
+
     // VBR (variable bit-rate dynamic KV) representation ladder selector.
     // Ported from buun-llama-cpp; consumed by src/llama-vbr-codec.h.
     // AUTO is a ladder of its own (f16 -> turbo8 -> q5_1 -> q4_1 -> turbo4 -> turbo3_tcq); it is
@@ -413,6 +425,11 @@ extern "C" {
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
                                           // a VBR pool at decode boundaries (0 = 1 GiB default)
 
+        enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
+        int32_t moe_cache_expert_parallel;          // -1 = provider policy, 0 = disabled, N = device fanout
+        int32_t moe_cache_cpu_overlap;              // -2 = inherit provider, -1 = auto, 0..8 = CPU rows per operation
+        const char * moe_cache_profile_path;        // optional versioned expert heatmap
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
