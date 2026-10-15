@@ -15213,10 +15213,98 @@ CPU 线程自动解析」（需要 fork 独有的 `common_cpu_get_num_moe_thread
    ⚠️ 且 needle 的**缩进必须与 port 实测一致**：本片 `continue;` 在 port 是 **16** 空格，按 fork
    目测写 20 空格 ⇒ identity。⇒ 变异 needle 也要**从文件里量**，不靠肉眼。
 
-##### ⏳ 剩余（S8 起）
+#### 10.92.16 切片 S8 已落地：MoE 缓存的测试面（2026-10-15，`9l-d5b S8`）
 
-`S8` = 四个 `test-moe-cache*` 测试 + `tests/CMakeLists.txt`（⚠️⚠️ `tests/test-moe-cache-fit.cpp` **不能整体拿**：
-它混装 `common_fit_extra_context_size` / **9 字段版** `common_fit_extra_model` / `common_fit_extra_cache_probe`，
-而 port 只有 4 字段、另两个符号根本不存在 ⇒ 只取 `plan_fit` 段）；
+**四个源，三个在本机可跑。** 本片能钉住的不是数字而是**编排**：哪几行被 park、哪几个源被编译、
+哪几个被注册、哪几个两者都不是。
+
+| 文件 | 来源 | 本机行为 |
+|---|---|---|
+| `tests/test-moe-cache.cpp` | fork 逐字 + **4 段 park** | 编译执行，末行 `SKIP: CUDA/HIP backend unavailable`；4313 → **4329** 行（+16） |
+| `tests/test-cuda-moe-cache-flat-hits-selector.cpp` | fork **逐字节**（sha256 同） | ✅ `PASS: MoE cache flattened-hit selector`（38 行；只依赖 header-only 的 `moe-cache-mmv-tuning.h`） |
+| `tests/test-moe-cache-fit.cpp` | fork 的 **`plan_fit` 段 + 5 行 banner** | ✅ `MoE cache fit tests passed`（274 → **207** 行） |
+| `tests/test-cuda-moe-cache-flat-hits.cpp` | fork **逐字节**（sha256 同） | 需真 CUDA 设备 ⇒ 保持 fork 的门，本机**仅源码**（210 行） |
+
+**⚠️ `test-moe-cache-fit.cpp` 只有 `plan_fit` 段能拿。** fork 版混装三个 port 没有的符号：
+`common_fit_extra_context_size`（6 处）、**9 字段版** `common_fit_extra_model`（6 处）、
+`common_fit_extra_cache_probe`（2 处）—— 全在 fork **31–103** 行。机械判据（`_verify_s8_fit_slice.py`）：
+
+> `port == banner(1–5) + 空行(6) + fork[1..30] + fork[104..274]`（`'\n'.join` **逐字节相等**）
+
+⇒ port 版是 fork 的**纯切片**；省略区间含那三个符号的 **14/14** 全部命中，代码区 **0** 处引用。
+
+**⚠️⚠️ 两个 fork 独有 ggml 类型 ⇒ 加门 park，不删。** `GGML_TYPE_Q8_0_G128`（group-128 Q8，本树无
+`row_size`/核）与 `GGML_TYPE_EXL3_2`（EXL3 已明确放弃）在 port 不存在。做法：两个**默认 0** 的门宏
+罩住 4 段共 **9** 处引用，**行保持在场**（删掉即丢 fork 覆盖面且不留记录）。机械判据
+（`_verify_s8_park.py`）：反向还原 park 后**逐字节等于 fork** —— `4329 = 4313 + 门 8 行 + 宏块 8 行`。
+
+| 门 | port 行（`#if`/`#endif`） | 内容 |
+|---|---|---|
+| `…_HAS_Q8_0_G128` | 535 / 542 | `q8_g128_expert_size` 声明 + 3 个消费者（**6** 行）|
+| `…_HAS_EXL3_2` | 3778 / 3781 | `effective_min_expert_bytes(EXL3_2, …)` 对（2 行）|
+| `…_HAS_EXL3_2` | 3783 / 3790 | `expert_bytes` + `exl3_limit` 声明 + 断言 + 2 行注释 + 守卫（6 行）|
+| `…_HAS_EXL3_2` | 3794 / 3797 | `max_pool_slots(EXL3_2, 0)` / `(…, expert_bytes+1)`（2 行）|
+
+⚠️ **门宏必须在 POSIX 块之外。** 首次生成把 8 行插在最后一个 `#include` 之后，正好落在
+`#if defined(__linux__) || …` 的**块内** ⇒ Windows 上宏未定义 ⇒ `#if <未定义标识符>` 被当作 0，
+「翻成 1 让它生效」看起来生效而**实际没有**。**正确落点 = 文件作用域**（`#endif` 之后、`namespace {` 之前）。
+
+**落点**：`tests/CMakeLists.txt` **+39**（含尾空行），4 个新文件 **+4784** 行。
+
+**声明 delta 3 条**：
+
+| # | 名称 | fork | port | 理由 |
+|---|---|---|---|---|
+| 1 | `D_REG_PLACE` | `test-moe-cache.cpp` 与 selector 在 `if (NOT LLAMA_USE_SYSTEM_GGML)` **内**（缩进 4） | **顶层**（缩进 0） | fork 那块是一个 CUDA 仪器化区域的**尾巴**，本树没有该区域；本树的两个 `NOT LLAMA_USE_SYSTEM_GGML` 块装的是别的测试（`test-backend-meta-replay`；`test-gguf`/`test-alloc`）|
+| 2 | `D_FIT_BANNER` | 无 | 头 5 行 `// fork 9l-d5b S8: …` | 唯一记录「少了什么」的地方（三个未移植符号）|
+| 3 | `D_PARK_GATES` | 无 | 8 行宏块 + 4 对 `#if`/`#endif` | 两个本树不存在的类型 |
+
+⚠️ **`target_include_directories(test-moe-cache* PRIVATE ../ggml/src)` 测出来是多余的 ⇒ 没进。**
+四个源的 ggml 私有头全走**源文件相对路径**（`"../ggml/src/…"`），编译器从**含该指令的文件所在目录**
+开始找，不需要 include 目录。单变量反向控制：删掉三行、删 obj 强制重编 ⇒ `=== BUILD OK ===`，
+三目标全部编译+链接。对照：本树唯一真正需要它的是 `test-backend-expert-transfer`
+（它用**裸** `#include "ggml-backend-impl.h"`）。⇒ 判据写进守卫 INV5。
+
+**验证**（`test_moe_cache_s8_guards.py`，生成器嵌入 fork 原文 7 段 + port delta 2 段）：
+基线 green，**32/32 变异全捕获**（无 identity、无漏检）。
+
+- **INV1** 两处类型门**默认 0**、行**在场**且**在门内**；判据按 `#define … 0` 的**末 token** 比，
+  不按整行字面（宏块里对齐是 4 空格）。
+- **INV2** 两个 fork 独有类型**只准出现在门内**（`outside_gates()` 逐行计数，**跳过注释行**
+  —— 宏块上方的注释按设计就点了这两个名字）。
+- **INV3** 每个源**恰编译一次**且**每个都注册**。判据认三种注册形态（`llama_test(<name> ` /
+  `llama_test(<name>)` / `llama_build_and_test(<src>)`）——⚠️ 前两版判据漏了第三种，
+  selector 与 fit 被误报「never registered」。
+- **INV4** 三个本机可跑的必须注册在**顶层**（判据 = 行首无缩进的精确串在场）。嵌进条件里 ⇒
+  条件为假时**不创建 target 且不报任何字**。
+- **INV5** 那三行 include 目录不得回来（把上面那次反向控制的结论钉成 tripwire）。
+- **INV6** fit 文件 = 切片 + banner；**代码区**不得出现三个未移植符号（判据用 `code_of()` 剥掉
+  头部的 `//` banner —— banner 按设计就是要点这三个名字的）。
+- **INV7** CUDA 门的三个条件 + 设备 pin + baseline 别名及其环境。
+- **BOUNDARY** = 四个文件各自的**结果行**在场（`cache-pool-limits` / `MoE cache fit tests passed` /
+  `PASS: MoE cache flattened-hit selector` / `SM86` 跳过行）。⚠️ `test-moe-cache.cpp` 的正文没被
+  嵌入（只有 park 段来自 fork），所以这是**唯一**说「它还是 MoE 缓存的测试」的行。
+- **ABSENT**：三个未移植符号在本片 5 个文件里 **0** 次；`test-auto-memory-policy.cpp` 不在本树
+  （⚠️ 初版把 `test-kv-cell-position-index.cpp` 也列进 ABSENT，**该文件本树早就有且已注册** ⇒ 撤）。
+
+**⚠️ 本片新增的两个判据陷阱**（接 §10.92.15 的两条）：
+1. **`body_all` 拼接忘补尾 `\n` ⇒ 只有最后一段假红。** `"\n".join(body)` 让每段**末尾无换行**；
+   `literal()` 出来的 PARK 块**带尾 `\n`** ⇒ 只有**最后一段**匹配不上，前三段因为吃到段间分隔符
+   而通过。这种「只红最后一条」的形状极易被当成真缺陷。
+2. **块级判定必须先剥 banner 再看。** 同一个符号在**注释里**出现是**记录**、在**代码里**出现是**引用**；
+   `ABSENT` / INV6 这类「不得出现」的判据若不先 `code_of()`，会把**按设计写的说明**判红。
+   反向同理：`outside_gates()` 必须跳过 `//` 行。
+
+**验证（运行痕迹）**：`build_cpu.bat` ⇒ `=== BUILD OK ===`（`RC=0`）；三目标
+`bin/test-moe-cache{,-fit,-selector}.exe` 均 `rc=0`；`ctest` 注册为 **#88 / #89 / #90** 且均 `Passed`。
+⚠️ 全量 ctest = **96% / 100 条**，4 条未通过**全部与环境有关、与本次改动无因果**：
+`test-download-model`（`HTTP response code said error`，需网络）与 `test-jinja-py`
+（`ModuleNotFoundError: No module named 'jinja2'`）为环境前提；`test-thread-safety` /
+`test-state-restore-fragmented` 是前者的**依赖级联**（`Not Run`）。
+⚠️ 另注：`bin/test-moe-cache.exe` 在 CPU 树上末行是 `SKIP: CUDA/HIP backend unavailable`
+—— **这是 fail-closed 跳过，不是「跑过了」**；只有 `cache-pool-limits` 一段真跑。要全覆盖必须上 V100。
+
+##### ⏳ 剩余（S9）
+
 `S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
 

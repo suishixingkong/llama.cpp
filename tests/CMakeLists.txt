@@ -806,6 +806,45 @@ target_include_directories(test-vbr-swa-window PRIVATE ${PROJECT_SOURCE_DIR}/src
 # target would silently not exist on this Windows + shared build.
 llama_build_and_test(test-speculative-mtp-carry.cpp)
 
+# MoE expert cache (slice 9l-d5b S8).
+#
+# Four sources. Three build here; the fourth needs a real CUDA device, so it
+# keeps exactly the fork's gates and stays source-only on this machine.
+#
+# test-moe-cache.cpp and the flat-hits selector are registered at top level
+# rather than inside `if (NOT LLAMA_USE_SYSTEM_GGML)` the way the fork does it:
+# the fork's block is the tail of a CUDA-instrumentation region this tree does
+# not carry, and this tree's two such blocks hold unrelated tests
+# (test-backend-meta-replay; test-gguf/test-alloc). All four reach ggml's
+# private headers through source-relative paths (`../ggml/src/...`), so unlike
+# test-backend-expert-transfer they need no target_include_directories.
+llama_build(test-moe-cache.cpp)
+llama_test(test-moe-cache LABEL "main;backend")
+set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
+
+llama_build_and_test(test-cuda-moe-cache-flat-hits-selector.cpp)
+
+llama_build_and_test(test-moe-cache-fit.cpp)
+
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    find_package(CUDAToolkit REQUIRED)
+    llama_build(test-cuda-moe-cache-flat-hits.cpp)
+    target_link_libraries(test-cuda-moe-cache-flat-hits PRIVATE ggml-cuda CUDA::cudart)
+    llama_test(test-cuda-moe-cache-flat-hits LABEL "main;backend")
+    set_property(TEST test-cuda-moe-cache-flat-hits PROPERTY ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+    set_tests_properties(test-cuda-moe-cache-flat-hits PROPERTIES TIMEOUT 120)
+    if (GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        target_compile_definitions(test-cuda-moe-cache-flat-hits
+            PRIVATE GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+    endif()
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+    llama_test(test-moe-cache NAME test-moe-cache-flat-hits-baseline LABEL "main;backend")
+    set_property(TEST test-moe-cache-flat-hits-baseline PROPERTY
+        ENVIRONMENT "GGML_TEST_MOE_CACHE_FLAT_HITS_EXPECT_BASELINE=1;CUDA_VISIBLE_DEVICES=0")
+    set_tests_properties(test-moe-cache-flat-hits-baseline PROPERTIES TIMEOUT 180)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
