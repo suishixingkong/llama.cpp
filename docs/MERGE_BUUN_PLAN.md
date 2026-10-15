@@ -14614,3 +14614,76 @@ fork 的融合路径，约 **+420 行**：`struct moe_cache_fused_state`、
 `ggml_moe_cache_can_fuse()`、`ggml_cpu_try_fuse_moe_cache()`，
 以及 `work_size += MOE_CACHE_FUSED_WORK_SIZE` 和 `ggml_graph_compute` 里的融合尝试调用点。
 ⚠️ 它同样带 EXL3 依赖，按本节的同一套判据降级。
+
+#### 10.92.9 切片 S3b 已落地：融合 gate/up/down 路径（2026-10-15）
+
+**范围**：`ggml/src/ggml-cpu/ggml-cpu.c` 一个文件，**+452 −4**（含对 S3a 的修订，见下）。
+
+| # | 落点 | 内容 |
+|---|---|---|
+| 1 | `ggml_compute_forward_mul_mat_id` 包装之后 | `struct moe_cache_fused_state` + `MOE_CACHE_FUSED_WORK_SIZE`（13 行） |
+| 2 | `ggml_graph_plan` 的 `work_size` 收尾 | `work_size += MOE_CACHE_FUSED_WORK_SIZE;` |
+| 3 | `ggml_cpu_try_fuse_ops` 之前 | 403 行：`ggml_moe_cache_weight_is_eligible()` / `struct ggml_moe_cache_fusion` / `ggml_moe_cache_can_fuse()` / `ggml_compute_forward_swiglu_masked()` / `ggml_cpu_try_fuse_moe_cache()` |
+| 4 | `ggml_cpu_try_fuse_ops` 开头 | `GGML_OP_MUL_MAT_ID` 节点先交给融合驱动，成功则返回跳过的节点数 |
+
+与 S3a 逐行对比：S3a 让后端接管**单个 `mul_mat_id` 的某些行**；S3b 把整个
+SwiGLU MoE 块（up + gate 两个 `mul_mat_id`、可选 CLAMP、GLU、可选 down）合成**一个缓存节点**，
+驻留行连"反量化 → CPU 算 → 回填"这一趟都省掉。S3b 也是本移植第一次触碰**图调度**。
+
+##### ⛔⛔ 对 10.92.8 的修订：三条降级是错的，已撤回
+
+10.92.8 把 `row_mask` / `use_row_mask` / `allow_moe_cache` / `convert_src1` 和 `_impl` 拆分
+一起降级掉了，理由是"fork 的唯一调用点恒传常量"。**这个理由只对了一半**：
+它只看 S3a 自己那一个调用点，而 S3b 才是这些参数真正的用途所在。
+
+```c
+// ggml_cpu_try_fuse_moe_cache 里的实际调用
+ggml_compute_forward_mul_mat_id_impl(&sub_params, up,   miss_mask, true, false, true);
+//                                                      ^row_mask ^use  ^allow_moe_cache=false
+ggml_compute_forward_mul_mat_id_impl(&sub_params, gate, miss_mask, true, false, false);
+//                                                                        ^convert_src1=false
+```
+
+- `allow_moe_cache = false`：**不是**恒 true。融合路径自己已经在用缓存了，
+  再让被调的 `mul_mat_id` 去查一次缓存会重复命中。
+- `convert_src1 = false`：**不是**恒 true。gate 复用 up 已经转换好的激活前缀，
+  注释写得很清楚（"Up and gate share src1 and vec_dot_type"）。
+- `row_mask = miss_mask`：让 CPU 只算**未命中**的行——这是融合能省一半以上工作的原因，
+  **没有替代实现**。
+
+⇒ 这 4 个参数与 `_impl` 拆分**已全部照 fork 落地**（`_impl` 现在有 6 个参数），
+10.92.8 表格里的第 4/5/6/7 行**作废**；仍成立的只有第 1/2/3 行（expert-window）
+与第 8 行（EXL3）。S3a 守卫相应地把这几项从 **ABSENT 改成 MUST**，并补了 3 个变异。
+
+⭐⭐⭐ **教训（已写进技能加餐 74）**：**"这个参数恒为常量"只能在遍历完该特性
+的全部调用点之后才能说，不能在写完当前切片之后就说。** 只差一个切片，
+"恒 true" 就变成了 "有一半调用点传 false"。降级省下的 10 行，最后还是要加回来，
+而且要多付一次"改已提交代码 + 改守卫 + 改文档"的代价。
+
+##### 一处不变的原则：CPU-only 仍然零行为
+
+与 S3a 同源：`ggml_moe_cache.fused_begin` 的唯一写入点是 `ggml-cuda/moe-cache.cu:4470`，
+`can_fuse` 的第一个判断就是 `!ggml_moe_cache.fused_begin || ...` ⇒ **不含 CUDA 时
+每个 MUL_MAT_ID 节点只多一次比较**。
+
+⚠️ 但 S3b **有一个所有构建都要付的代价**：`ggml_graph_plan` 无条件给 `work_size`
+加上 `MOE_CACHE_FUSED_WORK_SIZE`（`sizeof(struct moe_cache_fused_state)` 对齐后 ≈ 640 B）。
+这是 fork 的设计——融合驱动把 `params->wdata` 的**前缀**当作 state，把剩余部分
+交给 stock `mul_mat_id`，所以这个前缀必须永远存在。守卫把"预留"和"消费"
+（`params->wsize - MOE_CACHE_FUSED_WORK_SIZE`）**成对断言**，因为单看任一半都发现不了
+另一方被删掉后 `wsize` 的下溢。
+
+##### 证据（本机无 GPU，全部是编译/结构级）
+
+- `RC_COMPILE=0`：`ggml-cpu.c` 单 TU 编译通过；LF 复核 `tr -dc '\r' | wc -c` = 0。
+- 新守卫 `test_moe_cache_s3b_guards.py`：`sheet(live) = 0`，**15/15 变异被捕获**
+  （13 个结构删除 + EXL3 反向控制 + CR）。
+- `test_moe_cache_s3a_guards.py` 同步更新后 **20/20**（原 18 + 3 个新参数相关的变异 − 1 个失效的）。
+- S1、S2 守卫仍绿。
+- **行为证据：没有，且本机不可得。**
+
+##### ⏳ S4（下一片，未开始）
+
+llama 层接线：`src/llama-context.cpp:1066/1133` 调用 `ggml_backend_sched_set_moe_cache()`、
+`src/llama-cparams.h`、`include/llama.h`。⚠️ 这是**让 S1–S3b 从"装好了"变成"会点火"**的一片：
+在此之前 `set_moe_cache` 在本树**零消费者**，S2 建的 session 只能拿着默认配置。
