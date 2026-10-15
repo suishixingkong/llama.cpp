@@ -15052,3 +15052,90 @@ CPU 线程自动解析」（需要 fork 独有的 `common_cpu_get_num_moe_thread
 只有 4 个字段、另两个符号**根本不存在** ⇒ 只能逐段取其 `plan_fit` 部分，其余留给那条特性自己的切片；
 `S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
 
+#### 10.92.14 切片 S6b2 已落地：适配器 + 全部接线（2026-10-15，`9l-d5b S6b2`）
+
+承接 10.92.13 末尾的「剩余（S6b2 起）」段：本片把它整段做完 —— 适配器、`moe_tensors` 扇出、
+`common_fit_params` 的 `moe_cache` 形参及其全部调用点、两处 `pattern_moe_all` 替换、SOFT/AUTO
+放置决策，以及 `common.cpp` / `fit-params.cpp` 的接口面。**这是 MoE 线第一次有行为可观测的落点**，
+所以证据从「结构面」升级为「构建面 + 运行痕迹 + 反转控制」。
+
+| 文件 | numstat | 本片落点 |
+|---|---|---|
+| `common/fit.cpp` | **+412 −11**（1761→2162） | `include` 块（`common.h` + `../ggml/src/ggml-backend-moe-cache.h`）；适配器 `common_moe_cache_evaluate_fit()`（fork `390-463`，74 行）；`common_get_device_memory_data_impl()` 的 `moe_tensors` 形参 + 两趟采集；impl 签名 + `moe_tensors` 声明 + 入口 `fit_selected = false`；两处测量传 `&moe_tensors`；`log_stock_fit` lambda + 2 个调用点；两个 cache lambda；`pattern_moe_all` 删除、唯一使用点改用 `common_moe_cache_tensor_override_pattern()`；候选计算块（29 行）；决策块（214 行）；包装函数签名/守卫/转发 |
+| `common/fit.h` | +1 | `common_fit_params()` 增加 `common_moe_cache_params * moe_cache,`（`tensor_buft_overrides` 与 `margins` 之间） |
+| `common/common.cpp` | +1 | 真实调用点传 `&params.moe_cache,`（`:1498`） |
+| `tools/fit-params/fit-params.cpp` | +13 −1 | 调用传 `&params.moe_cache`；`-c` 回显之后回显 `--moe-cache {N\|auto\|on}` 与 `--no-repack` |
+| `tools/llama-bench/llama-bench.cpp` | +3 | 第 3 个调用点传 `nullptr` + `fork 9l-d5b S6b2` 标记（它自己的 MoE 臂归 S7） |
+
+**声明 delta（2 条，均写入守卫常量）**：① `D_MODEL`：`model.get()` → `model`（fork 的 `plan_fit`
+入口拿 `llama_model_ptr`，port 是裸指针）；② `D_EXTRA`：`add_extra_memory(candidate_memory, &candidate);`
+→ `add_extra_memory(candidate_memory);`（port 的 cache lambda 是单参版）。两条都**不是放宽判据**，而是
+「fork 侧合法差异」的登记 —— 守卫对 fork 原文做 `adapted(block, pairs)` 后**逐字节**比对。
+
+**⚠️ fork 的 `fit.cpp` 混装 4 类无关特性，本片逐 hunk 只取 MoE 行**（全文件 `difflib` 差分得
+**17 个 moe hunk**、fork 侧约 430 行）：① `common_get_device_memory_data_with_parent()`（64 行）
+整块不取；② `common_fit_extra_cache_update()`（102 行，extra-model 缓存链）整块不取；
+③ `llama_model_ptr` / `llama_context_ptr` 智能指针（连带 `fit` 失败回滚快照 `mparams_before` /
+`moe_cache_before`）不取；④ `SPLIT_MODE_TENSOR`（`sm_tensor`）与两参版 `add_extra_memory` 不取。
+⚠️ **过滤器盲点**：`log_stock_fit();` 的**调用行本身不含任何 moe token**（它落在普通 `delete` hunk 里）
+⇒ 只按「含 moe 关键字」筛会**漏掉 2 处调用点**，靠「列出全部 hunk 再逐条归因」才补回。
+
+**行为证据**（本片是首个可观测落点）：
+- **单编 8/8 `RC_COMPILE=0`**：`fit.h` 的全部消费者 TU 逐个单编（`fit.cpp` / `common.cpp` / `sampling.cpp` /
+  `fit-params.cpp` / `llama-bench.cpp` / `perplexity.cpp` / `server-context.cpp` / `server.cpp`）；
+  改 `fit.h` 即改头文件 ⇒ 按规约逐个 TU 验，不靠一次全量构建代替。
+- **全量构建**：`build_cpu.bat`（含 `vsenv`）**134/134**，收尾 `=== BUILD OK ===`。
+- **冒烟**：`test-arg-parser` `RC=0`；Windows 平台上该 exe 的下载用例走 `SKIP`（不是静默通过，
+  逐行确认 `SKIP -- no outbound network`）。
+
+**守卫**（`test_moe_cache_s6b2_guards.py`，生成器嵌入 5 个 fork 原文块）：基线 `sheet(live)=0`，
+**46/46 变异全捕获**。八条不变式 + BOUNDARY：
+- **INV1** 两趟采集契约：定尺寸（`…(model, nullptr, 0)`）与填充（`…(model, data(), size())`）必须都在；
+  `resize(count)` 必须**早于**填充（否则写进空 vector）；`GGML_ASSERT(written == count)` 两者一致。
+- **INV2** ⭐ `fit_selected = false` **在 impl 体内、且早于体内所有其他策略使用**（placement 赋值 /
+  适配器调用 / override helper 调用）；`= true` 恰 **3** 次（soft 备用量 / soft 部分驱逐 / dense 放置）。
+- **INV3** 适配器 1 定义 + 3 调用点 = **4** 次，且**每个调用点的结果都被 `.feasible` 测过**。
+- **INV4** soft 模式的梯子：备用量失败 → 部分驱逐 → 放弃，三级各自保留 reason 串。
+- **INV5** 驱逐搜索的**方向**：可行中点降 `hi`、不可行中点抬 `lo`；升序足迹排序 + 驱逐字节账。
+- **INV6** 候选构造的 4 条守卫：层数溢出（`INT32_MAX`）、`mid` / `best_n_evict` 两处 override 上界、
+  终结项 `{nullptr, nullptr}`。
+- **INV7** 4 个调用面：`common.cpp` 传 `&params.moe_cache,`；`fit-params.cpp` 传 + 回显；
+  **`llama-bench.cpp` 不得获得 MoE 权柄**（`&params.moe_cache` 出现即红）**且必须留着 `fork 9l-` 标记**
+  （否则「传 nullptr」会被读成有意选择而非待办）；`fit.h` 声明含参数。
+- **INV8** `common_fit_params` 形参顺序：`moe_cache` 必须在 `margins` 之前（错位则 C++ 静默按类型匹配）。
+- **BOUNDARY** 四行 = 10.92.13 那四行的**翻转版**（适配器定义必须在 / helper 恰 3 次 / `pattern_moe_all`
+  **0** 次 / `fit.h` 签名必须含 `moe_cache`）。
+
+**⚠️ 两处既有守卫改判据（不是删除）**：① `test_moe_cache_s5_guards.py` 的
+「`&params.moe_cache,` 尚未传到 `common_fit_params`」由 **ABSENT 翻转为 MUST**，对应变异同步翻转为
+「wiring taken back out」；② `test_moe_cache_s6b1_guards.py` 的 **BOUNDARY 四行全部翻转**，且 **INV1 换域** ——
+它原来比的是「helper 返回值 == 它将来要替换的 `pattern_moe_all` 字面量」，本片**把那个字面量删了** ⇒
+第二操作数消失。做法是**把比对目标换到 fork 自带的 helper**（`quoted_after(FIT_C_BLOCK, …)`），
+即「替换仍然是行为保持的」这一命题**换域后依然可证**；同时**退役**一条随之失效的变异
+（`the legacy literal drifts`），并注明「场景消失 ⇒ 退役，而不是改写成与另一条重复的变异」。
+
+**⚠️⚠️ 本片踩到的四个判据陷阱（写进技能加餐）**：
+1. **块级移除变异的 needle 必须带同一套声明 delta**。5 条「整块移除」变异里，凡块的 delta 非空
+   （`decision` 1 条 / `cache lambdas` 1 条 / `inventory` 2 条）的，用**fork 原文**当 needle 会
+   `str.replace` **静默不命中** ⇒ 报告为 `mutation is the identity`（既非通过也非失败，纯噪声）。
+   修法 = `adapted(BLOCK, DELTAS[key])`，与 `MUST` 行**共用同一份 delta 常量**。
+2. **`ABSENT` 的域必须收窄，不能全域扫**。`llama_model_ptr` / `llama_context_ptr` 在
+   `common/common.cpp` 是**既有 pimpl 代码**（`common_init_result::impl`，`:1366/1367/1431`），
+   与本片无关 ⇒ 全域扫描把**正确的树**判红。修法 = 把这两条的域从 `FILES` 收窄到 `fit.cpp`。
+3. **不变式不能跨文件比字符串位置**。INV2 原写「reset 早于 `the model has no routed expert weight
+   tensors`」——那句在**适配器**里（`:247`），不在 impl 内，位置比较毫无意义。修法 = 在
+   `body_of(c, "static void common_params_fit_impl(")` 之内比较，判据从「时间」变成「体内的先后」。
+4. **同一符号在不同文件里的合法性不同** ⇒ 判据要写清「在哪出现才算越界」。
+
+全量 sweep（163 个守卫）：`total failing checks: 2` —— **只剩既存债务 `test_9l_d4b9a_guards.py`**，
+与 S6a / S6b1 时相同（本片同样**无需任何守卫声明 delta**，理由见 10.92.13）。
+
+##### ⏳ 剩余（S7 起）
+
+`S7` = `llama-bench` 臂：`common_moe_cache_from_bench_mode()` + `CacheFitSelected` 列，并去掉本片
+留在 `:2577` 的 `nullptr` 与 `fork 9l-d5b S6b2` 标记（届时 INV7 的那条「不得获得权柄」判据要同一片翻转）；
+`S8` = 四个 `test-moe-cache*` 测试 + `tests/CMakeLists.txt`（⚠️⚠️ `tests/test-moe-cache-fit.cpp` **不能整体拿**：
+它混装 `common_fit_extra_context_size` / **9 字段版** `common_fit_extra_model` / `common_fit_extra_cache_probe`，
+而 port 只有 4 字段、另两个符号根本不存在 ⇒ 只取 `plan_fit` 段）；
+`S9` = server 3 行（DSpark 既定排除 ⇒ 天然不可达，断言缺席即可）+ `docs/backend/CUDA-MOE-CACHE.md`（305 行）。
+

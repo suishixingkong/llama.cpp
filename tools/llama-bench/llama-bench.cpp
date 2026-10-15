@@ -2577,6 +2577,9 @@ int llama_bench(int argc, char ** argv) {
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
+                // fork 9l-d5b S6b2: llama-bench has no MoE fit authority yet; its
+                // --moe-cache arm (common_moe_cache_from_bench_mode) is a later slice.
+                nullptr,
                 margins.data(),
                 inst.fit_min_ctx,
                 nullptr,
