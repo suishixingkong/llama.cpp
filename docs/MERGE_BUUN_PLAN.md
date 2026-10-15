@@ -14419,7 +14419,7 @@ fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交
 | 片 | 内容 | 行为 | 证据级别（无 GPU 时） |
 |---|---|---|---|
 | **S1** | `ggml-backend-moe-cache.h` + `moe-cache.cuh` + `moe-cache.cu` + `moe-cache-mmv-tuning.h` + `mmvq.cu/cuh` 的 MoE 块 + `ggml-cuda.cu` 注册 + `ggml-cuda/CMakeLists.txt` | inert（无消费者） | 编译 + 链接 + **obj 探针（mangled 名）** + 逐字节保真守卫 + 被删的 fork-only 类型 case 断言为缺席 |
-| **S2** | `ggml-backend.cpp`：session enter/leave/destroy + `sched_free` + 12 处 invalidate + `ggml_backend_sched_set_moe_cache` | inert | 编译 + 探针；断言 12 个 API 各自那一行 |
+| **S2** | `ggml-backend.cpp`：session enter/leave/destroy + `sched_free` + 12 处 invalidate + `ggml_backend_sched_set_moe_cache` | ⚠️ **不是 inert，见 10.92.7**（会建 session、装线程局部作用域；但不分配显存、不起线程、不派发 kernel） | 编译 + 探针；断言 12 个 API 各自那一行 |
 | **S3** | `ggml-cpu.c`：`mul_mat_id` hook + `can_fuse` / `swiglu_masked` / `try_fuse` | ✅ **第一个行为切片** | 编译 + 探针 + **区域级三方合并的逐块守卫**（port 的函数名/结构与 fork 不同：port 无 `_impl` 拆分、另有 IQP 路径） |
 | **S4** | `llama-cparams.h` + `include/llama.h` + `llama-context.cpp`（`sched_reserve` / `resolve_fused_ops`） | ✅ 接线 | 编译 + 全树 includer 回归（⚠️ 公共头） |
 | **S5** | `arg.cpp` + `common.{h,cpp}` + 替换 `test-arg-parser.cpp` 的过期注释 | ✅ 用户可见 | `--help` 出现该簇 + 反向控制 |
@@ -14464,3 +14464,78 @@ fire*）：三条自动恢复路由的准入互不相同 —— ① 空目标交
   修法是结构性的：缺席行改在**屏蔽注释与字符串**的文本上判定（等长屏蔽，偏移不变），并补一个"以代码形式重新引入 EXL3 调用"的变异，
   证明屏蔽确实生效而不是把断言改松了。
 - **行为证据：没有，且本机不可得**（开发机无 GPU）。CPU 编译只证明树一致，不编译 `.cu` 里的任何东西。
+
+#### 10.92.7 切片 S2 已落地：调度器 session 接线（2026-10-15）
+
+**范围**：`ggml-backend.cpp` 一个文件，**19 个 hunk**（+130 −2，全部由 fork/port 的 `difflib` opcode 机械导出，
+只取带 moe 的块，不手抄）：
+
+| # | 落点 | 内容 |
+|---|---|---|
+| 1 | `ggml_backend_buft_get_device` 之后 | `ggml_backend_moe_cache_invalidate_buffer()` 辅助函数（9 行） |
+| 2–13 | 12 个公开 API 各一处 | `buffer_free` / `buffer_clear` / `buffer_set_usage` / `buffer_reset` / `buffer_copy_tensor` / `tensor_set_async` / `tensor_set_2d_async` / `tensor_set` / `tensor_set_2d` / `tensor_memset` / `tensor_copy` / `tensor_copy_async` |
+| 14 | `struct ggml_backend_sched` | `void * moe_cache_session;`（`calloc` ⇒ 天然为 null，无需显式初始化） |
+| 15 | `ggml_backend_sched_compute_splits` | `struct moe_cache_scope` + `cache_scope(sched->moe_cache_session)`（21 行） |
+| 16 | `ggml_backend_sched_new` | `session_create(cache_backends, n_backends, nullptr)` |
+| 17 | 新函数 | `ggml_backend_sched_set_moe_cache()`（38 行，含 `cpu_overlap` 参数与值域断言） |
+| 18 | `ggml_backend_sched_free` | 释放 session |
+
+⚠️ **12 处 invalidate 有 6 处文本逐字相同**（`clear`/`set_usage`/`reset`/`set_async`/`set`/`memset` 的部分块）⇒
+**纯文本断言分不清"删了哪一处的"**，故守卫改为**按宿主函数归因**（`fn_extent` + 包体内含调用），
+并配一条**计数行**（13 = 1 定义 + 12 调用）。变异也按**绝对偏移**删除，否则 `str.replace` 会删掉文件里第一处。
+
+##### ⭐⭐ 10.92.5 的「S2 inert」标注是错的，此处更正
+
+实测推翻原判据：`moe_cache_config::enabled` **默认 `true`**（`moe-cache.cu:174`），
+`moe_cache_apply_mode_defaults()` **不改 `enabled`**；fork 文档 §「auto is the default」与「common applications do this for their implicit `auto` default」印证
+⇒ **CUDA 构建下 `ggml_backend_sched_new` 会真的建出一个 `auto` session**，`compute_splits` 会真的 enter/leave 线程局部作用域。
+这不是"无消费者 ⇒ 无对象"。
+
+但**代价仍为零**，这一半靠追踪调用链得出，不是估计：
+- `moe_cache_budget_register`（`:406`）只往 `g_physical_budgets` 里插 reserve、递增 participants ⇒ **不 `cudaMalloc`**。
+- 池与填充线程**不在 session_create 里起**：`moe_cache_allocate_pool`(`:1683`) ← `moe_cache_build_pending`(`:1776`) ← `moe_cache_discover_pool`(`:1855`) ← **`moe_cache_begin`(`:2328`)**，
+  而 `moe_cache_begin` 是 **S3 的 CPU hook** 才调的入口 ⇒ 本片**零显存、零线程、零 kernel、零数值影响**。
+- `std::thread` 全文件只有一处创建点（`:1629`），就在 `moe_cache_start_worker`，只被 `moe_cache_allocate_pool` 调用（`:1752`）。
+
+⇒ 准确的措辞是：**S2 建立了生命周期与失效通知的骨架，但没有任何 GPU 侧资源动作或数值路径**。
+
+##### 一处"连带"适配（不是纯插入）
+
+`ggml_backend_tensor_copy` 的 hunk 不只是加调用：fork 还把 `is_host(src->buffer)` / `is_host(dst->buffer)`
+换成了新引入的 `src_buf` / `dst_buf`（`view_src ? view_src->buffer : buffer`）。
+**这不是可选的**——invalidate 调用本身需要 `dst_buf`，只加调用会编译不过（未定义标识符）。
+
+判为**语义中性**后才照抄：`ggml_backend_view_init`（本树 `:2171`）写 `tensor->buffer = tensor->view_src->buffer;` ⇒
+对一切正规 view，两者相等。且该文件**已有 8 处**同样写法（`:227/347/362/378/400/421/899/1048`），是文件自身惯例。
+
+##### ⛔ 一处故意不移植的 hunk（buun `7384bcdf8`）
+
+```
+-    while (!ggml_bitset_get(used_ids.data(), id)) {
++    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
++    }
++    if (id == n_expert) {
++        // A zero-output token batch selects no experts to transfer.
++        continue;
+```
+
+它来自 `exl3: support CPU execution and CUDA MoE caching`，但**与 EXL3 无关**：是"空专家批次"越界读的加固。
+⛔ **不进本片**。⏳ **S3/S4 前回来裁定**。
+
+⚠️⚠️ **第一版给出的理由是错的，已撤回**：初稿称"无 MoE 缓存时同样可达（`ne[0]*ne[1] == 0`）"。
+实测**不成立**——两棵树**都已有**更早的 `if (ggml_nelements(ids_tensor) == 0) { continue; }`
+（port 来自上游 `43f3dda62` / PR #28739；fork 在 `:1794`）。且 ids 张量非空时循环至少置一个 bit
+（`GGML_ASSERT(id >= 0 && id < n_expert)` 先兜住）⇒ **无界自增在本树不可达**。
+
+⇒ 正确的定性：fork 这条是**防御性加固**，不是本树的已发缺陷修复。因此延期的理由只能是
+**"越界"不属于本片范围**（它改的是共享调度器里现在就活着的代码路径），而不能声称"本片会引入该缺陷"。
+若 S3/S4 改变了 ids 的读取方式、使 `used_ids` 有可能全零，则必须回来带上它。
+
+已在源码该处留 `PORT-DEVIATION` 注释指向本节，守卫把它列为 **ABSENT**（缺席断言走屏蔽文本，
+否则会被这条注释自己命中——S1 已踩过一次），并配一个"以代码形式把它落地"的反向控制变异。
+
+**证据（无 GPU，全部是编译/结构级）**
+- `RC_COMPILE=0`：`ggml-backend.cpp` 在 `D:/llama-build/cpu` 单 TU 编译通过（`_chk_cpu_tu.py`，LF-only 复核 `tr -dc '\r' | wc -c` = 0）。
+- 守卫 `test_moe_cache_s2_guards.py`：`sheet(live) = 0`，**23 个变异全部被捕获**（12 个"逐站点删除" + 7 个结构删除 + 2 个反向控制 + CR + 括号失衡）。
+- 全量 `guard_sweep` 报告 **2 failing**，均为既存 `test_9l_d4b9a_guards.py` 冻结重建债务，不触及本片任何文件。
+- **行为证据：没有，且本机不可得**（开发机无 GPU）。
