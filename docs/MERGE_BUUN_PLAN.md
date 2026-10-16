@@ -15364,3 +15364,59 @@ CPU hook（S3a/S3b）→ llama 层接线（S4）→ CLI 面（S5）→ 内省 + 
 ⏳ **未做**：`reuse_sched`（`5f00827b7`，留档**前向依赖**：将来必须带 `!moe_cache_eligible`）；
 V100 上的**行为覆盖**（本机 CPU 树只能跑到 `SKIP: CUDA/HIP backend unavailable`）。
 
+
+#### 10.92.18 S8 收口：`flat-hits` 的注册门必须排除**共享** `ggml-cuda`（`3c47a761a`）
+
+**触发**：CUDA 树上链接 `bin\test-cuda-moe-cache-flat-hits.exe` 失败，`LNK2019` 未解析
+`?ggml_cuda_moe_cache_mmv@@YA?AW4ggml_cuda_moe_cache_mmv_path@@…`。同样的报错**回来了两次**，
+第二次是 **976 步**（近全量重建）之后。
+
+**判据链（全部落在仓库内，无推测）**：
+
+| # | 事实 | 落点 |
+|---|------|------|
+| 1 | 该树 `BUILD_SHARED_LIBS=ON`（否则不会有 `llama-server-impl.dll`：该 target 用的是**无类型** `add_library`） | `tools/server/CMakeLists.txt:72`；日志 `Linking CXX shared library bin\llama-server-impl.dll` |
+| 2 | ⇒ `GGML_BACKEND_DL=OFF` 时 `ggml_add_backend_library` 同样是无类型 `add_library`，于是 `ggml-cuda` 是 **DLL**，`ggml-cuda.lib` 是**导入库** | `ggml/src/CMakeLists.txt:396` |
+| 3 | ⇒ `GGML_BACKEND_SHARED` 被定义，`GGML_BACKEND_API` = `__declspec(dllexport/dllimport)` | `ggml/src/CMakeLists.txt:404-406`；`ggml/include/ggml-backend.h:6-18` |
+| 4 | `ggml-cuda` **未**开 `WINDOWS_EXPORT_ALL_SYMBOLS` ⇒ 导入库只含 `GGML_BACKEND_API` 符号 | `ggml/src/ggml-cuda/CMakeLists.txt` |
+| 5 | `ggml_cuda_moe_cache_mmv` 是 `mmvq.cuh` 里的**内部** helper，**无导出宏** ⇒ 不在导入库 | `mmvq.cuh:36` |
+| 6 | 该测试**自带 ABI 声明并调用它** ⇒ 共享构建下**恒不可链** | `tests/test-cuda-moe-cache-flat-hits.cpp:15,125` |
+| 7 | 同一符号的调用在 `moe-cache.cu` 里，**在 `ggml-cuda.dll` 内部解析** ⇒ 服务器链接保持绿色 | `moe-cache.cu:3154,3177` |
+
+**⚠️⚠️ 本片最重要的一条：同一个 `LNK2019` 有两个完全不同的根因，报错文本一模一样。**
+
+- 上一次（2026-10-15）我本机的确是**陈旧 `ggml-cuda.lib`**（09-18 归档、`grep -aoc` = 0；重归档后 0→4）。
+- 这一次**不是**：`llama-server-impl.dll` 链接成功即**否证**陈旧论 —— 一个未被引用的陈旧 obj 不会暴露自身
+  未解析引用，而服务器侧**确实**引用同一符号，所以库要是真缺该符号，DLL 也必红。
+- ⇒ **「同批只有一个 exe 失败、DLL 成功」不是「陈旧库」的充分判据**；正确的一步是问
+  **「还有谁引用了这个符号，那个目标链上了吗」**。把「重建」当修法，会连错第二次。
+
+**修法（`3c47a761a`）**：把注册门照仓库既有先例（`tests/CMakeLists.txt:426-450`，同样写「符号刻意不导出
+⇒ skip instead of failing the link」）**再收窄一档**：
+
+```cmake
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
+```
+
+⚠️ **`GGML_BACKEND_DL` 只覆盖一种「后端被拆出去」的形态**：DL 模式是 MODULE + 运行期加载，而
+`BUILD_SHARED_LIBS=ON`（DL=OFF）是**普通共享库 + 导入库**，两者对「内部符号可链性」的效果**相同**，
+但只有前者在原门里被排除。**这是本条最可复用的通则：判「能不能链到内部符号」时，要比对的是
+「符号是否被导出」，而不是「目标是谁建的」。**
+
+**验证（运行痕迹）**：
+- **单变量 A/B**（同一构建目录 `cuda70`，只翻 `BUILD_SHARED_LIBS`，两次 configure 均 `RC=0`）：
+  `ON` ⇒ 树里出现 `ggml-cuda.dll` target、`GGML_BACKEND_SHARED` 在场、`build.ninja` 里
+  `flat-hits.cpp` **ABSENT** 而 `flat-hits-selector.cpp` **PRESENT**；`OFF` ⇒ 两者都 **PRESENT**。
+  （A/B 后已把 `cuda70` 还原为 `OFF`。）
+- 六个冻结重建型守卫按新文本**机械重钉**（39 → 54 行，`dfd3cce7…3026dc` → `8eb7bf71…e47c80`），
+  全绿；`d4b9s` **0/22** 变异存活。
+- **反向控制**：改动块内**中间一行** ⇒ `d4b8p` 变红；还原成逐字节相同 ⇒ 复绿。pin 是**区间**不是**洞**。
+- `test_moe_cache_s8_guards` **PASS**（新增两条门变异「丢掉共享子句」「整行删除」均被捕获）；
+  牵挂 `tests/CMakeLists.txt` 的 **14** 个守卫全部 `RC=0 / failures=0`。
+
+**给 CUDA 树的两条路**（二选一，源码已两路都能 configure）：
+1. 保持共享：`ninja` 即可 —— `tests/CMakeLists.txt` 是 `build.ninja` 的输入，cmake 会自动重跑，
+   该 target 随之不再注册，链接不再被调用。
+2. 想要这个测试真的建出来：`-DBUILD_SHARED_LIBS=OFF` 重配（本机 `cuda70` 即此配置，可链上）。
+   ⚠️ 但它在 V100（sm_70）上**恒 `SKIP`**（`main()` 硬门要求 SM86），所以为它付一次 CUDA 全量构建
+   不划算。
