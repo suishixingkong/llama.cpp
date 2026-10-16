@@ -818,6 +818,21 @@ llama_build_and_test(test-speculative-mtp-carry.cpp)
 # (test-backend-meta-replay; test-gguf/test-alloc). All four reach ggml's
 # private headers through source-relative paths (`../ggml/src/...`), so unlike
 # test-backend-expert-transfer they need no target_include_directories.
+#
+# The fork gates the fourth source on `TARGET ggml-cuda AND NOT GGML_BACKEND_DL`
+# alone. That is not enough here. With BUILD_SHARED_LIBS=ON and DL off,
+# ggml_add_backend_library (ggml/src/CMakeLists.txt:396) uses a typeless
+# add_library, so ggml-cuda is an ordinary shared library and ggml-cuda.lib is an
+# IMPORT library that carries only the symbols marked GGML_BACKEND_API
+# (ggml/include/ggml-backend.h:6-18; GGML_BACKEND_SHARED is set at
+# ggml/src/CMakeLists.txt:404-406, and ggml-cuda sets no
+# WINDOWS_EXPORT_ALL_SYMBOLS). This test calls ggml_cuda_moe_cache_mmv, an
+# internal helper declared in mmvq.cuh with no export macro, so against a shared
+# ggml-cuda the exe can never link (LNK2019) -- while the same call from
+# moe-cache.cu resolves inside ggml-cuda.dll and the server link stays green,
+# which is what makes the failure look like a stale library. It is not one.
+# Same property as the kv-stream/turbo/vbr-vmm tests above, one step stronger;
+# same remedy as their comment gives: skip instead of failing the link.
 llama_build(test-moe-cache.cpp)
 llama_test(test-moe-cache LABEL "main;backend")
 set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
@@ -826,7 +841,7 @@ llama_build_and_test(test-cuda-moe-cache-flat-hits-selector.cpp)
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 
-if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     find_package(CUDAToolkit REQUIRED)
     llama_build(test-cuda-moe-cache-flat-hits.cpp)
     target_link_libraries(test-cuda-moe-cache-flat-hits PRIVATE ggml-cuda CUDA::cudart)
