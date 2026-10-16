@@ -15420,3 +15420,98 @@ if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
 2. 想要这个测试真的建出来：`-DBUILD_SHARED_LIBS=OFF` 重配（本机 `cuda70` 即此配置，可链上）。
    ⚠️ 但它在 V100（sm_70）上**恒 `SKIP`**（`main()` 硬门要求 SM86），所以为它付一次 CUDA 全量构建
    不划算。
+
+#### 10.92.19 S8 修：`ctest -R test-moe-cache` 在 V100 上 19 条红 —— 一个真缺陷，一个「本该 SKIP」
+
+**触发**：V100（`C:/Users/yj/llama/llama.cpp/build`）上 `ctest -R test-moe-cache -V`
+⇒ `test-moe-cache` **Failed**（19 条 FAIL）、`test-moe-cache-fit` Passed。
+
+**先分类，再动手**（skill 03：用法/参数 · 环境前提 · 真缺陷）。19 条红**不是**一类：
+
+| 类 | 条数 | 检查名 | 根因 |
+|---|---|---|---|
+| **真缺陷** | **1** | `cache-capabilities` | 一个**从未被写入**的字段：`info.devices[id].total_vram` |
+| **route A 偏差**（本片有意不移植） | 18 | 16 个 `cache-fused-*` + `cache-activation-map` + `cache-multi-token` | 缺 **dedicated expert matvec**（fused / clamped / activation-map 都走它） |
+
+##### 一、真缺陷：`total_vram` 有声明、有两个读者、没有写入者
+
+`cache-capabilities` 是唯一**带调试输出**的失败，那一行就是判据本身：
+
+```
+cache-capabilities debug: budget=4194304 reserve=0 explicit=1 min-devices=1
+  min-expert=1024 overlap=0 auto-config=1 auto-explicit=0 auto-device=1
+  auto-reserve=0 dev=CUDA0
+```
+
+`auto-reserve=0` 撞上 `test-moe-cache.cpp` 的 `ok &= automatic_caps.recommended_reserve_bytes >= 1024 * MiB`
+⇒ 失败。往前追三层：
+
+| # | 事实 | 落点 |
+|---|------|------|
+| 1 | `recommended_reserve_bytes = moe_cache_recommended_reserve_bytes(cuda_device.total_vram)` | `moe-cache.cu:1428-1431` |
+| 2 | 该函数末行是 `return std::min(reserve, total_vram / 4);` ⇒ **`total_vram == 0` 时整个函数返回 0**（前面的 `std::max(1024 MiB, …)` 被这一行的 `min` 抹掉） | `moe-cache.cu:723-731` |
+| 3 | 字段有声明（`common.cuh`）、有**两个读者**（`moe-cache.cu` 的 query_device 与 session 各一处）、**全仓零个写入者** | `grep -rn total_vram ggml/src/ggml-cuda/` 只列声明与读者 |
+| 4 | fork 有且仅有一行写入，就在同一台设备初始化循环里 | fork `ggml-cuda.cu:334` |
+
+**修法**（1 行，与 fork **逐字节相同**，无 PORT 标记 —— 它不是偏差，是补齐）：
+
+```cpp
+        const size_t device_vram_mib = device_vram / (1024 * 1024);
+        info.devices[id].total_vram = device_vram;
+```
+
+**⚠️⚠️ 为什么 S1 漏了它 —— 这条最值得留档。** 字段（`common.cuh`）、两个读者（`moe-cache.cu`）
+都在「本特性的文件」里，随 S1 一起落了；那**唯一一个写入者**在 `ggml-cuda.cu` —— 一个被当成
+「不是这个特性的文件」的通用文件。**闭包扫描（谁 include 我）看的是读者；缺的是写入者。**
+⇒ 通则：**移植一个「被计算出来的结构体字段」时，必须同时反问「谁负责把值放进去」**，
+否则字段默认 0、读者算出 0、而**没有任何错误**。这也是本片唯一能解释「V100 上 15036 MiB 空闲、
+reserve 却是 0 MiB」的方向（日志 `[…] CUDA0 capacity: cap=4 MiB granted=4 MiB free=15036 MiB reserve=0 MiB`）。
+
+##### 二、18 条 route A：FAIL 是假红，静默是假绿
+
+port 有意只带 **generic modulo-index MMV**（`moe-cache.cu:71-79` 的 PORT-DEVIATION，
+`moe_cache_dedicated_mmv_available()` 恒 `false`）。两处拒绝点：
+
+| 落点 | 拒绝方式 | 被它挡掉的检查 |
+|---|---|---|
+| `moe_cache_fused_begin()` ⇒ `return nullptr`（`:3840-3842`） | CPU 后端判定「不是可省略子图」⇒ **整节点走 stock 路径** | 16 个 `cache-fused-*` |
+| `if (!dedicated && !modulo_activation) return 0;`（`:3041-3043`） | 节点被拒 ⇒ 无 collect ⇒ **无每步统计** | `cache-activation-map`、`cache-multi-token` |
+
+⚠️ **`cache-multi-token` 与 fused 是同一个根因，不是第二个 bug**：它用 10 token × 6 used ⇒
+`activation_indices[i] == i % activation_rows` 不成立（行是 token-major，激活是 `i/6`）⇒
+`modulo_activation == false` ⇒ 节点被拒。症状正是它独有的那一行：
+`cache-multi-token: cache stage was not observed`，而它被打出来的 capture 里
+`act-dedup=189`、`dispatch-fail=0` 全是正常的 —— 因为那些计数在**dispatch 期**自增，
+而 `live_hit` 判的是**每步统计行**，后者出自 collect，恰好在被拒的那一侧。
+**⚠️ 这正是「数字好看 ≠ 该阶段跑过」的又一个形状：要挑的是判据所依赖的那条**通道**，
+不是总量。**
+
+**修法**：给这些场景一个**显式能力门**，报 SKIP 并说明原因 ——
+`#define GGML_MOE_CACHE_TEST_HAS_DEDICATED_MMV 0`（与既有两个类型门同风格），
+`scenario_options.requires_dedicated_mmv` 由场景**自己声明**，`run_scenario()` 在
+`configure_cache()` **之前**短路。⚠️ 判据必须**按名声明**、不能按结果推断：
+若改成「`!stage_ok` 且无 dedicated ⇒ SKIP」，就会把**真失败**（例如 generic 路径坏了）一起吞掉，
+正是本仓禁止的「放宽判据」。6 个函数级套件（partial-invalidation / activation-map / full-ffn /
+concurrent / lifecycle / multi-token）在 `main()` 里用一个 `if/else` 罩住，`else` 分支逐个打印
+12 个 SKIP；**mxFP4 套件留在门外**（它不是缺 MMV 的那类，且本构建本来就能过）。
+
+##### 三、验证（运行痕迹）
+
+- **真缺陷**：`ninja ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/ggml-cuda.cu.obj`
+  ⇒ `[1/2] Building CUDA object …`、`RC_TU=0`（obj 13:05 重写）；
+  与 fork 的该 8 行区段**逐字节相同**（机械比对）。
+- **测试文件**：单 TU 编译 `tests/test-moe-cache.cpp` ⇒ `RC_COMPILE=0`，**零告警**。
+- **守卫**：`test_moe_cache_s8_guards` 基线绿、**44/44** 变异捕获（新增 INV8 + 11 条变异）；
+  `test_moe_cache_s1_guards` 基线绿、**11/11**（新增 4 条 MUST 行 + 2 条变异，含
+  「写入者被删」与「写成另一个字段名」）。
+  ⚠️ 新门**不是 `#if`**（它选一个 `constexpr`），所以 S8 守卫的 `gated_rows()` 仍恰好数到 **4** 个类型门，
+  INV1 语义不变 —— **加门时先看既有守卫有没有数「门有几个」**。
+- 相邻守卫 `d4b9j/d4b9m/d4b9n/d4b9o/d4b7d` 全绿。
+
+##### 四、给 V100 的下一步
+
+重跑 `ctest -R test-moe-cache -V`，预期 `test-moe-cache` **Passed**：`cache-capabilities` 变 OK
+（reserve 回到 1024 MiB），18 条变 `SKIP (dedicated MoE cache MMV not ported)`。
+⚠️ 本机**无法**验证这两点：开发机无 CUDA ⇒ 该测试在 `find_cuda_device()` 处就
+`SKIP: CUDA/HIP backend unavailable`，所以本片只能给出**编译 + 守卫 + 与 fork 的字节同一性**，
+行为证据必须回 V100 取。
