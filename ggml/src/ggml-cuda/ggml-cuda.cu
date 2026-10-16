@@ -370,6 +370,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].physical_share_count = physical_share_count[physical_id];
         const size_t device_vram = prop.totalGlobalMem / info.devices[id].physical_share_count;
         const size_t device_vram_mib = device_vram / (1024 * 1024);
+        info.devices[id].total_vram = device_vram;
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
