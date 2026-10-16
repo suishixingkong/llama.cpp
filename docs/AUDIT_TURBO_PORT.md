@@ -103,7 +103,7 @@ fork 在该文件里有：
 - `test_set_rows_turbo3`（带误差上限，验证 `f32 → WHT → PolarQuant → dequant → f32` 全链路）
 - FA 的 KV 类型列表含 `GGML_TYPE_TURBO3_0`
 
-**后果**：本树没有任何后端级测试能覆盖 turbo kernel。`MERGE_TURBO_KVSTREAM.md` 把它归因为
+**后果**：本树没有任何后端级测试能覆盖 turbo kernel。`MERGE_TURBOQUANT.md` 把它归因为
 "CPU-only 设备下 harness 跳过 CPU 后端"，这低估了问题——即使插上 GPU，也没有 turbo 用例可跑。
 CUDA 侧 21 个 FA 实例 + `set_rows` + `TURBO_WHT` 目前只有"能编译"这一层证据。
 
@@ -168,7 +168,7 @@ fork：
    **直接下标** `GGML_QUANT_SIZES[t]` → 真遇到 type 43/44/45 会抛裸 `KeyError`。
    影响低（turbo 是运行时类型，不会进 GGUF），但枚举与尺寸表应当一致。
 2. 同一个 commit 把 fork 的 `constants.py` 整文件搬了过来，带进了被
-   `MERGE_TURBO_KVSTREAM.md` 明确声明"已排除"的架构定义：
+   `MERGE_TURBOQUANT.md` 明确声明"已排除"的架构定义：
    `MODEL_ARCH.INKLING`、完整的 `MODEL_TENSORS[MODEL_ARCH.INKLING]`、
    `MODEL_TENSOR.ATTN_R / ATTN_REL_PROJ / SHORTCONV_K / SHORTCONV_V / SHORTCONV_ATTN /
    SHORTCONV_MLP / FFN_GSCALE`、`TENSOR_NAMES` 对应项、`VisionProjectorType.INKLING`。
@@ -195,7 +195,7 @@ fork：
   建议在 V100 机器上做一次 `ninja ggml-cuda` 全量链接 + 一个 MLA 模型
   （`glm-4.7-flash` 一类，head_dim 576→640）的 `-ctk turbo4` 端到端生成。
 - **没有重量级数值验证**：fork 自己的 PPL/KLD 数字（7 个模型家族、旋转策略对比）
-  没有复测，`MERGE_TURBO_KVSTREAM.md` 里那些数字仍然只是 fork 的数字。
+  没有复测，`MERGE_TURBOQUANT.md` 里那些数字仍然只是 fork 的数字。
 - Metal / Vulkan 未编译（本就未移植）。
 - `--cache-reuse` / KV streaming 路径与 turbo 的组合未验证（不属本次审计范围）。
 
@@ -237,7 +237,7 @@ CUDA (D:\llama-build\cuda, arch sm_80, 无 GPU，仅编译)
   fattn-mma-f16-instance-ncols1_2-ncols2_16.cu.obj → OK
 ```
 
-**重要更正**：`MERGE_TURBO_KVSTREAM.md` 说 "test-backend-ops cannot validate the turbo
+**重要更正**：`MERGE_TURBOQUANT.md` 说 "test-backend-ops cannot validate the turbo
 kernels with a CPU-only device" ——**这个说法不成立**。CPU 后端能跑 turbo FA、
 SET_ROWS turbo3、TURBO_WHT（走 CPU 参考实现），上面 56 个用例就是证据。
 原来的缺口纯粹是"没有测试用例"，不是"设备不支持"。

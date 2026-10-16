@@ -1,13 +1,12 @@
-# TurboQuant KV cache + adaptive KV streaming — integration notes
+# TurboQuant KV cache + turbo weight quantization — integration notes
 
-Merge of two downstream forks into upstream `llama.cpp`:
+Merge of the [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) downstream fork into upstream `llama.cpp`.
 
 | source | branch in this repo | upstream base | what was taken |
 |---|---|---|---|
 | [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) @ `044dff242` | `tq-master` | `1c3c9674d` (706 commits behind) | TurboQuant KV cache + TQ weights only |
-| [`RaymondHuang210129/llama.cpp-adaptive-kv-streaming`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming) @ `d7680c67b` | `akv-feature` | `465e49b9c` (145 commits behind) | the whole branch (KV streaming) |
 
-Result: branch **`turbo-kvstream-merge`**, 113 files, `+23040 / -318` against `master`.
+This fork was merged together with [`llama.cpp-adaptive-kv-streaming`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming) onto branch **`turbo-kvstream-merge`** (113 files, `+23040 / -318` against `master`). This note covers only the TurboQuant part; see [`MERGE_ADAPTIVE_KVSTREAMING.md`](MERGE_ADAPTIVE_KVSTREAMING.md) for the KV-streaming part.
 
 ```
 4c9233c03  master (upstream)
@@ -22,13 +21,9 @@ Result: branch **`turbo-kvstream-merge`**, 113 files, `+23040 / -318` against `m
 ```bash
 # turbo KV cache (requires flash attention; llama_context enables it automatically)
 llama-server -m model.gguf -ctk turbo4 -ctv turbo4 -fa on
-
-# adaptive KV streaming (CUDA arena in VRAM, remainder in host memory)
-llama-server -m model.gguf --cache-reuse 256 --kv-stream-stage-mib 1024 -np 1
 ```
 
-`-ctk/-ctv` now accept `turbo2`, `turbo3`, `turbo4` in addition to the upstream
-types. Weight quantisation gained `--outtype tq3_1s` / `tq4_1s`.
+`-ctk/-ctv` now accept `turbo2`, `turbo3`, `turbo4` in addition to the upstream types. Weight quantisation gained `--outtype tq3_1s` / `tq4_1s`.
 
 ## 激活方式（编译 / 环境变量 / 参数）
 
@@ -40,7 +35,6 @@ types. Weight quantisation gained `--outtype tq3_1s` / `tq4_1s`.
 |---|---|---|
 | Turbo KV 缓存 | `-ctk turbo4 -ctv turbo4 -fa on` | 需开启 FlashAttention；`llama_context` 会自动启用 FA。KV 类型支持 `turbo2`/`turbo3`/`turbo4` |
 | 权重量化 | `--outtype tq3_1s` / `tq4_1s` | 转换模型权重时选用 turbo 权重量化 |
-| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**仅 Qwen3.5 可用**（其它架构设了 `--kv-stream-stage-mib` 会建上下文失败，这是上游 fork 自身限制）。可与 turbo KV（`-ctk turbo4 -ctv turbo3`）和 MTP 推测解码（`--spec-type draft-mtp`）叠加，见 [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md) |
 
 **环境变量**：
 
@@ -98,7 +92,7 @@ Turbo KV cache types are runtime-only and never stored in a GGUF.
 ## Integration decisions worth knowing
 
 - **FA vector-kernel dispatch.** Upstream replaced the `#ifdef
-  GGML_CUDA_FA_ALL_QUANTS` macro dispatch with a table in
+  `GGML_CUDA_FA_ALL_QUANTS` macro dispatch with a table in
   `ggml_cuda_get_fattn_vec_case()` driven by `if constexpr
   (GGML_CUDA_FA_<K>_<V>)`. The 21 turbo combinations are registered there and
   compiled via `ggml_cuda_fattn_vec_instances()` in `ggml/cmake/common.cmake`.
@@ -127,9 +121,6 @@ Turbo KV cache types are runtime-only and never stored in a GGUF.
 - **`TURBO_AUTO_ASYMMETRIC`** (fork, default on): for a high GQA ratio the K cache
   is upgraded from `turbo*` to `q8_0` to protect quality. Set
   `TURBO_AUTO_ASYMMETRIC=0` to force symmetric turbo K/V.
-- **`peer_access` map restored** in `ggml_cuda_device_info` (`common.cuh`);
-  upstream dropped it with the multi-GPU split infrastructure but the KV-streaming
-  cross-device copy path uses it.
 - The fork's `GGML_PREC_F32_PEDANTIC` plumbing was dropped: neither that enum
   value nor the `ggml_prec()` accessor exists upstream, and it was only ever set
   by the excluded `build_lora_mm(..., prec)` parameter.
@@ -148,14 +139,10 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
   **21/21**, `FLASH_ATTN_EXT` `turbo3` **8/8**. The cases themselves come from
   the fork and were ported in a follow-up to this merge; see the correction
   under *Known limitations*.
-- `test-kv-stream-plan` / `-config` / `-softmax` / `-bench-config`:
-  54 tests, 325 assertions, 0 failures.
 - End-to-end generation, `Qwen2.5-0.5B-Instruct Q4_K_M`, `-ctk turbo4 -ctv turbo4
   -fa on` — both `llama-completion` and `llama-server`
   (`/v1/chat/completions`) answer `"The capital of France is Paris."`, matching
   the f16-KV baseline.
-- `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` are parsed and reach
-  context creation. See the limitation below.
 - **CUDA compile** (`CUDA 12.4`, `-allow-unsupported-compiler`, arch `sm_80`):
   `ggml-cuda.cu`, `fattn.cu`, `convert.cu`, `getrows.cu`, `set-rows.cu`,
   `mmvq-tq.cu`, `turbo-wht.cu`, `turbo-innerq.cu` and all **21** turbo
@@ -165,10 +152,6 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
 
 ## Known limitations
 
-- **KV streaming is restricted to Qwen3.5** by
-  `llama-kv-stream-config.cpp` (`block KV streaming currently supports only
-  Qwen3.5`). Other architectures fail context creation when
-  `--kv-stream-stage-mib` is set. This is the upstream fork's own restriction.
 - Turbo KV cache is unusable on Metal/Vulkan in this tree (no kernels ported).
 - **Turbo KV + KV streaming and MTP + KV streaming were broken until
   [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md)**: turbo types were
@@ -177,7 +160,8 @@ Build: MSVC 14.40 + Ninja + CMake 3.28, static libs.
   one token per sequence, which a speculative verify batch cannot satisfy
   (`phase arena currently supports TG1 without speculative batches`). Both are
   fixed; the GPU-side numerics of the turbo conversion fallback still need a
-  run on real hardware.
+  run on real hardware. See [`MERGE_ADAPTIVE_KVSTREAMING.md`](MERGE_ADAPTIVE_KVSTREAMING.md)
+  for the KV-streaming side.
 - **CUDA GPU validation is still outstanding.** The turbo kernels *are* covered
   by `test-backend-ops` on the CPU backend (see *Verification performed*); the
   harness does not skip it, it runs the reference implementations. An earlier

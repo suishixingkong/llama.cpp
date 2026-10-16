@@ -16,11 +16,13 @@ down under [Upstream llama.cpp README](#upstream-llama-cpp-readme).
 
 | Repository | Origin / focus | What was integrated | Notes |
 |---|---|---|---|
-| [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) | TurboQuant KV cache + turbo weight quantization | TurboQuant KV cache types (`turbo2/3/4`) and `TQ3_1S`/`TQ4_1S` weight quantization (subset only) | [MERGE_TURBO_KVSTREAM.md](MERGE_TURBO_KVSTREAM.md) |
-| [`RaymondHuang210129/llama.cpp-adaptive-kv-streaming`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming) | Adaptive KV cache streaming for the CUDA `llama-server` | Host-pinned KV with a bounded CUDA arena, phase multiplexing, and prefetch scheduling (the full KV-streaming branch) | [MERGE_TURBO_KVSTREAM.md](MERGE_TURBO_KVSTREAM.md) |
-| [`anyei/llamacpp-v100`](https://github.com/anyei/llamacpp-v100) | Tesla V100 (Volta) CUDA tuning | sm70 `MMVQ_PARAMETERS_VOLTA` table + one-shot P2P NVLink AllReduce for 2-GPU tensor mode (4 files) | [MERGE_V100.md](MERGE_V100.md) · [AUDIT_V100_MERGE.md](AUDIT_V100_MERGE.md) |
-| [`jackjusko/jusko-llama-volta-qwen3flash`](https://github.com/jackjusko/jusko-llama-volta-qwen3flash) | Volta / SM70 Qwen3.8-Flash optimizations | sm70 q8_0 tensor-core FA, 256×256 compact FA specialization, Volta GEMV variants (Q5_K×4, Q6_K W4R4), Q6_K MMQ Pascal-DP4A routing, GDN 128×4 Volta kernel, `--prefill-reuse`, and `--checkpoint-recurrent-prev` recurrent-state replay | [MERGE_JUSKO_VOLTA.md](MERGE_JUSKO_VOLTA.md) · [AUDIT_JUSKO_MERGE.md](AUDIT_JUSKO_MERGE.md) |
-| [`jackinthebox52/qwen38-v100-serve`](https://github.com/jackinthebox52/qwen38-v100-serve) | Qwen3.8-27B V100 serving | `flash_attn_ext_vec` `ncols2 = 3` GQA head packing for GQA ratios with factor 3 (e.g. Qwen3.8-27B 24/4) on Volta (1 file) | [MERGE_QWEN38_V100.md](MERGE_QWEN38_V100.md) |
+| [`AtomicBot-ai/atomic-llama-cpp-turboquant`](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) | TurboQuant KV cache + turbo weight quantization | TurboQuant KV cache types (`turbo2/3/4`) and `TQ3_1S`/`TQ4_1S` weight quantization (subset only) | [MERGE_TURBOQUANT.md](docs/MERGE_TURBOQUANT.md) |
+| [`RaymondHuang210129/llama.cpp-adaptive-kv-streaming`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming) | Adaptive KV cache streaming for the CUDA `llama-server` | Host-pinned KV with a bounded CUDA arena, phase multiplexing, and prefetch scheduling (the full KV-streaming branch) | [MERGE_ADAPTIVE_KVSTREAMING.md](docs/MERGE_ADAPTIVE_KVSTREAMING.md) |
+| [`spiritbuun/buun-llama-cpp`](https://github.com/spiritbuun/buun-llama-cpp) | VBR 动态 KV 量化 · MoE 缓存 · mmproj-gpu-swap · recurrent-state 回放 | VBR 动态 KV 量化（host/VMM 预算重分层）、MoE 缓存（generic 路径）、`--mmproj-gpu-swap` 多模态投影 GPU⇄CPU 交换、recurrent-state 回放 | [MERGE_BUUN_PLAN.md](docs/MERGE_BUUN_PLAN.md) |
+| [`TheTom/llama-cpp-turboquant`](https://github.com/TheTom/llama-cpp-turboquant) | turbo4 量化算法上游对齐（TheTom 码本/块 + buun mean-sub） | turbo2/3/4 量化算法的上游对齐来源（TheTom 码本/块 + buun mean-sub） | [MERGE_TURBO234_UPSTREAM.md](docs/MERGE_TURBO234_UPSTREAM.md) |
+| [`anyei/llamacpp-v100`](https://github.com/anyei/llamacpp-v100) | Tesla V100 (Volta) CUDA tuning | sm70 `MMVQ_PARAMETERS_VOLTA` table + one-shot P2P NVLink AllReduce for 2-GPU tensor mode (4 files) | [MERGE_V100.md](docs/MERGE_V100.md) · [AUDIT_V100_MERGE.md](docs/AUDIT_V100_MERGE.md) |
+| [`jackjusko/jusko-llama-volta-qwen3flash`](https://github.com/jackjusko/jusko-llama-volta-qwen3flash) | Volta / SM70 Qwen3.8-Flash optimizations | sm70 q8_0 tensor-core FA, 256×256 compact FA specialization, Volta GEMV variants (Q5_K×4, Q6_K W4R4), Q6_K MMQ Pascal-DP4A routing, GDN 128×4 Volta kernel, `--prefill-reuse`, and `--checkpoint-recurrent-prev` recurrent-state replay | [MERGE_JUSKO_VOLTA.md](docs/MERGE_JUSKO_VOLTA.md) · [AUDIT_JUSKO_MERGE.md](docs/AUDIT_JUSKO_MERGE.md) |
+| [`jackinthebox52/qwen38-v100-serve`](https://github.com/jackinthebox52/qwen38-v100-serve) | Qwen3.8-27B V100 serving | `flash_attn_ext_vec` `ncols2 = 3` GQA head packing for GQA ratios with factor 3 (e.g. Qwen3.8-27B 24/4) on Volta (1 file) | [MERGE_QWEN38_V100.md](docs/MERGE_QWEN38_V100.md) |
 
 Each fork is a full distribution; this tree takes only the parts relevant to its
 targets (CUDA + Volta / V100, and a backend-agnostic recurrent-checkpoint feature),
@@ -29,13 +31,18 @@ deliberately **excluded**, the integration decisions, and the verification resul
 
 ## Merge & audit documents in this repository
 
-- **[`MERGE_TURBO_KVSTREAM.md`](MERGE_TURBO_KVSTREAM.md)** — TurboQuant KV cache + adaptive KV streaming (two forks merged together).
-- **[`AUDIT_TURBO_PORT.md`](AUDIT_TURBO_PORT.md)** — independent audit of the TurboQuant (+ adaptive-KV-streaming) port (verdict: algorithm ported correctly, no numeric drift; issues were in test coverage, the template-instance list, and excluded-arch leftovers — all fixed).
-- **[`MERGE_V100.md`](MERGE_V100.md)** — Tesla V100 (Volta) CUDA port from `llamacpp-v100`.
-- **[`AUDIT_V100_MERGE.md`](AUDIT_V100_MERGE.md)** — independent audit of the `llamacpp-v100` port (verdict: complete & correct).
-- **[`MERGE_JUSKO_VOLTA.md`](MERGE_JUSKO_VOLTA.md)** — Volta/SM70 pieces + recurrent checkpoint tail replay from `jusko-llama-volta-qwen3flash`.
-- **[`AUDIT_JUSKO_MERGE.md`](AUDIT_JUSKO_MERGE.md)** — independent audit of the `jusko` port (verdict: faithful, complete, doc/code consistent).
-- **[`MERGE_QWEN38_V100.md`](MERGE_QWEN38_V100.md)** — Qwen3.8-27B GQA packing from `qwen38-v100-serve`.
+- **[`MERGE_TURBOQUANT.md`](docs/MERGE_TURBOQUANT.md)** — TurboQuant KV cache + turbo weight quantization (from `atomic-llama-cpp-turboquant`).
+- **[`MERGE_ADAPTIVE_KVSTREAMING.md`](docs/MERGE_ADAPTIVE_KVSTREAMING.md)** — Adaptive KV cache streaming (from `llama.cpp-adaptive-kv-streaming`).
+- **[`MERGE_BUUN_PLAN.md`](docs/MERGE_BUUN_PLAN.md)** — buun-llama-cpp → llama.cpp(master) 合并方案（VBR 动态 KV 量化 · MoE 缓存 · mmproj-gpu-swap · recurrent-state 回放）。
+- **[`AUDIT_VBR_FINAL.md`](docs/AUDIT_VBR_FINAL.md)** — independent audit of the buun VBR dynamic-KV-quant engine / server / wiring / test surface (residual 0).
+- **[`MERGE_TURBO234_UPSTREAM.md`](docs/MERGE_TURBO234_UPSTREAM.md)** — turbo2/3/4 上游对齐移植（TheTom 码本/块 + buun mean-sub）。
+- **[`AUDIT_TURBO234_THREEWAY.md`](docs/AUDIT_TURBO234_THREEWAY.md)** — three-way audit of the turbo2/3/4 upstream alignment (sorting + measured).
+- **[`AUDIT_TURBO_PORT.md`](docs/AUDIT_TURBO_PORT.md)** — independent audit of the TurboQuant (+ adaptive-KV-streaming) port (verdict: algorithm ported correctly, no numeric drift; issues were in test coverage, the template-instance list, and excluded-arch leftovers — all fixed).
+- **[`MERGE_V100.md`](docs/MERGE_V100.md)** — Tesla V100 (Volta) CUDA port from `llamacpp-v100`.
+- **[`AUDIT_V100_MERGE.md`](docs/AUDIT_V100_MERGE.md)** — independent audit of the `llamacpp-v100` port (verdict: complete & correct).
+- **[`MERGE_JUSKO_VOLTA.md`](docs/MERGE_JUSKO_VOLTA.md)** — Volta/SM70 pieces + recurrent checkpoint tail replay from `jusko-llama-volta-qwen3flash`.
+- **[`AUDIT_JUSKO_MERGE.md`](docs/AUDIT_JUSKO_MERGE.md)** — independent audit of the `jusko` port (verdict: faithful, complete, doc/code consistent).
+- **[`MERGE_QWEN38_V100.md`](docs/MERGE_QWEN38_V100.md)** — Qwen3.8-27B GQA packing from `qwen38-v100-serve`.
 
 ## Caveats (read before using)
 
