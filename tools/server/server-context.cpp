@@ -3734,11 +3734,16 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        // with the GPU swap the projector and the drafter are phase-exclusive, so the
-        // projector does not need a permanent reservation
-        if (has_mmproj && params_base.fit_params && !mmproj_swap_applicable) {
+        // without the swap the projector is resident next to the drafter, so its bytes raise the
+        // per-device margin.  With the swap the two are phase-exclusive and the projector is
+        // measured where it will actually run (the GPU): the fitter then charges
+        // max(drafter, projector) per device instead of adding them up.
+        // fork 9l-mmproj-swap: the phase-exclusive half is a port delta (2026-10-17) -- the
+        // fork only ever measured the projector when it was permanently resident.
+        if (has_mmproj && params_base.fit_params) {
             int64_t t_start = ggml_time_us();
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(),
+                    mmproj_swap_applicable ? make_mmproj_params(true) : mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
@@ -3746,15 +3751,22 @@ private:
                     total += size;
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
-                GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
+                if (mmproj_swap_applicable) {
+                    // the fitter matches these keys against the devices the target actually
+                    // loads onto, so no index space has to be agreed on here
+                    params_base.mmproj_swap_fit_bytes.assign(mmproj_mem.begin(), mmproj_mem.end());
+                    SRV_DBG("%s", "[mtmd] mmproj is phase-exclusive with the drafter: fit charges max(drafter, mmproj) per device\n");
+                } else {
+                    GGML_ASSERT(!params_base.fit_params_target.empty());
+                    for (auto & [dev, size] : mmproj_mem) {
+                        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                            if (ggml_backend_dev_get(i) == dev) {
+                                if (i < params_base.fit_params_target.size()) {
+                                    SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                                    params_base.fit_params_target[i] += size;
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }

@@ -70,6 +70,16 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    // an optional consumer that is PHASE-EXCLUSIVE with this model: on each device the fit
+    // charges max(extra model, alternative) instead of the two adding up, because the two are
+    // never resident at the same time
+    //   - `--mmproj-gpu-swap` passes the GPU projector here: the drafter is destroyed for the
+    //     duration of every image encode, so reserving both would under-serve the image phase
+    //     (the projector's bytes were ignored entirely) or over-reserve the text phase
+    //   - keyed by device pointer; the keys are matched against the devices the main model
+    //     actually loads onto, and a key with no match is dropped
+    //   - empty (the default) means "no alternative consumer", i.e. plain coexistence
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> phase_alt_bytes = {};
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)

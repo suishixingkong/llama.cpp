@@ -1490,6 +1490,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            // --mmproj-gpu-swap: the projector never coexists with the drafter, price max() not sum()
+            /*.phase_alt_bytes =*/ params.mmproj_swap_fit_bytes,
         };
 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,

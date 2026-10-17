@@ -530,6 +530,39 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
+    // charge the phase-exclusive consumer (common_fit_extra_model::phase_alt_bytes) on top of the
+    // extra model, so each device has to hold the larger of the two rather than their sum
+    //   - runs after every re-measurement of dmds_extra: that footprint follows n_ctx, while the
+    //     alternative's is a constant, so the max has to be re-taken per candidate context
+    auto add_phase_alt_bytes = [&]() {
+        if (extra == nullptr) {
+            return;
+        }
+        for (const auto & alt : extra->phase_alt_bytes) {
+            if (alt.second == 0) {
+                continue;
+            }
+            for (size_t id = 0; id < devs.size(); id++) {
+                if (devs[id] != alt.first) {
+                    continue;
+                }
+                const size_t have = dmds_extra[id].mb.total();
+                if (alt.second > have) {
+                    // booked as `context`: of the three categories this aggregate exposes,
+                    // `context` is the only one no estimator reads back (the context-scaling
+                    // estimators read the target-only dmds_target_full, and the layer-drop
+                    // heuristic reads dmds_full.mb.model). Booking it as `model` would corrupt
+                    // the per-layer size that heuristic divides by.
+                    dmds_extra[id].mb.context += alt.second - have;
+                    LOG_TRC("%s: phase-exclusive alternative needs %.2f MiB on %s, charging the %.2f MiB above the extra model's footprint\n",
+                            __func__, alt.second / (1024.0*1024.0), ggml_backend_dev_name(devs[id]),
+                            (alt.second - have) / (1024.0*1024.0));
+                }
+                break;
+            }
+        }
+    };
+
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
@@ -556,6 +589,8 @@ static void common_params_fit_impl(
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
+                // the alternative consumer is loaded regardless of the drafter, keep its reservation
+                add_phase_alt_bytes();
                 n_ctx_extra = cparams->n_ctx;
                 return;
             }
@@ -577,6 +612,8 @@ static void common_params_fit_impl(
                     dmd.mb.model = 0;
                 }
             }
+
+            add_phase_alt_bytes();
 
             n_ctx_extra = cparams->n_ctx;
         }

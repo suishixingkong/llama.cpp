@@ -1234,8 +1234,10 @@ external DFlash 相关的小部分属本特性，未移植。
 
 **bundle 拆解**（`8e64d7a3a` 的 commit message 自述四件事）：只取 flag 本体 +
 `has_type()` helper + `make_mmproj_params()`/`reload_mmproj()` 提取；**auto-fit 页边距**与
-**kv_unified 自动启用**两项刻意不取（前者依赖本树没有的 `recurrent_expansion`/`n_parallel_user`
+**kv_unified 自动启用**两项移植当时刻意不取（前者依赖本树没有的 `recurrent_expansion`/`n_parallel_user`
 体系；后者是正交的独立改动，buun 后来也自己拆成 `fee9ddd54`）。
+⭐ **2026-10-17 更正**：auto-fit 页边距**不需要**那套体系也能做对 —— 在 fit 内部按
+「每设备 max(drafter, projector)」计价即可，见 §10.27.3。
 
 **适配要点**（本树 `server-context.cpp` 5634 行 vs buun 22995 行的必然结果，逐 hunk 不可行 → 重表达）：
 draft 上下文由 `spec_init`（`common_speculative_init_result`）持有，故重建走
@@ -1281,7 +1283,7 @@ draft 上下文由 `spec_init`（`common_speculative_init_result`）持有，故
 | bundle 成员 | 处置 | 理由 |
 |---|---|---|
 | **`--mmproj-gpu-swap` 本体** | ✅ 移植 | 目标特性 |
-| auto-fit：在 n_parallel 翻倍**之前**跑 fitter | ❌ 未移植 | 依赖 buun 的 `server_recurrent_expansion_state` / `recurrent_expanded` / `n_parallel_user` 体系，本树没有该重构。**后果**：本树下自动 fit 的页边距不考虑投影器的相位需求，需要 `-c` 显式指定时才精确。属已知局限，非缺陷。 |
+| auto-fit：在 n_parallel 翻倍**之前**跑 fitter | ❌ 未移植（只剩**顺序**这一项） | 依赖 buun 的 `server_recurrent_expansion_state` / `recurrent_expanded` / `n_parallel_user` 体系，本树没有该重构。⚠️ 移植当时写的「本树自动 fit 的页边距不考虑投影器」**已作废**：投影器现在按相位互斥计价（每设备 `max(drafter, projector)`），见 §10.27.3，`-c` 不再是必需。 |
 | np=1 + spec 时自动启用 `kv_unified` | ❌ 未移植 | 与投影器无关的独立改动，buun 自己也随后把它拆成单独提交（`fee9ddd54`）。是否要这条应单独决策。 |
 | `has_type()` helper（替代 verbose `std::find`） | ✅ 移植 | 本特性到处用它 |
 | 提取 `make_mmproj_params()` / `reload_mmproj()` | ✅ 移植 | 重载路径的前提 |
@@ -1344,9 +1346,11 @@ if (!slot.spec_draft.empty()) {
 1. **本树没有的 drafter（DFlash / DSpark）不可能参与交换** —— 它们的整个投机实现都未移植。
    （移植当时还写了一条「外部 drafter 一律不参与」；**2026-10-17 已撤回并放开**，见 §10.27.2：
    外部 draft 文件现在会销毁模型并在媒体段结束时从文件重载。）
-2. **auto-fit 的相位感知页边距未移植**（见 §2）。用 `-c` 显式指定上下文时无影响。
-   ⚠️ 对 §10.27.2 的外部 draft 同样成立且更要紧：开交换后 fit **不再**为投影器留页边距，
-   若投影器比 draft 大，图像阶段会退回 CPU 编码（fail-open，有 `falling back to CPU` 日志）。
+2. **auto-fit 的相位感知页边距**：**2026-10-17 已自行重表达**（§10.27.3）—— 开关打开时投影器
+   按「每设备 `max(drafter, projector)`」计价，既不忽略它、也不与它相加，因此
+   「投影器比 draft 大 ⇒ 图像阶段退回 CPU」这条已知退化**不再成立**。
+   仍未移植的只是 buun 的**顺序**改动（在 `n_parallel` 翻倍之前跑 fitter），它依赖本树没有的
+   `recurrent_expansion` / `n_parallel_user` 体系；`-c` 显式指定从「必需」降为「可选（跳过自动拟合）」。
 3. **`kv_unified` 自动启用未移植**（见 §2）。与本特性正交。
 4. 上游后来把「投影器/草稿交换」的待处理状态接进了投机调度（`projector_swap_pending`，
    避免对着即将销毁的 owner 排队草稿）。本树不需要：交换**发生在该 slot 的媒体段之前**，
@@ -1394,9 +1398,9 @@ llama-server -m <MTP 模型> --mmproj <投影器> --spec-type draft-mtp --spec-d
 
 ##### 6. 后续
 
-- 若需要外部 drafter 也参与交换，需先量「重新加载 drafter 的代价」是否值得；
-- 若要移植 auto-fit 相位感知页边距，需先合入 buun 的 `recurrent_expansion` / `n_parallel_user` 体系
-  （或在本树的 fit 路径上另写等价物）。
+- ~~若需要外部 drafter 也参与交换~~ → **已做**（§10.27.2，2026-10-17）；代价 = 每个媒体段一次模型加载。
+- ~~若要移植 auto-fit 相位感知页边距，需先合入 buun 的 `recurrent_expansion` / `n_parallel_user` 体系~~
+  → **已做，且不需要那套体系**（§10.27.3，2026-10-17）。
 
 ##### 7. 测试步骤（有卡机器）
 
@@ -1408,7 +1412,7 @@ llama-server -m <MTP 模型> --mmproj <投影器> --spec-type draft-mtp --spec-d
 | **必需前提** | `-mm` / `--mmproj FILE` | 不给则 `has_mmproj` 为假，整段逻辑不执行（静默） |
 | | `--spec-type draft-mtp` | 原生 MTP（不给 `-md`）：重建只是 `llama_init_from_model(model_tgt, …)`，**不读盘**，往返毫秒级 |
 | | `-md` / `--spec-draft-model` | **可以给**（2026-10-17 起，含 `-md` 加载的 MTP 头）：draft 模型被销毁并在每个媒体段结束时**从文件重载**，代价 = 一次模型加载（页缓存命中时是内存拷贝） |
-| | `-c N` | **建议显式给**：本移植未含 auto-fit 相位感知页边距（§2），自动 fit 的页边距不考虑投影器 |
+| | `-c N` | **可选**：2026-10-17 起 auto-fit 已按「每设备 max(drafter, projector)」为投影器留页边距（§10.27.3）；显式给只是跳过自动拟合 |
 | **相关可选** | `-mmdev` / `--mmproj-device` | 投影器换到 GPU 时用的设备（默认跟随 `--device`） |
 | | `--spec-draft-n-max N` | MTP 草稿长度，同时决定 MTP 上下文大小（要腾出的显存量） |
 | | `--mmproj-offload` / `--no-mmproj-offload` | **不用手动设**：交换启用时起始位置强制为 CPU，由本特性接管 |
@@ -1526,10 +1530,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 
 ##### 4. 残留局限（与 §4 对齐）
 
-1. **auto-fit 不为投影器留页边距**（继承既有局限，见 §2/§4.2）。开交换后 fit 只按 draft 计价，
-   若**投影器体积 > draft**，图像阶段会 `falling back to CPU`（fail-open，有日志）⇒ 显式 `-c`
-   或 `-ngld 0`。fork 在 `:6445-6472` 为 DFlash 做过 `max(draft, mmproj)`，本树未移植：
-   draft 的实际占用在 `common_fit_params` 内部才测，此处拿不到，做等价改动需要第二个估算入口。
+1. ~~**auto-fit 不为投影器留页边距**~~ → **本 commit 之后已解决**，见 §10.27.3：投影器改为
+   在 fit 内部按「每设备 `max(drafter, projector)`」计价（fork 在 `:6445-6472` 只对 DFlash 做了
+   同一件事，而且要靠它自己的 draft 测量；本树把 max 放进 fit，原生 MTP 也一并覆盖）。
 2. **`-np > 1` 的并发窗口**：交换是进程级的，A 槽媒体段结束即 `reload_mmproj(false)`，
    B 槽若仍在编码会被抽走投影器。MTP 原生路径同样存在；外部 draft 下恢复更慢、窗口更长 ⇒
    先按 `-np 1` 验证。
@@ -1562,6 +1565,69 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 - ⏳ **未覆盖**：交换的**实际往返**（`swapping … out` → `mmproj->draft swap done`）需要真投影器 +
   有卡机器。命令见 §7，把 `--spec-type draft-mtp` 换成 `-md <MTP gguf> --spec-type draft-mtp` 并
   量 `MTP->mmproj` / `mmproj->draft` 两段耗时（后者就是重载成本）。
+
+#### §10.27.3 auto-fit 按「相位互斥」给投影器留页边距（2026-10-17）
+
+##### 1. 问题
+
+交换打开后 `load_model()` **刻意跳过**投影器的 fit 预留（`!mmproj_swap_applicable` 分支）——理由成立
+（两者不共存），但另一半没做：drafter 的占用照旧由 `common_fit_extra_model` 计价，投影器按 **0** 计。
+当**投影器体积 > drafter** 时，图像阶段腾出的显存不够装投影器 ⇒
+`failed to load mmproj to GPU, falling back to CPU`（fail-open，但每张图 30–60 s）。
+
+##### 2. 为什么不能「把投影器加进 margins」
+
+`fit_params_target`（= fit 的每设备 margin）是**常数**，而 drafter 的占用**随候选 `n_ctx` 变化**
+（KV + compute）⇒ `max(drafter(ctx), projector)` **不能**用常数 margin 表达。直接相加 = 取「和」，
+多留 `min(D,P)`，把开关「省显存」的目的抵消掉。
+fork 用**定点迭代**在 fit **外面**解这个依赖（`:6554-6600`）；本树把 max 放进 fit 的
+`add_extra_memory` —— 那里本来就在每个候选 ctx 上重测 `dmds_extra`，所以依赖天然成立，**不需要迭代**。
+（这也解释了为什么「移植 fork 的 auto-fit 页边距要先合 `recurrent_expansion` 体系」是**错判**：
+那道门槛属于 fork 的实现方式，不是问题本身。）
+
+##### 3. 接线（5 文件）
+
+| 位置 | 改动 |
+|---|---|
+| `common/common.h` | 新通道 `common_params::mmproj_swap_fit_bytes`（`vector<pair<ggml_backend_dev_t,size_t>>`，设备指针 → 字节）。只有 server 填，其余配置为空 |
+| `tools/server/server-context.cpp` | 开关打开时投影器改用 `make_mmproj_params(true)`（**GPU 放置** —— 它真正要跑的位置）测一次，写进上面的通道；关闭时保持原来的「加进 `fit_params_target`」路径不变 |
+| `common/common.cpp` | `common_fit_extra_model` 多填一个 `phase_alt_bytes` |
+| `common/fit.h` | `common_fit_extra_model::phase_alt_bytes`（默认空 = 普通共存） |
+| `common/fit.cpp` | `add_phase_alt_bytes()`：每次 `dmds_extra` 重测后，若某设备的替代消费者字节 > drafter 在该设备的实测占用，把**差额**补上；`extra` 测量失败的分支同样补（投影器照样会被加载） |
+
+三个实现要点：
+
+- ⭐ **记账分类**：差额记进 `dmds_extra[id].mb.context`。它是这个聚合体暴露的三个分类里**唯一没人回读**的
+  —— ctx 估计器读的是 target-only 的 `dmds_target_full`，而 `dmds_full.mb.model` 会被层数回退的
+  `model_per_layer = sum_projected_model / n_gpu_layers` 除。记 `model` 会污染层数回退；记 `context`
+  只影响 `total()`，而 `total()` 正是要修正的东西。
+- ⭐ **设备匹配用指针**：`phase_alt_bytes` 的键直接与 fitter 自己的 `devs`（`llama_model_get_device` 序列）
+  比对，不引入索引空间 —— 顺带绕开 upstream `e2b129e1b` 留下的那条「按**全局**设备序号写
+  `fit_params_target`」的老路（它在 `--device CUDA1` 这类配置下与 `margins[id]` 的**模型设备序号**不一致）。
+  ⚠️ 那条老路本次**未动**（是 upstream 的代码，不是移植缺陷），只是新路径不走它。
+- **原生 MTP 一并覆盖**：`shares_model` 只把 `.model` 清零，比较用的是 `total()`，于是
+  `max(MTP ctx, 投影器)`；同一机制对「外部 draft」和「原生 MTP」都成立。
+
+##### 4. 判据（有卡机器）
+
+`-lv 4` 下 fit 期会出现（**仅当**投影器更大）：
+`phase-exclusive alternative needs X MiB on <dev>, charging Y MiB above the extra model's footprint`
+- 出现 ⇒ 页边距生效，且广告出的 `n_ctx` 会比不加此机制时**小**；
+- 不出现 ⇒ drafter 的实测占用已覆盖投影器（正常，不需要额外预留）。
+- **反向控制**：同一命令去掉 `--mmproj-gpu-swap`，应回到旧路径（`adding X MiB to fit_params_target`）。
+
+##### 5. 验证
+
+- **构建**：`fit.h` + `common.h` 变更 ⇒ 受影响目标（`llama-server` / `llama-cli` / `llama-bench` /
+  `llama-fit-params` / `llama-perplexity`）**RC_BUILD=0**；`common.h` 一改前后两轮各 64 / 76 目标。
+  ⚠️ 环境坑：这轮全量重编是因为**提交改了版本串**（`git` 版本号进 `-D` 宏）⇒ 整个 ggml/llama 都要重编；
+  重链 `llama.dll` 时 `cmake -E __create_def` 写 `exports.def` 被**沙箱文件写策略**拒绝 ⇒ 打开沙箱放行才成功。
+- **回归**：CPU 树 `llama-cli -ngl 0 -c 512` 正常出词（fit 路径带着新 lambda 跑通，alt 为空=空操作）；
+  门的三臂探针与 §10.27.2 完全一致（A 警告 1 次 / B、C 0 次）。
+- **守卫**：`server-context.cpp` 与 `common/common.h` 的两处 hunk 各带 `fork 9l-mmproj-swap:` 标记
+  （`test_9l_d4b8i_guards.py` 的 FILES **含 `common/common.h`** —— 这是本轮踩到的：只给 server 文件加标记不够）。
+  全扫 total = 2（= 基线既存债务）。
+- ⏳ **未覆盖**：`add_phase_alt_bytes` 的**运行痕迹**需要真投影器（本机没有）⇒ §4 那行 TRC 就是它在设备上的判据。
 
 ### §10.28 FA_QUANTS 默认值收窄 + q5_1/q4_1-turbo4_0 实例（2026-09-24 深夜）
 

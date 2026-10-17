@@ -533,6 +533,11 @@ struct common_params {
     // the caller's ordinary per-device safety headroom and account auxiliaries through live free
     // memory instead of treating their bytes as permanently unavailable a second time.
     uint64_t fit_params_vbr_growth_headroom_bytes = 0; // 0 = derive from fit_params_target
+    // fork 9l-mmproj-swap: phase-exclusive alternative to the draft model, per device. With
+    // --mmproj-gpu-swap the GPU projector only ever coexists with the target, never with the
+    // drafter, so common_init_from_params() hands these bytes to the fitter as
+    // max(drafter, projector) instead of dropping them. Set by the server; empty otherwise.
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> mmproj_swap_fit_bytes;
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
