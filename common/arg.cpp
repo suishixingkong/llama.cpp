@@ -3605,8 +3605,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
         {"--mmproj-gpu-swap"},
-        "temporarily destroy the MTP draft context to free VRAM so the multimodal projector can run on the GPU for image encoding, then recreate it\n"
-        "(useful when the MTP context and the GPU projector do not fit in VRAM at the same time)",
+        "temporarily destroy the draft context (native MTP, or the --spec-draft-model file) to free VRAM so the multimodal projector can run on the GPU for image encoding, then recreate it\n"
+        "(useful when the draft context and the GPU projector do not fit in VRAM at the same time; an external draft model is reloaded from its file on every media interval)",
         [](common_params & params) {
             params.mmproj_gpu_swap = true;
         }

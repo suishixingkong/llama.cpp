@@ -1287,7 +1287,8 @@ draft 上下文由 `spec_init`（`common_speculative_init_result`）持有，故
 | 提取 `make_mmproj_params()` / `reload_mmproj()` | ✅ 移植 | 重载路径的前提 |
 
 后续精化提交（`4c714197f` / `143150400` / `396469835` / `fea2e08f0`）里与本特性相关的部分
-是对 **external DFlash** 的支持（相位互斥扩到可从磁盘重载的外部 drafter）。**未移植**，理由见 §4。
+是对 **external DFlash** 的支持（相位互斥扩到可从磁盘重载的外部 drafter）。移植当时**未取**；
+**2026-10-17 自行重表达为「任何外部 draft 文件」**，见 §10.27.2（DFlash 本身仍不在本树）。
 
 ##### 3. 本树结构差异与适配
 
@@ -1300,7 +1301,7 @@ buun 的 `server-context.cpp` 是 22995 行（4× 本树 5634 行），draft 生
 | 草稿上下文创建 | 独立 `create_mtp_context()` 直接 `llama_init_from_model` | 复用 `common_base_params_to_speculative()` + `common_speculative_init_from_params()`，与 `load_model()` 的首建路径同源（**避免两条创建路径漂移**） |
 | slot 绑定 | `slot.spec_shared` + `slot.get_spec()` | `slot.spec`（原始指针）+ 成员 `spec` 统一 |
 | slot 上的投影器状态 | `slot.mbatch` | 同，且**本树 `mbatch` 与 `mctx` 强绑定**（`mtmd_batch_init(mctx)`）⇒ `reload_mmproj()` 必须先 `slot.mbatch.reset()`，否则悬空 |
-| 泛化到外部 drafter | `swap_spec_to_mmproj_gpu()` 按 `model_dft` 分支 | 只在 `!has_draft && spec_mtp`（纯 MTP）时启用；不满足则**告警并保持两者常驻**（fail-open，不改变原有行为） |
+| 泛化到外部 drafter | `swap_spec_to_mmproj_gpu()` 按 `model_dft` 分支 | 移植当时只在 `!has_draft && spec_mtp`（纯 MTP）时启用。**2026-10-17 起改为 `spec_mtp \|\| has_draft`**：外部 draft 文件（含 `-md` 加载的 MTP 头）走「销毁模型 → 恢复时从文件重载」；只有既无 MTP 又无 draft 文件（纯 ngram）才告警并保持常驻。见 §10.27.2 |
 
 ###### 3.1 一个被移植进来的真实缺陷
 
@@ -1340,9 +1341,12 @@ if (!slot.spec_draft.empty()) {
 
 ##### 4. 刻意未移植 / 已知局限
 
-1. **外部 drafter（DFlash 等）不参与交换**。它会从磁盘重新加载模型，代价与本特性目标
-   （省显存、别重建太多）冲突。不满足条件时打警告并保持常驻 —— **不静默改变行为**。
+1. **本树没有的 drafter（DFlash / DSpark）不可能参与交换** —— 它们的整个投机实现都未移植。
+   （移植当时还写了一条「外部 drafter 一律不参与」；**2026-10-17 已撤回并放开**，见 §10.27.2：
+   外部 draft 文件现在会销毁模型并在媒体段结束时从文件重载。）
 2. **auto-fit 的相位感知页边距未移植**（见 §2）。用 `-c` 显式指定上下文时无影响。
+   ⚠️ 对 §10.27.2 的外部 draft 同样成立且更要紧：开交换后 fit **不再**为投影器留页边距，
+   若投影器比 draft 大，图像阶段会退回 CPU 编码（fail-open，有 `falling back to CPU` 日志）。
 3. **`kv_unified` 自动启用未移植**（见 §2）。与本特性正交。
 4. 上游后来把「投影器/草稿交换」的待处理状态接进了投机调度（`projector_swap_pending`，
    避免对着即将销毁的 owner 排队草稿）。本树不需要：交换**发生在该 slot 的媒体段之前**，
@@ -1402,8 +1406,8 @@ llama-server -m <MTP 模型> --mmproj <投影器> --spec-type draft-mtp --spec-d
 |---|---|---|
 | **本特性** | `--mmproj-gpu-swap` | 无值开关。**只在 `llama-server` 注册**（`LLAMA_EXAMPLE_SERVER`）——`llama-cli`/`llama-bench`/`llama-perplexity` 传它会报未知参数。无环境变量。 |
 | **必需前提** | `-mm` / `--mmproj FILE` | 不给则 `has_mmproj` 为假，整段逻辑不执行（静默） |
-| | `--spec-type draft-mtp` | **交换只对纯 MTP 生效**（`!has_draft && spec_mtp`） |
-| | ❌ `--spec-draft-model` | **不要给**。外部 drafter ⇒ 触发 `requires the MTP draft context` 警告并**禁用**交换 |
+| | `--spec-type draft-mtp` | 原生 MTP（不给 `-md`）：重建只是 `llama_init_from_model(model_tgt, …)`，**不读盘**，往返毫秒级 |
+| | `-md` / `--spec-draft-model` | **可以给**（2026-10-17 起，含 `-md` 加载的 MTP 头）：draft 模型被销毁并在每个媒体段结束时**从文件重载**，代价 = 一次模型加载（页缓存命中时是内存拷贝） |
 | | `-c N` | **建议显式给**：本移植未含 auto-fit 相位感知页边距（§2），自动 fit 的页边距不考虑投影器 |
 | **相关可选** | `-mmdev` / `--mmproj-device` | 投影器换到 GPU 时用的设备（默认跟随 `--device`） |
 | | `--spec-draft-n-max N` | MTP 草稿长度，同时决定 MTP 上下文大小（要腾出的显存量） |
@@ -1427,8 +1431,8 @@ llama-server.exe ^
 启动日志只可能有两种结果，这是**第一个判据**：
 
 - ✅ `loaded multimodal model on CPU (GPU swap enabled), '<投影器>'` ⇒ 交换已启用（投影器不占显存）；
-- ❌ `mmproj GPU swap requires the MTP draft context; keeping the projector and the drafter resident`
-  ⇒ 条件不满足（多半是给了 `--spec-draft-model`，或 MTP 没生效），交换**不会**发生。
+- ❌ `mmproj GPU swap needs a draft context it can recreate; keeping the projector resident`
+  ⇒ 既没有原生 MTP 也没有 `-md` 草稿模型（例如只用 ngram 投机）：没有任何显存可腾，交换**不会**发生。
 
 ```powershell
 ###### 第 2 步：端到端 —— 另开一个 PowerShell 发图（内联 base64，无需额外启动参数）
@@ -1452,11 +1456,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 
 | 观察 | 含义 | 下一步 |
 |---|---|---|
-| 启动即出现 `requires the MTP draft context` 警告 | 不是纯 MTP 配置 | 去掉 `--spec-draft-model`，确认 `--spec-type draft-mtp` 生效 |
-| 有 `on CPU (GPU swap enabled)`，但发图后**没有** `swapping MTP out` | `needs_mmproj_swap` 未成立（该 slot 的 batch 里没认出 media chunk） | 确认请求真带图；确认该 slot 的 prompt 里有图像占位 token |
-| `swapping MTP out` → 随后 `failed to load mmproj to GPU` + `falling back to CPU` | 腾出的显存不够放投影器 | 降 `-c` / 降 `--spec-draft-n-max`；用 nvidia-smi 确认 MTP 真被释放 |
-| `MTP->mmproj swap done` 与 `mmproj->MTP swap done` **成对**出现 | ✅ 往返成功 | 继续文本对话，确认投机恢复（见下条） |
-| `continuing without speculative decoding after the mmproj swap` | MTP 重建失败，已 fail-open | 输出仍正确，但失去投机；查显存占用 |
+| 启动即出现 `needs a draft context it can recreate` 警告 | 没有任何基于模型的 drafter（纯 ngram） | 加 `--spec-type draft-mtp`（原生 MTP）或 `-md`；纯 ngram 没有显存可腾 |
+| 有 `on CPU (GPU swap enabled)`，但发图后**没有** `swapping … out` | `needs_mmproj_swap` 未成立（该 slot 的 batch 里没认出 media chunk） | 确认请求真带图；确认该 slot 的 prompt 里有图像占位 token |
+| `swapping MTP out`（原生 MTP） | 交换已触发，往返不读盘 | 对照下一条看耗时 |
+| `swapping the draft model out` + `the draft model is reloaded from its file when the media interval ends` | 交换已触发，**外部 draft（`-md`）** | 恢复段会多花一次模型加载；`-ngld` 越小/文件越小越快 |
+| `swapping … out` → 随后 `failed to load mmproj to GPU` + `falling back to CPU` | 腾出的显存不够放投影器 | 降 `-c` / 降 `--spec-draft-n-max`；用 nvidia-smi 确认 drafter 真被释放。⚠️ 外部 draft 下多半是「投影器 > draft」，此时改用 `-ngld 0`（draft 常驻 CPU）更省事 |
+| `MTP->mmproj swap done` 与 `mmproj->draft swap done` **成对**出现 | ✅ 往返成功 | 继续文本对话，确认投机恢复（见下条） |
+| `continuing without speculative decoding after the mmproj swap` | drafter 重建失败，已 fail-open | 输出仍正确，但失去投机；查显存占用 / draft 文件是否还在 |
 | `failed to load the multimodal projector during the GPU swap` + 该请求报错 | 投影器 GPU/CPU 都加载失败 | 查投影器文件与 `-mmdev` |
 
 **预期内的「退化」**：交换期间与交换后，**其它 slot** 缓存的草稿状态被丢弃（§3.3），
@@ -1468,6 +1474,94 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 测试步骤/判读表见本计划 §10.27.1。
 
 提交：`49ddf4ff4`。
+
+#### §10.27.2 交换放开到外部 draft 模型（`-md` / `--spec-draft-model`）（2026-10-17）
+
+##### 1. 用户的问题与结论
+
+「`-md` 加载 MTP 模型时，能不能让内存里的 mmproj 和显存里的 MTP 互换空间？」
+—— **移植当时不能，现在能**。旧门 `:3694` 写作
+
+    const bool mmproj_swap_applicable = params_base.mmproj_gpu_swap && !has_draft && spec_mtp;
+
+而 `has_draft = speculative.has_dft() = !draft.mparams.empty()`（`common/common.h:391`）⇒
+**只要给 `-md` 就为真 ⇒ 门恒关**，打 `requires the MTP draft context` 警告后投影器按
+`mmproj_use_gpu` 常驻 GPU。⭐ 容易误判的一点：`-md` 指向 MTP 权重时 `spec_mtp` **往往也是真**
+（`common/arg.cpp:1382-1384`：未显式给 `--spec-type` 时按 draft 自带的 sidecar 自动设 `draft-mtp`），
+所以关门的**只有 `!has_draft` 这一项**，不是类型不匹配。
+
+##### 2. ⭐ 「把 MTP 移到内存」在本树只能这样实现
+
+`llama_model` 的权重在 backend buffer 里，**没有任何 host↔device 搬运原语**（本树 0 命中
+`llama_model_share_tensors`，也没有权重换页）。可行的实现只有一条：**销毁 draft 模型释放显存，
+下次从 gguf 重新加载**。效果上等价于用户描述的互换 —— 文件的页面就是「内存里的那一份」，
+页缓存命中时重载不产生物理 I/O。区别在**耗时不是 0**：原生 MTP 的重建是
+`llama_init_from_model(model_tgt, …)`（`common/speculative.cpp:2803`，不读盘，毫秒级）；
+外部 draft 要付一次 `llama_model_load_from_file` 的代价。
+
+##### 3. 改动（3 文件 / 无新增符号 / 无头文件改动）
+
+| 位置 | 改动 |
+|---|---|
+| `server-context.cpp:3712` | 门改为 `params_base.mmproj_gpu_swap && (spec_mtp \|\| has_draft)`；签名/语义不变 |
+| `server-context.cpp:3714` | 警告改为 `needs a draft context it can recreate`（现在只在**没有任何基于模型的 drafter** 时才发：纯 ngram 投机没有显存可腾） |
+| `server-context.cpp:3523` | `swap_spec_to_mmproj_gpu()` 按 `has_dft()` 打出 `swapping the draft model out` 并**预告恢复要重载文件**；`spec_init.reset()` 本就同时销毁 model+context（impl 里 model 先声明 ⇒ 析构 context→model），只是补了注释说明这**就是**释放显存的那一步 |
+| `server-context.cpp:3485` | `recreate_mtp_context()` → **`recreate_draft_context()`**（全树仅 2 处引用，无守卫钉住）；**函数体一行未改** |
+| `server-context.cpp:3570` | `swap_mmproj_to_spec()` 日志 `mmproj->draft swap done` |
+| `common/arg.cpp` | `--mmproj-gpu-swap` 帮助文本：写明可配 `-md`、且外部 draft **每个媒体段都要重载一次** |
+
+⭐ **归属标记（这八个守卫会因「新落点」变红）**：`server-context.cpp` 受 `9l-d4b8i/w/x/y/z`、
+`9l-d4b9a/b/c` 八个 `blast`/`ownership` 守卫约束 —— **任何与各自 BASE 不同的 hunk 里都必须有一行含
+`fork 9l-`**（`test_9l_d4b8w_guards.py:182`、`test_9l_d4b9c_guards.py` 同形）。首版改动后实测
+**66 条红**，逐条点名全是本次四处 hunk（`recreate` / `swap-out` / `swap-back` / 3837 那行注释）。
+四处统一用新标签 **`fork 9l-mmproj-swap:`**，刻意**不复用任何 slice 名**：
+`test_9l_d4b9c_guards.py:259` 断言 `fork 9l-d4b9c` 恰好 3 次，另有大量 `count(MARK) == 1`；
+新标签过 `d4b8j/k` 的**前缀冲突检查**（`9l-m` 与任何 `9l-d` 无前缀关系）。
+补标记后这 8 个脚本回到 **7 绿 + d4b9a 的 2 条既存债务**。
+
+⭐⭐ **恢复路径本来就支持外部 draft，这是本次改动小的根本原因**：`recreate_draft_context()` 调的
+`common_speculative_init_from_params()` 在 `has_dft()` 为真时走的就是
+`llama_model_load_from_file` + `llama_init_from_model`（`common/speculative.cpp:2779-2797`）——
+即「重载 draft 模型」的代码早已在首建路径里存在，只是旧门永远不放行。
+
+##### 4. 残留局限（与 §4 对齐）
+
+1. **auto-fit 不为投影器留页边距**（继承既有局限，见 §2/§4.2）。开交换后 fit 只按 draft 计价，
+   若**投影器体积 > draft**，图像阶段会 `falling back to CPU`（fail-open，有日志）⇒ 显式 `-c`
+   或 `-ngld 0`。fork 在 `:6445-6472` 为 DFlash 做过 `max(draft, mmproj)`，本树未移植：
+   draft 的实际占用在 `common_fit_params` 内部才测，此处拿不到，做等价改动需要第二个估算入口。
+2. **`-np > 1` 的并发窗口**：交换是进程级的，A 槽媒体段结束即 `reload_mmproj(false)`，
+   B 槽若仍在编码会被抽走投影器。MTP 原生路径同样存在；外部 draft 下恢复更慢、窗口更长 ⇒
+   先按 `-np 1` 验证。
+3. 仍然排除的是**本树没有的 drafter**（DFlash / DSpark 未移植），不是「外部 draft」。
+
+##### 5. 验证
+
+- **单 TU 编译**：`_chk_cpu_tu.py` 对 `tools/server/server-context.cpp` 与 `common/arg.cpp`
+  各 `RC_COMPILE=0`，0 warning（本机无 GPU；`vcvarsall.bat` 因沙箱屏蔽 `reg.exe` 不可用，
+  INCLUDE/LIB 由脚本手工装配）。
+- **全量构建 + 链接**：`D:\llama-build\cpu`（Ninja/MSVC，CPU-only）`cmake --build . --target llama-server`
+  **RC_BUILD=0**，173 目标，`bin/llama-server.exe` 时间戳刷新；补归属标记后增量复建（12 目标，含重链）
+  再次 **RC_BUILD=0**。⚠️ 手工 `export INCLUDE/LIB` 后跑，否则 cl 报
+  `cannot open include file: stdbool.h`（**环境前提，不是代码缺陷**）。
+- **守卫全扫** `guard_sweep.py`（166 脚本）：**total failing = 2**，全在 `test_9l_d4b9a_guards.py`
+  （`frozen: reconstruct(BASE) != OWN` ×2 —— 10-16 起就有的既存债务，基线 `guard_sweep_d5bfix2.txt`
+  同为 2）。⚠️ 首版改动后的**中间态是 66 红**，归因与修法见 §3 的归属标记说明，不是放宽判据。
+- **门的三臂运行时探针**（单变量 A/B/C，日志判据，见下）：用不存在的投影器路径即可在**不加载真投影器**
+  的前提下观察门决策 —— 警告行在 `mtmd_init_from_file` **之前**打印。
+
+| 臂 | 命令行（省略 `-m qwen2.5-0.5b-q4km.gguf -mm <不存在>`） | `needs a draft context it can recreate` |
+|---|---|---|
+| A | `--mmproj-gpu-swap --spec-type ngram-simple` | **出现 1 次** ⇒ 门关（无模型 drafter） |
+| B | `-md <model> --spec-type draft-simple --mmproj-gpu-swap` | **0 次** ⇒ 门开（外部 draft） |
+| C | `-md <model> --spec-type draft-mtp --mmproj-gpu-swap` | **0 次** ⇒ 门开（`-md` 载 MTP 头，用户场景） |
+
+  A 臂随后 `failed to load multimodal model`、B 臂先 `loading draft model '…'` 再失败、
+  C 臂随后 `context type MTP requested but model doesn't contain MTP layers`（测试用 qwen2.5-0.5b
+  没有 MTP 层，属夹具限制）—— 三臂都停在门之后的同一点，证明门决策本身已翻转。
+- ⏳ **未覆盖**：交换的**实际往返**（`swapping … out` → `mmproj->draft swap done`）需要真投影器 +
+  有卡机器。命令见 §7，把 `--spec-type draft-mtp` 换成 `-md <MTP gguf> --spec-type draft-mtp` 并
+  量 `MTP->mmproj` / `mmproj->draft` 两段耗时（后者就是重载成本）。
 
 ### §10.28 FA_QUANTS 默认值收窄 + q5_1/q4_1-turbo4_0 实例（2026-09-24 深夜）
 

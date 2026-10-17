@@ -3478,9 +3478,13 @@ private:
         spec.reset();
     }
 
-    // recreate the MTP draft context and its speculative owner after the projector swap tore
-    // them down. Mirrors the speculative init block in load_model().
-    bool recreate_mtp_context() {
+    // recreate the draft context and its speculative owner after the projector swap tore them
+    // down. Mirrors the speculative init block in load_model(). For native MTP this only
+    // re-instantiates a context on the target model; for an external draft file
+    // common_speculative_init_from_params() reloads the model from disk first.
+    // fork 9l-mmproj-swap: renamed from recreate_mtp_context() and generalized to external
+    // draft files (port delta 2026-10-17; body unchanged -- the reload was already here).
+    bool recreate_draft_context() {
         common_params params_dft = common_base_params_to_speculative(params_base);
 
         spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
@@ -3488,7 +3492,7 @@ private:
         ctx_dft   = spec_init->context();
 
         if (ctx_dft == nullptr) {
-            SRV_ERR("%s", "failed to recreate the MTP context after the mmproj swap\n");
+            SRV_ERR("%s", "failed to recreate the draft context after the mmproj swap\n");
             spec_init.reset();
             model_dft = nullptr;
             return false;
@@ -3516,10 +3520,20 @@ private:
         return true;
     }
 
-    // destroy the MTP draft context so the projector can have its VRAM, then load the
+    // fork 9l-mmproj-swap: the swap-out also drops an external draft model, not only the MTP
+    // context, so the swap serves any model-based drafter (port delta 2026-10-17).
+    // destroy the draft context so the projector can have its VRAM, then load the
     // projector onto the GPU. Returns false if the projector could not be brought up at all.
     bool swap_spec_to_mmproj_gpu() noexcept {
-        SRV_INF("%s", "swapping MTP out of VRAM, loading mmproj to GPU...\n");
+        // an external draft model is destroyed here, not just its context: its weights are a
+        // separate llama_model and they are what the projector needs the VRAM for
+        const bool external_draft = params_base.speculative.has_dft();
+
+        SRV_INF("swapping %s out of VRAM, loading mmproj to GPU...\n",
+                external_draft ? "the draft model" : "MTP");
+        if (external_draft) {
+            SRV_INF("%s", "the draft model is reloaded from its file when the media interval ends\n");
+        }
         const int64_t t0 = ggml_time_us();
 
         mmproj_is_on_gpu = false;
@@ -3527,6 +3541,8 @@ private:
         try {
             // every slot must stop referring to the draft context before it is destroyed
             unbind_slots_from_draft_context();
+            // releases the draft context and, when it is an external draft file, the draft
+            // model with it -- the latter is what returns the bulk of the VRAM
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -3555,19 +3571,21 @@ private:
         return false;
     }
 
+    // fork 9l-mmproj-swap: wording only -- the restore terminal recreates whichever drafter
+    // the swap-out removed (port delta 2026-10-17).
     void swap_mmproj_to_spec() noexcept {
-        SRV_INF("%s", "unloading mmproj from the GPU, recreating MTP...\n");
+        SRV_INF("%s", "unloading mmproj from the GPU, recreating the draft context...\n");
         const int64_t t0 = ggml_time_us();
 
         mmproj_is_on_gpu = false;
 
         try {
             reload_mmproj(false);
-            if (!recreate_mtp_context()) {
+            if (!recreate_draft_context()) {
                 SRV_ERR("%s", "continuing without speculative decoding after the mmproj swap\n");
                 return;
             }
-            SRV_INF("mmproj->MTP swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+            SRV_INF("mmproj->draft swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
         } catch (const std::exception & e) {
             SRV_ERR("mmproj swap-back failed: %s\n", e.what());
         } catch (...) {
@@ -3687,13 +3705,19 @@ private:
                     params_base.fit_params_target.begin(), params_base.fit_params_target.end());
         }
 
-        // The GPU swap destroys the draft context for the duration of an image encode, which
-        // is only viable for MTP: it is recreated against the target model without reloading
-        // anything. An external draft model would have to be loaded from disk again, so the
-        // projector and such a drafter stay resident together.
-        const bool mmproj_swap_applicable = params_base.mmproj_gpu_swap && !has_draft && spec_mtp;
+        // The GPU swap destroys the draft context for the duration of an image encode and
+        // recreates it once the media interval ends. Any model-based drafter qualifies:
+        //  - native MTP (spec_mtp, no draft file): the context is rebuilt against the target
+        //    model, so nothing is read back and the round trip stays in the millisecond range;
+        //  - an external draft file (-md / --spec-draft-model), including an MTP head shipped
+        //    as its own gguf: the draft model itself is dropped and reloaded from its file.
+        //    llama.cpp cannot page weights between host and device, so the file (or its page
+        //    cache) is the host-side copy and the restore pays a model load.
+        // Only a drafter that owns no model at all (ngram-only speculation) has nothing to
+        // free, and keeps the projector resident.
+        const bool mmproj_swap_applicable = params_base.mmproj_gpu_swap && (spec_mtp || has_draft);
         if (params_base.mmproj_gpu_swap && !mmproj_swap_applicable && has_mmproj) {
-            SRV_WRN("%s", "mmproj GPU swap requires the MTP draft context; keeping the projector and the drafter resident\n");
+            SRV_WRN("%s", "mmproj GPU swap needs a draft context it can recreate; keeping the projector resident\n");
         }
 
         // with the swap enabled the projector starts on the CPU and only moves to the GPU for
@@ -3816,7 +3840,7 @@ private:
                 return false;
             }
 
-            // the swap needs a live MTP context to tear down and recreate
+            // fork 9l-mmproj-swap: the swap needs a live draft context to tear down and recreate
             mmproj_gpu_swap = mmproj_swap_applicable && ctx_dft != nullptr;
             if (mmproj_gpu_swap) {
                 SRV_INF("loaded multimodal model on CPU (GPU swap enabled), '%s'\n", mmproj_path.c_str());
