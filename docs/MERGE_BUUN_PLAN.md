@@ -1468,6 +1468,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 | `MTP->mmproj swap done` 与 `mmproj->draft swap done` **成对**出现 | ✅ 往返成功 | 继续文本对话，确认投机恢复（见下条） |
 | `continuing without speculative decoding after the mmproj swap` | drafter 重建失败，已 fail-open | 输出仍正确，但失去投机；查显存占用 / draft 文件是否还在 |
 | `failed to load the multimodal projector during the GPU swap` + 该请求报错 | 投影器 GPU/CPU 都加载失败 | 查投影器文件与 `-mmdev` |
+| 服务在 `load_tensors: … model buffer size` 之后**无任何错误输出直接退出** | 已修（§10.27.4）：draft 重载收到悬空的 progress 回调 `user_data` ⇒ 访问违例 | 升级到含 §10.27.4 的提交；旧版只能去掉 `--mmproj-gpu-swap` 规避 |
 
 **预期内的「退化」**：交换期间与交换后，**其它 slot** 缓存的草稿状态被丢弃（§3.3），
 它们会退化为纯目标解码。表现是 `n_draft_accepted` / `n_draft_verif_steps` 暂时停滞 ——
@@ -1562,9 +1563,10 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
   A 臂随后 `failed to load multimodal model`、B 臂先 `loading draft model '…'` 再失败、
   C 臂随后 `context type MTP requested but model doesn't contain MTP layers`（测试用 qwen2.5-0.5b
   没有 MTP 层，属夹具限制）—— 三臂都停在门之后的同一点，证明门决策本身已翻转。
-- ⏳ **未覆盖**：交换的**实际往返**（`swapping … out` → `mmproj->draft swap done`）需要真投影器 +
-  有卡机器。命令见 §7，把 `--spec-type draft-mtp` 换成 `-md <MTP gguf> --spec-type draft-mtp` 并
-  量 `MTP->mmproj` / `mmproj->draft` 两段耗时（后者就是重载成本）。
+- **设备首跑已做（V100，gemma-4-E2B + `-md` MTP + 真投影器）：崩溃，已修** —— 见 §10.27.4
+  （`load_tensors: … model buffer size` 之后无输出直接退出 = `params_base` 里悬空的 progress 回调）。
+  ⏳ 修复后的往返仍需复验：`swapping … out` → `MTP->mmproj swap done` → `mmproj->draft swap done`
+  两段耗时（后者就是重载成本）。
 
 #### §10.27.3 auto-fit 按「相位互斥」给投影器留页边距（2026-10-17）
 
@@ -1628,6 +1630,63 @@ fork 用**定点迭代**在 fit **外面**解这个依赖（`:6554-6600`）；�
   （`test_9l_d4b8i_guards.py` 的 FILES **含 `common/common.h`** —— 这是本轮踩到的：只给 server 文件加标记不够）。
   全扫 total = 2（= 基线既存债务）。
 - ⏳ **未覆盖**：`add_phase_alt_bytes` 的**运行痕迹**需要真投影器（本机没有）⇒ §4 那行 TRC 就是它在设备上的判据。
+
+#### §10.27.4 设备首跑崩溃：draft 重载喂了悬空的 progress 回调（2026-10-17）
+
+##### 1. 现象
+
+V100（build 393 = `ea69a3a26`）用 gemma-4-E2B + `-md` MTP + `--mmproj-gpu-swap` 发图像请求，
+服务**没有任何错误输出，直接退出**。`-lv 4` 日志最后一行恰好是：
+
+```
+0.18.414.530 I load_tensors:        CUDA0 model buffer size =    41.44 MiB
+```
+
+前后对齐：`0.16.371.244 unloading mmproj from the GPU, recreating the draft context...` →
+`0.16.4~0.16.7` 投影器回 CPU（两个 `CLIP using CPU backend`）→ `0.17.199.238 loading draft model '<mtp gguf>'`
+→ `load_tensors` 落位 → **日志在此截断**。即崩溃在 `llama_context: constructing llama_context` 之前、
+draft 模型 tensor 落位之后。
+
+##### 2. 根因：`params_base` 里存了指向**已返回栈帧**的指针
+
+1. `load_model()` 内 `load_progress_data load_progress_text(this, "text_model");` 是**局部变量**
+   （`tools/server/server-context.cpp:3649`）；
+2. `:3782-3783` 把 `&load_progress_text` 写进 **`params_base`**（成员，活得比函数长）⇒ 函数一返回即悬空；
+3. swap-back 的 `recreate_draft_context()` 从 `params_base` **整体拷贝**出 `params_dft`
+   （`common_base_params_to_speculative()` 第一句就是 `common_params result = params;`），
+   `common_model_params_to_llama()`（`common/common.cpp:2000-2001`）再把两个字段原样转给 `llama_model_params`；
+4. `llama_model_load_from_file` → `llm_load_tensors` 打印完 buffer 尺寸（`src/llama-model.cpp:1865-1871`）
+   → `load_all_data()` 对**每个** tensor 先调 `progress_callback(size_done/size_data, user_data)`
+   （`src/llama-model-loader.cpp:1629`）；
+5. 回调里 `d->t_last_load_progress_ms = t_now` 写进已释放的栈帧，紧接着
+   `{"stages", d->stages}` 从一个**垃圾 `std::vector<std::string>`** 拷贝 ⇒ 访问违例；
+   进程被系统杀掉，没有任何 `LLAMA_LOG_ERROR`（这就是「日志干净截断」的原因）。
+
+为什么以前没炸：原生 MTP 的 `recreate_*` **不加载模型**（`llama_init_from_model(model_tgt, …)`），
+根本不进 loader；`reload_mmproj()` 走 mtmd，没有这个回调。⇒ 这个 UB 只在「交换到外部 draft 文件」
+这条新路径上才被踩到，属于 §10.27.2 放开门之后暴露的**既有缺陷**，不是交换逻辑本身错。
+
+##### 3. 修法（`tools/server/server-context.cpp`，2 处，均带 `fork 9l-mmproj-swap:` 标记）
+
+| 位置 | 改动 |
+|---|---|
+| `recreate_draft_context()` | 声明**活着的** `load_progress_data load_progress_spec(this, "spec_model")`，把 `params_dft` 的 `load_progress_callback` / `..._user_data` 覆盖成它。⇒ 重载期进度事件恢复，且不再依赖 `params_base` 里那个指针（即使它仍是脏的也安全） |
+| `load_model()`，`common_init_from_params(params_base)` 之后 | 立刻把 `params_base.load_progress_callback` / `..._user_data` 清成 `nullptr`。`params_base` 从此不持有指向死栈帧的指针，防住未来任何「拷贝 params_base 再加载模型」的同类复发 |
+
+⭐ 判据不是「要不要回调」，而是**谁活得比谁长**：`user_data` 必须与那次加载调用同生命周期。
+上游对同一危害已有先例 —— `common/common.cpp:1428` 给 fit 探针显式清空了这两个字段；
+本次是同类错误在 server 侧（fork 引入的分阶段进度 reporter）复发。
+
+##### 4. 验证
+
+- **构建**：`cmake --build . --target llama-server` **RC_BUILD=0**（20 目标，含重链
+  `llama-server-impl.dll` 与 `llama-server.exe`）。
+- **守卫**：8 个 blast / 归属脚本 7 个 `0 failing`，`test_9l_d4b9a_guards.py` 仍是 2 条既存债务；
+  全扫 166 脚本 **total failing = 2**（= 基线）。
+- ⏳ **设备复验判据**（同一条命令发图）应看到**四行齐全**、服务存活并恢复投机：
+  `swapping the draft model out of VRAM…` → `MTP->mmproj swap done in N ms` →
+  `unloading mmproj from the GPU, recreating the draft context...` → **`mmproj->draft swap done in M ms`**。
+  崩溃已修好但若 M 很大，说明重载成本就是这条路径的价格（页缓存命中时不产生物理 I/O）。
 
 ### §10.28 FA_QUANTS 默认值收窄 + q5_1/q4_1-turbo4_0 实例（2026-09-24 深夜）
 

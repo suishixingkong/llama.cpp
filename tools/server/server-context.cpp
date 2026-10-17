@@ -3487,6 +3487,15 @@ private:
     bool recreate_draft_context() {
         common_params params_dft = common_base_params_to_speculative(params_base);
 
+        // fork 9l-mmproj-swap: the draft model is reloaded from its file here, and the loader
+        // reports progress through params_dft. The data has to be alive for the whole call --
+        // load_model()'s instance is long gone, and handing the loader a stale pointer kills
+        // the process inside load_all_data() right after the tensors are placed (port delta
+        // 2026-10-17; load_model() now clears the copy it leaves in params_base).
+        load_progress_data load_progress_spec(this, "spec_model");
+        params_dft.load_progress_callback           = load_progress_callback;
+        params_dft.load_progress_callback_user_data = &load_progress_spec;
+
         spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
         model_dft = spec_init->model();
         ctx_dft   = spec_init->context();
@@ -3784,6 +3793,13 @@ private:
         }
 
         llama_init = common_init_from_params(params_base);
+
+        // fork 9l-mmproj-swap: `load_progress_text` is a local of this function, so the user
+        // data written into params_base above dies with it. params_base does not: anything that
+        // copies it after load_model() returns inherits a dangling pointer, and the mmproj swap
+        // does exactly that when it recreates the draft context (port delta 2026-10-17).
+        params_base.load_progress_callback           = nullptr;
+        params_base.load_progress_callback_user_data = nullptr;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
