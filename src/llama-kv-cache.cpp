@@ -1229,9 +1229,23 @@ llama_kv_cache::llama_kv_cache(
         v_heads[s] = 0;
     }
 
-    v_cells.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].resize(kv_size);
+    // fork 9l-mmproj-swap: only a cache that OWNS its cells may size them.
+    // `llama_kv_cells::resize()` ends with `reset()` (llama-kv-cells.h), and a share-linked
+    // cache binds `v_cells` to the owner's map (`v_cells_impl` above), so sizing here would
+    // wipe the OWNER's live positions. The owner has already sized the map -- `kv_size` was
+    // adopted from it a few lines above -- so this block is pure re-initialisation for a view.
+    // Defensive: it is not what broke the gemma4-assistant swap (that was clear() during the
+    // seq_rm capability probe, see clear() below); it just keeps any future mis-sized view from
+    // erasing live history. (port delta 2026-10-17; docs/MERGE_BUUN_PLAN.md section 10.27.5)
+    if (other == nullptr) {
+        v_cells.resize(n_stream);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].resize(kv_size);
+        }
+    } else if (v_cells.size() != n_stream || v_cells[0].size() != kv_size) {
+        LLAMA_LOG_WARN("%s: share-linked cache geometry mismatch (owner %zu x %u, view %u x %u); "
+                "keeping the owner's cell map as-is\n", __func__,
+                v_cells.size(), v_cells.empty() ? 0u : v_cells[0].size(), n_stream, kv_size);
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -2860,6 +2874,19 @@ void llama_kv_cache::vbr_shared_scratch_detach() {
 }
 
 void llama_kv_cache::clear(bool data) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // fork 9l-mmproj-swap: a share-linked cache does not own its cells -- `v_cells` IS the
+    // owner's map (v_cells_impl above), so clearing here would erase the owner's live positions
+    // and every later decode would restart from cell 0 on top of a cache the owner still thinks
+    // is full. Mirror seq_rm_impl(), which already treats a view as a no-op that reports
+    // success: there is nothing of our own to clear. (port delta 2026-10-17; the reachable
+    // trigger was common_context_can_seq_rm() probing the re-created MTP drafter, whose memory
+    // is a view of the target's -- device trace: seq 0 pos_min/pos_max 1120 -> -1 -> garbled
+    // repetition; docs/MERGE_BUUN_PLAN.md §10.27.5)
+    if (other) {
+        return;
+    }
+
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
     const vbr_mutation_op::success_on_return mutation_ok(mutation_op);

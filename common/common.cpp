@@ -1878,6 +1878,17 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
     }
 
+    // fork 9l-mmproj-swap: the probe below is destructive -- it clears the context memory and
+    // decodes two dummy tokens to see whether partial removal is accepted. A drafter whose cache
+    // is a view of another context (`ctx_other`, the gemma4 assistant) would erase that
+    // context's live cell map and write dummy K/V into its tensors; it has no memory of its own,
+    // where seq_rm() and clear() are no-ops that report success. Report what the probe would
+    // conclude (partial removal accepted) without touching anything. (port delta 2026-10-17;
+    // docs/MERGE_BUUN_PLAN.md §10.27.5)
+    if (llama_get_ctx_other(ctx) != nullptr) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    }
+
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
     llama_memory_clear(mem, true);

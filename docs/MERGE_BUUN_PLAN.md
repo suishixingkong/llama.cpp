@@ -1469,6 +1469,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
 | `continuing without speculative decoding after the mmproj swap` | drafter 重建失败，已 fail-open | 输出仍正确，但失去投机；查显存占用 / draft 文件是否还在 |
 | `failed to load the multimodal projector during the GPU swap` + 该请求报错 | 投影器 GPU/CPU 都加载失败 | 查投影器文件与 `-mmdev` |
 | 服务在 `load_tensors: … model buffer size` 之后**无任何错误输出直接退出** | 已修（§10.27.4）：draft 重载收到悬空的 progress 回调 `user_data` ⇒ 访问违例 | 升级到含 §10.27.4 的提交；旧版只能去掉 `--mmproj-gpu-swap` 规避 |
+| 共享 KV 的 drafter 发图后输出**错乱重复** | 已修（§10.27.5 第 8 节）：`common_context_can_seq_rm()` 的破坏性探针清空了 target 的 cell 表 | 升级到含该修复的提交；旧版只能去掉 `--mmproj-gpu-swap` 规避 |
 
 **预期内的「退化」**：交换期间与交换后，**其它 slot** 缓存的草稿状态被丢弃（§3.3），
 它们会退化为纯目标解码。表现是 `n_draft_accepted` / `n_draft_verif_steps` 暂时停滞 ——
@@ -1687,6 +1688,194 @@ draft 模型 tensor 落位之后。
   `swapping the draft model out of VRAM…` → `MTP->mmproj swap done in N ms` →
   `unloading mmproj from the GPU, recreating the draft context...` → **`mmproj->draft swap done in M ms`**。
   崩溃已修好但若 M 很大，说明重载成本就是这条路径的价格（页缓存命中时不产生物理 I/O）。
+
+#### §10.27.5 共享 KV 的 drafter 与 --mmproj-gpu-swap（设备四轮：错乱 → 排除 → 根因 → 修复）（2026-10-17）
+
+##### 1. 现象（V100，build 含 §10.27.4）
+
+命令：`-m gemma-4-E2B-it-qat-Q4_0` + `-md mtp-gemma-4-E2B-it-qat-Q4_0` + `-mm mmproj-…Q8_0`
++ `--mmproj-gpu-swap -ctk turbo4 -ctv turbo4 -c 4096 -np 1`。日志显示交换**两段都成功**：
+
+```
+0.15.114 swapping the draft model out of VRAM...   0.16.189 MTP->mmproj swap done in 1075 ms
+0.16.19..0.16.97  image decoded (batch 1/2 134 ms, 2/2 66 ms)   ← GPU 编码，1026 token
+0.16.973 unloading mmproj from the GPU...          0.19.207 mmproj->draft swap done in 2233 ms
+0.19.244 prompt processing n_tokens = 1127 → tg 241 t/s，但**输出完全错乱并不断重复**
+```
+
+去掉 `--mmproj-gpu-swap`（投影器常驻 GPU）或改用 `--no-mmproj-offload`（CPU 编码）均正常。
+
+##### 2. 日志能证明的三件事
+
+1. **这个 drafter 没有任何自己的 KV**：全日志只有 target 有分配行（`CUDA0 KV buffer size = 6.31 / 3.23 MiB`）；
+   drafter 侧只有 `layer 3 → target 34`、`layer 0/1/2 → target 33`（三个 SWA 层指向**同一个** tensor），
+   而 `size = 2.06 / 0.77 MiB` 是**别名账**（按 turbo4 打包算的 K/V 字节），不是它自己的分配。
+2. **新建的 draft context 与启动时逐行相同**：cells（4096 / 1024）、层映射、`attn_rot_k = 0`、
+   `shared-KV scratch binding #0`、`CUDA0 compute buffer size = 23.00 MiB`、`graph nodes 134`、
+   `spec` 配置（`n_max=3, n_embd=1536, cache_k=f16, backend_sampling=1`）全部一致。
+3. **投机在跑**（241 t/s；纯目标解码 E2B 在 V100 上达不到这个数）⇒ 不是「草稿被拒」，而是上下文本身错了。
+
+静态可排除的：位置记账（`pos_next()` = 1131、`n_tokens` 1127/1131 自洽）、占位 chunk（`mtmd_input_chunk_copy`）、
+图像嵌入上传（`ggml_backend_cuda_buffer_set_tensor` 内含 `cudaStreamSynchronize`，`mtmd_free` 不会踩到 in-flight DMA）、
+verification 对共享层的覆写（target 的 verify batch 会重写 `pos0`）。
+
+##### 3. 代价：这个组合值不值得开
+
+| 项 | 数值（日志实测） |
+|---|---|
+| 交换能腾出的显存 | `41.44 MiB`（draft 模型）+ `23.00 MiB`（draft compute）≈ **65 MiB** |
+| 交换的代价 | 换出 **1075 ms** + 投影器回 CPU ~830 ms + draft 重载 **~1.2 s+** ⇒ **≈ 3.3 s / 张图** |
+| 它自己的 KV | **0 字节**（全部是 target 的别名） |
+
+⇒ 共享 KV 的 drafter **能交换，但不划算**：腾 65 MiB 付 3.3 s/图。收益更大的配置是 native MTP
+（`ctx_other` 为空，drafter 有自己的 nextn KV 层）与任何不共享 KV 的外部 draft（⚠️ 后者只在 CPU 树上验过门是开的，
+**输出正确性未在设备上验证**）。
+
+##### 4. 已知不精确
+
+- ⚠️ fit 的相位互斥计价（§10.27.3）发生在 draft context 存在**之前**，所以 fit 始终按 `max(drafter, projector)`
+  记账 —— 对共享 KV 的 drafter 会**高估** `min(...)`（本例 ≈ 65–190 MiB）。
+  显式 `-c` 时无影响（本机即如此）；自动 fit 且显存贴边时留意广告出的 `n_ctx` 偏小。
+##### 5. 两条单变量实验的结果（2026-10-17 下午，V100，均带 `GGML_MMPROJ_SWAP_ALLOW_SHARED_KV=1`）
+
+> ⚠️ `GGML_MMPROJ_SWAP_ALLOW_SHARED_KV` 是实验期的临时开关，**最终树里没有**；复现需自行加回。
+
+两次都是**发图后输出同样错乱重复**：
+
+| 臂 | 只改了这一个变量 | 排除掉什么 |
+|---|---|---|
+| ① `-ctk f16 -ctv f16` | 关掉 turbo4 与 shared-KV scratch | **KV codec / VBR scratch / import-receipt 记账**这条线 |
+| ② `--spec-type ngram-simple` | drafter 不写共享 KV、也不做 `seq_rm(pos0, -1)` | **草稿写入 / 位置记账 / 验证覆写**这条线 |
+
+⭐ 两条臂**共同保留**的变量只剩一个：交换期内「销毁 + 重建一个 share-linked 的 iswa 视图」
+（ngram 臂同样创建并销毁 gemma4-assistant context；f16 臂只换掉 KV 类型）。于是候选缩到两条：
+
+- **(A) 视图构造/析构对 target 的影响**。cells 是**共享**的 `v_cells_impl`（`llama-kv-cache.cpp:1119-1120`），
+  而 `llama_kv_cache::clear()` 会 `v_cells[s].reset()`（`:2862-2869`）⇒ 对 draft 的任何 clear / seq_rm
+  都直接作用在 target 的账本上。
+- **(B) 外部 draft 模型的卸载/重载**（`llama_model_free` + `load_from_file`）。原生 MTP 路径**没有**这一步
+  （只 `llama_init_from_model`）——这也是「自带 MTP 头正常」的可能解释之一。
+
+⏳ **唯一能分开 (A)/(B) 的实验**：`-md` 一个**不共享 KV** 的 draft（最省事：`-md` 同一个 gemma-4 target
+文件 + `--spec-type draft-simple`）再发图。**正常** ⇒ 罪在 (A)，本节判据成立；**仍错乱** ⇒ 罪在 (B)，
+本节的判据要撤回并改成「`-md` + 交换一律不启用」。
+
+⚠️ 因此本节的判据目前只能当**充分条件**：`ctx_other != nullptr` ⇒ 一定不要开（4 种配置全错已验证）；
+反过来「自有 KV ⇒ 可以开」**尚未在设备上验证**（CPU 树只验了门的开关，没验输出正确性）。
+
+##### 6. 投影器路径已排除：错乱来自 teardown（2026-10-17 15:30）
+
+> ⚠️ 第 6、7 节用到的诊断开关（`SKIP_TEARDOWN` / `NO_RECREATE`）在根因确定后**已删除**；这里保留当时的实验记录。
+
+诊断开关 `GGML_MMPROJ_SWAP_SKIP_TEARDOWN=1`（与 `ALLOW_SHARED_KV=1` 同开）：交换**只搬投影器、drafter 完全不拆**，
+其余不变。结果：
+
+```
+0.22.34 swapping the draft model out of VRAM...       0.23.29 MTP->mmproj swap done in 951 ms
+0.23.85 unloading mmproj from the GPU...              0.24.73 mmproj->draft swap done in 877 ms (drafter was never torn down)
+0.28.50 n_gen = 464, tg = 154.26 t/s, draft acceptance = 0.38889, mean len = 2.17   ← 输出正确
+```
+
+⇒ **排除候选 (C)**（投影器在 target context 之后加载 / 每张图上传下载一次投影器），也与「缓存内容」无关
+（drafter 一直在跑、acceptance 正常）。分界落到：**错乱由 teardown 造成**——销毁 draft 或重建 draft。
+⇒ 另外，`951 + 877 ms` 是不拆 drafter 时交换的**固有代价**（投影器上下卡），与 teardown 的开销无关。
+
+##### 7. 分界确定：销毁无害，**重建**才是元凶（2026-10-17 15:42）
+
+`GGML_MMPROJ_SWAP_NO_RECREATE=1`（teardown 照做、但不重建）⇒ **输出正常**：
+
+```
+0.18.73 swapping the draft model out of VRAM...   0.19.79 MTP->mmproj swap done in 1065 ms
+0.20.35 unloading mmproj from the GPU...          0.21.35 GGML_MMPROJ_SWAP_NO_RECREATE=1: leaving speculation off (diagnostic)
+0.24.42 n_gen = 431, tg = 143.02 t/s，无 draft acceptance 行（这一臂没有投机）   ← 输出正确
+```
+
+⇒ **排除「销毁 draft（context + model）」**。三条实验 + 一次投影器排除合起来只剩一个触发点：
+**在已有历史的 target 上重新建立一个 share-linked 的 draft context**
+（`llama_model_load_from_file` + `llama_init_from_model(..., cparams.ctx_other = ctx_tgt)`）。
+
+⏳ 下一步判据：`GGML_MMPROJ_SWAP_TRACE_STATE=1` 打印 target 的 `seq 0 pos_min/pos_max`（teardown 前 / 重建前 / 重建后）
+—— 范围保住 ⇒ 账本没坏，是 **KV 字节**被踩（下一个怀疑：重建时 draft 模型 / context 的显存与 target KV 重叠）；
+范围掉了 ⇒ 是**共享账本**被重置（`v_cells_impl` 是 shared_ptr，两个缓存共用）。
+
+##### 8. 根因：能力探测 `common_context_can_seq_rm()` 在共享视图上 `llama_memory_clear` + 2 token decode（2026-10-17 16:00）
+
+trace 三行把第 7 节的两种可能掐成一种：
+
+```
+target before teardown: seq 0 pos_min/pos_max = 0/94
+target before recreate: n_ctx = 4096, seq 0 pos_min/pos_max = 97/1120
+target after recreate:  n_ctx = 4096, seq 0 pos_min/pos_max = -1/-1  (draft view -1/-1)
+```
+
+⇒ 不是 KV 字节被踩，是**账本被清空**。
+
+⚠️ 构造函数里的 `v_cells.resize()` **不是**触发点：把「只有自有 cells 的缓存才 size 自己」的门加上之后，
+`after recreate` 仍是 `-1/-1`，且「几何不匹配」的告警**没有出现**（说明根本没走到 resize）。
+那个门作为**防御**保留（视图永远不该给 owner 的表定尺寸），但它不是病因。
+
+真正清表的是下面这条，就在 `recreate_draft_context()` 里、`common_speculative_init_from_params()` 之后：
+
+```cpp
+ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);   // server-context.cpp:3525
+```
+
+`common_context_can_seq_rm()`（`common/common.cpp:1870`）是一个**破坏性探针**：
+
+```cpp
+llama_memory_clear(mem, true);                 // ← 1
+llama_decode(ctx, 2 个假 token);               // ← 2
+llama_memory_seq_rm(mem, 0, 1, -1);            // ← 3（视图上是 no-op）
+llama_memory_clear(mem, true);                 // ← 4
+```
+
+而 `llama_kv_cache::clear()` **不检查 `other`**（对比 `seq_rm_impl()` 第一行就是 `if (other) return true;`）⇒
+`v_cells[s].reset()` 直接作用在 **owner（target）** 的 cell 表上。此外第 2 步还会往 target 的 33/34 层 K/V
+写两个位置。
+
+这一条能同时解释全部观察：
+
+| 观察 | 解释 |
+|---|---|
+| `SKIP_TEARDOWN=1` / `NO_RECREATE=1` 输出正常 | 两条臂都不进 `recreate_draft_context()`，探针没跑 |
+| `-ctk f16`、`--spec-type ngram-simple` 仍错乱 | 与 codec、与草稿写入都无关 |
+| trace 里 target 与「draft view」同值 | `seq_pos_max` 对视图**委托给 owner**（`llama-kv-cache.cpp:3568`），读的是同一份表 |
+| 启动时（target 为空）没症状 | 空表清一遍无感；`server-context.cpp:4061/4092` 同一探针在加载期跑，target 还是空的 |
+
+修法两处（外加一条**不改**）：
+
+1. `src/llama-kv-cache.cpp::clear()`：`if (other) return;` —— 视图没有自己的 cell 可清，语义与 `seq_rm_impl()` 对齐。
+2. `common/common.cpp::common_context_can_seq_rm()`：`llama_get_ctx_other(ctx) != nullptr` ⇒ 直接返回
+   `COMMON_CONTEXT_SEQ_RM_TYPE_PART`，**不做探针**（视图上 `seq_rm`/`clear` 都是 no-op，探针只会破坏 owner）。
+   ⚠️ 副作用：eagle3/dflash（借用 target 的嵌入/输出头但**自有 KV**）也不再探测 —— 它们原本的结果同样是
+   `PART`，等于省掉一次破坏性试验；只有「连部分移除都不支持」的 drafter 会被误判成 `PART`。
+3. `tools/server/server-context.cpp`：不改门 —— `-md` gemma4-assistant 本来就满足 `(spec_mtp || has_draft)`，
+   修复后它输出正确；值不值得开由 §3 的代价决定。
+
+⚠️ 保留的**真正**限制只有两条：`-np > 1`（交换是进程级的）与「draft 显存由 target 的别名构成时只省 ~65 MiB」。
+
+##### 9. 验证状态
+
+**设备验证通过（2026-10-17 16:5x，V100，同一命令 + 两个诊断开关）**：
+
+```
+trace: target before teardown: seq 0 pos_min/pos_max = 0/94
+trace: target before recreate: n_ctx = 4096, seq 0 pos_min/pos_max = 97/1120
+trace: target after recreate:  n_ctx = 4096, seq 0 pos_min/pos_max = 97/1120 (draft view 97/1120)   ← 修复前是 -1/-1
+MTP->mmproj swap done in 1203 ms / mmproj->draft swap done in ~2.2 s，输出正确、投机正常
+```
+
+⭐ `PROBE kvclear` 仍会出现（说明 `clear()` 确实被调用），但**不再紧跟 `PROBE cells_reset`** —— 早退生效。
+
+- 构建：`llama-server`/`llama-cli`/`llama-bench`/`llama-fit-params` **RC_BUILD=0**（共享视图改动会影响
+  `llama.dll` 的全部使用方）。
+- 守卫：8 个 blast/归属脚本 = 7×0 + `test_9l_d4b9a_guards.py` 2 条（10-16 起的既存债务）；覆盖
+  `llama-kv-cache.cpp` 的 8 个脚本全 0；全扫 166 脚本 **total failing = 2**。
+- CPU 回归：`llama-cli -m qwen2.5-0.5b -c 512 -ngl 0 -st` 正常出词（自有 KV 的 `clear()` 路径未变）；
+  门的两臂探针不变（`--spec-type ngram-simple` 告警 1 次；`-md` draft 0 次）。
+- 四个诊断开关（`SKIP_TEARDOWN` / `NO_RECREATE` / `TRACE_STATE` / `ALLOW_SHARED_KV`）与
+  `GGML_KV_TRACE_RESET` 探针**已全部删除**，不随修复提交；第 6、7 节保留它们作为当时的实验记录。
+
 
 ### §10.28 FA_QUANTS 默认值收窄 + q5_1/q4_1-turbo4_0 实例（2026-09-24 深夜）
 
