@@ -506,7 +506,6 @@ llama_context::llama_context(
         const llama_kv_stream_config stream_config = {
             /*.arena_bytes         =*/ kv_stream_arena_bytes,
             /*.minimum_arena_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
-            /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,
@@ -519,11 +518,23 @@ llama_context::llama_context(
         if (stream_validation.enabled) {
             using page_bytes_fn_t = bool (*)(
                 ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
+            using head_dim_supported_fn_t = bool (*)(uint32_t);
             using arena_new_fn_t = void * (*)(ggml_backend_dev_t, size_t);
             using arena_free_fn_t = void (*)(void *);
             using arena_set_compute_fn_t = bool (*)(void *, size_t, size_t);
             using arena_buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
             using graph_reset_fn_t = bool (*)(ggml_backend_t);
+
+            // The SWA architectures keep their layers in two caches (llama_kv_cache_iswa: a dense
+            // one and a sliding-window one) that have different KV lengths, while the streaming
+            // runtime has exactly one page geometry and one resident layout. Say that here: without
+            // this check a sliding-window model gets past the probe and only fails later, when the
+            // arena is activated.
+            if (hparams.is_swa_any()) {
+                throw std::runtime_error(
+                    "block KV streaming does not support sliding-window attention caches yet "
+                    "(the dense and SWA halves are two caches with different KV lengths)");
+            }
 
             ggml_backend_dev_t stream_device = nullptr;
             size_t page_bytes = 0;
@@ -546,20 +557,36 @@ llama_context::llama_context(
                     reg, "ggml_backend_cuda_kv_stream_page_bytes");
                 auto workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
                     reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
-                if (page_bytes_fn == nullptr || workspace_bytes_fn == nullptr) {
+                auto head_dim_supported_fn = (head_dim_supported_fn_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_kv_stream_head_dim_supported");
+                if (page_bytes_fn == nullptr || workspace_bytes_fn == nullptr ||
+                        head_dim_supported_fn == nullptr) {
                     throw std::runtime_error("block KV streaming requires the CUDA backend");
+                }
+                const uint32_t head_dim_k = llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il));
+                const uint32_t head_dim_v = llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il));
+                // The streamed attention kernels exist per head dim (K and V must share it), and the
+                // backend is the only place that knows which instances this build compiled. The
+                // architecture is deliberately not part of this decision: any model whose attention
+                // layers have a streamed instance and one uniform page geometry is eligible.
+                if (head_dim_k != head_dim_v || !head_dim_supported_fn(head_dim_k)) {
+                    throw std::runtime_error(
+                        "block KV streaming has no streamed attention kernel for layer " +
+                        std::to_string(il) + " (head_dim_k = " + std::to_string(head_dim_k) +
+                        ", head_dim_v = " + std::to_string(head_dim_v) +
+                        ", K = " + ggml_type_name(type_k) + ", V = " + ggml_type_name(type_v) + ")");
                 }
                 size_t layer_page_bytes = 0;
                 size_t layer_conversion_bytes = 0;
                 if (!page_bytes_fn(
                         type_k, type_v,
-                        llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
-                        llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
+                        head_dim_k,
+                        head_dim_v,
                         hparams.n_head_kv(il), 256, &layer_page_bytes) ||
                     !workspace_bytes_fn(
                         type_k, type_v,
-                        llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il)),
-                        llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il)),
+                        head_dim_k,
+                        head_dim_v,
                         hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
                     throw std::runtime_error("invalid block KV streaming page geometry");
                 }
@@ -1037,12 +1064,20 @@ bool llama_context::kv_stream_switch_phase(
         return false;
     }
 
-    auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (hybrid_memory == nullptr || hybrid_memory->get_mem_attn() == nullptr) {
-        LLAMA_LOG_ERROR("%s: phase arena requires hybrid attention memory\n", __func__);
+    // The phase arena is shared between the streaming KV cache and the graph's compute buffers,
+    // so the repartition has to reach the cache that owns the streaming runtime. That is the
+    // attention child of a hybrid memory, or the plain KV cache of a dense model; composite caches
+    // (iswa, hybrid-iswa, indexed hybrid) never receive a runtime and stay out of this path.
+    llama_kv_cache * kv = nullptr;
+    if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = hybrid_memory->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    if (kv == nullptr) {
+        LLAMA_LOG_ERROR("%s: phase arena requires a block-streaming KV cache\n", __func__);
         return false;
     }
-    auto * kv = hybrid_memory->get_mem_attn();
     const auto & target = decode ? arena.token_generation : arena.prefill;
 
     synchronize();
@@ -2149,41 +2184,52 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Consume feedback from the previous completed decode before building the
     // next graph. Repartition itself synchronizes only when hysteresis selects
     // a new boundary, so steady-state token generation stays asynchronous.
-    if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
-            const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
-            if (attn_context != nullptr) {
-                llama_kv_stream_phase phase =
-                    LLAMA_KV_STREAM_PHASE_AUTOMATIC;
-                if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
-                    phase = LLAMA_KV_STREAM_PHASE_PROMPT;
-                } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
-                    phase = LLAMA_KV_STREAM_PHASE_GENERATION;
-                }
-                const bool generation =
-                    llama_kv_stream_phase_is_generation(
-                        phase, ubatch.n_tokens);
-                if (kv_stream_phase_arena.configured && generation &&
-                        ubatch.n_tokens > kv_stream_phase_arena.max_generation_tokens) {
-                    LLAMA_LOG_ERROR(
-                        "%s: phase arena reserved compute for %u generation tokens "
-                        "(n_seq_max = %u, n_draft_max = %u) but the batch has %u\n",
-                        __func__, kv_stream_phase_arena.max_generation_tokens,
-                        cparams.n_seq_max, cparams.n_draft_max, ubatch.n_tokens);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
-                if (!kv_stream_switch_phase(
-                        generation, attn_context->get_n_kv())) {
-                    LLAMA_LOG_ERROR(
-                        "%s: failed to switch shared CUDA arena phase\n",
-                        __func__);
-                    ret = GGML_STATUS_ALLOC_FAILED;
-                    return nullptr;
-                }
-                (void) hybrid_memory->get_mem_attn()->kv_stream_adapt(
-                    attn_context->get_n_kv(), ubatch.n_tokens);
+    {
+        // Same ownership question as kv_stream_switch_phase(): a hybrid memory keeps its
+        // streaming runtime on the attention child, a dense model on the KV cache itself.
+        // A cache without a runtime simply returns from kv_stream_adapt().
+        llama_kv_cache * attn_memory = nullptr;
+        const llama_kv_cache_context * attn_context = nullptr;
+        if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            attn_memory = hybrid_memory->get_mem_attn();
+            if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
+                attn_context = hybrid_context->get_attn();
             }
+        } else if (auto * kv_memory = dynamic_cast<llama_kv_cache *>(memory.get())) {
+            attn_memory = kv_memory;
+            attn_context = dynamic_cast<llama_kv_cache_context *>(mctx);
+        }
+        if (attn_memory != nullptr && attn_context != nullptr) {
+            llama_kv_stream_phase phase =
+                LLAMA_KV_STREAM_PHASE_AUTOMATIC;
+            if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
+                phase = LLAMA_KV_STREAM_PHASE_PROMPT;
+            } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
+                phase = LLAMA_KV_STREAM_PHASE_GENERATION;
+            }
+            const bool generation =
+                llama_kv_stream_phase_is_generation(
+                    phase, ubatch.n_tokens);
+            if (kv_stream_phase_arena.configured && generation &&
+                    ubatch.n_tokens > kv_stream_phase_arena.max_generation_tokens) {
+                LLAMA_LOG_ERROR(
+                    "%s: phase arena reserved compute for %u generation tokens "
+                    "(n_seq_max = %u, n_draft_max = %u) but the batch has %u\n",
+                    __func__, kv_stream_phase_arena.max_generation_tokens,
+                    cparams.n_seq_max, cparams.n_draft_max, ubatch.n_tokens);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (!kv_stream_switch_phase(
+                    generation, attn_context->get_n_kv())) {
+                LLAMA_LOG_ERROR(
+                    "%s: failed to switch shared CUDA arena phase\n",
+                    __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            (void) attn_memory->kv_stream_adapt(
+                attn_context->get_n_kv(), ubatch.n_tokens);
         }
     }
 

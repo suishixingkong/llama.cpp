@@ -915,9 +915,23 @@ static bool kv_stream_page_mutable(
 
 namespace {
 
-constexpr int KV_STREAM_HEAD_DIM = 256;
+// Head dims that have a compiled streamed-attention instance. Every DECL_FATTN_VEC_CASE() in
+// template-instances/fattn-vec-instance-*.cu emits the same D set (64/128/256), and the native
+// streamed partial kernel as well as its f16-conversion fallback are both selected from it - so
+// this table is what "a streamed kernel exists for this head dim" means. It is a build property,
+// not a model property: any model whose attention layers satisfy it can stream.
+constexpr int KV_STREAM_HEAD_DIMS[] = { 64, 128, 256 };
 constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
 constexpr int KV_STREAM_QUERY_WORKSPACE_TOKENS = 256;
+
+static bool kv_stream_head_dim_supported(int64_t head_dim) {
+    for (const int candidate : KV_STREAM_HEAD_DIMS) {
+        if (head_dim == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static int kv_stream_parts_per_chunk() {
     static const int parts = []() {
@@ -1060,7 +1074,7 @@ static __global__ void kv_stream_normalize_chunk_results(
 using kv_stream_native_partial_fn = void (*)(
     ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);
 
-// Partial (per-KV-chunk) kernel of the exact (K,V) pair, D == KV_STREAM_HEAD_DIM, or nullptr.
+// Partial (per-KV-chunk) kernel of the exact (K,V) pair at head dim D, or nullptr.
 //
 // Whether a pair has that template instance is a per-pair property of the build, not a global
 // one: ggml_cuda_fattn_vec_instances() (ggml/cmake/common.cmake) emits one
@@ -1074,17 +1088,20 @@ using kv_stream_native_partial_fn = void (*)(
 // F32 is deliberately absent: it has no partial template instance for any partner (upstream's
 // generic selector maps F32 onto the F16 case instead, which the streamed native path does not
 // do - it stages whatever the KV cache holds).
-#define KV_STREAM_NATIVE_PARTIAL_CASE(type_K_case, type_V_case)                        \
+// `D` is the enclosing template parameter of kv_stream_resolve_native_partial_dim(); the
+// macro is expanded inside that function only, so it does not need to be passed in.
+#define KV_STREAM_NATIVE_PARTIAL_CASE(type_K_case, type_V_case)                       \
     if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                        \
         if (type_k == GGML_TYPE_##type_K_case && type_v == GGML_TYPE_##type_V_case) {  \
             return ggml_cuda_flash_attn_ext_vec_partial_case<                          \
-                KV_STREAM_HEAD_DIM, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>; \
+                D, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>;                  \
         }                                                                             \
     }
 
 // Same K/V pair set as ggml_cuda_get_fattn_vec_case() below, TurboQuant first because that is
 // what the streamed KV cache is normally asked for.
-static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
+template <int D>
+static kv_stream_native_partial_fn kv_stream_resolve_native_partial_dim(
         ggml_type type_k, ggml_type type_v) {
     // TurboQuant KV-cache types.
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO2_0, TURBO2_0)
@@ -1217,7 +1234,124 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
 
     return nullptr;
 }
+
+// Per head dim dispatch: the streamed kernel is templated on D, so an unsupported dim has no
+// instance to call. The D set is exactly KV_STREAM_HEAD_DIMS - the same set the reject check and
+// the build-side capability probe use.
+static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
+        int64_t head_dim, ggml_type type_k, ggml_type type_v) {
+    switch (head_dim) {
+        case 64:  return kv_stream_resolve_native_partial_dim<64> (type_k, type_v);
+        case 128: return kv_stream_resolve_native_partial_dim<128>(type_k, type_v);
+        case 256: return kv_stream_resolve_native_partial_dim<256>(type_k, type_v);
+        default:  return nullptr;
+    }
+}
+
+// Pair-level question (independent of D): compiled instance files declare 64/128/256 together, so
+// one successful dim means every dim in the table has one.
+static bool kv_stream_pair_has_native_partial(ggml_type type_k, ggml_type type_v) {
+    for (const int head_dim : KV_STREAM_HEAD_DIMS) {
+        if (kv_stream_resolve_native_partial(head_dim, type_k, type_v) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
 #undef KV_STREAM_NATIVE_PARTIAL_CASE
+
+// --- head-dim dispatch for the three streamed launches -------------------------------------
+//
+// ggml_cuda_flash_attn_ext_streamed() merges its per-chunk results with kernels templated on the
+// head dim, and the f16-conversion route calls the f16 vec partial kernel. Both used to be bound
+// to the single dim the streamed path was validated on; the dispatch below is what makes a model
+// with any head dim in KV_STREAM_HEAD_DIMS eligible. The reject check guarantees the dim is in
+// the table, so the "default" arm may assert on 256.
+static void kv_stream_vec_partial_f16(
+        int64_t head_dim, ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        float * parts, float2 * meta, int nparts) {
+    switch (head_dim) {
+        case 64:
+            ggml_cuda_flash_attn_ext_vec_partial_case<64, GGML_TYPE_F16, GGML_TYPE_F16>(
+                ctx, dst, parts, meta, nparts);
+            return;
+        case 128:
+            ggml_cuda_flash_attn_ext_vec_partial_case<128, GGML_TYPE_F16, GGML_TYPE_F16>(
+                ctx, dst, parts, meta, nparts);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 256);
+            ggml_cuda_flash_attn_ext_vec_partial_case<256, GGML_TYPE_F16, GGML_TYPE_F16>(
+                ctx, dst, parts, meta, nparts);
+            return;
+    }
+}
+
+template <int D>
+static void kv_stream_accumulate_launch(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        const float * parts, const float2 * meta, float * accumulator,
+        float2 * accumulator_meta, int tile_nrows, size_t row_offset,
+        bool initialize, int partial_count) {
+    const dim3 blocks(tile_nrows, 1, 1);
+    const dim3 threads(D, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<D>, launch_params,
+        parts, meta, accumulator + row_offset*dst->ne[0],
+        accumulator_meta + row_offset, tile_nrows, initialize, partial_count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void kv_stream_accumulate_dispatch(
+        int64_t head_dim, ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        const float * parts, const float2 * meta, float * accumulator,
+        float2 * accumulator_meta, int tile_nrows, size_t row_offset,
+        bool initialize, int partial_count) {
+    switch (head_dim) {
+        case 64:
+            kv_stream_accumulate_launch<64>(ctx, dst, parts, meta, accumulator,
+                accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
+            return;
+        case 128:
+            kv_stream_accumulate_launch<128>(ctx, dst, parts, meta, accumulator,
+                accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 256);
+            kv_stream_accumulate_launch<256>(ctx, dst, parts, meta, accumulator,
+                accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
+            return;
+    }
+}
+
+template <int D>
+static void kv_stream_normalize_launch(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const float * accumulator, const float2 * accumulator_meta, int nrows) {
+    const dim3 blocks(nrows, 1, 1);
+    const dim3 threads(D, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<D>, launch_params,
+        accumulator, accumulator_meta, static_cast<float *>(dst->data), nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void kv_stream_normalize_dispatch(
+        int64_t head_dim, ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const float * accumulator, const float2 * accumulator_meta, int nrows) {
+    switch (head_dim) {
+        case 64:
+            kv_stream_normalize_launch<64>(ctx, dst, accumulator, accumulator_meta, nrows);
+            return;
+        case 128:
+            kv_stream_normalize_launch<128>(ctx, dst, accumulator, accumulator_meta, nrows);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 256);
+            kv_stream_normalize_launch<256>(ctx, dst, accumulator, accumulator_meta, nrows);
+            return;
+    }
+}
 
 } // namespace
 
@@ -1352,7 +1486,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // turbo attention uses. The forward WHT on Q and the inverse rotation on the attention
         // output are graph ops (llama-graph.cpp), so they are unaffected by which FA kernel runs.
         // turbo8 / TCQ are included because DECL_FATTN_VEC_CASE instantiates their streamed
-        // partial case as well; kv_stream_resolve_native_partial() below lists the valid pairs.
+        // partial case as well; kv_stream_resolve_native_partial() lists the valid pairs.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
@@ -1387,7 +1521,7 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
     // through to the F16 conversion path below, which is exactly what upstream's generic
     // selector does for them.
     if (capabilities_k.direct_attention && capabilities_v.direct_attention &&
-            kv_stream_resolve_native_partial(type_k, type_v) != nullptr) {
+            kv_stream_pair_has_native_partial(type_k, type_v)) {
         return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
     }
     if (capabilities_k.storage && capabilities_v.storage &&
@@ -1445,6 +1579,10 @@ bool ggml_cuda_kv_stream_page_bytes(
     return true;
 }
 
+bool ggml_cuda_kv_stream_head_dim_supported(uint32_t head_dim) {
+    return kv_stream_head_dim_supported(int64_t(head_dim));
+}
+
 bool ggml_cuda_kv_stream_workspace_bytes(
         ggml_type type_k, ggml_type type_v,
         uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
@@ -1486,11 +1624,14 @@ const char * ggml_cuda_flash_attn_ext_streamed_reject_reason(const ggml_tensor *
             GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED) {
         return "this (K,V) type pair has no streamed attention mode";
     }
-    if (Q->ne[0] != KV_STREAM_HEAD_DIM) {
-        return "Q head dim is not KV_STREAM_HEAD_DIM (256)";
+    if (!kv_stream_head_dim_supported(Q->ne[0])) {
+        return "Q head dim has no streamed attention kernel instance (supported: 64, 128, 256)";
     }
-    if (V->ne[0] != KV_STREAM_HEAD_DIM) {
-        return "V head dim is not KV_STREAM_HEAD_DIM (256)";
+    if (!kv_stream_head_dim_supported(V->ne[0])) {
+        return "V head dim has no streamed attention kernel instance (supported: 64, 128, 256)";
+    }
+    if (Q->ne[0] != V->ne[0]) {
+        return "Q and V have different head dims";
     }
     if (Q->ne[1] < 1) {
         return "Q has no queries";
@@ -2043,6 +2184,9 @@ void ggml_cuda_flash_attn_ext_streamed(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    // Every streamed kernel below is templated on this, and the reject check above proved it is one
+    // of KV_STREAM_HEAD_DIMS with K and V equal.
+    const int64_t head_dim = Q->ne[0];
     const auto attention_mode =
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
     const bool convert_to_f16 =
@@ -2051,7 +2195,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     // belt-and-braces re-derivation rather than the place where the decision is made.
     const kv_stream_native_partial_fn native_partial =
         attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ?
-            kv_stream_resolve_native_partial(K->type, V->type) : nullptr;
+            kv_stream_resolve_native_partial(head_dim, K->type, V->type) : nullptr;
     GGML_ASSERT(attention_mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ||
         native_partial != nullptr);
     const to_fp16_cuda_t converter_k = convert_to_f16 && K->type != GGML_TYPE_F16 ?
@@ -2547,9 +2691,8 @@ void ggml_cuda_flash_attn_ext_streamed(
                 }
             } else {
                 if (convert_to_f16) {
-                    ggml_cuda_flash_attn_ext_vec_partial_case<
-                        KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
-                            ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
+                    kv_stream_vec_partial_f16(
+                        head_dim, ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
                 } else {
                     GGML_ASSERT(native_partial != nullptr);
                     native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
@@ -2558,14 +2701,9 @@ void ggml_cuda_flash_attn_ext_streamed(
 
             const int tile_nrows = int(query_count*rows_per_query);
             const size_t row_offset = size_t(query_begin*rows_per_query);
-            const dim3 blocks(tile_nrows, 1, 1);
-            const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
-            const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-            ggml_cuda_kernel_launch(
-                kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-                parts.ptr, meta.ptr, accumulator.ptr + row_offset*dst->ne[0],
-                accumulator_meta.ptr + row_offset, tile_nrows, chunk == 0, partial_count);
-            CUDA_CHECK(cudaGetLastError());
+            kv_stream_accumulate_dispatch(
+                head_dim, ctx, dst, parts.ptr, meta.ptr, accumulator.ptr,
+                accumulator_meta.ptr, tile_nrows, row_offset, chunk == 0, partial_count);
         }
 
         if (desc.streamed) {
@@ -2617,12 +2755,8 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
 
-    const dim3 blocks(nrows, 1, 1);
-    const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
-        accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
-    CUDA_CHECK(cudaGetLastError());
+    kv_stream_normalize_dispatch(
+        head_dim, ctx, dst, accumulator.ptr, accumulator_meta.ptr, nrows);
 }
 
 template <int DKQ, int DV, int ncols2>

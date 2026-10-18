@@ -7,7 +7,9 @@ struct llama_kv_stream_config {
     uint64_t arena_bytes         = 0;
     uint64_t minimum_arena_bytes = 0;
 
-    bool arch_qwen35     = false;
+    // Run-time shape of the request. Whether the model's attention geometry can be streamed is
+    // not a property of this struct: that is probed against the CUDA backend in llama-context
+    // (page geometry, one device, head dim). No architecture is whitelisted here.
     bool context_default = false;
     bool single_sequence = false;
     bool flash_attention = false;

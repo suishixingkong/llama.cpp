@@ -15,7 +15,6 @@ int main() {
         llama_kv_stream_config config;
         config.arena_bytes         = 64ULL*1024ULL*1024ULL;
         config.minimum_arena_bytes = 1664ULL*256ULL;
-        config.arch_qwen35        = true;
         config.context_default    = true;
         config.single_sequence    = true;
         config.flash_attention    = true;
@@ -30,7 +29,6 @@ int main() {
         llama_kv_stream_config base;
         base.arena_bytes         = 64ULL*1024ULL*1024ULL;
         base.minimum_arena_bytes = 1664ULL*256ULL;
-        base.arch_qwen35         = true;
         base.context_default     = true;
         base.single_sequence     = true;
         base.flash_attention     = true;
@@ -42,9 +40,6 @@ int main() {
         };
 
         auto config = base;
-        config.arch_qwen35 = false;
-        expect_invalid("non-Qwen architecture", config);
-        config = base;
         config.context_default = false;
         expect_invalid("draft/MTP context", config);
         config = base;

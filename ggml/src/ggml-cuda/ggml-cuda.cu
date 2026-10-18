@@ -7529,6 +7529,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 type_k, type_v, head_dim_k, head_dim_v, head_count, page_tokens, page_bytes);
         };
     }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_head_dim_supported") == 0) {
+        return (void *) +[](uint32_t head_dim) {
+            return ggml_cuda_kv_stream_head_dim_supported(head_dim);
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_workspace_bytes") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v,
                 uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,

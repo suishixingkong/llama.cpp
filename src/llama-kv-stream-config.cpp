@@ -11,9 +11,6 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
         return llama_kv_stream_config_result { false, false, error };
     };
 
-    if (!config.arch_qwen35) {
-        return invalid("block KV streaming currently supports only Qwen3.5");
-    }
     if (!config.context_default) {
         return invalid("block KV streaming currently supports only the target context, not MTP/draft contexts");
     }
