@@ -12,6 +12,14 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
+// Block KV streaming attaches to the *dense* child only (get_base()). That half is the one that
+// grows with the context; the SWA half is already bounded by n_swa + n_ubatch at
+// (llama_kv_cache_iswa.cpp constructs it as PAD(min(kv_size, n_swa + n_ubatch), 256)), so it
+// stays resident. The streaming runtime has exactly one page geometry and one resident layout,
+// which is why it cannot span both children. Callers that must not stream (MTP contexts, the
+// share-linked gemma4-assistant view, llama_memory_hybrid_iswa's attention child) leave the three
+// parameters at zero and say so at the call site.
+
 // Keep collection and reduction in one production seam so model-free tests can
 // prove that child evidence is actually requested rather than only testing the
 // arithmetic reducer in isolation.
@@ -61,7 +69,11 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share = nullptr,
-        const llama_memory_vbr_params & vbr = {});
+        const llama_memory_vbr_params & vbr = {},
+        // dense child only, see the note above; zero means "no streaming runtime"
+                         size_t   kv_stream_stage_bytes = 0,
+                           void * kv_stream_phase_arena = nullptr,
+                         size_t   kv_stream_maximum_pool_bytes = 0);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -80,7 +92,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-        const llama_memory_vbr_params & vbr = {});
+        const llama_memory_vbr_params & vbr = {},
+                         size_t   kv_stream_stage_bytes = 0,
+                           void * kv_stream_phase_arena = nullptr,
+                         size_t   kv_stream_maximum_pool_bytes = 0);
 
     ~llama_kv_cache_iswa() = default;
 

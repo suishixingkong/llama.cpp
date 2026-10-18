@@ -31,9 +31,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    const llama_memory_vbr_params & vbr) :
+    const llama_memory_vbr_params & vbr,
+                 size_t   kv_stream_stage_bytes,
+                   void * kv_stream_phase_arena,
+                 size_t   kv_stream_maximum_pool_bytes) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, vbr) {
+            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, vbr,
+            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -53,7 +57,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-    const llama_memory_vbr_params & vbr) : swa_full(swa_full), unified(unified) {
+    const llama_memory_vbr_params & vbr,
+                 size_t   kv_stream_stage_bytes,
+                   void * kv_stream_phase_arena,
+                 size_t   kv_stream_maximum_pool_bytes) : swa_full(swa_full), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -113,10 +120,19 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            /* name_tag */ "", /* kv_stream */ 0, nullptr, 0, vbr_base);
+            /* name_tag */ "", kv_stream_stage_bytes, kv_stream_phase_arena,
+            kv_stream_maximum_pool_bytes, vbr_base);
+
+    if (kv_stream_stage_bytes != 0) {
+        LLAMA_LOG_INFO("%s: block KV streaming is attached to the non-SWA half only; "
+                "the SWA half stays resident\n", __func__);
+    }
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    // The SWA half never streams: its size is already bounded by n_swa + n_ubatch, so it does not
+    // grow with the context, and the streaming runtime has one page geometry and one resident
+    // layout - attaching it to both children would make them contend for the same pool and ring.
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,

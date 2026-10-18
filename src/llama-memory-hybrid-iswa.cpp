@@ -50,7 +50,11 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_attn,
         nullptr,
         nullptr,
-        vbr
+        vbr,
+        // llama_memory_hybrid_iswa carries no streaming parameters: a hybrid model with SWA has
+        // no full-attention child of its own to stream, and llama_context rejects this shape
+        // before it could ever hand an arena down.
+        0, nullptr, 0
     )),
     mem_recr(new llama_memory_recurrent(
         model,

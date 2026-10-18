@@ -525,15 +525,28 @@ llama_context::llama_context(
             using arena_buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
             using graph_reset_fn_t = bool (*)(ggml_backend_t);
 
-            // The SWA architectures keep their layers in two caches (llama_kv_cache_iswa: a dense
-            // one and a sliding-window one) that have different KV lengths, while the streaming
-            // runtime has exactly one page geometry and one resident layout. Say that here: without
-            // this check a sliding-window model gets past the probe and only fails later, when the
-            // arena is activated.
+            // Sliding-window models keep their layers in two caches with different KV lengths
+            // (llama_kv_cache_iswa: the dense half is n_ctx, the SWA half is n_swa + n_ubatch),
+            // while the streaming runtime has exactly one page geometry and one resident layout.
+            // That is not fatal: only the dense half grows with the context, and
+            // llama_kv_cache_iswa attaches the runtime to get_base() and leaves the SWA half
+            // resident. Two shapes still cannot express it:
+            //   - hybrid + SWA (llama_memory_hybrid_iswa) takes no streaming parameters at all,
+            //     and its attention child has no full-attention half of its own to stream;
+            //   - --swa-full sizes the SWA half like the dense one, so streaming would save
+            //     nothing while doubling the resident footprint.
             if (hparams.is_swa_any()) {
-                throw std::runtime_error(
-                    "block KV streaming does not support sliding-window attention caches yet "
-                    "(the dense and SWA halves are two caches with different KV lengths)");
+                if (llm_arch_is_hybrid(model.arch)) {
+                    throw std::runtime_error(
+                        "block KV streaming does not support hybrid models with sliding-window "
+                        "layers yet (their attention child cache takes no streaming parameters)");
+                }
+                if (params.swa_full) {
+                    throw std::runtime_error(
+                        "block KV streaming does not combine with --swa-full: the sliding-window "
+                        "half would be allocated at full context size, which is what streaming "
+                        "is meant to avoid");
+                }
             }
 
             ggml_backend_dev_t stream_device = nullptr;
@@ -542,6 +555,14 @@ llama_context::llama_context(
             uint32_t layer_count = 0;
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
                 if (!hparams.has_kv(il) || hparams.is_recr(il)) {
+                    continue;
+                }
+                // Only the dense half is streamed, so only it decides the page geometry: the SWA
+                // layers live in the other child cache, which is resident. Counting them here
+                // would size the resident KV region for pages this runtime never holds - and on
+                // a model like gemma4 it would also mix two different SWA head dims into one
+                // uniformity check that does not apply to either cache.
+                if (hparams.is_swa(il)) {
                     continue;
                 }
                 auto * dev = model.dev_layer(il);
@@ -600,7 +621,9 @@ llama_context::llama_context(
                 conversion_bytes = layer_conversion_bytes;
             }
             if (stream_device == nullptr || page_bytes == 0 || layer_count == 0) {
-                throw std::runtime_error("block KV streaming found no attention layers");
+                throw std::runtime_error(
+                    "block KV streaming found no full-attention layers to stream "
+                    "(every KV-carrying layer is sliding-window or recurrent)");
             }
 
             const uint64_t bootstrap_pages =
@@ -1066,11 +1089,14 @@ bool llama_context::kv_stream_switch_phase(
 
     // The phase arena is shared between the streaming KV cache and the graph's compute buffers,
     // so the repartition has to reach the cache that owns the streaming runtime. That is the
-    // attention child of a hybrid memory, or the plain KV cache of a dense model; composite caches
-    // (iswa, hybrid-iswa, indexed hybrid) never receive a runtime and stay out of this path.
+    // attention child of a hybrid memory, the dense child of a sliding-window pair, or the plain
+    // KV cache of a dense model; the remaining composite (hybrid-iswa, indexed hybrid) never
+    // receives a runtime and stays out of this path.
     llama_kv_cache * kv = nullptr;
     if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
         kv = hybrid_memory->get_mem_attn();
+    } else if (auto * iswa_memory = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+        kv = iswa_memory->get_base();
     } else {
         kv = dynamic_cast<llama_kv_cache *>(memory.get());
     }
@@ -2186,14 +2212,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a new boundary, so steady-state token generation stays asynchronous.
     {
         // Same ownership question as kv_stream_switch_phase(): a hybrid memory keeps its
-        // streaming runtime on the attention child, a dense model on the KV cache itself.
-        // A cache without a runtime simply returns from kv_stream_adapt().
+        // streaming runtime on the attention child, a sliding-window pair on the dense child, a
+        // dense model on the KV cache itself. A cache without a runtime simply returns from
+        // kv_stream_adapt().
         llama_kv_cache * attn_memory = nullptr;
         const llama_kv_cache_context * attn_context = nullptr;
         if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
             attn_memory = hybrid_memory->get_mem_attn();
             if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
                 attn_context = hybrid_context->get_attn();
+            }
+        } else if (auto * iswa_memory = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+            attn_memory = iswa_memory->get_base();
+            if (auto * iswa_context = dynamic_cast<llama_kv_cache_iswa_context *>(mctx)) {
+                attn_context = iswa_context->get_base();
             }
         } else if (auto * kv_memory = dynamic_cast<llama_kv_cache *>(memory.get())) {
             attn_memory = kv_memory;

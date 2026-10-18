@@ -2620,7 +2620,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr, vbr);
+                            // MTP context: llama_kv_stream_config_validate() only enables
+                            // streaming for the target context, and this cache belongs to the
+                            // drafter, so it stays ordinary VRAM.
+                            nullptr, vbr, 0, nullptr, 0);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2661,7 +2664,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr, vbr);
+                            // DSpark draft ring: the window, not the context, sizes this cache,
+                            // so there is nothing for the streaming runtime to save here.
+                            nullptr, vbr, 0, nullptr, 0);
                     break;
                 }
             }
@@ -2862,7 +2867,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share, vbr);
+                                    // The drafter's caches are views of the target's KV cache
+                                    // (layer_share_cb), so they own no cells and cannot carry a
+                                    // streaming runtime of their own.
+                                    share, vbr, 0, nullptr, 0);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2879,7 +2887,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share, vbr);
+                                    // Sliding-window models stream their dense (non-SWA) half:
+                                    // llama_context probes the page geometry over those layers
+                                    // only, and this constructor hands the arena to kv_base.
+                                    share, vbr,
+                                    params.kv_stream_stage_bytes,
+                                    params.kv_stream_phase_arena,
+                                    params.kv_stream_maximum_pool_bytes);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

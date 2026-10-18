@@ -31,7 +31,7 @@ llama-server -m model.gguf --cache-reuse 256 --kv-stream-stage-mib 1024 -np 1
 
 | 功能 | 参数 | 说明 |
 |---|---|---|
-| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**不再限定架构**，改由上下文创建时探测（见下文 "Eligibility"）。可与 turbo KV（`-ctk turbo4 -ctv turbo3`）和 MTP 推测解码（`--spec-type draft-mtp`）叠加，见 [`MERGE_TURBOQUANT.md`](MERGE_TURBOQUANT.md) 与 [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md) |
+| 自适应 KV 流式 | `--cache-reuse 256 --kv-stream-stage-mib 1024 -np 1` | CUDA arena 放 VRAM，其余落主机内存；**不再限定架构**，改由上下文创建时探测（见下文 "Eligibility"）；SWA 模型（gemma2/3 等）只流式 **dense 半边**，SWA 半边常驻。可与 turbo KV（`-ctk turbo4 -ctv turbo3`）和 MTP 推测解码（`--spec-type draft-mtp`）叠加，见 [`MERGE_TURBOQUANT.md`](MERGE_TURBOQUANT.md) 与 [`FIX_KVSTREAM_TURBO_MTP.md`](FIX_KVSTREAM_TURBO_MTP.md) |
 
 **环境变量**：无 KV-streaming 专属变量（注意力旋转 / `TURBO_AUTO_ASYMMETRIC` 等见 [`MERGE_TURBOQUANT.md`](MERGE_TURBOQUANT.md)）。
 
@@ -63,25 +63,41 @@ capability: it even rejected `LLM_ARCH_QWEN35MOE`. The gate is now a probe, run 
 
 | condition | reported as |
 |---|---|
-| every attention (KV-carrying, non-recurrent) layer on **one** CUDA device | `requires every attention layer on one CUDA device` |
+| every streamed attention (KV-carrying, non-recurrent, **non-SWA**) layer on **one** CUDA device | `requires every attention layer on one CUDA device` |
 | same padded K and V head dim, with a compiled streamed instance (64 / 128 / 256) | `no streamed attention kernel for layer N (head_dim_k = …, head_dim_v = …)` |
-| one page geometry for all layers (same head dim / head count / K,V types) | `requires uniform attention-layer geometry` |
+| one page geometry for all streamed layers (same head dim / head count / K,V types) | `requires uniform attention-layer geometry` |
 | a streamed attention mode for the `(K,V)` type pair | `invalid block KV streaming page geometry` |
-| no sliding-window cache (`hparams.is_swa_any()` is false) | `does not support sliding-window attention caches yet` |
+| at least one full-attention layer to stream | `found no full-attention layers to stream` |
+| no sliding-window cache, or a sliding-window cache with a streamable dense half | `does not support hybrid models with sliding-window layers yet` / `does not combine with --swa-full` |
 | `-np 1`, Flash Attention, `--no-kv-offload` absent, target context only | as before |
 
-Memory types that carry the runtime: `llama_memory_hybrid` (attention child) and, since this
-change, the plain `llama_kv_cache` of a **dense, non-SWA** model. `llama_kv_cache_iswa`,
-`llama_memory_hybrid_iswa` and `llama_memory_hybrid_idx` still take no streaming parameters:
-iswa keeps its layers in two caches (`get_base()` for the dense ones, `get_swa()` for the
-sliding-window ones) whose KV lengths differ, while the runtime has exactly one page geometry
-and one resident layout. Streaming only the dense half would be the way in — the SWA half is
-already bounded by `n_swa + n_ubatch` and stays resident — but that needs the arena ownership
-(the third `llama_kv_cache` owner) and a probe that counts dense layers only.
+Memory types that carry the runtime: `llama_memory_hybrid` (attention child), the plain
+`llama_kv_cache` of a **dense, non-SWA** model, and `llama_kv_cache_iswa` (**dense half only**).
+The last one is what makes gemma2/gemma3-class models work: their layers are split into a dense
+cache of `n_ctx` cells and a sliding-window cache of `PAD(min(n_ctx, n_swa + n_ubatch), 256)`
+cells, so the SWA half is O(1) in the context length and stays resident while `get_base()`
+streams. The probe therefore walks the **non-SWA** layers only; counting the SWA half would size
+the resident region for pages the runtime never holds (and on gemma4 it would mix two different
+SWA head dims into a uniformity check that applies to neither cache).
+
+`llama_memory_hybrid_iswa` and `llama_memory_hybrid_idx` still take no streaming parameters at
+all, and `--swa-full` is rejected: it sizes the SWA half like the dense one, which is the half the
+streaming is supposed to move out of VRAM.
 
 Not eligible, by construction: MLA caches (K/V head dims differ), attention sinks (`gpt-oss`),
 head dims without a compiled instance (e.g. 96 — unless TurboQuant padding lifts them to 128),
-`-np > 1`, and MTP/draft contexts.
+`-np > 1`, MTP/draft contexts, and `llama_memory_hybrid_iswa` models (hybrid **and** SWA).
+
+### What base-only streaming buys on a sliding-window model
+
+The streamed half is the only one that grows, so the crossover is
+`n_ctx > (n_layer - n_dense)/n_dense * (n_swa + n_ubatch)`: ~4k tokens for gemma2 (every 2nd
+layer dense, `n_swa` 4096), ~5k for gemma3 and the 4B `spark2_5` in this tree (every 6th/4th
+layer dense, `n_swa` 1024/512). Below that the SWA half dominates and streaming saves nothing.
+Above it, every `n_ctx`-sized page lives in host memory and the decode cost is the resident
+window's complement: each step reads `(active - resident) * page_bytes * n_dense` over PCIe, so
+1M context on a model with 9 dense layers is ~9 GiB per step, i.e. ~1 s/token on PCIe 3.0 x16.
+That is the same curve Qwen3.5 has, scaled by the number of streamed layers.
 
 ## Known limitations
 
