@@ -219,11 +219,19 @@ llama-cli.exe -m D:\llama-build\models\Ternary-Bonsai-2-2B-PTQ1_0.gguf -ngl 99 -
 所以上面两条 `test-backend-ops` 判据在 iGPU 上已经满足；**V100 / GTX 950 上要重跑**（不同 subgroup 宽度、
 不同 shared memory 上限，走的是不同的 DMMV workgroup 档位）。
 
-**⚠️ 已知未通**：折叠模型（Bonsai 2）在 Vulkan 上 `-ngl 99` 在**加载阶段**退出（日志停在
-`init: llama threadpool init`，无 error —— `GGML_ABORT` 不 flush 的典型形态）。同一台机器上非折叠的
-PTQ1_0/PQ2_0 模型正常，非 Prism 模型正常，`-ngl 0` 也能跑 ⇒ 范围是"折叠路径 × Vulkan"。
-实机上先按这个顺序取：① `-ngl 0` 与 `-ngl 1` 的分界；② 在 `load_tensors` 里旋转张量创建处加一次性日志；
-③ 对比 `ggml_backend_buft_get_device()` 对该 Vulkan buft 的返回值。
+**折叠模型（Bonsai 2）已通**（2026-10-19，Intel UHD 730）：`-ngl 99` 真跑完
+（`llama-cli` prefill 11 token + 24 token decode；`llama-perplexity -c 512 -b 512` 1025 token，
+PPL **2.8440**，纯 CPU 参照 `-dev none -ngl 0` 为 **2.8522**）。期间修掉两个缺陷，
+根因与证据见 `docs/MERGE_PRISM_QUANT.md` §8.1：
+① `llama_verify_hadamard_graph()` 原本在 `graph_compute()` 里跑，那张图已被 `sched_reserve` 插过 copy，
+   embedding 的 `MUL_MAT.src[1]` 被改写 ⇒ 误判"没做逆变换" ⇒ 抛异常终止（**静默**是因为
+   `common/log.cpp` 的日志走异步 worker 线程，进程一死队列全丢）；
+② 无 coopmat 的设备上 `qx_needs_dequant` 恒真，`token_embd.weight`（2048 × 248320 = 5.09 亿元素）
+   一次性 dequant ⇒ `wg = 496640 > maxComputeWorkGroupCount = 65536`。
+
+⇒ **V100 / GTX 950 上重跑时，把这条当回归项**：同一模型 `-ngl 99` 必须能出 PPL，且与 `-dev none -ngl 0`
+在同一语料上落在 ±1% 内。若再次出现"无 error 直接退出"，先用 `GGML_LOG_SYNC=1` 打开同步日志
+（环境变量，配合一处临时旁路；日志变同步后异常前的最后一行才有意义）再二分。
 
 **已知取舍**：Vulkan 侧目前只走 `mul_mat_vec`（decode 快路径）+ `dequant → f16`（prefill）。
 没有 coopmat/MMQ 版本，所以 `pp512` 会明显慢于 CUDA —— 这是设计取舍，不是缺陷。

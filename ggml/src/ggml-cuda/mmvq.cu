@@ -808,6 +808,98 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // fork: PTQ1_0 small_k warp-per-row geometry. Upstream's small_k loop strides K-blocks across
+    // the whole block (kbx = tid; kbx += 128), so for K=5120 (40 blocks) only threads 0..39 ever load
+    // anything: warp 0 is full, warp 1 has 8 lanes, the rest only wait at __syncthreads while holding
+    // SM warp slots. Measured in-graph with CUPTI on an RTX 4070 (fork): 350-390 GB/s for every
+    // K=5120 GEMV vs 460 GB/s for the K=17408 geometry where all four warps stream. Here warp w owns
+    // row row0+w and its lanes stride that row's K-blocks: every warp issues loads, the reduction is
+    // a shuffle, and there is no shared memory or block barrier. Activations are re-read per warp but
+    // they are 20 KB and L1/L2 resident. The fork guards this on a compile-time `y_soa` template
+    // parameter; this tree passes the activation layout as a runtime argument (y_layout), so the guard
+    // is a runtime test and a non-SoA launch falls through to the generic loop below.
+    if constexpr (small_k && type == GGML_TYPE_PTQ1_0 && ncols_dst == 1 && nwarps > 1 && rows_per_cuda_block == nwarps) {
+        if (y_layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+            const int  warp   = threadIdx.y;
+            const int  lane   = threadIdx.x;
+            const bool row_ok = uint32_t(row0 + warp) < stride_col_dst;
+
+            float acc[ncols_dst] = { 0.0f };
+            [[maybe_unused]] float acc_gate[has_fusion ? ncols_dst : 1] = { 0.0f };
+            if (row_ok) {
+                const int kbx_row = kbx_offset + warp * stride_row_x;
+                for (int kbx = lane; kbx < blocks_per_row_x; kbx += warp_size) {
+                    float dots[ncols_dst];
+                    vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        acc[j] += dots[j];
+                    }
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                            for (int j = 0; j < ncols_dst; ++j) {
+                                acc_gate[j] += dots[j];
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                acc[j] = warp_reduce_sum<warp_size>(acc[j]);
+                if constexpr (has_fusion) {
+                    acc_gate[j] = warp_reduce_sum<warp_size>(acc_gate[j]);
+                }
+            }
+            if (lane == 0 && row_ok) {
+                float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + warp;
+                [[maybe_unused]] const uint32_t channel_bias = ids ? channel_x : channel_dst;
+                [[maybe_unused]] const int64_t  bias_off     = sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0 + warp;
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    float result = acc[j];
+                    if constexpr (has_fusion) {
+                        if (use_bias) {
+                            result += ((const float *) fusion.x_bias)[bias_off + j*stride_col_dst];
+                        }
+                        if (use_gate) {
+                            float gate_value = acc_gate[j];
+                            if (use_gate_bias) {
+                                gate_value += ((const float *) fusion.gate_bias)[bias_off + j*stride_col_dst];
+                            }
+                            switch (active_glu) {
+                                case GGML_GLU_OP_SWIGLU:
+                                    result *= ggml_cuda_op_silu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_GEGLU:
+                                    result *= ggml_cuda_op_gelu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_OAI:
+                                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_CLAMP:
+                                    result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                                    break;
+                                default:
+                                    result = result * gate_value;
+                                    break;
+                            }
+                        }
+                    }
+                    dst_row[j*stride_col_dst] = result;
+                }
+            }
+            GGML_UNUSED_VARS(use_gate, use_scale, use_gate_scale, gate_bias, x_bias, gate_scale, x_scale,
+                             x_scales, gate_scales, x_biases, gate_biases, glu_limit, tmp, tmp_gate,
+                             vec_dot_q_cuda, blocks_per_iter);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 

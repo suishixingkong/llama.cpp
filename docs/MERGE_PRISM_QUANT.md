@@ -18,7 +18,8 @@
 | 直接跑 prism 发布的 Bonsai 2 权重 | ✅ 阶段二（Hadamard 折叠）已落地，见 §5 |
 | CUDA 原生 mmq/mmvq | ✅ 已移植并编译通过，未上卡验证，见 §6 |
 | `gguf-py` 常量 / HF 转换脚本 | ✅ 见 §7 |
-| Vulkan / SYCL 后端 | ❌ 未移植，见 §8 |
+| Vulkan 后端 | ✅ 已落地；折叠模型 `-ngl 99` 真跑通，PPL 与 CPU 一致，见 §8 / §8.1 |
+| SYCL 后端 | ❌ 放弃（缺 oneAPI 工具链，3000+ 行 Xe2 专属），见 §8 |
 
 ## 2 移植清单（阶段一实际改动）
 
@@ -140,7 +141,26 @@ prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩�
 （fork 记录 fp16 反量化 + cuBLAS 正是 PTQ1_0 在 CUDA 上掉精度的来源），`GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH` 留作 A/B 开关。
 `mul_mat_id` 不再绕开这两种类型。
 
-## 6.1 激活布局：SoA 单列 / PT 列共享 / PQ2 多列（已落地）
+### 6.1 PTQ1_0 的 small_k warp-per-row 几何（后补）
+
+fork 的 `small_k` 参数本身早就有了（`calc_nwarps(..., small_k)` +
+`calc_rows_per_block()` 里 `small_k ? nwarps : 1`），本树也已具备。缺的是 fork 针对
+**PTQ1_0 + 1 列 + SoA** 的专用 K 循环：通用 small_k 循环按 `kbx = tid; kbx += 128` 让整个 block 瓜分
+K-block，K=5120（40 块）时只有 0..39 号线程在搬数据 —— warp 0 满载、warp 1 只剩 8 lane、
+warp 2..3 在 `__syncthreads` 空占 SM warp 槽。fork 用 CUPTI 在 RTX 4070 上量的组内 GEMV 带宽是
+**K=5120 全部档位 350–390 GB/s，而 K=17408（四个 warp 都在流）460 GB/s**。
+
+改法（`ggml/src/ggml-cuda/mmvq.cu`）：warp `w` 独占第 `row0+w` 行，32 个 lane 分担该行的 K-block，
+归约用 shuffle，没有共享内存也没有 block barrier；激活会被每个 warp 重读，但只有 20 KB 且常驻 L1/L2。
+依赖全部齐备（`vec_dot_ptq1_0_q8_1_multi` 与 fork 同签名，fusion/gate/bias 变量名一致），
+只多补了本树独有的 `GGML_GLU_OP_SWIGLU_CLAMP` 分支。
+
+**与 fork 的唯一偏差**：fork 用编译期模板参数 `y_soa` 把这段代码只实例化给 SoA；本树的激活布局是
+运行时参数 `y_layout`（见 6.2），所以门退化成一次运行时判断，非 SoA 的 launch 落到下面的通用循环。
+
+⏳ **未上卡验证**：本机无 GPU，只做到 `ggml-cuda` 编译通过。
+
+### 6.2 激活布局：SoA 单列 / PT 列共享 / PQ2 多列（已落地）
 
 fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺序**。本树按同一套设计接进来：
 `ggml_cuda_q8_1_layout`（AOS / SOA_ISUM / PT / PQ2），由 `ggml_cuda_q8_1_layout_host(type, ncols, ids, plain_2d)`
@@ -213,16 +233,49 @@ batch 维、`mul_mat_id`）。同机 CPU 侧 1465/1465。
 > "2 块/组"（64 invocation × 4 元素 = 256 元素 = 2 个 128 权重的块）。表现是 n≤8 全绿（走 mul_mat_vec、
 > 不经过这个 shader），n≥9 与带 batch 维的用例全红。修正后 0 失败 —— 这就是"构建通过 ≠ 正确"的实例。
 
-**⚠️ 未通**：**折叠模型（Bonsai 2）在 Vulkan 上加载阶段就退出**（`-ngl 99`，日志停在
-`init: llama threadpool init` 之后，无任何 error 输出 —— 典型的 `GGML_ABORT` 不 flush）。
-同一台机器上：
-- 非折叠的 `q2.5-ptq1_0.gguf` / `q2.5-pq2_0.gguf` `-ngl 99` 正常（RC=0）；
-- 非 Prism 的 `qwen2.5-0.5b-q4km.gguf` `-ngl 99` 正常（PPL 13.8483）；
-- 同一个 Bonsai 模型 `-ngl 0` 能跑（直到 compute 阶段才撞到另一个与本移植无关的
-  `maxComputeWorkGroupCount` 断言）。
-⇒ 范围缩小到"**折叠路径 × Vulkan**"，即 §5 那段 `load_tensors` 里的旋转/符号张量在 Vulkan buffer type 上的创建。
-待办：在 Vulkan 上给 `ggml_backend_alloc_ctx_tensors_from_buft` 那段加一次性日志定位，或直接把旋转张量
-建在 host-visible 的通用 buft 上再显式搬运。
+### 8.1 折叠模型在 Vulkan 上"静默退出"——已定位并修复
+
+**症状**：`Ternary-Bonsai-2-2B-PTQ1_0.gguf -ngl 99` 无任何 error 输出直接退出（退出码 `0xC0000409`），
+日志停在 `computation-frontier ratchet`。**日志"干净截断"本身就是判据**：末尾是完整普通行、无 error ⇒
+不是 abort 打印失败，而是异常在**第一条日志之前**抛出。
+
+**定位手段**（可复用）：`common/log.cpp` 的日志是**异步 worker 线程**打印的，进程被终止时队列里的内容全丢
+⇒ 任何"静默"故障都看不到上下文。加一个 `GGML_LOG_SYNC=1` 的同步旁路后，日志行行落地，
+再按 `graph_compute → hadamard 校验 → sched` 三段插桩即可二分。
+
+**根因 1（校验时机）**：`llama_verify_hadamard_graph()` 原本在 `llama_context::graph_compute()` 里调用，
+即 **`ggml_backend_sched_reserve()` 已经改写过这张图之后**。图切分会在 split 边界插入 copy 并把**消费者的
+`src[]` 重写成 copy 张量**，于是"embedding 的 `GET_ROWS` 经 reshape 喂给带 hint 的 `MUL_MAT`"这条链在
+指针层面断了，校验误判成 `Hadamard-latent table 'token_embd.weight' is read without the inverse transform`
+并抛异常（无人 catch ⇒ terminate）。实测该图 `graph splits = 2 / sched copies = 1`，被改写的正是
+embedding 的 `MUL_MAT.src[1]`（指向调度器缓冲区，`op == GGML_OP_NONE`，因此 `unwrap()` 停在它上面）。
+`-ngl 1` 之所以通过是巧合：那一档图恰好没在该边界插 copy。
+
+**修法**：把校验移到 `llama_context::graph_reserve()` 里 `model.build_graph()` 之后、调度器接手之前 ——
+折叠契约是"模型构图器产出的那张图"的性质，不是"调度后那张图"的性质。
+
+**根因 2（dequant 全量 dispatch 溢出）**：修完根因 1 后 prefill 立刻撞第二个断言
+`GGML_ASSERT(wg0 <= maxComputeWorkGroupCount)`。插桩显示罪魁是
+`dequant_ptq1_0 els=(508559360,1,1) wg=(496640,1,1)`，而设备上限是 65536：
+`token_embd.weight` 是 2048 × 248320，**整个权重一次性反量化**。触发条件是
+`ggml_vk_mul_mat_q_f16()` 里 `qx_needs_dequant = mmp_map == nullptr || x_non_contig` ——
+本机（Intel UHD 730）没有 coopmat ⇒ `mmp_map == nullptr` ⇒ 恒为真。上游类型没暴露这个问题，
+是因为它们能走 Q8_1 mat-vec（`ggml_vk_get_dequantize_mul_mat_vec(..., GGML_TYPE_Q8_1, ...)` 的白名单里有），
+不必 dequant 权重；PQ2_0/PTQ1_0 不在该白名单里。
+
+**修法**：dispatch 侧分块（不动 shader）。每次发 `min(剩余, maxComputeWorkGroupCount[0] * wg_denoms[0])`
+个元素，**两个 binding 的 offset 同步前进**、`p.nel` 缩到本次块数 —— shader 本来就从 0 开始索引绑定区间，
+所以每个元素仍恰好被写一次。非连续的 `cpy` 路径保持单次 dispatch。
+
+**验证（Intel UHD 730 真跑，同一语料 1355 token / `-c 512 -b 512`）**：
+
+| 运行 | PPL |
+|---|---|
+| `-ngl 99`（Vulkan 全卡） | **2.8440 +/- 0.31715** |
+| `-dev none -ngl 0`（纯 CPU 参照） | **2.8522 +/- 0.31860** |
+
+⇒ Vulkan 与 CPU 一致（差 0.3%，浮点累加顺序）。`llama-cli -ngl 99` 亦跑通
+（prefill 11 token + 24 token decode，`graphs reused = 31`）。
 
 **SYCL**：**放弃**。需要 Intel oneAPI `icpx`（本机没有 ⇒ 盲改零验证），且 fork 那 3000+ 行是 Xe2 专属
 dpas/w8a8/pq2_xmx，没有对应硬件时风险远大于收益。
@@ -233,6 +286,11 @@ dpas/w8a8/pq2_xmx，没有对应硬件时风险远大于收益。
   Vulkan 侧到 shader 全部生成 + `ggml-vulkan.lib` 链接为止。实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。
 - `-np > 1`、把 PQ2_0/PTQ1_0 当 `-ctk/-ctv`：不支持（它们只用于权重）。
 - CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植；本机 i5-12400 无 AVX-512，该路径本来也不启用。
-- Vulkan 无 coopmat/MMQ 实现（见 §8）。
+- Vulkan 无 coopmat/MMQ 实现（见 §8）：本机没有 coopmat，prefill 一律走 dequant → f16，
+  PTQ1_0 的 GEMV 因此仍是带宽受限；`PQ2_0/PTQ1_0` 也不在上游 Q8_1 mat-vec 白名单里
+  （加入它需要给 `mul_mat_vec_q8_1_*.comp` 补两种格式的 `dequantize_block_q8_1`，是另一轮工作）。
+- `-ngl 0 -nkvo`（权重全 CPU、KV 也回 host，但 Vulkan 仍留在 scheduler 里）时，折叠模型会把
+  descriptor pool 用尽并撞 `descriptor_set_idx < descriptor_sets.size()`；同参数的
+  `Qwen3.5-0.8B-Q4_K_M.gguf` 正常，`-dev none` 也正常 ⇒ 属边缘组合，未修。
 - 测试里的 `test-ptq1_0-cuda-dot.cpp` / `test-ptq1_0-element-map.cpp` 是**转写件**（把 CUDA 侧逻辑抄到主机上跑），
   它们绿只能证明转写件与 CPU codec 一致；与真实 kernel 的一致性靠转写时的人工核对 + 实机 test-backend-ops。
