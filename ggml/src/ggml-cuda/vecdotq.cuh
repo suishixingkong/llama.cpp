@@ -112,6 +112,11 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
+#define VDR_PQ2_0_Q8_1_MMVQ  1  // PQ2_0 group 128: one 32-element chunk at a time, same codec as Q2_0
+#define VDR_PQ2_0_Q8_1_MMQ   2  // 4 32-element chunks per block, two per MMQ call
+#define VDR_PTQ1_0_Q8_1_MMVQ 4  // one call consumes the whole 128-weight block (see vec_dot_ptq1_0_q8_1)
+#define VDR_PTQ1_0_Q8_1_MMQ  2
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -769,6 +774,163 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+}
+
+// PQ2_0 (group 128): same 2-bit codec as Q2_0, one scale per 128 weights instead of 64.
+// Whole block carries a single scale, so the 4 chunks of 32 all use it and only the
+// Q8_1 scale is per chunk; iqs selects the chunk (0-3).
+static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq + kbx;
+
+    const float     d2 = (float) bq2_0->d;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
+        const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
+
+#if defined(GGML_USE_HIP)
+        const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
+        const uint32_t qy_bits    = q >> 8;
+        const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+        const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+        const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+#else
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP)
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+        sumi = ggml_cuda_dp4a(v, qy, sumi);
+    }
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * sumi;
+}
+
+// PTQ1_0 (group 128, ternary): 5 trits per byte in qs[24] covering 120 values, then
+// qh[2] covering the last 8. Digit t of byte b is ((b * 3^(t+1)) >> 8) & 0xFF, held in
+// {0,1,2} and biased by -1.
+//
+// Value index of byte b at digit t (from dequantize_row_ptq1_0): b < 16 -> t*16 + b,
+// 16 <= b < 24 -> 80 + t*8 + (b - 16), qh[h] -> 120 + t*2 + h.
+//
+// A whole block per call (VDR_PTQ1_0_Q8_1_MMVQ == 4, so iqs is always 0): running the
+// 3x chain four bytes at a time in 16-bit lanes keeps the byte walk uniform and lets the
+// four 32-element chunks be dotted without splitting the decode.
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
+
+    GGML_UNUSED(iqs);
+
+    int sumi[4] = { 0, 0, 0, 0 }; // sum of digit * u, digit in {0,1,2}
+    int sumu[4] = { 0, 0, 0, 0 }; // sum of u, to subtract the -1 bias
+
+#if defined(GGML_USE_HIP)
+    // No hardware byte permute on the HIP path; decode one byte per step.
+    for (int m = 0; m < 24; ++m) {
+        const int stride = m < 16 ? 16 : 8;
+        const int base   = m < 16 ? m      : 80 + (m - 16);
+        uint32_t  v      = bq->qs[m];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            v = w & 0xFF;
+            const int e = base + t * stride;
+            const int a = (int) bq8_1[e >> 5].qs[e & 31];
+            sumi[e >> 5] += (int) (w >> 8) * a;
+            sumu[e >> 5] += a;
+        }
+    }
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            v = w & 0xFF;
+            const int e = 120 + t * 2 + h;
+            const int a = (int) bq8_1[e >> 5].qs[e & 31];
+            sumi[e >> 5] += (int) (w >> 8) * a;
+            sumu[e >> 5] += a;
+        }
+    }
+#else
+    // qs[0..15]: four bytes per step, value index t*16 + 4*g + lane
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140); // bytes 0,1 as 16-bit lanes
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342); // bytes 2,3
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __byte_perm(w_lo, w_hi, 0x7531); // high byte of each lane = digit
+            const int e = t * 16 + 4 * g;
+            const int u = get_int_b4(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+
+    // qs[16..23]: strides of 8
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __byte_perm(w_lo, w_hi, 0x7531);
+            const int e = 80 + t * 8 + 4 * g;
+            const int u = get_int_b4(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+
+    // qh[0..1]: four digits per byte, value index 120 + t*2 + h. Only 8 values, and they
+    // interleave two bytes per step, so decode them scalar instead of packing a 4-byte dot.
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
+            const int a      = (int) bq8_1[e >> 5].qs[e & 31];
+            sumi[e >> 5] += (int) (w >> 8) * a;
+            sumu[e >> 5] += a;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[k].ds) * (float) (sumi[k] - sumu[k]);
+    }
+    return (float) bq->d * acc;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
