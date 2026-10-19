@@ -9673,8 +9673,26 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (x_non_contig) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
     } else if (qx_needs_dequant) {
-        const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
-        ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
+        // One dispatch can only address maxComputeWorkGroupCount[0] * wg_denoms[0] elements, so a
+        // weight with a long vocabulary (e.g. 248320 x 2048 = 508 M elements) overflows the limit
+        // and trips the workgroup-count assert. Dequantize in chunks: both bindings advance
+        // together and p.nel shrinks to the chunk, so every element is still written exactly once
+        // and the shaders (which index from 0 within the bound range) need no change. Contiguous
+        // copies keep the single-dispatch form.
+        const uint64_t blck_size = ggml_blck_size(src0->type);
+        const uint64_t src_bs    = ggml_type_size(src0->type);
+        const uint64_t chunk_max = (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0] * to_fp16_vk_0->wg_denoms[0];
+        const uint64_t chunk     = chunk_max - chunk_max % blck_size;
+        for (uint64_t done = 0; done < x_ne; done += chunk) {
+            const uint64_t n = std::min(chunk, x_ne - done);
+            const uint64_t q_off = (done / blck_size) * src_bs;
+            const uint64_t d_off =  done             * sizeof(ggml_fp16_t);
+            const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)n };
+            ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
+                    { vk_subbuffer{ d_Qx, qx_buf_offset + q_off, qx_sz - q_off },
+                      vk_subbuffer{ d_X,  d_off,                x_sz  - d_off } },
+                    pc, { (uint32_t) n, 1, 1});
+        }
         ggml_vk_sync_buffers(ctx, subctx);
     }
     if (y_non_contig) {

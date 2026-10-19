@@ -3485,6 +3485,16 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    // The folding contract is a property of the graph the model builder emits, so check it here,
+    // before the scheduler runs: graph splitting inserts copies at the split boundaries and rewrites
+    // the consumer sources to point at them, which breaks the "this matmul is fed by the transformed
+    // lookup" shape that llama_verify_hadamard_graph() walks the graph for.
+    if (!hadamard_verified && gf &&
+            (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+        hadamard_verified = true;
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -3594,12 +3604,6 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
-    }
-
-    if (!hadamard_verified && gf &&
-            (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
-        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
-        hadamard_verified = true;
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
