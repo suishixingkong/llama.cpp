@@ -345,6 +345,10 @@ private:
 
     llama_cparams cparams;
 
+    // set once the first graph with Hadamard-folded weights has been verified; see
+    // llama_verify_hadamard_graph in llama-context.cpp
+    mutable bool hadamard_verified = false;
+
     struct kv_stream_phase_arena_owner {
         struct layout {
             size_t kv_bytes = 0;

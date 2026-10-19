@@ -43,6 +43,72 @@
 // llama_context
 //
 
+
+// Verify that every Hadamard-folded weight consumed by the graph receives its
+// activation-side transform, and that every latent lookup table gets the inverse.
+// An architecture or tensor kind whose matmul path bypasses the helpers would
+// otherwise load cleanly and silently compute the wrong thing.
+static void llama_verify_hadamard_graph(
+        ggml_cgraph * gf,
+        const llama_hadamard_rotations & rotations,
+        const llama_hadamard_rotations & inverses) {
+    auto unwrap = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
+            t = t->src[0];
+        }
+        return t;
+    };
+
+    std::map<const ggml_tensor *, bool> lookups; // get_rows results of latent tables
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+
+        if (node->op == GGML_OP_GET_ROWS && inverses.count(node->src[0])) {
+            lookups.emplace(node, false);
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT && ((const int32_t *) node->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD) {
+            const auto lk = lookups.find(unwrap(node->src[1]));
+            if (lk != lookups.end()) {
+                lk->second = true;
+            }
+            continue;
+        }
+
+        const auto it = rotations.find(node->src[0]);
+        if (it == rotations.end()) {
+            if (inverses.count(node->src[0])) {
+                throw std::runtime_error(format(
+                    "Hadamard-latent table '%s' is used as a head without a forward transform", node->src[0]->name));
+            }
+            continue;
+        }
+        const ggml_tensor * src = unwrap(node->src[1]);
+        const bool transformed = src && src->op == GGML_OP_MUL_MAT &&
+            ((const int32_t *) src->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD &&
+            src->src[0] == it->second.rot;
+        if (!transformed) {
+            throw std::runtime_error(format(
+                "Hadamard-folded weight '%s' is consumed without its activation transform; "
+                "this graph's matmul path does not support prism.hadamard folding",
+                node->src[0]->name));
+        }
+    }
+
+    for (const auto & [node, ok] : lookups) {
+        if (!ok) {
+            throw std::runtime_error(format(
+                "Hadamard-latent table '%s' is read without the inverse transform", node->src[0]->name));
+        }
+    }
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -3502,6 +3568,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.hadamard_rotations =*/ &model.hadamard_rotations,
+        /*.hadamard_inverses  =*/ &model.hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3526,6 +3594,12 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    if (!hadamard_verified && gf &&
+            (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+        hadamard_verified = true;
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

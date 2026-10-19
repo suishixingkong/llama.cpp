@@ -579,22 +579,6 @@ llama_model_loader::llama_model_loader(
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
         }
 
-        // Prism (Bonsai) models can carry Hadamard-folded weights: the tensors listed in
-        // prism.hadamard.weight_names are stored pre-rotated and every consumer must rotate the
-        // activation with the FWHT before the matmul. Only the weight formats (PQ2_0/PTQ1_0) are
-        // ported here, not the folding runtime, so such a model would run and silently produce
-        // wrong numbers. Fail loudly instead.
-        for (const char * key : { "prism.hadamard.weight_names", "prism.hadamard.inverse_weight_names",
-                                  "prism.hadamard.version", "prism.hadamard.tied_output" }) {
-            if (gguf_find_key(metadata, key) >= 0) {
-                throw std::runtime_error(format(
-                        "%s: %s declares '%s': this model uses Prism's Hadamard weight folding, which is not "
-                        "ported into this build. Only the PQ2_0/PTQ1_0 weight formats are supported; load a "
-                        "model without prism.hadamard metadata (or port the folding runtime first)",
-                        __func__, fname.c_str(), key));
-            }
-        }
-
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 

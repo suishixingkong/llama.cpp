@@ -1502,6 +1502,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    hadamard_rotations (params.hadamard_rotations),
+    hadamard_inverses  (params.hadamard_inverses),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1524,11 +1526,51 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_activation(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    if (!hadamard_rotations) {
+        return cur;
+    }
+    const auto it = hadamard_rotations->find(w);
+    if (it == hadamard_rotations->end()) {
+        return cur;
+    }
+    const llama_hadamard_transform & t = it->second;
+
+    const auto key = std::make_tuple((const ggml_tensor *) cur, (const ggml_tensor *) t.rot,
+                                     (const ggml_tensor *) t.signs, t.perm_hd, t.perm_nk, t.perm_rep);
+    const auto memo = hadamard_memo.find(key);
+    if (memo != hadamard_memo.end()) {
+        // qkv/gate/up share this activation: the transform is already in the graph
+        return memo->second;
+    }
+
+    ggml_tensor * res = cur;
+    if (t.perm_rep > 1) {
+        // tiled [hd, nk, rep] -> grouped [hd, rep, nk], the order the fold was computed in
+        ggml_tensor * x = ggml_is_contiguous(res) ? res : ggml_cont(ctx0, res);
+        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+        x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+        res = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    if (t.signs) {
+        res = ggml_mul(ctx0, res, t.signs);
+    }
+    res = llama_mul_mat_hadamard(ctx0, res, t.rot);
+
+    hadamard_memo.emplace(key, res);
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * cur_mm = build_hadamard_activation(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1545,7 +1587,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
+                ggml_mul_mat(ctx0, lw->a, cur_mm)
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
@@ -1560,6 +1602,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
+    cur = build_hadamard_activation(w, cur);
+
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
@@ -2394,6 +2438,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+
+        // a Hadamard-latent embedding table stores rotated rows: restore the primal
+        // basis right after the lookup, h = s * (H z), the inverse of the fold's
+        // x -> H (x * s)
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd);
+            if (it != hadamard_inverses->end()) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+                if (it->second.signs) {
+                    cur = ggml_mul(ctx0, cur, it->second.signs);
+                }
+            }
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
