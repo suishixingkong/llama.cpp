@@ -827,6 +827,110 @@ static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
 // A whole block per call (VDR_PTQ1_0_Q8_1_MMVQ == 4, so iqs is always 0): running the
 // 3x chain four bytes at a time in 16-bit lanes keeps the byte walk uniform and lets the
 // four 32-element chunks be dotted without splitting the decode.
+#if !defined(GGML_USE_HIP)
+// y_col0: activation column 0 base (warp-transposed layout, see ggml_cuda_ptq1_q8_word);
+// kbx_x: absolute PTQ1 block index into vbq; kb: K-block index within the row;
+// stride_col_y: column stride in block_q8_1 units.
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
+                                                                 const block_q8_1 * __restrict__ y_col0,
+                                                                 const int &    kbx_x,
+                                                                 const int &    kb,
+                                                                 const uint32_t stride_col_y,
+                                                                 float *        result) {
+    const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx_x;
+    int                  sumi[ncols_dst][4] = {};
+
+    // Lane-coalesced activation words: word ww of this K-block is at yw[ww*32]; 32 lanes of a
+    // warp own 32 consecutive K-blocks, so every load below is 32 consecutive words.
+    const int * __restrict__ yw = (const int *) y_col0 + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
+    const uint32_t           sy = stride_col_y * (sizeof(block_q8_1) / 4);
+#    define PTQ1_U(j, sub, m) yw[(j) * sy + ((sub) * 8 + (m)) * GGML_CUDA_PTQ1_Q8_GROUP_KB]
+#    define PTQ1_DS(j, sub)   yw[(j) * sy + (32 + (sub)) * GGML_CUDA_PTQ1_Q8_GROUP_KB]
+
+    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
+#    pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            // Raw digits {0,1,2}; the -1 bias is folded into the per-32-block exact q8 sum below.
+            const int q = __byte_perm(w_lo, w_hi, 0x7531);
+            const int e = t * 16 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = PTQ1_U(j, e >> 5, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+#    pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __byte_perm(w_lo, w_hi, 0x7531);
+            const int e = 80 + t * 8 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = PTQ1_U(j, e >> 5, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#    pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v                 = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v                 = w1 & 0x00FF00FF;
+
+        const int q = __byte_perm(w0, w1, 0x7531);
+#    pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = PTQ1_U(j, 3, 6 + t / 2);
+            sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+        }
+    }
+
+    const float d = (float) bq->d;
+#    pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#    pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int   ds_bits = PTQ1_DS(j, k);
+            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
+            // ds.y carries the exact int16 sum of the 32 q8 values (see quantize_q8_1<SOA_ISUM>).
+            const int   isum    = (int) __half_as_short(__high2half(ds));
+            acc += __low2float(ds) * (float) (sumi[j][k] - isum);
+        }
+        result[j] = d * acc;
+    }
+#    undef PTQ1_U
+#    undef PTQ1_DS
+}
+#endif
+
 static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

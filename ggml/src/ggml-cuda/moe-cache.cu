@@ -3130,7 +3130,7 @@ static int moe_cache_dispatch_internal(
                 cudaMemcpyHostToDevice, device.compute_stream), "input upload", true);
     if (ok) {
         quantize_row_q8_1_cuda(
-                d_act, nullptr, device.d_act_q8, (ggml_type)wtype,
+                d_act, nullptr, device.d_act_q8, GGML_CUDA_Q8_1_AOS,
                 n_in, n_in, (int64_t)activation_rows * n_in,
                 (int64_t)activation_rows * n_in, padded_n_in,
                 activation_rows, 1, 1, device.compute_stream);
@@ -3164,7 +3164,7 @@ static int moe_cache_dispatch_internal(
     }
     if (ok && full) {
         quantize_row_q8_1_cuda(
-                device.d_out, nullptr, device.d_act_q8, (ggml_type)wtype,
+                device.d_out, nullptr, device.d_act_q8, GGML_CUDA_Q8_1_AOS,
                 n_out, n_out, (int64_t)n_hits * n_out,
                 (int64_t)n_hits * n_out, padded_n_mid,
                 n_hits, 1, 1, device.compute_stream);
