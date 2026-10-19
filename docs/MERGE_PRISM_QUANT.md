@@ -140,8 +140,37 @@ prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩�
 （fork 记录 fp16 反量化 + cuBLAS 正是 PTQ1_0 在 CUDA 上掉精度的来源），`GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH` 留作 A/B 开关。
 `mul_mat_id` 不再绕开这两种类型。
 
-**未移植**：fork 的 SoA/exact-isum 单列路径与 PT 列共享核（`mmvq-pq2_0.cuh`、`mmvq-ptq1_0.cuh`）。
-后果只在多列（speculative 验证）与单列 PTQ1 的线程利用率上，正确性不受影响。
+## 6.1 激活布局：SoA 单列 / PT 列共享 / PQ2 多列（已落地）
+
+fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺序**。本树按同一套设计接进来：
+`ggml_cuda_q8_1_layout`（AOS / SOA_ISUM / PT / PQ2），由 `ggml_cuda_q8_1_layout_host(type, ncols, ids, plain_2d)`
+一次决定，量化器、padding 与 kernel 派发三方共用同一个值（`common.cuh`）。
+
+| 布局 | 用在 | 存放方式 |
+|---|---|---|
+| `SOA_ISUM` | PTQ1_0、1 列、非 Ampere、非 batch-invariant | 按 32 个 K-block 分组，组内 word w 连续（`ggml_cuda_ptq1_q8_word`），`ds.y` 里放**精确整数和** |
+| `PT` | PTQ1_0、2–8 列或 MoE ids，以及 Ampere/batch-invariant 的 1 列 | 每个 128 权重的 8 个 16 字节平面 + 一个 `(d,s)` 平面；列跨度仍是 `block_q8_1` 的字节数 |
+| `PQ2` | PQ2_0、3–8 列、**仅 sm_89** | 列内 qs 在前（每 16 元素组内置换），随后每 32-block 一个 `half2(d, 整数和)` |
+| `AOS` | 其他一切，以及两条遗留入口（多卡切分 `ggml_cuda_op_mul_mat_vec_q`、moe-cache） | 普通 `block_q8_1` |
+
+- `quantize.cu`：`quantize_q8_1<layout>` 四路模板；`quantize_row_q8_1_cuda` 改吃 layout 而不是 `type_src0`。
+  `SOA_ISUM` 需要把 K padding 到 `GGML_CUDA_PTQ1_K_PAD`(4096)，否则分组不完整。
+- `vecdotq.cuh`：`vec_dot_ptq1_0_q8_1_multi<ncols>`（SoA 版，一次吃整块并减去精确整数和）。
+- `mmvq-ptq1_0.cuh`：`ptq1_0_pt_block_dot<ncols,nrows>`（PT 版的共享解码）+ 专用的
+  `mul_mat_vec_ptq1_0_pt`（1–8 列、`rows_per_cta` 填满 128 线程、partial 写 smem 后统一归约，
+  `GGML_CUDA_BATCH_INVARIANT` 时走 warp 归约以保证列数无关）。
+- `mmvq-pq2_0.cuh`：`mul_mat_vec_pq2_0_mc`（3–8 列，4 行/warp，激活切片跨行复用）。
+- `mmvq.cu`：新增 `y_layout` 参数贯穿 `switch_type → switch_ncols_dst → switch_fusion → kernel`；
+  kernel 里 `if constexpr (type == GGML_TYPE_PTQ1_0)` 三路（SoA / PT / AoS 兜底）；
+  `calc_nwarps`/`calc_rows_per_block` 增加 PTQ1_0 多列规则；`should_use_mmvq` 对 PTQ1_0 判 `ne11 <= 4`
+  （fork 在 Ada 上量到 8 列时 MMQ 反超）。
+
+⚠️ **AoS 兜底不是可有可无的**：`ggml_cuda_op_mul_mat_vec_q`（多卡切分）与 `ggml_cuda_moe_cache_mmv`
+喂进来的激活是别处按 AoS 量化的，若只写"SoA/PT 两分支"，这两条路径会静默算错。
+
+**未对齐 fork 的一处**：fork 在 `small_k && PTQ1_0 && 1 列 && SoA` 时另有一套 warp-per-row 几何
+（每个 warp 独占一行、无 smem、无 barrier），这里没搬 —— 正确性不受影响，只是 K 较小的 1 列 GEMV
+少了那点并行度。V100 上是否值得补，等 §测试方案 1.2/3.3 的实测数字再定。
 
 **验证**：`ggml-cuda.lib` 静态构建 72/72 链接通过（0 error），两个 `mmq-instance-{pq2_0,ptq1_0}.cu.obj` 生成。
 无 GPU，未上卡；解码数学改用"模拟 `__byte_perm`/`__vsub4` + 索引算术"对照参考反量化：
@@ -158,29 +187,52 @@ prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩�
 - `conversion/qwen.py`：折叠过的 `linear_attn.in_proj_qkv` / `out_proj` 跳过 V 头重排，改置 `gdn_v_grouped`。
 - 未端到端跑：复现 Bonsai gguf 需要打包好的 checkpoint 和外置 packer，本树都没有。
 
-## 8 未移植：Vulkan / SYCL
+## 8 Vulkan（已落地）/ SYCL（放弃）
 
-两者都是**重量级重写**而非机械搬运，原因可量化：
+**Vulkan**：本树的 `mul_mat_vec.comp` 是**单 shader + `MmTypeA` spec constant** 的结构（fork 那套按类型
+编译的 `mul_mat_vec_<type>.comp` 在本树只有 `_k`/`tq` 还在），所以接入点是"补类型"，不是"搬 shader"：
 
-**Vulkan**（fork 侧 +235/−19 `ggml-vulkan.cpp`、+750 行 5 个 shader）
-- 本树 `ggml-vulkan.cpp` 相对同一基线已发散 **+2393/−1216**；fork 的改动依赖它自己那套按类型编译的
-  `mul_mat_vec`，而本树已经把量化 matmul 收成**单个 shader + `MmTypeA` spec constant 的 switch**。
-  因此不是"把 shader 拷过来"，而是要把解码逻辑接进这个 switch，再加 C++ 侧的 pipeline/type 表 —— 等于重写。
-- 环境是具备的（`D://Program Files\Vulkan`、glslc 都在），所以这件事可做，但要单独排期。
+| 文件 | 改动 |
+|---|---|
+| `types.glsl` | `QUANT_K_PQ2_0/PTQ1_0 = 128`、`QUANT_R = 1`、`block_pq2_0`（`d` + 32B qs）、`block_ptq1_0`（24B qs + 2B qh + `d`）、`A_TYPE` 绑定 |
+| `dequant_funcs.glsl` | `dequantize`/`dequantize4`/`get_dm`；PTQ1_0 用 `ptq1_0_val()` 逐元素走 base-3 余数递推（与 CPU codec 同构），PQ2_0 直接复用 Q2_0 的 2-bit 取码 |
+| `dequant_{pq2_0,ptq1_0}.comp` | 反量化核；PTQ1_0 版一次出 8 个元素、把 `pow3[n]` 提到 8 次循环外 |
+| `vulkan-shaders-gen.cpp` | `type_names` 加两项 → 自动生成 `dequant_*`、`get_rows_*`、`mul_mat_vec_{pq2_0,ptq1_0}_{f32,f16}_f32*`、`mul_mat_vec_id_*` |
+| `ggml-vulkan.cpp` | 5 处类型白名单（`ggml_vk_get_to_fp16`、`dequantize_mul_mat_vec{,_id}`、`supports_op` 的 MUL_MAT 与 GET_ROWS）+ dmmv/dequant/get_rows 管线创建（`2*rm_stdq`，与 Q1_0/Q2_0 同档） |
 
-**SYCL**（+约 6000 行，其中 TernSYCL/Xe2 kernel 3000+ 行）
-- 需要 Intel oneAPI（`icpx`）才能编译，本机没有 ⇒ 盲改无任何验证。
-- Xe2 的 int2/int8 dpas、w8a8、pq2_xmx 都是体系结构专属优化，没有对应硬件时风险远大于收益。
+**取舍**：只走 `mul_mat_vec`（decode 快路径）+ `dequant → f16`（prefill）。没有 coopmat/MMQ 版本
+（`mul_mm.comp` 的 `a_q2_0` 那套按类型的 buffer 声明需要另开一轮），所以 prefill 明显慢于 CUDA。
+PTQ1_0 的反量化是逐元素而非按字节并行，1.75 bpw 的 GEMV 仍然是带宽受限。
 
-**当前状态**：Vulkan/SYCL 上这两种类型会在 `supports_op` 处被拒绝，权重留在 CPU 跑 —— 正确但无加速。
+**已验证（开发机 Intel UHD 730，真跑）**：
+`test-backend-ops -o MUL_MAT -b Vulkan0` **1236/1236 通过**，
+`-o GET_ROWS -b Vulkan0` **255/255 通过**，两种新格式全部覆盖（m=67 行尾、n=1..64、k∈{128,256,1024,5120}、
+batch 维、`mul_mat_id`）。同机 CPU 侧 1465/1465。
+
+> 这一步抓到一个真缺陷：`dequant_pq2_0.comp` 最初按 Q2_0 的 64 宽块写了 "4 块/组"，128 宽应该是
+> "2 块/组"（64 invocation × 4 元素 = 256 元素 = 2 个 128 权重的块）。表现是 n≤8 全绿（走 mul_mat_vec、
+> 不经过这个 shader），n≥9 与带 batch 维的用例全红。修正后 0 失败 —— 这就是"构建通过 ≠ 正确"的实例。
+
+**⚠️ 未通**：**折叠模型（Bonsai 2）在 Vulkan 上加载阶段就退出**（`-ngl 99`，日志停在
+`init: llama threadpool init` 之后，无任何 error 输出 —— 典型的 `GGML_ABORT` 不 flush）。
+同一台机器上：
+- 非折叠的 `q2.5-ptq1_0.gguf` / `q2.5-pq2_0.gguf` `-ngl 99` 正常（RC=0）；
+- 非 Prism 的 `qwen2.5-0.5b-q4km.gguf` `-ngl 99` 正常（PPL 13.8483）；
+- 同一个 Bonsai 模型 `-ngl 0` 能跑（直到 compute 阶段才撞到另一个与本移植无关的
+  `maxComputeWorkGroupCount` 断言）。
+⇒ 范围缩小到"**折叠路径 × Vulkan**"，即 §5 那段 `load_tensors` 里的旋转/符号张量在 Vulkan buffer type 上的创建。
+待办：在 Vulkan 上给 `ggml_backend_alloc_ctx_tensors_from_buft` 那段加一次性日志定位，或直接把旋转张量
+建在 host-visible 的通用 buft 上再显式搬运。
+
+**SYCL**：**放弃**。需要 Intel oneAPI `icpx`（本机没有 ⇒ 盲改零验证），且 fork 那 3000+ 行是 Xe2 专属
+dpas/w8a8/pq2_xmx，没有对应硬件时风险远大于收益。
 
 ## 9 仍存缺口
 
-- **CUDA 未上卡**：CUDA 树在本机无法整体链接（见下），只能验证到 `ggml-cuda.lib` + 数学模拟。
-- ⚠️ **本树静态构建当前是断的（与本移植无关）**：`ggml-backend-meta.cpp` 把
-  `ggml_backend_dev_is_meta` / `ggml_backend_meta_dev_n_devs` / `ggml_backend_meta_buft_n_bufts` 等定义成 `static`，
-  而 `src/llama-kv-cache.cpp`、`common/fit.cpp` 在调用它们 ⇒ 静态构建链接 `llama.lib` 必挂（LNK2019，
-  `nm` 在 ggml-base 自己的 obj 里是 `t`）。共享构建（`BUILD_SHARED_LIBS=ON`）因为带上 `GGML_SHARED` 宏反而正常，
-  CPU 验证就是在共享树上做的。
-- `-np > 1`、KV cache 用这两种类型当 `-ctk/-ctv`：不支持（它们只用于权重）。
-- CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植。
+- **CUDA / Vulkan 都未上卡**：本机无 GPU。CUDA 侧到 `ggml-cuda.lib` + 解码数学模拟为止；
+  Vulkan 侧到 shader 全部生成 + `ggml-vulkan.lib` 链接为止。实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。
+- `-np > 1`、把 PQ2_0/PTQ1_0 当 `-ctk/-ctv`：不支持（它们只用于权重）。
+- CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植；本机 i5-12400 无 AVX-512，该路径本来也不启用。
+- Vulkan 无 coopmat/MMQ 实现（见 §8）。
+- 测试里的 `test-ptq1_0-cuda-dot.cpp` / `test-ptq1_0-element-map.cpp` 是**转写件**（把 CUDA 侧逻辑抄到主机上跑），
+  它们绿只能证明转写件与 CPU codec 一致；与真实 kernel 的一致性靠转写时的人工核对 + 实机 test-backend-ops。
