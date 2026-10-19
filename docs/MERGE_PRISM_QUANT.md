@@ -18,7 +18,7 @@
 | 直接跑 prism 发布的 Bonsai 2 权重 | ✅ 阶段二（Hadamard 折叠）已落地，见 §5 |
 | CUDA 原生 mmq/mmvq | ✅ 已移植并编译通过，未上卡验证，见 §6 |
 | `gguf-py` 常量 / HF 转换脚本 | ✅ 见 §7 |
-| Vulkan 后端 | ✅ 已落地；折叠模型 `-ngl 99` 真跑通，PPL 与 CPU 一致，见 §8 / §8.1 |
+| Vulkan 后端 | ✅ 已落地；折叠模型 `-ngl 99` 真跑通，PPL 与 CPU 一致，见 §8 / §8.1；q8_1 mat-vec + coopmat 接入见 §6.2 |
 | SYCL 后端 | ❌ 放弃（缺 oneAPI 工具链，3000+ 行 Xe2 专属），见 §8 |
 
 ## 2 移植清单（阶段一实际改动）
@@ -160,7 +160,50 @@ warp 2..3 在 `__syncthreads` 空占 SM warp 槽。fork 用 CUPTI 在 RTX 4070 �
 
 ⏳ **未上卡验证**：本机无 GPU，只做到 `ggml-cuda` 编译通过。
 
-### 6.2 激活布局：SoA 单列 / PT 列共享 / PQ2 多列（已落地）
+### 6.2 Vulkan：q8_1 mat-vec 与 coopmat 接入（后补）
+
+移植前先量了一遍差距，结论是**缺的从来不是 MMQ/coopmat 引擎本身**：
+
+| 面 | 本树移植前 | fork |
+|---|---|---|
+| `mul_mmq.comp`（int MMQ） | 有 | **有，且两边 `mul_mmq_funcs.glsl` 逐字节相同（488 行），fork 也没加 PTQ1_0/PQ2_0 分支** |
+| coopmat（`mul_mm.cm1`） | 有（327 处引用） | 有，fork 多 14 条 `CREATE_MM2` |
+| q8_1 mat-vec（GEMV） | **PQ2_0/PTQ1_0 缺失** | `mul_mat_vecq_ptq1_0.comp` 404 行 + `ptq1_0.glsl` 38 行 |
+
+⇒ 实际工作量只有两块：把两种格式接进既有的 coopmat 与 q8_1 mat-vec 管线。
+
+**q8_1 mat-vec（decode 主力）**：`mul_mat_vecq_ptq1_0.comp` / `mul_mat_vec_ptq1_0.comp` /
+`ptq1_0.glsl` 从 fork 直拷（都走 `data_a_u32` 原始 dword 视图，不依赖 `A_TYPE`，
+与本树 `types.glsl` 无冲突；`mul_mat_vec_base.glsl` 两边逐字节相同）。`PQ2_0` 复用通用
+`mul_mat_vecq.comp`，在 `mul_mat_vecq_funcs.glsl` 加 `DATA_A_PQ2_0` 分支：
+
+- ⚠️ **`get_dm` 与 `repack4` 都要按 128/32 = 4 折叠块号**。`ib` 是 q8_1 块索引（32 激活），
+  而 PQ2_0 块是 128 权重 ⇒ 同一 PQ2_0 块被 4 个不同 `ib` 命中，块内窗口号 = `ib % 4`。
+  Q2_0 不需要这一步是因为它的两个 64 宽半块**交错**同一段字节（`qs_idx = (ib&1)*4 + iqs*2`），
+  PQ2_0 的 qs 是顺序排布的。**第一版漏了这个折叠 ⇒ 24 个 MUL_MAT 用例全 `ERR = inf`。**
+- `mul_q8_1` 与 `unpack_q2_0` 提到 `DATA_A_Q2_0 || DATA_A_PQ2_0` 公共守卫下（否则 PQ2_0
+  分支看不到它们，`no matching overloaded function`）。
+
+**生成器的两处白名单必须同步**：编译循环（`string_to_spv`）与 `arr_dmmv_*_q8_1_f32` 符号产出
+各有一份类型清单，漏改后者只会得到 `C2065: 未声明的标识符`（GLSL 全过、C++ 才炸）。
+已提取成 `has_q8_1_mmvq()` 单一判据。
+
+**coopmat 注册要限定在 coopmat 块内**：⚠️ **`non_lut_quant_types[]` 是全后端共享清单，有 10 个
+消费点**（coopatmat2 subgroup、subgroup、`mul_mmq` int-dot 等）。把两种格式加进去会让
+**无 coopmat 的设备**（本机 Intel iGPU）也创建 `sg_create_quant` pipeline，而
+`mul_mmq_funcs.glsl` 没有对应分支 ⇒ shader 什么都不解 ⇒ **19 个 PTQ1_0 用例 `ERR = inf`**。
+正解是新开 `coopmat_only_quant_types[]`，只在 `cm1_create_quant` 那个循环里用（对齐 fork 把
+`CREATE_MM2` 放在 coopmat 块内的做法）。
+
+**验证（Intel UHD 730）**：`test-backend-ops -b Vulkan0` 的 `MUL_MAT` 全量 **0 FAIL**
+（ptq1_0 / pq2_0 定向各 0 FAIL），`GET_ROWS` 0 FAIL。折叠模型
+`Ternary-Bonsai-2-2B-PTQ1_0.gguf -ngl 99` 的 PPL = **2.8440 +/- 0.31715**，与移植前
+（dequant → f16 路径）**逐位相同**。
+
+⏳ **未上卡验证**：本机无 coopmat（`device->coopmat_support == false`），coopmat 注册
+只做到编译通过，prefill 的 GEMM 收益要在 V100 / 950 上重测。
+
+## 6.3 激活布局：SoA 单列 / PT 列共享 / PQ2 多列（已落地）
 
 fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺序**。本树按同一套设计接进来：
 `ggml_cuda_q8_1_layout`（AOS / SOA_ISUM / PT / PQ2），由 `ggml_cuda_q8_1_layout_host(type, ncols, ids, plain_2d)`
@@ -286,9 +329,9 @@ dpas/w8a8/pq2_xmx，没有对应硬件时风险远大于收益。
   Vulkan 侧到 shader 全部生成 + `ggml-vulkan.lib` 链接为止。实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。
 - `-np > 1`、把 PQ2_0/PTQ1_0 当 `-ctk/-ctv`：不支持（它们只用于权重）。
 - CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植；本机 i5-12400 无 AVX-512，该路径本来也不启用。
-- Vulkan 无 coopmat/MMQ 实现（见 §8）：本机没有 coopmat，prefill 一律走 dequant → f16，
-  PTQ1_0 的 GEMV 因此仍是带宽受限；`PQ2_0/PTQ1_0` 也不在上游 Q8_1 mat-vec 白名单里
-  （加入它需要给 `mul_mat_vec_q8_1_*.comp` 补两种格式的 `dequantize_block_q8_1`，是另一轮工作）。
+- Vulkan 的 **int MMQ（`mul_mmq.comp`）没有 `PQ2_0/PTQ1_0` 解码分支**，fork 也没有；
+  `mul_mmq_funcs.glsl` 两边逐字节相同（488 行）。 coopmat 与 q8_1 mat-vec 两条路已补（见 §6.2），
+  int MMQ 这条仍缺。
 - `-ngl 0 -nkvo`（权重全 CPU、KV 也回 host，但 Vulkan 仍留在 scheduler 里）时，折叠模型会把
   descriptor pool 用尽并撞 `descriptor_set_idx < descriptor_sets.size()`；同参数的
   `Qwen3.5-0.8B-Q4_K_M.gguf` 正常，`-dev none` 也正常 ⇒ 属边缘组合，未修。

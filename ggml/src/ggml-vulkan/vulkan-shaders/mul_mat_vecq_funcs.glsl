@@ -8,6 +8,10 @@
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib / 2].d);
 }
+#elif defined(DATA_A_PQ2_0)
+FLOAT_TYPE get_dm(uint ib) {
+    return FLOAT_TYPE(data_a[ib / (QUANT_K / QUANT_K_Q8_1)].d);
+}
 #elif defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib].d);
@@ -34,14 +38,27 @@ FLOAT_TYPEV2 get_dm(uint ib) {
 #endif
 
 // Each iqs value maps to a 32-bit integer
-#if defined(DATA_A_Q2_0)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
 uint unpack_q2_0(uint bits) {
     // Move bit pairs [1:0], [3:2], [5:4], [7:6] to [1:0], [9:8], [17:16], [25:24].
     bits &= 0xffu;
     bits = (bits | (bits << 12u)) & 0x000f000fu;
     return (bits | (bits << 6u)) & 0x03030303u;
 }
+#endif
 
+#if defined(DATA_A_Q2_0)
+#endif
+
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
+// Weights are (q - 1) * d, so with q8_1 activations the per-block correction is
+// d * sum(q8) rather than d * 16 * sum(q8).
+FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return FLOAT_TYPE(da * (float(q_sum) * dsb.x - dsb.y / float(sum_divisor)));
+}
+#endif
+
+#if defined(DATA_A_Q2_0)
 i32vec4 repack4(uint ib, uint iqs) {
     const uint qs_idx = (ib & 1u) * 4u + iqs * 2u;
     const uint bits = pack32(u16vec2(data_a_packed16[ib / 2].qs[qs_idx],
@@ -49,9 +66,36 @@ i32vec4 repack4(uint ib, uint iqs) {
     return i32vec4(unpack_q2_0(bits), unpack_q2_0(bits >> 8u),
                    unpack_q2_0(bits >> 16u), unpack_q2_0(bits >> 24u));
 }
+#endif
 
-FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
-    return FLOAT_TYPE(da * (float(q_sum) * dsb.x - dsb.y / float(sum_divisor)));
+#if defined(DATA_A_PQ2_0)
+// Same 2-bit codec as Q2_0 but a block spans 128 weights (32 bytes of qs, one fp16 scale per
+// block) instead of 64. ib is a q8_1 block index and one q8_1 block covers 32 activations, so
+// the block index already says which 32-wide window of the 128-wide PQ2_0 block this dot
+// product covers: window = (ib % 4) * 2 + iqs. Q2_0 gets the same coverage for free because
+// its two 64-wide halves interleave the same byte range; here the qs are laid out straight,
+// so the window has to be recovered from ib rather than from ib alone.
+// 8 quants per dword, 4 bytes per window step.
+i32vec4 repack4(uint ib, uint iqs) {
+    const uint qs_idx = (ib % (QUANT_K / QUANT_K_Q8_1)) * (QUANT_K_Q8_1 / 4) + iqs * 4;
+    const uint bits = pack32(u8vec4(data_a[ib / (QUANT_K / QUANT_K_Q8_1)].qs[qs_idx    ],
+                                   data_a[ib / (QUANT_K / QUANT_K_Q8_1)].qs[qs_idx + 1],
+                                   data_a[ib / (QUANT_K / QUANT_K_Q8_1)].qs[qs_idx + 2],
+                                   data_a[ib / (QUANT_K / QUANT_K_Q8_1)].qs[qs_idx + 3]));
+    return i32vec4(unpack_q2_0(bits), unpack_q2_0(bits >> 8u),
+                   unpack_q2_0(bits >> 16u), unpack_q2_0(bits >> 24u));
+}
+
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    int32_t q_sum = 0;
+    const i32vec4 qs_a = repack4(ib_a, iqs);
+    q_sum += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
+    q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
+    q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
+
+    // 16 quants per call => divide sums by 32/16 = 2
+    return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
 }
 #endif
 
