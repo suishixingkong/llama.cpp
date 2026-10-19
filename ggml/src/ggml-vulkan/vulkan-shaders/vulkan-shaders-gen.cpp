@@ -252,6 +252,13 @@ bool has_q8_1_mmvq(const std::string& type_name) {
            type_name == "iq1_s" || type_name == "iq1_m" || type_name == "ptq1_0" || type_name == "pq2_0";
 }
 
+// Types with an integer-dot (q8_1) matrix-multiply shader (mul_mmq.comp). The host side has a
+// matching per-type table in ggml-vk_matmul_int_shmem_support plus one pipeline registration per
+// type; a type missing here compiles into nothing and the host side then quietly dequantizes.
+bool has_q8_1_mmq(const std::string& type_name) {
+    return has_q8_1_mmvq(type_name) && !string_starts_with(type_name, "iq");
+}
+
 bool is_iq_quant(const std::string& type_name) {
     return string_starts_with(type_name, "iq");
 }
@@ -634,7 +641,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         };
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
+        if (!f16acc && !coopmat && !coopmat2 && !dot2 && has_q8_1_mmq(tname)) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif

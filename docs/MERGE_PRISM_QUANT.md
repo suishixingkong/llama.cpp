@@ -239,6 +239,31 @@ fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺
 无 GPU，未上卡；解码数学改用"模拟 `__byte_perm`/`__vsub4` + 索引算术"对照参考反量化：
 `vec_dot_ptq1_0_q8_1` 300/300 随机块逐元素一致，mmq 瓦片 lane 映射 100/100 一致。
 
+## 6.4 Vulkan：int MMQ（`mul_mmq.comp`）接入（已落地）
+
+`mul_mmq.comp` 本身按类型分支（`block_a_to_shmem` / `block_a_to_registers` / `mmq_dot_product`），
+所以接入点是"补类型"：
+
+| 文件 | 改动 |
+|---|---|
+| `mul_mmq_shmem_types.glsl` | 两种格式各一份 `block_a_cache`：`int32_t qs[8]` + `FLOAT_TYPE dm`，`QUANT_R_MMQ 1`（与 Q2_0 同宽：32 权重/子块，128 权重/块 ⇒ 4 个子块共享一个 scale） |
+| `mul_mmq_funcs.glsl` | PQ2_0：`block_idx = ib/4`、`byte_idx = (ib&3)*8 + iqs`，取码与 Q2_0 相同，−1 偏置仍靠 `- cache_b.ds.y` 抵消；PTQ1_0：`ptq1_0_trit()` 用与 `dequantize_row_ptq1_0` 同一套 base-3 余数递推（`v = (v*3)&0xFF`、`t = (v*3)>>8`）逐元素出 −1/0/1，`mmq_dot_product` **不减** `ds.y`（trits 自带符号） |
+| `vulkan-shaders-gen.cpp` | 新增 `has_q8_1_mmq()` 单判据（= `has_q8_1_mmvq()` 去掉 `iq1_*`），编译循环只认它 |
+| `ggml-vulkan.cpp` | `ggml_vk_matmul_int_shmem_support` 加两档尺寸；三处注册（`matmul_{pq2_0,ptq1_0}_q8_1` / `matmul_id_subgroup_*` / `matmul_id_*`） |
+
+**验证（Intel UHD 730 真跑）**
+
+| 项 | 结果 |
+|---|---|
+| `test-backend-ops -o MUL_MAT -b Vulkan0` | 0 FAIL；pq2_0 / ptq1_0 各 104 例，其中 17+17 例命中 `matmul_{pq2_0,ptq1_0}_q8_1`（临时探针实测，n≥9 时 `quantize_y=1`） |
+| `-o MUL_MAT_ID -b Vulkan0` | 0 FAIL；152 例，38+38 走 id 版 |
+| 折叠模型 PPL（`-ngl 99 -c 512 -b 512`，同一语料） | int MMQ **53.2516** vs `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`（dequant→f16）**53.2835**，差 0.06% |
+
+⚠️ **这一档在 iGPU 上不快**：同一 PPL 的 prefill 是 **9.39 s/pass**（MMQ）对 **8.78 s/pass**（dequant→f16），
+约 **+7%**。PTQ1_0 的取码在 `block_a_to_shmem` 里是逐元素余数递推（每 4 元素一次内层循环），
+比 Q2_0 那种位取码贵；V100 上是否反超未测。真要提速，把"同一 word 内 digit 序号 n 恒定"这一点用上
+（`qs[0..79]` 段按 16 步进、`qs[80..119]` 段按 8 步进），可以把内层循环换成一次 `b*3^n mod 256`。
+
 ## 7 `gguf-py` 常量与 HF 转换脚本（已落地）
 
 - `constants.py`：`GGMLQuantizationType.PQ2_0=142 / PTQ1_0=143`、`GGML_QUANT_SIZES (128,34)/(128,28)`、
@@ -263,8 +288,7 @@ fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺
 | `vulkan-shaders-gen.cpp` | `type_names` 加两项 → 自动生成 `dequant_*`、`get_rows_*`、`mul_mat_vec_{pq2_0,ptq1_0}_{f32,f16}_f32*`、`mul_mat_vec_id_*` |
 | `ggml-vulkan.cpp` | 5 处类型白名单（`ggml_vk_get_to_fp16`、`dequantize_mul_mat_vec{,_id}`、`supports_op` 的 MUL_MAT 与 GET_ROWS）+ dmmv/dequant/get_rows 管线创建（`2*rm_stdq`，与 Q1_0/Q2_0 同档） |
 
-**取舍**：只走 `mul_mat_vec`（decode 快路径）+ `dequant → f16`（prefill）。没有 coopmat/MMQ 版本
-（`mul_mm.comp` 的 `a_q2_0` 那套按类型的 buffer 声明需要另开一轮），所以 prefill 明显慢于 CUDA。
+**取舍**：decode 走 `mul_mat_vec`（q8_1，见 §6.2），prefill 走 coopmat（§6.2）与 int MMQ（§6.4）。
 PTQ1_0 的反量化是逐元素而非按字节并行，1.75 bpw 的 GEMV 仍然是带宽受限。
 
 **已验证（开发机 Intel UHD 730，真跑）**：
@@ -323,17 +347,33 @@ embedding 的 `MUL_MAT.src[1]`（指向调度器缓冲区，`op == GGML_OP_NONE`
 **SYCL**：**放弃**。需要 Intel oneAPI `icpx`（本机没有 ⇒ 盲改零验证），且 fork 那 3000+ 行是 Xe2 专属
 dpas/w8a8/pq2_xmx，没有对应硬件时风险远大于收益。
 
+### 8.2 `-ngl 0 -nkvo` 撞 descriptor 断言——已修
+
+**症状**：折叠模型在 `-ngl 0 -nkvo`（权重全 CPU、KV 回 host，但 Vulkan 仍留在 scheduler 里）下
+`GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size())` 失败；同参数的 Q4_K_M 模型与 `-dev none` 都正常。
+
+**定位**（临时插在 `ggml_vk_dispatch_pipeline` 的断言前，未提交）：
+`idx=6 size=6 req=3 pipeline=dequant_ptq1_0 node=result_output` —— 该节点只请求了 1 个 descriptor set，
+却派发了 6 次以上。
+
+**根因**：§8.1 根因 2 的修法把 dequant 改成**按 chunk 循环 dispatch**，但请求处仍写死 `1`。
+这两件事必须同时改，否则"请求数 < 派发数"只在图的 req 累加刚好贴着 size 时才暴露 ——
+`-ngl 99` 的大图有富余，所以一直没红；`-ngl 0 -nkvo` 时 Vulkan 侧只剩少数节点，第 7 次 dispatch 就撞线。
+
+**修法**：chunk 大小抽成 `ggml_vk_dequant_chunk()`，请求与循环共用同一个值，
+请求数 = `CEIL_DIV(x_ne, chunk)`。
+
+**验证**（`-ngl 0 -nkvo -c 512 -b 512`，同一语料）：
+`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` 强制走 dequant→f16 分块路径 → 7 个 chunk 全跑完，
+PPL **53.3759**（= 修前那条命令要算的数值），RC=0、无 assert；默认参数下 output 层已改走 int MMQ（§6.4），
+`-ngl 0` / `-ngl 99` 分别 53.2621 / 53.2516，均 RC=0。
+修前同一命令在第一个 pass 内就撞 `idx=6 size=6 req=3`。
+
 ## 9 仍存缺口
 
-- **CUDA / Vulkan 都未上卡**：本机无 GPU。CUDA 侧到 `ggml-cuda.lib` + 解码数学模拟为止；
-  Vulkan 侧到 shader 全部生成 + `ggml-vulkan.lib` 链接为止。实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。
+- **CUDA 仍未上卡**：本机没有 NVIDIA 卡，CUDA 侧到 `ggml-cuda.lib` + 解码数学模拟为止，
+  实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。Vulkan 侧已在 Intel UHD 730 上真跑（§8、§6.4）。
 - `-np > 1`、把 PQ2_0/PTQ1_0 当 `-ctk/-ctv`：不支持（它们只用于权重）。
 - CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植；本机 i5-12400 无 AVX-512，该路径本来也不启用。
-- Vulkan 的 **int MMQ（`mul_mmq.comp`）没有 `PQ2_0/PTQ1_0` 解码分支**，fork 也没有；
-  `mul_mmq_funcs.glsl` 两边逐字节相同（488 行）。 coopmat 与 q8_1 mat-vec 两条路已补（见 §6.2），
-  int MMQ 这条仍缺。
-- `-ngl 0 -nkvo`（权重全 CPU、KV 也回 host，但 Vulkan 仍留在 scheduler 里）时，折叠模型会把
-  descriptor pool 用尽并撞 `descriptor_set_idx < descriptor_sets.size()`；同参数的
-  `Qwen3.5-0.8B-Q4_K_M.gguf` 正常，`-dev none` 也正常 ⇒ 属边缘组合，未修。
 - 测试里的 `test-ptq1_0-cuda-dot.cpp` / `test-ptq1_0-element-map.cpp` 是**转写件**（把 CUDA 侧逻辑抄到主机上跑），
   它们绿只能证明转写件与 CPU codec 一致；与真实 kernel 的一致性靠转写时的人工核对 + 实机 test-backend-ops。

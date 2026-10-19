@@ -40,6 +40,103 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+#if defined(DATA_A_PQ2_0)
+// A PQ2_0 block is 128 weights wide with one scale, so four 32-weight sub-blocks share it.
+// The qs bytes are positional like Q2_0's, hence the same packed-value dot product with the
+// activation sum subtracted for the -1 offset.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint block_idx = ib / 4;
+    const uint byte_idx = (ib & 3u) * 8u + iqs;
+    const uint bits = uint(data_a[block_idx].qs[byte_idx]);
+    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
+        int8_t(bits & 3u),
+        int8_t((bits >> 2u) & 3u),
+        int8_t((bits >> 4u) & 3u),
+        int8_t(bits >> 6u)));
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
+}
+#endif
+
+#if defined(DATA_A_PTQ1_0)
+// Trit e of one 128-weight block as -1/0/1. Five trits per byte, but not in positional order:
+// qs[0..15] carries e = 16*t+j, qs[16..23] carries 80+8*t+j and qh[0..1] carries 120+2*t+h.
+// The digit comes out of the remainder recurrence v = (v*3) & 0xFF, t = (v*3) >> 8, the same
+// one dequantize_row_ptq1_0 and ptq1_0_val() use.
+int8_t ptq1_0_trit(const uint block_idx, const uint e) {
+    uint b;
+    uint n;
+    if (e < 80u) {
+        b = uint(data_a[block_idx].qs[e & 15u]);
+        n = e >> 4u;
+    } else if (e < 120u) {
+        b = uint(data_a[block_idx].qs[16u + ((e - 80u) & 7u)]);
+        n = (e - 80u) >> 3u;
+    } else {
+        b = uint(data_a[block_idx].qh[(e - 120u) & 1u]);
+        n = (e - 120u) >> 1u;
+    }
+    uint v = b;
+    [[unroll]] for (uint i = 0; i < 4u; ++i) {
+        if (i < n) {
+            v = (v * 3u) & 0xFFu;
+        }
+    }
+    return int8_t(int((v * 3u) >> 8u) - 1);
+}
+
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint block_idx = ib / 4;
+    const uint e = (ib & 3u) * 32u + iqs * 4u;
+    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
+        ptq1_0_trit(block_idx, e + 0u),
+        ptq1_0_trit(block_idx, e + 1u),
+        ptq1_0_trit(block_idx, e + 2u),
+        ptq1_0_trit(block_idx, e + 3u)));
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    // the trits are already -1/0/1, so unlike Q2_0 there is no offset to subtract
+    return ACC_TYPE(float(cache_a[ib_a].dm) * float(cache_b.ds.x) * float(q_sum));
+}
+#endif
+
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
 // 2-byte loads for Q4_0 blocks (18 bytes)
 // 4-byte loads for Q4_1 blocks (20 bytes)
