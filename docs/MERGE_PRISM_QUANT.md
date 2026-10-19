@@ -1,4 +1,4 @@
-# Prism (Bonsai) 私有量化格式移植到本树 — 阶段一
+# Prism (Bonsai) 私有量化格式移植到本树
 
 > 源：`PrismML-Eng/llama.cpp` 分支 `prism`（工作副本 `C:/Users/confu/llama/prism-llama`），
 > 基线 `5ea87ddad`（2026-08-25 上游 #27538，本树 `master` 已包含）。
@@ -15,7 +15,10 @@
 | CUDA 反量化 + get_rows（matmul 走 dequant→cuBLAS 兜底） | ✅ 编译通过，未上卡验证 |
 | `llama-quantize` 能产出这两种格式 | ✅ |
 | 与 prism 自身的数值行为一致 | ✅ 逐字节 + 逐位 PPL |
-| 直接跑 prism 发布的 Bonsai 2 权重 | ❌ **被 Hadamard 折叠挡住**，见 §5 |
+| 直接跑 prism 发布的 Bonsai 2 权重 | ✅ 阶段二（Hadamard 折叠）已落地，见 §5 |
+| CUDA 原生 mmq/mmvq | ✅ 已移植并编译通过，未上卡验证，见 §6 |
+| `gguf-py` 常量 / HF 转换脚本 | ✅ 见 §7 |
+| Vulkan / SYCL 后端 | ❌ 未移植，见 §8 |
 
 ## 2 移植清单（阶段一实际改动）
 
@@ -97,58 +100,87 @@ n=1024/896 上的重建误差与上游 Q2_0、TQ1_0 同量级（0.5·max_d），
 - CPU mul_mat 的 vec_dot 类型由 `ggml_cpu_vec_dot_type(src0)` 决定，**不是**静态 trait
 - CUDA 下这两个类型**只**走 `ggml_cuda_mul_mat_cublas`（dequantize→F16→cuBLAS），mmq/mmvq 均返回 false
 
-## 5 阻断项：官方 Bonsai 2 权重是 Hadamard 折叠的
+## 5 阶段二：Hadamard 折叠（已落地）
 
-下载 `prism-ml/Ternary-Bonsai-2-2B-gguf` 的 `PTQ1_0`（409 MiB）读元数据：
+prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩阵旋转进 Hadamard 基
+（`W' = W H S`，H 为 block 512 的归一化 Sylvester Hadamard，S 为每输入通道 ±1 符号），
+运行时必须把激活送进同一个基。少这一层 = 模型能加载但算错，所以阶段一曾用 loader 硬失败拦住。
 
-```
-general.architecture              = qwen35
-general.file_type                 = 143
-prism.hadamard.version            = 2
-prism.hadamard.tied_output        = True
-prism.hadamard.block_size         = 512
-prism.hadamard.transform          = normalized-sylvester-walsh-hadamard
-prism.hadamard.sign_mode          = explicit
-prism.hadamard.weight_names       = [blk.*.attn_qkv/attn_gate/ssm_out/ffn_{down,gate,up}.weight, ...]
-prism.hadamard.inverse_weight_names = [token_embd.weight]
-prism.hadamard.sign_widths        = [2048, 6144]
-```
+**实现（按本树既有设施走"图组合"，零新内核）**
 
-即：绝大多数权重在**转换时**已被旋转进 Hadamard 基，运行时必须把激活按 512 一块做 FWHT 并乘符号向量；
-`token_embd` 还要当输出头用（tied output，`output.weight` 不存在）。少了这层运行时，模型能加载但**算错**。
+| 位置 | 内容 |
+|---|---|
+| `llama-model.cpp`（`load_hparams`） | 解析并校验 `prism.hadamard.*`：版本 1/2、`tied_output` 与版本耦合、block 必须是 2 的幂、`transform`/`axis` 白名单、sign 宽度必须是 block 的整数倍且取值只能 ±1、折叠张量的 *种类* 白名单（只有 `build_lora_mm(_id)` 消费的权重）、架构白名单 |
+| `llama-model.cpp`（`load_tensors` 尾部） | 按 (block_size, buft) 建一张 H，按 (width, buft) 建符号向量，放在**权重所在的那个 buffer type** 上；H 对称 ⇒ 同一张张量兼作前向与逆向旋转；逆向（查表）优先跟随前向所在的 buft，否则逐 token 变换要来回过 PCIe；tied output 把 LM head 记在 `output`（loader 复制的那个）上、把查表记在 `tok_embd` 上 |
+| `llama-graph.cpp` | `build_hadamard_activation()`：可选 GDN 头重排 → 乘 signs → `llama_mul_mat_hadamard()`（复用本树已有的 `GGML_HINT_SRC0_IS_HADAMARD` FWHT 提示），按 (激活, rot, signs, perm) 记忆化（qkv/gate/up 共用同一个激活）；接进 `build_lora_mm` 与 `build_lora_mm_id`；`build_inp_embd` 在 token 查表后立刻做逆变换 |
+| `llama-context.cpp` | 把两张 map 传进 `llm_graph_params`，并在**首次**带折叠权重的图计算前做一次图级校验：每个折叠权重必须被"src1 是指向同一 rot 的 hint matmul"消费，每个 latent 查表必须先旋转。这条守卫把"静默算错"变成报错 |
 
-因此阶段一在 loader 里加了硬失败守卫（不允许静默算错）：
+**验收（CPU，同一台机器）**
 
-```
-E llama_model_loader: ... declares 'prism.hadamard.weight_names': this model uses Prism's
-  Hadamard weight folding, which is not ported into this build. Only the PQ2_0/PTQ1_0 weight
-  formats are supported; load a model without prism.hadamard metadata (or port the folding runtime first)
-```
+| 项 | 本树 | prism 参照 |
+|---|---|---|
+| 加载汇总 | `loaded 152 Hadamard-folded weight(s) (1 inverse-lookup) using 1 rotation(s) and 2 sign vector(s)` | 同 |
+| PPL（同一 2×512 token 片段） | **13.9223** | **13.9484** |
+| 贪心续写 `The capital of France is` | 同一段文本 | 同一段文本 |
+| 回归（无折叠元数据的 qwen2.5-0.5b Q4_K_M） | 20.8087（= 阶段一基线） | — |
 
-**判定**：格式层是必要条件、不是充分条件。要真正跑通官方 Bonsai 2 权重，必须做阶段二。
+差异 0.19% 来自本树（buun lineage）自身在 CPU 数学/repack 上的发散，不是折叠错误：折叠错了会掉到几千以上。
 
-## 6 阶段二（Hadamard 折叠）可行性评估
+**反向控制**：把 `build_hadamard_activation` 短路后，进程在首次 compute 处直接终止、无输出（守卫生效）；
+还原后 PPL 精确复现 13.9223。
 
-本树已具备底座，明显便宜于在原生上游上做：
+## 6 阶段三：CUDA 原生 mmq/mmvq（已落地，未上卡）
 
-- `GGML_HINT_SRC0_IS_HADAMARD`（`ggml.h:471`）与 `ggml_mul_mat_set_hint`（`src/llama-impl.h:71`）已在；
-- 各后端 unsigned FWHT 已实现：CUDA `fwht.cu` 支持 **n=512**（正是 Bonsai 的 block_size）、CPU
-  `ggml_compute_forward_fwht_f32`、Metal、SYCL、Vulkan、BLAS；
-- 缺的是：`prism.hadamard.*` 解析与旋转张量、图内注入、图级校验、tied output v2，以及**符号向量**。
+| 类型 | mmvq | mmq |
+|---|---|---|
+| PQ2_0 | `vec_dot_pq2_0_q8_1`，VDR 1（4 个 32 元素块/128 权重，同一 scale） | `load_tiles_pq2_0` = Q2_0 布局 + group-128 常量 |
+| PTQ1_0 | `vec_dot_ptq1_0_q8_1`，VDR 4（一次吞整块 128 权重，qi/vdr=1）；四字节并行走 base-3 链，dp4a 累加数字 + 并行累加激活和来抵消 −1 偏置 | `load_tiles_ptq1_0` 把 qs/qh 展开成 int8 写在 smem，8 lane/块，全部走同一条 5 步链 ⇒ 无分支发散；lane 6 处理 qh（读 offset 24 会顺带读到 scale 前两字节，靠 `v_hi = v_lo` 丢弃） |
 
-两种实现路线：
+`should_use_mmq`：PQ2_0 并入 Q1_0/Q2_0 组；PTQ1_0 只在 `turing_mma_available` 时接受，但**默认全 batch 都走 MMQ**
+（fork 记录 fp16 反量化 + cuBLAS 正是 PTQ1_0 在 CUDA 上掉精度的来源），`GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH` 留作 A/B 开关。
+`mul_mat_id` 不再绕开这两种类型。
 
-1. **图组合**（推荐先做）：`x' = FWHT_blocks(x ⊙ s)` —— 用 `ggml_mul` 施加符号、`ggml_reshape_4d` 成
-   `[512, n/512, ...]`、`GGML_HINT_SRC0_IS_HADAMARD` 触发现有 unsigned FWHT。**零内核改动**，代价是每个
-   折叠权重多一个 elementwise MUL。需要确认各后端 FWHT 的 n=512 路径都可用（CUDA 已确认）。
-2. **内核内符号**（prism 原样）：FWHT 核内乘 `signs`，省掉那次 MUL，但要改 5 个后端。
+**未移植**：fork 的 SoA/exact-isum 单列路径与 PT 列共享核（`mmvq-pq2_0.cuh`、`mmvq-ptq1_0.cuh`）。
+后果只在多列（speculative 验证）与单列 PTQ1 的线程利用率上，正确性不受影响。
 
-合入顺序建议：`prism.hadamard` 解析 + 图组合 + tied output v2 → 先用 CPU 与 prism 对 PPL（逐位一致）→
-再放开 CUDA。
+**验证**：`ggml-cuda.lib` 静态构建 72/72 链接通过（0 error），两个 `mmq-instance-{pq2_0,ptq1_0}.cu.obj` 生成。
+无 GPU，未上卡；解码数学改用"模拟 `__byte_perm`/`__vsub4` + 索引算术"对照参考反量化：
+`vec_dot_ptq1_0_q8_1` 300/300 随机块逐元素一致，mmq 瓦片 lane 映射 100/100 一致。
 
-## 7 未做 / 已知缺口
+## 7 `gguf-py` 常量与 HF 转换脚本（已落地）
 
-- CUDA 未上卡跑（开发机无 GPU）；`-ngl` 全部 offload 后的数值与性能待 V100 验证。
-- 原生 mmq/mmvq 未移植 ⇒ GPU 上 2-bit 权重每层都要反量化成 F16，显存与带宽代价约 8×，性能不可用于生产。
-- `gguf-py` 未加这两种类型 ⇒ `convert_hf_to_gguf.py` 无法直接产出，只能 `llama-quantize`。
-- `-ctk/-ctv` 若选了这两种类型：KV cache 路径不支持（它们只用于权重）。
+- `constants.py`：`GGMLQuantizationType.PQ2_0=142 / PTQ1_0=143`、`GGML_QUANT_SIZES (128,34)/(128,28)`、
+  `LlamaFileType.MOSTLY_PQ2_0=141 / MOSTLY_PTQ1_0=143`。
+  ⚠️ fork 的 gguf-py 写的是 128/129，与它自己的 `llama.h`（141/143）和线上 gguf（`general.file_type=143`）都矛盾，
+  这里按 `llama.h` 对齐。
+- `conversion/base.py`：`hadamard_folded_names()` + `add_hadamard_metadata()`，把外置 packer 留下的
+  `hadamard_packing.json` 转成 GGUF 元数据，校验规则与运行时一致（写出的 11 个键与运行时读取的 11 个键完全对齐）。
+- `conversion/qwen.py`：折叠过的 `linear_attn.in_proj_qkv` / `out_proj` 跳过 V 头重排，改置 `gdn_v_grouped`。
+- 未端到端跑：复现 Bonsai gguf 需要打包好的 checkpoint 和外置 packer，本树都没有。
+
+## 8 未移植：Vulkan / SYCL
+
+两者都是**重量级重写**而非机械搬运，原因可量化：
+
+**Vulkan**（fork 侧 +235/−19 `ggml-vulkan.cpp`、+750 行 5 个 shader）
+- 本树 `ggml-vulkan.cpp` 相对同一基线已发散 **+2393/−1216**；fork 的改动依赖它自己那套按类型编译的
+  `mul_mat_vec`，而本树已经把量化 matmul 收成**单个 shader + `MmTypeA` spec constant 的 switch**。
+  因此不是"把 shader 拷过来"，而是要把解码逻辑接进这个 switch，再加 C++ 侧的 pipeline/type 表 —— 等于重写。
+- 环境是具备的（`D://Program Files\Vulkan`、glslc 都在），所以这件事可做，但要单独排期。
+
+**SYCL**（+约 6000 行，其中 TernSYCL/Xe2 kernel 3000+ 行）
+- 需要 Intel oneAPI（`icpx`）才能编译，本机没有 ⇒ 盲改无任何验证。
+- Xe2 的 int2/int8 dpas、w8a8、pq2_xmx 都是体系结构专属优化，没有对应硬件时风险远大于收益。
+
+**当前状态**：Vulkan/SYCL 上这两种类型会在 `supports_op` 处被拒绝，权重留在 CPU 跑 —— 正确但无加速。
+
+## 9 仍存缺口
+
+- **CUDA 未上卡**：CUDA 树在本机无法整体链接（见下），只能验证到 `ggml-cuda.lib` + 数学模拟。
+- ⚠️ **本树静态构建当前是断的（与本移植无关）**：`ggml-backend-meta.cpp` 把
+  `ggml_backend_dev_is_meta` / `ggml_backend_meta_dev_n_devs` / `ggml_backend_meta_buft_n_bufts` 等定义成 `static`，
+  而 `src/llama-kv-cache.cpp`、`common/fit.cpp` 在调用它们 ⇒ 静态构建链接 `llama.lib` 必挂（LNK2019，
+  `nm` 在 ggml-base 自己的 obj 里是 `t`）。共享构建（`BUILD_SHARED_LIBS=ON`）因为带上 `GGML_SHARED` 宏反而正常，
+  CPU 验证就是在共享树上做的。
+- `-np > 1`、KV cache 用这两种类型当 `-ctk/-ctv`：不支持（它们只用于权重）。
+- CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植。
