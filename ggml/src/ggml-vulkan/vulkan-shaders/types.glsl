@@ -211,6 +211,44 @@ struct block_q1_0
 #define A_TYPE block_q1_0
 #endif
 
+// Prism private formats: both use a group size of 128, which upstream Q2_0 (64) and
+// TQ1_0 (256) cannot express.
+#define QUANT_K_PQ2_0 128
+#define QUANT_R_PQ2_0 1
+
+struct block_pq2_0
+{
+    float16_t d;
+    uint8_t qs[QUANT_K_PQ2_0 / 4];
+};
+
+#if defined(DATA_A_PQ2_0)
+#define QUANT_K QUANT_K_PQ2_0
+#define QUANT_R QUANT_R_PQ2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_pq2_0
+#endif
+
+#define QUANT_K_PTQ1_0 128
+#define QUANT_R_PTQ1_0 1
+
+// base-3 packed trits, five per byte in qs[24] (16 bytes carrying elements
+// 16*t+j, then 8 bytes carrying 80+8*t+j) and four per byte in qh[2]
+// (120 + 2*t + h). Element order is therefore not positional.
+struct block_ptq1_0
+{
+    uint8_t qs[24];
+    uint8_t qh[2];
+    float16_t d;
+};
+
+#if defined(DATA_A_PTQ1_0)
+#define QUANT_K QUANT_K_PTQ1_0
+#define QUANT_R QUANT_R_PTQ1_0
+#define QUANT_AUXF 1
+#define A_TYPE block_ptq1_0
+#endif
+
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1
 

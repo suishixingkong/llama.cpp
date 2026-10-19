@@ -1,0 +1,61 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_ptq1_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+// Powers of 3 mod 256: 3^0 .. 3^4
+const uint pow3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// One invocation produces eight consecutive elements, 64 invocations per four blocks.
+// The digit within a byte is uniform over the eight elements of every chunk below, so the
+// base-3 power is hoisted out of the unrolled loop.
+void main() {
+    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+
+    const uint tid = gl_LocalInvocationID.x % 64;
+    const uint il  = tid / 4;
+    const uint ir  = tid % 4;
+    const uint ib  = 4*i + ir;
+    if (ib >= p.nel / QUANT_K_PTQ1_0) {
+        return;
+    }
+
+    const uint b_idx = 512*i + QUANT_K_PTQ1_0*ir + 8*il;
+    const float d = float(data_a[ib].d);
+
+    if (il < 10u) {
+        // qs[0..15]: 16 bytes of digit (il>>1), elements 16*t + j
+        const uint n = il >> 1u;
+        const uint p_val = pow3[n];
+        const uint qs_offset = (il & 1u) != 0u ? 8u : 0u;
+
+        [[unroll]] for (uint l = 0u; l < 8u; ++l) {
+            const uint b = uint(data_a[ib].qs[qs_offset + l]);
+            const uint v = (b * p_val) & 0xFFu;
+            data_b[b_idx + l] = D_TYPE(float(int((v * 3u) >> 8u) - 1) * d);
+        }
+    } else if (il < 15u) {
+        // qs[16..23]: 8 bytes of digit il-10, elements 80 + 8*t + j
+        const uint p_val = pow3[il - 10u];
+
+        [[unroll]] for (uint l = 0u; l < 8u; ++l) {
+            const uint b = uint(data_a[ib].qs[16u + l]);
+            const uint v = (b * p_val) & 0xFFu;
+            data_b[b_idx + l] = D_TYPE(float(int((v * 3u) >> 8u) - 1) * d);
+        }
+    } else {
+        // qh[0..1]: elements 120 + 2*t + h, four digits per byte
+        const uint qh0 = uint(data_a[ib].qh[0]);
+        const uint qh1 = uint(data_a[ib].qh[1]);
+
+        [[unroll]] for (uint l = 0u; l < 8u; ++l) {
+            const uint b = (l & 1u) != 0u ? qh1 : qh0;
+            const uint v = (b * pow3[l >> 1u]) & 0xFFu;
+            data_b[b_idx + l] = D_TYPE(float(int((v * 3u) >> 8u) - 1) * d);
+        }
+    }
+}

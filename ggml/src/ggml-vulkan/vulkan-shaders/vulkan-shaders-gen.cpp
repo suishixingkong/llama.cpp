@@ -74,6 +74,8 @@ const std::vector<std::string> type_names = {
     "nvfp4",
     "tq1_0",
     "tq2_0",
+    "pq2_0",
+    "ptq1_0",
     "bf16",
 };
 

@@ -154,6 +154,63 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_PQ2_0)
+// Same 2-bit codec as Q2_0, one scale per 128 weights instead of 64.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]) >> (2u * (iqs % 4u));
+    return vec2(bits & 3u, (bits >> 2u) & 3u) - 1.0f;
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]);
+    return vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f;
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_PTQ1_0)
+// Trits are packed base-3 five per byte, so the element order is not positional:
+// qs[0..15] carries element 16*t+j, qs[16..23] carries 80+8*t+j, qh[0..1] carries
+// 120+2*t+h. The digit comes out of the remainder recurrence v = (v*3)&0xFF and
+// t = (v*3)>>8, which is what dequantize_row_ptq1_0 on the CPU does.
+float ptq1_0_val(uint ib, uint e, uint a_offset) {
+    uint b;
+    uint n;
+    if (e < 80u) {
+        b = uint(data_a[a_offset + ib].qs[e & 15u]);
+        n = e >> 4u;
+    } else if (e < 120u) {
+        b = uint(data_a[a_offset + ib].qs[16u + ((e - 80u) & 7u)]);
+        n = (e - 80u) >> 3u;
+    } else {
+        b = uint(data_a[a_offset + ib].qh[(e - 120u) & 1u]);
+        n = (e - 120u) >> 1u;
+    }
+    uint v = b;
+    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+        if (i < n) {
+            v = (v * 3u) & 0xFFu;
+        }
+    }
+    return float(int((v * 3u) >> 8u) - 1);
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(ptq1_0_val(ib, iqs, a_offset), ptq1_0_val(ib, iqs + 1u, a_offset));
+}
+// iqs is a multiple of 8 in the mat-vec path, so four consecutive elements always sit in the
+// same one of the three chunks (0..79 / 80..119 / 120..127).
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(ptq1_0_val(ib, iqs + 0u, a_offset),
+                ptq1_0_val(ib, iqs + 1u, a_offset),
+                ptq1_0_val(ib, iqs + 2u, a_offset),
+                ptq1_0_val(ib, iqs + 3u, a_offset));
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
 #if defined(DATA_A_IQ1_S)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint ib32 = iqs / 32;
