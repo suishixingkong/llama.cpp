@@ -5793,6 +5793,10 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # Prism-private: group size 128 instead of Q2_0's 64 / TQ1_0's 256. The ids are private
+    # to the fork (43..141 are unused) and must stay out of the way of upstream additions.
+    PQ2_0   = 142
+    PTQ1_0  = 143
     # TurboQuant types are appended after upstream's last id so that GGUF files
     # written by upstream llama.cpp stay readable.
     TURBO2_0 = 43
@@ -5863,6 +5867,11 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # These follow include/llama.h, which is what actually ships in the Bonsai ggufs
+    # (general.file_type = 143 for PTQ1_0). The fork's gguf-py says 128/129 and disagrees
+    # with its own loader, so do not copy those values.
+    MOSTLY_PQ2_0         = 141  # except 1d tensors; 142 is the legacy pre-rename slot
+    MOSTLY_PTQ1_0        = 143  # except 1d tensors
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
 
@@ -6005,6 +6014,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
     GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+    GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
     # TurboQuant KV-cache types. Runtime-only: they never appear in a GGUF file,
     # but they are exposed on GGMLQuantizationType, so the size table has to cover
     # them or the direct-index lookups in gguf_reader.py / quants.py raise KeyError.
