@@ -94,10 +94,16 @@ int main() {
                     ggml_type_value != GGML_TYPE_BF16) {
                 continue;
             }
-            // TQ3_1S / TQ4_1S are weight-only formats (LLAMA_FTYPE_MOSTLY_TQ*_1S): -ctk/-ctv
-            // does not offer them and they have no KV cache path at all.
+            // TQ3_1S / TQ4_1S and the Prism formats PQ2_0 / PTQ1_0 are weight-only
+            // (LLAMA_FTYPE_MOSTLY_TQ*_1S, _PQ2_0 / _PTQ1_0): -ctk/-ctv does not offer them
+            // (common/arg.cpp kv_cache_types) and they have no KV cache path at all, so the
+            // backend must not claim a class for them either.
             if (ggml_type_value == GGML_TYPE_TQ3_1S ||
-                    ggml_type_value == GGML_TYPE_TQ4_1S) {
+                    ggml_type_value == GGML_TYPE_TQ4_1S ||
+                    ggml_type_value == GGML_TYPE_PQ2_0 ||
+                    ggml_type_value == GGML_TYPE_PTQ1_0) {
+                t.assert_true(ggml_type_name(ggml_type_value),
+                    !ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type_value).classified);
                 continue;
             }
 
