@@ -554,13 +554,21 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
             weight, scale = reorder_rows(weight, scale, 1)
         elif name.endswith(".linear_attn.out_proj.weight"):
-            col_perm = self._reorder_v_heads(
-                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
-                1, num_k_heads, num_v_per_k, head_v_dim,
-            ).squeeze(0)
-            weight, scale = apply_col_perm(weight, scale, col_perm)
+            if self._hadamard_folds_tensor(name):
+                self._hadamard_gdn_v_grouped = True
+            else:
+                col_perm = self._reorder_v_heads(
+                    torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                    1, num_k_heads, num_v_per_k, head_v_dim,
+                ).squeeze(0)
+                weight, scale = apply_col_perm(weight, scale, col_perm)
 
         return weight, scale
+
+    def _hadamard_folds_tensor(self, name: str) -> bool:
+        # a packed checkpoint already carries this tensor in the fold's own feature order,
+        # so the runtime-side permute replaces the reorder the plain path would do
+        return any(name.endswith(n) or n.endswith(name) for n in self.hadamard_folded_names())
 
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
@@ -577,13 +585,18 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
             if ".in_proj_qkv." in name:
                 # QKV weight: reorder only the V rows
-                q_dim = head_k_dim * num_k_heads
-                k_dim = head_k_dim * num_k_heads
-                q = data_torch[:q_dim]
-                k = data_torch[q_dim:q_dim + k_dim]
-                v = data_torch[q_dim + k_dim:]
-                v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
-                data_torch = torch.cat([q, k, v], dim=0)
+                if self._hadamard_folds_tensor(name):
+                    # the fold was computed on the grouped layout; the runtime permutes the
+                    # activation back into it, so the rows must stay as packed
+                    self._hadamard_gdn_v_grouped = True
+                else:
+                    q_dim = head_k_dim * num_k_heads
+                    k_dim = head_k_dim * num_k_heads
+                    q = data_torch[:q_dim]
+                    k = data_torch[q_dim:q_dim + k_dim]
+                    v = data_torch[q_dim + k_dim:]
+                    v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([q, k, v], dim=0)
 
             elif ".in_proj_z." in name:
                 # Z gate weight: reorder rows (num_v_heads * head_v_dim)
