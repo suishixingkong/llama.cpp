@@ -264,8 +264,22 @@ fork 的多列核不是"再写一个 vec_dot"，它换掉了**激活的存放顺
 比 Q2_0 那种位取码贵；V100 上是否反超未测。真要提速，把"同一 word 内 digit 序号 n 恒定"这一点用上
 （`qs[0..79]` 段按 16 步进、`qs[80..119]` 段按 8 步进），可以把内层循环换成一次 `b*3^n mod 256`。
 
-## 7 `gguf-py` 常量与 HF 转换脚本（已落地）
+## 6.5 CUDA 首跑崩溃：mmvq 的分派表少了这两型（已修）
 
+**症状**：V100 上 `llama-server -ngl 99`（`-ctk/-ctv f16`、`--flash-attn on`）启动即崩，日志末行是
+`ggml/src/ggml-cuda/mmvq.cu:1762: fatal error`；`-ngl 0` 能起。ptq1_0 与 pq2_0 两个模型表现相同。
+
+**根因**：`1762` 是 `mul_mat_vec_q_switch_type()` 的 `default: GGML_ABORT("fatal error")`。这一型的
+vec_dot、转换核、`mul_mat_q_case`、`should_use_mmvq`（`ne11 <= 8`）都已就位，**唯独那张 case 列表没有
+`PQ2_0` / `PTQ1_0`** ⇒ 走到 decode 步（warmup 就是 1 token）直接 abort。又一处"函数在 + 有单测 ≠ 接线了"：
+`test-quantize-fns` 只测 codec，`test-backend-ops` 从未在这台卡上跑过。
+
+`ggml_cuda_op_mul_mat_vec_q()`（多卡切分）走的是同一个 `mul_mat_vec_q_switch_type`，所以一处补齐两处都通。
+
+**验证**：`ggml-cuda.lib`（`CMAKE_CUDA_ARCHITECTURES=70`）0 error；⏳ 待 V100 上先跑
+`test-backend-ops -b CUDA0 -o MUL_MAT`（这是唯一能在真卡上逐元素验收 `SOA_ISUM` / `PT` / mmq 三条路的东西）。
+
+## 7 `gguf-py` 常量与 HF 转换脚本（已落地）
 - `constants.py`：`GGMLQuantizationType.PQ2_0=142 / PTQ1_0=143`、`GGML_QUANT_SIZES (128,34)/(128,28)`、
   `LlamaFileType.MOSTLY_PQ2_0=141 / MOSTLY_PTQ1_0=143`。
   ⚠️ fork 的 gguf-py 写的是 128/129，与它自己的 `llama.h`（141/143）和线上 gguf（`general.file_type=143`）都矛盾，

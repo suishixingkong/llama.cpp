@@ -12,7 +12,7 @@
 | 项 | 值 |
 |---|---|
 | 机器 | V100-SXM2-16GB（sm_70）+ GTX 950 2GB（sm_52），Windows，MSVC 2022 14.40，CUDA 12.x |
-| 模型 | `models/Ternary-Bonsai-2-2B-PTQ1_0.gguf`（真实折叠模型）；`models/qwen2.5-0.5b-q4km.gguf`（无折叠回归）；`D:\llama-build\models\q2.5-{pq2_0,ptq1_0}.gguf`（自量化对照） |
+| 模型 | `models/Ternary-Bonsai-2-2B-PTQ1_0.gguf`（真实折叠模型）；`models/qwen2.5-0.5b-q4km.gguf`（无折叠回归）；⚠️ **不要**用 `llama-quantize` 自己转出来的 `q2.5-{pq2_0,ptq1_0,q2_0}.gguf`（见前置 0.3） |
 | 参照 | `D:\llama-build\prism-cpu\bin\*`（fork 自己的二进制，CPU）—— 数值只跟它比，不跟"文本通不通顺"比 |
 | 构建 | `D:\llama-build\cuda70`（**静态**，`BUILD_SHARED_LIBS=OFF`）、`D:\llama-build\vulkan`（Vulkan） |
 
@@ -32,6 +32,29 @@ GGML_API 符号定义成 `static`，静态构建必挂。若这里仍然红，**
 - cmd 里 `set X=` 是**删变量**，不是设为空串。
 - 手跑一律补 `-c 4096`（不传 ⇒ n_ctx=262144 ⇒ 单 context KV 3072 MiB，显存贴边必红）。
 - 16 GB 卡上 2B 模型 + `-ngl 99` 之外不要开 `-np > 1`（交换是进程级的）。
+
+**前置 0.3 — 自量化出来的 PTQ1_0/PQ2_0 模型不能用**
+
+这三个格式的参考量化器都是 `d = amax`（块内绝对值最大），而重建栅格的最细步长就是 `d`：
+只保留 `{-d, 0, d}`（PTQ1_0）或 `{-d, 0, d, 2d}`（Q2_0/PQ2_0）。因此 `|w| < amax/2` 的权重**全部归零**，
+对稠密模型等于把 ~80% 的权重抹掉 ⇒ 输出错乱。prism 的权重是 QAT 过的、本来就落在栅格上，所以 `d = amax`
+对它们无损；上游 `TQ1_0` 的 `quantize_row_tq1_0_ref` 用的是同一套约定（也只适用于 ternary 权重）。
+
+实测（同一 f16 源，`-c 512 -b 128` 本地语料，CPU）：
+
+| 文件 | PPL |
+|---|---|
+| f16（源） | 55.15 |
+| Q4_0（同源量化，对照） | 69.72 |
+| Q2_0 | **1,889,990** |
+| PTQ1_0 | **4,394,142** |
+| PQ2_0 | **4,176,584** |
+
+字节级复核（`blk.0.ffn_up.weight` 首行，直接解 gguf）：`d = 0.03204 = amax`，前 8 个权重里 7 个解出 0，
+最大误差 = 0.5×amax。⇒ 文件内容与"归零"一致，不是加载或内核的问题；换旧构建（`e7f39842a`）得到**逐位相同**的 PPL。
+
+**结论**：类型/端到端数值只能用 `Ternary-Bonsai-2-2B-PTQ1_0.gguf` 验；
+想验 `PQ2_0` 只能等 prism 的 QAT 权重，自量化对照这条路不成立。
 
 ---
 
