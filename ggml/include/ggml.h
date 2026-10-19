@@ -445,7 +445,11 @@ extern "C" {
         GGML_TYPE_TURBO3_TCQ = 49, // TurboQuant 3-bit KV cache: TCQ (right-shift trellis, k=3, L=9, 512 states)
         GGML_TYPE_TURBO2_TCQ = 50, // TurboQuant 2-bit KV cache: TCQ (right-shift trellis, k=2, L=8, 256 states)
         GGML_TYPE_TURBO1_TCQ = 51, // TurboQuant 1-bit KV cache: TCQ (right-shift trellis, k=1, L=8, 256 states)
-        GGML_TYPE_COUNT   = 52,
+        // Prism (Bonsai) private weight formats, ported from PrismML-Eng/llama.cpp.
+        // High ids so they slot above every upstream and fork type; 52..141 stay unused.
+        GGML_TYPE_PQ2_0   = 142, // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64)
+        GGML_TYPE_PTQ1_0  = 143, // Prism-private ternary at group size 128 (upstream TQ1_0 is group 256)
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
@@ -501,6 +505,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors (Prism-private group-128 Q2_0)
+        GGML_FTYPE_MOSTLY_PTQ1_0  = 129, // except 1d tensors (Prism-private group-128 ternary)
     };
 
     // available tensor operations:

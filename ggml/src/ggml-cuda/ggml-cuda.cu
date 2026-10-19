@@ -3145,10 +3145,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // Prism formats (PQ2_0/PTQ1_0) have dequantize + cuBLAS support only until the native
+    // PTQ1_0/PQ2_0 mat-vec kernels are ported; keep them off the mmvq dispatch.
+    const bool is_prism_weight_id = (src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
+            if (ggml_is_quantized(src0->type) && !is_tq_weight_id && !is_prism_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
@@ -6783,6 +6786,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -6824,6 +6829,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

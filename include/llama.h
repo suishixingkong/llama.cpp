@@ -158,6 +158,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
+        // Prism (Bonsai) formats, ported from PrismML-Eng/llama.cpp. The values match
+        // the published Prism ggufs, including the pre-rename PQ2_0 legacy value.
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism group-128 Q2_0)
+        LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // pre-rename value for the same format
+        LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors (Prism group-128 ternary, 1.75 bpw)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
