@@ -3153,10 +3153,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    // Prism formats (PQ2_0/PTQ1_0) are correct on the dense mat-vec/mat-mat kernels, but not on the
+    // ids variant: there the dedicated PT/PQ2 column kernels are skipped and the generic per-column
+    // vec_dot has no layout for a weight block that spans four block_q8_1, so the activations are
+    // read at the wrong stride. Keep them on dequant + cuBLAS until those kernels are ported.
+    const bool is_prism_weight_id = (src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
+            if (ggml_is_quantized(src0->type) && !is_tq_weight_id && !is_prism_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
