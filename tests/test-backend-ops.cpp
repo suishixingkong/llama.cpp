@@ -9966,12 +9966,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
-    // Prism ternary formats at Bonsai weight shapes: k covers the real row lengths, m = 67 lands a
-    // partial row group, and n sweeps 1..8 so the multi-column mmvq dispatchers are exercised.
+    // Prism ternary formats at the shapes Bonsai-2 actually runs. k covers the real row lengths,
+    // the odd m values land a partial row group, and n sweeps 1..8 so the multi-column mmvq
+    // dispatchers run, which the 16 x 256 cases above never reach.
     for (ggml_type type_a : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
-        for (int64_t k : {1024, 5120}) {
-            for (int64_t n = 1; n <= 8; ++n) {
-                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 67, n, k, {1, 1}, {1, 1}));
+        for (int64_t k : {1024, 5120, 6144, 17408}) {
+            for (int64_t m : {67, 70}) {
+                for (int64_t n = 1; n <= 8; ++n) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
             }
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 4, k, {2, 3}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 4, k, {1, 2}, {2, 1}));
@@ -9982,7 +9985,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 7, n, k, {2, 2}, {2, 1}));
             }
         }
-        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 70, 4, 2048));
+        // routed MoE layout, every batch width the mat-vec dispatcher specialises
+        for (int64_t n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
+        }
+    }
+
+    // PQ2_0 at speculative verify widths: every n up to 32. 97 rows leaves a partial 32-row
+    // block, which both the MMQ row tiling and the mat-vec row grouping branch on.
+    for (int64_t n = 1; n <= 32; ++n) {
+        for (int64_t k : {1024, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 97, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    // ... and the mul_mm sizes past that width
+    for (int64_t n : {9, 16, 17, 32, 64}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4096, n, 17408, {1, 1}, {1, 1}));
+    }
+
+    // PTQ1_0 small batches, row tails and broadcast dimensions.
+    for (int n : {1, 2, 3, 4, 8}) {
+        for (int k : {128, 384, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 7, n, k, {2, 2}, {2, 1}));
+        }
+    }
+
+    // PTQ1_0 dedicated mat-vec at its shared-memory boundary: the launch asks for
+    // ncols * rows_per_cta * (K/128 + 1) * 4 bytes (the +1 is the odd epilogue stride), twice
+    // that with a gate, against the 48 KiB default. At one column and 4 rows per CTA the last
+    // fitting K is 393088 without a gate and 196480 with one; the next block over falls back.
+    for (int64_t k : {393088, 393216}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, 1, k, {1, 1}, {1, 1}));
+    }
+    for (int64_t k : {196480, 196608}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
+            false, 1, 1, false, false, true, false, {1, 1}));
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
