@@ -1088,6 +1088,14 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur) const;
 
+    // undo the fold after a lookup in a Hadamard-latent table: h = s * (H z), the inverse
+    // of the fold's x -> H (x * s). Returns rows unchanged when the table is not latent.
+    // Every graph that reads an embedding table with a raw ggml_get_rows needs this; the
+    // main graph does it in build_inp_embd(), the MTP graphs have their own lookup.
+    ggml_tensor * build_hadamard_inverse(
+        const ggml_tensor * table,
+              ggml_tensor * rows) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,

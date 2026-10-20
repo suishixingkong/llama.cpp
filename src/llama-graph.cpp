@@ -1564,6 +1564,23 @@ ggml_tensor * llm_graph_context::build_hadamard_activation(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_inverse(
+    const ggml_tensor * table,
+          ggml_tensor * rows) const {
+    if (!hadamard_inverses) {
+        return rows;
+    }
+    const auto it = hadamard_inverses->find(table);
+    if (it == hadamard_inverses->end()) {
+        return rows;
+    }
+    ggml_tensor * res = llama_mul_mat_hadamard(ctx0, rows, it->second.rot);
+    if (it->second.signs) {
+        res = ggml_mul(ctx0, res, it->second.signs);
+    }
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -2442,15 +2459,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         // a Hadamard-latent embedding table stores rotated rows: restore the primal
         // basis right after the lookup, h = s * (H z), the inverse of the fold's
         // x -> H (x * s)
-        if (hadamard_inverses) {
-            const auto it = hadamard_inverses->find(tok_embd);
-            if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
-                if (it->second.signs) {
-                    cur = ggml_mul(ctx0, cur, it->second.signs);
-                }
-            }
-        }
+        cur = build_hadamard_inverse(tok_embd, cur);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

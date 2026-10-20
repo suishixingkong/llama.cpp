@@ -113,8 +113,13 @@ prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩�
 |---|---|
 | `llama-model.cpp`（`load_hparams`） | 解析并校验 `prism.hadamard.*`：版本 1/2、`tied_output` 与版本耦合、block 必须是 2 的幂、`transform`/`axis` 白名单、sign 宽度必须是 block 的整数倍且取值只能 ±1、折叠张量的 *种类* 白名单（只有 `build_lora_mm(_id)` 消费的权重）、架构白名单 |
 | `llama-model.cpp`（`load_tensors` 尾部） | 按 (block_size, buft) 建一张 H，按 (width, buft) 建符号向量，放在**权重所在的那个 buffer type** 上；H 对称 ⇒ 同一张张量兼作前向与逆向旋转；逆向（查表）优先跟随前向所在的 buft，否则逐 token 变换要来回过 PCIe；tied output 把 LM head 记在 `output`（loader 复制的那个）上、把查表记在 `tok_embd` 上 |
-| `llama-graph.cpp` | `build_hadamard_activation()`：可选 GDN 头重排 → 乘 signs → `llama_mul_mat_hadamard()`（复用本树已有的 `GGML_HINT_SRC0_IS_HADAMARD` FWHT 提示），按 (激活, rot, signs, perm) 记忆化（qkv/gate/up 共用同一个激活）；接进 `build_lora_mm` 与 `build_lora_mm_id`；`build_inp_embd` 在 token 查表后立刻做逆变换 |
+| `llama-graph.cpp` | `build_hadamard_activation()`：可选 GDN 头重排 → 乘 signs → `llama_mul_mat_hadamard()`（复用本树已有的 `GGML_HINT_SRC0_IS_HADAMARD` FWHT 提示），按 (激活, rot, signs, perm) 记忆化（qkv/gate/up 共用同一个激活）；接进 `build_lora_mm` 与 `build_lora_mm_id`；`build_hadamard_inverse()` 做查表逆变换，`build_inp_embd` 与**各架构的 MTP 图**（`qwen35`/`qwen35moe`/`qwen3next` 自带 `ggml_get_rows`）共用它 |
 | `llama-context.cpp` | 把两张 map 传进 `llm_graph_params`，并在**首次**带折叠权重的图计算前做一次图级校验：每个折叠权重必须被"src1 是指向同一 rot 的 hint matmul"消费，每个 latent 查表必须先旋转。这条守卫把"静默算错"变成报错 |
+
+**MTP 头也要做逆变换**：draft 图 (`graph_mtp`) 有自己的 `ggml_get_rows`，不走 `build_inp_embd`。
+漏了这一步，折叠模型的 draft 就用旋转基下的 embedding 算 logits —— 主图的校验看不到这张图，
+所以表现为 draft 静默算错（prism 侧同一问题由 `0001-qwen35-mtp-hadamard-inverse.patch` 修）。
+本树白名单里带 MTP 图的三个架构都接上了 `build_hadamard_inverse()`；未折叠的模型它是空操作。
 
 **验收（CPU，同一台机器）**
 

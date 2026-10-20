@@ -657,6 +657,9 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        // this graph has its own lookup, so it must un-rotate a folded table itself,
+        // exactly as build_inp_embd() does for the main graph
+        tok_embd = build_hadamard_inverse(tok_embd_w, tok_embd);
     } else {
         tok_embd = inp->embd;
     }
