@@ -8,7 +8,8 @@
 // Weight = (trit - 1) * d, so with q8_1 activations: sum_e (q_e - 1) * y_e = sum_k (d_b[k] * sum_{e in k} q_e * q8_e - s_b[k]), s_b = d_b * sum(q8).
 //
 // Two lanes per 128-element block: sub=0 takes qs dwords 0..2, sub=1 takes qs dwords 3..5 and qh. Same instruction stream, no divergence.
-// One column (single sequence, bandwidth bound): load the activations of a block once, then decode and dot each row with the residue-tolerant trick (see TRIT_LEVEL).
+// One column (single sequence): the lane pair of a 128-element block strides that row's blocks and
+// decodes five trit levels per dword, so the work of a row is spread over the whole subgroup.
 // Several columns (batched decode, ALU bound): passes of CG columns; per block decode all rows once per level, pack the trits and dot them with every column of the pass.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
@@ -63,24 +64,6 @@ int32_t dot4_emulated(const int32_t a, const int32_t b, const int32_t acc) {
 #define DOT4(a, b, acc) dot4_emulated((a), (b), (acc))
 #endif
 
-// One trit level from the 16-bit lanes vl (bytes 0,2) and vh (bytes 1,3): after w = v*3 the trit is in byte 1/3 and the residue in byte 0/2.
-// The activation words are pre-masked (bytes 0,2 zero; yh = y1,y3 in bytes 1,3; yl = y0,y2 moved to bytes 1,3), so the dot product ignores the residue.
-#define TRIT_LEVEL(vl, vh, yl, yh, acc)          \
-    {                                            \
-        const uint wl = MUL3(vl);                \
-        const uint wh = MUL3(vh);                \
-        vl = wl & 0x00FF00FFu;                   \
-        vh = wh & 0x00FF00FFu;                   \
-        acc = DOT4(int32_t(wl), yl, acc);        \
-        acc = DOT4(int32_t(wh), yh, acc);        \
-    }
-// last level: no residue needed afterwards
-#define TRIT_LEVEL_LAST(vl, vh, yl, yh, acc)     \
-    {                                            \
-        acc = DOT4(int32_t(MUL3(vl)), yl, acc);  \
-        acc = DOT4(int32_t(MUL3(vh)), yh, acc);  \
-    }
-
 // Per-invocation state shared by the column-group passes.
 uint num_blocks_per_row, sub, blk_first, blk_stride;
 uint first_row_g, num_rows_g;
@@ -88,116 +71,143 @@ uint arow[NUM_ROWS];   // dword offset of the first block of each row
 uint bcol[NUM_COLS];   // block_q8_1_x4 index of the first block of each column
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
+// One row of one block. Everything the row needs is derived from the block itself, so the live
+// set is the six accumulators plus one level of activation words no matter how many rows the
+// workgroup walks -- the rows are decoded one after the other instead of in parallel.
+#define PTQ1_0_LEVEL_ACT(T)                                          \
+    const uvec4 q4 = data_b_u128[(bbase >> 2u) + (T)];               \
+    const uvec2 q2 = data_b_u64[(bbase >> 1u) + 10u + (T)];          \
+    const uint y0 = (sub != 0u) ? q4.w : q4.x;                       \
+    const uint y1 = (sub != 0u) ? q2.x : q4.y;                       \
+    const uint y2 = (sub != 0u) ? q2.y : q4.z;
+
+// One dp4a per four weights: the four digits of a dword are merged into one word and dotted
+// against the plain activation dword, so no dp4a lane is spent on a zero. The single-column path
+// has no second column to amortise a wider decode against, so this is the cheapest dot available.
+#define PTQ1_0_LEVEL_PACKED(T, ACCA, ACCB)                                        \
+    {                                                                             \
+        PTQ1_0_LEVEL_ACT(T)                                                       \
+        const uint a0l = MUL3(v0l), a0h = MUL3(v0h);                              \
+        const uint a1l = MUL3(v1l), a1h = MUL3(v1h);                              \
+        const uint a2l = MUL3(v2l), a2h = MUL3(v2h);                              \
+        v0l = a0l & 0x00FF00FFu; v0h = a0h & 0x00FF00FFu;                         \
+        v1l = a1l & 0x00FF00FFu; v1h = a1h & 0x00FF00FFu;                         \
+        v2l = a2l & 0x00FF00FFu; v2h = a2h & 0x00FF00FFu;                         \
+        (ACCA) = DOT4(int32_t(((a0l >> 8u) & 0x00FF00FFu) | (a0h & 0xFF00FF00u)),  \
+                      int32_t(y0), (ACCA));                                       \
+        (ACCB) = DOT4(int32_t(((a1l >> 8u) & 0x00FF00FFu) | (a1h & 0xFF00FF00u)),  \
+                      int32_t(y1), (ACCB));                                       \
+        (ACCB) = DOT4(int32_t(((a2l >> 8u) & 0x00FF00FFu) | (a2h & 0xFF00FF00u)),  \
+                      int32_t(y2), (ACCB));                                       \
+    }
+#define PTQ1_0_LEVEL_PACKED_LAST(T, ACCA, ACCB)                                   \
+    {                                                                             \
+        PTQ1_0_LEVEL_ACT(T)                                                       \
+        const uint a0l = MUL3(v0l), a0h = MUL3(v0h);                              \
+        const uint a1l = MUL3(v1l), a1h = MUL3(v1h);                              \
+        const uint a2l = MUL3(v2l), a2h = MUL3(v2h);                              \
+        (ACCA) = DOT4(int32_t(((a0l >> 8u) & 0x00FF00FFu) | (a0h & 0xFF00FF00u)),  \
+                      int32_t(y0), (ACCA));                                       \
+        (ACCB) = DOT4(int32_t(((a1l >> 8u) & 0x00FF00FFu) | (a1h & 0xFF00FF00u)),  \
+                      int32_t(y1), (ACCB));                                       \
+        (ACCB) = DOT4(int32_t(((a2l >> 8u) & 0x00FF00FFu) | (a2h & 0xFF00FF00u)),  \
+                      int32_t(y2), (ACCB));                                       \
+    }
+
+// qh: two bytes, four trits each, interleaved -> elements 120 + 2t + h, all inside the
+// sub-block accB2 covers on lane 1. Lane 0 feeds zeros through the same instruction stream.
+#define PTQ1_0_SINGLE_QH(ACC)                                                     \
+    {                                                                             \
+        const uvec2 yq = data_b_u64[(bbase >> 1u) + 15u];                         \
+        uint vq = (sub != 0u) ? ((w6 & 0xFFu) | ((w6 & 0xFF00u) << 8u)) : 0u;     \
+        uint wq;                                                                  \
+        wq = MUL3(vq); vq = wq & 0x00FF00FFu;                                     \
+        int32_t q01 = int32_t(((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u));      \
+        wq = MUL3(vq); vq = wq & 0x00FF00FFu;                                     \
+        q01 |= int32_t(((wq << 8u) & 0x30000u) | (wq & 0x03000000u));             \
+        wq = MUL3(vq); vq = wq & 0x00FF00FFu;                                     \
+        int32_t q23 = int32_t(((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u));      \
+        wq = MUL3(vq);                                                            \
+        q23 |= int32_t(((wq << 8u) & 0x30000u) | (wq & 0x03000000u));             \
+        (ACC) = DOT4(q01, int32_t(yq.x), (ACC));                                  \
+        (ACC) = DOT4(q23, int32_t(yq.y), (ACC));                                  \
+    }
+
+void single_row(const uint bbase, const uint abase, const uint j0, const uint n,
+                const float sA0, const float sA1, const float sA2,
+                const float sB0, const float sB1, const float sB2,
+                const float bias) {
+    const uint w0 = data_a_u32[abase + 3u*sub];
+    const uint w1 = data_a_u32[abase + 3u*sub + 1u];
+    const uint w2 = data_a_u32[abase + 3u*sub + 2u];
+    const uint w6 = data_a_u32[abase + 6u];
+
+    const float da = unpackHalf2x16(w6).y;
+
+    uint v0l = w0 & 0x00FF00FFu;
+    uint v0h = (w0 >> 8u) & 0x00FF00FFu;
+    uint v1l = w1 & 0x00FF00FFu;
+    uint v1h = (w1 >> 8u) & 0x00FF00FFu;
+    uint v2l = w2 & 0x00FF00FFu;
+    uint v2h = (w2 >> 8u) & 0x00FF00FFu;
+
+    int32_t accA0 = 0, accA1 = 0, accA2 = 0;
+    int32_t accB0 = 0, accB1 = 0, accB2 = 0;
+
+    PTQ1_0_LEVEL_PACKED     (0u, accA0, accB0)
+    PTQ1_0_LEVEL_PACKED     (1u, accA0, accB0)
+    PTQ1_0_LEVEL_PACKED     (2u, accA1, accB1)
+    PTQ1_0_LEVEL_PACKED     (3u, accA1, accB1)
+    PTQ1_0_LEVEL_PACKED_LAST(4u, accA2, accB2)
+
+    PTQ1_0_SINGLE_QH(accB2);
+
+    const float sum = fma(sA0, float(accA0),
+                      fma(sA1, float(accA1),
+                      fma(sA2, float(accA2),
+                      fma(sB0, float(accB0),
+                      fma(sB1, float(accB1),
+                      fma(sB2, float(accB2), -bias))))));
+    temp[j0][n] = fma(da, sum, temp[j0][n]);
+}
+
+// The two lanes of a block pair split it and the pair strides the row's blocks, so every lane
+// works on the same rows and the reduction stays a subgroup add. j0 is the column this call
+// handles: the multi-column loop ends every group of CG columns with a group of one.
+void process_single_column(const uint j0) {
+    for (uint blk = blk_first; blk < num_blocks_per_row; blk += blk_stride) {
+        const uint bx4   = bcol[j0] + blk;
+        const uint bbase = bx4 * Q8_1_X4_DWORDS + 4u;
+
+        const uvec4 dsraw = data_b_u128[bx4 * Q8_1_X4_UVEC4];
+        const vec2 ds0 = unpackHalf2x16(dsraw.x);
+        const vec2 ds1 = unpackHalf2x16(dsraw.y);
+        const vec2 ds2 = unpackHalf2x16(dsraw.z);
+        const vec2 ds3 = unpackHalf2x16(dsraw.w);
+
+        const float sA0 = ds0.x;
+        const float sA1 = ds1.x;
+        const float sA2 = ds2.x;
+        const float sB0 = (sub != 0u) ? ds2.x : ds0.x;
+        const float sB1 = (sub != 0u) ? ds3.x : ds1.x;
+        const float sB2 = (sub != 0u) ? ds3.x : ds2.x;
+        const float bias = (sub != 0u) ? (ds2.y + ds3.y) : (ds0.y + ds1.y);
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = min(n, num_rows_g - 1u);
+            const uint abase = (a_offset + (first_row_g + r) * num_blocks_per_row + blk) * PTQ1_0_DWORDS;
+            single_row(bbase, abase, j0, n, sA0, sA1, sA2, sB0, sB1, sB2, bias);
+        }
+    }
+}
+
 // One pass over the blocks for columns j0 .. j0 + CG - 1 (fewer in the last group). j0 is a literal at each call site, so column indices stay static.
+
 void process_group(const uint j0) {
     const uint nc = min(CG, NUM_COLS - j0);
 
     if (nc == 1u) {
-        // Single column: the row loop has a runtime bound, which keeps one row of decode state live (fewer registers than the level-major loop below).
-        for (uint blk = blk_first; blk < num_blocks_per_row; blk += blk_stride) {
-            const uint bx4   = bcol[j0] + blk;
-            const uint bbase = bx4 * Q8_1_X4_DWORDS + 4u;
-
-            const uvec4 dsraw = data_b_u128[bx4 * Q8_1_X4_UVEC4];
-            const vec2 ds0 = unpackHalf2x16(dsraw.x);
-            const vec2 ds1 = unpackHalf2x16(dsraw.y);
-            const vec2 ds2 = unpackHalf2x16(dsraw.z);
-            const vec2 ds3 = unpackHalf2x16(dsraw.w);
-
-            // accA[t/2] holds sub-block t/2. accB[t/2] holds sub-block t/2 on lane 0 and sub-block (80 + 8t)/32 on lane 1 (2,2,3,3,3). Each lane subtracts the sums of its own two sub-blocks.
-            const float sA0 = ds0.x;
-            const float sA1 = ds1.x;
-            const float sA2 = ds2.x;
-            const float sB0 = (sub != 0u) ? ds2.x : ds0.x;
-            const float sB1 = (sub != 0u) ? ds3.x : ds1.x;
-            const float sB2 = (sub != 0u) ? ds3.x : ds2.x;
-            const float bias = (sub != 0u) ? (ds2.y + ds3.y) : (ds0.y + ds1.y);
-
-            // Activations per trit level: both lanes issue the same two vector loads (16 bytes at dword 4t, 8 bytes at dword 20+2t) and pick their words.
-            int32_t yh0[5], yh1[5], yh2[5];
-            int32_t yl0[5], yl1[5], yl2[5];
-            [[unroll]] for (uint t = 0; t < 5; ++t) {
-                const uvec4 q4 = data_b_u128[(bbase >> 2u) + t];
-                const uvec2 q2 = data_b_u64[(bbase >> 1u) + 10u + t];
-                const uint y0 = (sub != 0u) ? q4.w : q4.x;
-                const uint y1 = (sub != 0u) ? q2.x : q4.y;
-                const uint y2 = (sub != 0u) ? q2.y : q4.z;
-                yh0[t] = int32_t(y0 & 0xFF00FF00u);
-                yh1[t] = int32_t(y1 & 0xFF00FF00u);
-                yh2[t] = int32_t(y2 & 0xFF00FF00u);
-                yl0[t] = int32_t((y0 << 8u) & 0xFF00FF00u);
-                yl1[t] = int32_t((y1 << 8u) & 0xFF00FF00u);
-                yl2[t] = int32_t((y2 << 8u) & 0xFF00FF00u);
-            }
-            // qh activations: elements 120..127
-            const uvec2 yq = data_b_u64[(bbase >> 1u) + 15u];
-            const int32_t yq0 = int32_t(yq.x);
-            const int32_t yq1 = int32_t(yq.y);
-
-            [[unroll]] for (uint n = 0; n < num_rows_g; ++n) {
-                const uint abase = (a_offset + (first_row_g + n) * num_blocks_per_row + blk) * PTQ1_0_DWORDS;
-                const uint w0 = data_a_u32[abase + 3u*sub];
-                const uint w1 = data_a_u32[abase + 3u*sub + 1u];
-                const uint w2 = data_a_u32[abase + 3u*sub + 2u];
-                const uint w6 = data_a_u32[abase + 6u];
-
-                const float da = unpackHalf2x16(w6).y;
-
-                uint v0l = w0 & 0x00FF00FFu;
-                uint v0h = (w0 >> 8u) & 0x00FF00FFu;
-                uint v1l = w1 & 0x00FF00FFu;
-                uint v1h = (w1 >> 8u) & 0x00FF00FFu;
-                uint v2l = w2 & 0x00FF00FFu;
-                uint v2h = (w2 >> 8u) & 0x00FF00FFu;
-
-                int32_t accA0 = 0, accA1 = 0, accA2 = 0;
-                int32_t accB0 = 0, accB1 = 0, accB2 = 0;
-
-                TRIT_LEVEL(v0l, v0h, yl0[0], yh0[0], accA0);
-                TRIT_LEVEL(v1l, v1h, yl1[0], yh1[0], accB0);
-                TRIT_LEVEL(v2l, v2h, yl2[0], yh2[0], accB0);
-
-                TRIT_LEVEL(v0l, v0h, yl0[1], yh0[1], accA0);
-                TRIT_LEVEL(v1l, v1h, yl1[1], yh1[1], accB0);
-                TRIT_LEVEL(v2l, v2h, yl2[1], yh2[1], accB0);
-
-                TRIT_LEVEL(v0l, v0h, yl0[2], yh0[2], accA1);
-                TRIT_LEVEL(v1l, v1h, yl1[2], yh1[2], accB1);
-                TRIT_LEVEL(v2l, v2h, yl2[2], yh2[2], accB1);
-
-                TRIT_LEVEL(v0l, v0h, yl0[3], yh0[3], accA1);
-                TRIT_LEVEL(v1l, v1h, yl1[3], yh1[3], accB1);
-                TRIT_LEVEL(v2l, v2h, yl2[3], yh2[3], accB1);
-
-                TRIT_LEVEL_LAST(v0l, v0h, yl0[4], yh0[4], accA2);
-                TRIT_LEVEL_LAST(v1l, v1h, yl1[4], yh1[4], accB2);
-                TRIT_LEVEL_LAST(v2l, v2h, yl2[4], yh2[4], accB2);
-
-                // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in sub-block 3 (accB2 on lane 1). Lane 0 decodes zeros.
-                {
-                    uint vq = (sub != 0u) ? ((w6 & 0xFFu) | ((w6 & 0xFF00u) << 8u)) : 0u;
-                    uint wq;
-                    wq = MUL3(vq); vq = wq & 0x00FF00FFu;
-                    int32_t q01 = int32_t(((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u));
-                    wq = MUL3(vq); vq = wq & 0x00FF00FFu;
-                    q01 |= int32_t(((wq << 8u) & 0x30000u) | (wq & 0x03000000u));
-                    wq = MUL3(vq); vq = wq & 0x00FF00FFu;
-                    int32_t q23 = int32_t(((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u));
-                    wq = MUL3(vq);
-                    q23 |= int32_t(((wq << 8u) & 0x30000u) | (wq & 0x03000000u));
-                    accB2 = DOT4(q01, yq0, accB2);
-                    accB2 = DOT4(q23, yq1, accB2);
-                }
-
-                const float sum = fma(sA0, float(accA0),
-                                  fma(sA1, float(accA1),
-                                  fma(sA2, float(accA2),
-                                  fma(sB0, float(accB0),
-                                  fma(sB1, float(accB1),
-                                  fma(sB2, float(accB2), -bias))))));
-                temp[j0][n] = fma(da, sum, temp[j0][n]);
-            }
-        }
+        process_single_column(j0);
         return;
     }
 

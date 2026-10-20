@@ -9855,6 +9855,15 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
 
         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+            // The blanket rule below is about the generic MMVQ path, whose per-type decode is
+            // shared with the f32 fallback. PTQ1_0 is the exception: its f32 fallback decodes one
+            // trit at a time into floats (mul_mat_vec_ptq1_0.comp, ~4.8 instructions per weight)
+            // while the integer kernel packs the trits of two bytes into 16-bit lanes and spends
+            // one dp4a per four weights (mul_mat_vecq_ptq1_0.comp). Measured at n = 1 on a UHD 730:
+            // 2.9 t/s through the f32 fallback against 21-23 t/s through this path.
+            if (src0_type == GGML_TYPE_PTQ1_0) {
+                return true;
+            }
             // Intel Windows proprietary driver MMVQ performance for !Q2/Q3/Q6 is worse than fp16,
             // see https://github.com/ggml-org/llama.cpp/issues/17628 and
             // https://github.com/ggml-org/llama.cpp/pull/23056
