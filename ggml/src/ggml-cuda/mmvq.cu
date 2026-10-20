@@ -599,6 +599,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
         if (ncols_dst == 1 && !small_k && halve_iters) {
             switch (type) {
+                case GGML_TYPE_Q1_0:
+                    return generic;
+                // 2-bit lanes decode twice the elements per pass, so a half-again block is enough
+                // to halve the trip count; the 2x block used by the 4-bit types over-reduces.
+                case GGML_TYPE_PQ2_0:
+                    return generic + generic / 2;
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
@@ -1468,6 +1474,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
         if (table_id != MMVQ_PARAMETERS_GB10) {
+            return false;
+        }
+
+        // PQ2_0 at the FFN gate/up shape: the wider block measurably loses here, so keep the
+        // narrow one even though the trip count would nominally allow halving.
+        if (type == GGML_TYPE_PQ2_0 && ncols_x == 6144 && nrows_x == 2048) {
             return false;
         }
 
