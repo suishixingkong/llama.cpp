@@ -273,7 +273,7 @@ static int test_vec_dot_ternary(bool verbose) {
         // blocks, i.e. an even number of 128-weight blocks.
         const bool  q8k      = type == GGML_TYPE_PQ2_0;
         const ggml_type ytype = q8k ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_0;
-        for (int nb : q8k ? std::vector<int>{2, 4} : std::vector<int>{1, 3}) {
+        for (int nb : q8k ? std::vector<int>{2, 4} : std::vector<int>{1, 2, 3, 4, 5, 7}) {
             const int n = nb * 128;
             std::vector<block_pq2_0> pq(nb);
             std::vector<block_ptq1_0> ptq(nb);
