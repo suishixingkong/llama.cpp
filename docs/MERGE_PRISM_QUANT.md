@@ -39,7 +39,7 @@
 |---|---|
 | `ggml/src/ggml-cpu/ggml-cpu.c` | traits（PQ2_0→Q8_K，PTQ1_0→Q8_0）、`ggml_cpu_vec_dot[_type]()`（PQ2_0 行宽非 256 倍数时退回 Q8_0，否则 Q8_K 会越界）、4 个调用点改走 src0 |
 | `ggml/src/ggml-cpu/quants.c` | `ggml_vec_dot_{pq2_0_q8_0,pq2_0_q8_K,ptq1_0_q8_0}_generic` |
-| `ggml/src/ggml-cpu/arch/x86/quants.c` | SSE2/SSSE3/AVX2/AVX-VNNI/AVX-512-VNNI 实现（含 PQ2_0×Q8_K、PTQ1_0×Q8_0） |
+| `ggml/src/ggml-cpu/arch/x86/quants.c` | PQ2_0×Q8_K / ×Q8_0：SSE2/AVX2/AVX-VNNI/AVX-512-VNNI；PTQ1_0×Q8_0：SSE2/SSSE3 单块 + AVX2 双块（见 §8.4）。三元核的 SSSE3 门用 `GGML_X86_HAS_SSSE3`，不能用裸 `__SSSE3__`（MSVC 在 `/arch:AVX*` 下不定义它） |
 | `ggml/src/ggml-cpu/arch/arm/quants.c` | NEON / dotprod / i8mm 实现 |
 | `ggml/src/ggml-cpu/arch-fallback.h` | 通用/ppc/loongarch/riscv/s390x/wasm 分支的 generic 别名（未加 repack 相关符号） |
 | `ggml/src/ggml-cpu/ops.cpp` | add/add1/acc/out_prod/set/get_rows/clamp 七处 case 标签 |
@@ -418,7 +418,7 @@ PPL **53.3759**（= 修前那条命令要算的数值），RC=0、无 assert；�
 
 | 位置 | 改动 |
 |---|---|
-| `ggml_vk_should_use_mmvq()` | Intel 专有驱动分支前加**仅 PTQ1_0** 的例外。理由可推广：例外按"f32 回退是不是一个专用的 float 解码器"划 —— PTQ1_0 是，PQ2_0 的 f32 回退就是 PR 23056 测过的通用路径，故不放行（同机它是 14.7 → 20.0，+36%，留作已知余量） |
+| `ggml_vk_should_use_mmvq()` | Intel 专有驱动分支前加 **PTQ1_0 + PQ2_0** 的例外。判据是**实测**而非"回退是不是专用解码器"：PTQ1_0 的 f32 回退是专用逐 trit 解码器（2.9 t/s，必须绕开）；PQ2_0 的回退虽是 PR 23056 测过的通用路径，但整数核仍比它快 **38%**（15.6 → 19.0 t/s），因为 2 bit 码直接解成 int8 走 dp4a，胜过把同样的码展开成 f16 再做浮点点积。原先"PQ2_0 留作已知余量"的结论**已撤回** |
 | `mul_mat_vecq_ptq1_0.comp` 单列路径 | 与多列路径统一成"四个 digit 打包进一个 dword + 每四个权重一次 dp4a"（原本是 2 个 dp4a 且一半 lane 乘 0）；行内解码状态 = 6 个累加器 + 一层激活字 |
 
 **验证（Intel UHD 730，同一时间窗内的相对数才有意义——这台 iGPU 同一命令跨时间波动 ±20%）**
@@ -426,7 +426,7 @@ PPL **53.3759**（= 修前那条命令要算的数值），RC=0、无 assert；�
 | 项 | 结果 |
 |---|---|
 | `tg128` PTQ1_0 默认 vs `GGML_VK_DISABLE_MMVQ=1`（= 修前的 f32 回退） | **22.87 ± 0.11**（跨次 20.5–22.9）对 **2.93 ± 0.00**，**7–8×** |
-| `tg128` PQ2_0（对照，本次未改） | 14.51 ± 0.09 ⇒ PTQ1_0 反超 **1.49×**，与 1.75 vs 2.13 bpw 相符 |
+| `tg128` PQ2_0（先作为对照未改，后来一并放行） | 修前 14.51 ± 0.09 ⇒ PTQ1_0 反超 **1.49×**；PQ2_0 也放行后 **24.0**，对 PTQ1_0 的 25.5 是 **1.07×**（bpw 比 1.22，差额落在 `mul_mat_vecq` 通用路径的行分组上） |
 | `pp128` | 64.55 / 119.48（PTQ1_0 / PQ2_0）—— prefill 走 MMQ，本次未触及，与改前 67.45 / 127.12 同档 |
 | 单列路径两版 A/B（同一构建，特化常量切换） | 19.26 → **24.45**（打包 + 不 hoist）；行数 1/2/4/8 = 13.9 / 20.9 / 24.5 / 24.5 |
 | `test-backend-ops -o MUL_MAT / MUL_MAT_ID -b Vulkan0` | 0 FAIL（2/2 backends）。n = 1 的用例现在才真正走到这条 shader；n = 4 / 7 通过每组的尾列（`nc == 1`）也走它 —— 第一版把列号写死成 0，正是被这两组抓住的 |
@@ -435,6 +435,45 @@ PPL **53.3759**（= 修前那条命令要算的数值），RC=0、无 assert；�
 `ncols = 2048` 时一行只有 16 个块、一个 workgroup 32 lane 正好铺满 —— 每行的工作量太小（每 lane 64 权重），
 workgroup 的启动开销压过一切。这也说明"把 CUDA 的 warp-per-row 搬过来"在 Vulkan 上收益是负的：
 CUDA 那边要的是"别让 warp 空转"，Vulkan 这边没有空转问题，只有发射开销。
+
+### 8.4 CPU：PTQ1_0 解码比 PQ2_0 慢 1.8 倍——没有 AVX2 核，且 MSVC 下连 SSSE3 都没开
+
+**症状**（同一份折叠权重、`-ngl 0`）：`tg128` PTQ1_0 **16.71** 对 PQ2_0 **29.88**，`pp512` **58.13** 对 **98.47**。
+⚠️ 这不是带宽问题：PTQ1_0 只有 398.8 MiB（1.75 bpw），PQ2_0 是 482.9 MiB（2.13 bpw）——带宽受限时 PTQ1_0 该快 1.21×。
+折算有效带宽 7.0 对 15.1 GB/s；且 **pp 与 tg 的倍率几乎相同（1.69× / 1.79×）**，prefill 的算力占比远高于 decode，
+两者同倍率只可能来自「每权重解码指令数」。
+
+**根因两条**
+
+| 层 | PTQ1_0 | PQ2_0 |
+|---|---|---|
+| 宽度 | 只有 `__SSE2__` 分支（128 位），**没有 AVX2 核** | `__AVX2__` 分支（256 位），另带 VNNI 分支 |
+| 三元码结构 | base-3 稠密编码：**同一字节承载 5 个连续 trit**，`decode_trits_*` 里 `*x = 3*x` 把余数留给下一层 ⇒ 5 级**串行依赖** | 每字节 4 个 2 bit 码互相独立，`srlv + and` 一次出 32 个 |
+
+⚠️ **MSVC 专属坑**：`/arch:AVX2` 下 `__AVX2__` 有、`__SSSE3__` **没有**（实测 `#pragma message`），
+所以裸 `#if defined(__SSSE3__)` 让这段在 MSVC 上一直走 `decode_trits_sse2`（16 位 lane + 每半 unpack 一次），
+比 SSSE3 版多一倍指令。门改成 `defined(__SSSE3__) || defined(__AVX__) || ...`（`GGML_X86_HAS_SSSE3`）。
+
+**修法与收益**
+
+`ggml_vec_dot_ptq1_0_q8_0` 改成两个 block 各占 128 位半区：base-3 链按字节走，两半天然独立；
+每半带自己的激活窗口和 `(w*d, y*d)` 尺度，于是**一个** `__m256` 累加器就能横跨两块。
+`maddubs → int32 →` 每层一次 FMA，整个 256 权重只需**一次**横向求和（原来每块 4 次 4-lane 归约）。
+单块 SSE 逻辑抽成 `ptq1_0_dot_block_sse()`，给 SSE2 分支和 AVX2 的奇数尾块共用
+（generic 标量版每块慢约 10×，任何奇数 nb 都会被它拖死）。
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| `tg128` PTQ1_0（`-ngl 0`） | 16.71 | **26.4**（26.60 / 26.17，1.58×） |
+| `pp512` PTQ1_0 | 58.13 | **64.33** |
+| 同窗 PQ2_0 对照 | 29.88 | 32.26 / 32.39 ⇒ 仍领先 22% |
+
+⚠️ 剩下的 22% 已知在哪：**8 字节段只有 16/32 lane 有数据**（`qs[16..23]` 每块 8 字节，两半凑不满 256 位），
+而它占 31% 的权重。吃掉它要改成 4 个 block 一组铺满 32 lane —— 未做。
+
+**验证**
+- `test-quantize-fns`：`ternary packed dot products: ok (0 failures)` —— 256 种码型 × nb ∈ {1,3}，用 `==` 对 float 参考逐位比较（双块体 + 尾块都覆盖）。
+- `llama-perplexity -f _9kb_port.txt -c 512`：CPU `-ngl 0` PPL **7.2476 ± 0.56715**，与 Vulkan 整数路径（`-ngl 99`）**完全相同** —— 后者是独立实现。
 
 ## 9 仍存缺口
 

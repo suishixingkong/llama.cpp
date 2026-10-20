@@ -9856,12 +9856,19 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
 
         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
             // The blanket rule below is about the generic MMVQ path, whose per-type decode is
-            // shared with the f32 fallback. PTQ1_0 is the exception: its f32 fallback decodes one
-            // trit at a time into floats (mul_mat_vec_ptq1_0.comp, ~4.8 instructions per weight)
-            // while the integer kernel packs the trits of two bytes into 16-bit lanes and spends
-            // one dp4a per four weights (mul_mat_vecq_ptq1_0.comp). Measured at n = 1 on a UHD 730:
-            // 2.9 t/s through the f32 fallback against 21-23 t/s through this path.
-            if (src0_type == GGML_TYPE_PTQ1_0) {
+            // shared with the f32 fallback. The two Prism formats are exceptions, for reasons that
+            // land on the same side:
+            //  - PTQ1_0's f32 fallback decodes one trit at a time into floats
+            //    (mul_mat_vec_ptq1_0.comp, ~4.8 instructions per weight) while the integer kernel
+            //    packs the trits of two bytes into 16-bit lanes and spends one dp4a per four
+            //    weights (mul_mat_vecq_ptq1_0.comp). Measured at n = 1 on a UHD 730: 2.9 t/s
+            //    through the fallback against 21-23 t/s through this path.
+            //  - PQ2_0's fallback *is* the generic path the blanket rule was measured on, so the
+            //    rule is technically satisfied for it, but its integer kernel still beats that
+            //    fallback by 38% (15.6 -> 19.0 t/s on the same device): two-bit codes decode
+            //    straight into int8 for dp4a, whereas the fallback expands the same codes into f16
+            //    for a floating-point dot product.
+            if (src0_type == GGML_TYPE_PTQ1_0 || src0_type == GGML_TYPE_PQ2_0) {
                 return true;
             }
             // Intel Windows proprietary driver MMVQ performance for !Q2/Q3/Q6 is worse than fp16,
