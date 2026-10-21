@@ -2985,6 +2985,33 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+// [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+// Single source of truth for "the ids dispatch sends this node through the mat-vec kernels".
+// Three places have to agree on it: ggml_cuda_mul_mat_id(), the sync/CUDA-graph check that must
+// predict what that dispatch will do, and the mul_mat + bias/scale fusion that bypasses the
+// dispatch and calls the mat-vec kernels straight. When they disagree, the node lands on the
+// synchronizing fallback with CUDA graphs still enabled and the assert in the dispatch fires.
+static bool ggml_cuda_mul_mat_id_uses_mmvq(const ggml_tensor * src0, int64_t ne2, const int cc) {
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+
+    // TurboQuant weight types only have the mmvq-tq path, whose ids variant synchronizes.
+    if (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ4_1S) {
+        return false;
+    }
+
+    // Prism formats (PQ2_0/PTQ1_0) are sound on the dense mat-vec kernels but not on the ids
+    // variant: there the dedicated PT/PQ2 column kernels are skipped and the generic per-column
+    // vec_dot has no layout for a weight block that spans four block_q8_1, so the activations are
+    // read at the wrong stride. Keep them off the ids mat-vec route until those kernels are ported.
+    if (src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0) {
+        return false;
+    }
+
+    return ne2 <= get_mmvq_mmid_max_batch(src0->type, cc);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3009,7 +3036,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && !ggml_cuda_mul_mat_id_uses_mmvq(src0, dst->ne[2], cc)) {
         return false;
     }
 
@@ -3118,11 +3145,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                return false;
-            }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+        if (ggml_cuda_mul_mat_id_uses_mmvq(src0, dst->ne[2], cc)) {
+            return false;
+        }
+        if (!ggml_is_quantized(src0->type) && GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
         }
     }
@@ -3151,27 +3177,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
-    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
-    // Prism formats (PQ2_0/PTQ1_0) are correct on the dense mat-vec/mat-mat kernels, but not on the
-    // ids variant: there the dedicated PT/PQ2 column kernels are skipped and the generic per-column
-    // vec_dot has no layout for a weight block that spans four block_q8_1, so the activations are
-    // read at the wrong stride. Keep them on dequant + cuBLAS until those kernels are ported.
-    const bool is_prism_weight_id = (src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0);
+    // which types may take the mat-vec route (and which therefore keep CUDA graphs) is decided in
+    // ggml_cuda_mul_mat_id_uses_mmvq(), shared with the sync check and the fusion above
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type) && !is_tq_weight_id && !is_prism_weight_id) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
-                }
-            } else if (!ggml_is_quantized(src0->type)) {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+            if (ggml_cuda_mul_mat_id_uses_mmvq(src0, ne2, cc)) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                return;
+            }
+            if (!ggml_is_quantized(src0->type) && GGML_CUDA_CC_IS_AMD(cc)) {
+                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                return;
             }
         }
 
