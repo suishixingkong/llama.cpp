@@ -915,12 +915,16 @@ static bool kv_stream_page_mutable(
 
 namespace {
 
-// Head dims that have a compiled streamed-attention instance. Every DECL_FATTN_VEC_CASE() in
-// template-instances/fattn-vec-instance-*.cu emits the same D set (64/128/256), and the native
-// streamed partial kernel as well as its f16-conversion fallback are both selected from it - so
-// this table is what "a streamed kernel exists for this head dim" means. It is a build property,
-// not a model property: any model whose attention layers satisfy it can stream.
-constexpr int KV_STREAM_HEAD_DIMS[] = { 64, 128, 256 };
+// Head dims that can have a compiled streamed-attention instance. Every instance file in
+// template-instances/fattn-vec-instance-*.cu emits the same D set (64/128/256 through
+// DECL_FATTN_VEC_CASE, 512 through DECL_FATTN_VEC_PARTIAL_CASE), and both the native streamed
+// partial kernel and its f16-conversion fallback are selected from it. It is a build property, not
+// a model property: any model whose attention layers satisfy it can stream.
+//
+// 512 is the dense half of gemma-4 and exists for every pair, but only as the partial kernel: the
+// regular vec case spills there. Which pairs have one at all is still a per-pair question, and
+// kv_stream_dim_supported() below is where it is asked.
+constexpr int KV_STREAM_HEAD_DIMS[] = { 64, 128, 256, 512 };
 constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
 constexpr int KV_STREAM_QUERY_WORKSPACE_TOKENS = 256;
 
@@ -1129,6 +1133,11 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_dim(
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO2_0)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO3_0, TURBO4_0)
     KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO3_0)
+    // The two turbo4_0 K pairs whose V is a TCQ type. Both had an instance file (and therefore
+    // compiled kernels) but no entry here, so streaming silently took the f16-conversion route
+    // while non-streamed attention used the native kernel.
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO2_TCQ)
+    KV_STREAM_NATIVE_PARTIAL_CASE(TURBO4_0, TURBO3_TCQ)
 
     // TurboQuant turbo8 / TCQ (ported from buun-llama-cpp): same treatment as turbo2/3/4 above.
     // DECL_FATTN_VEC_CASE already instantiates the streamed partial case alongside the regular
@@ -1237,19 +1246,20 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_dim(
 
 // Per head dim dispatch: the streamed kernel is templated on D, so an unsupported dim has no
 // instance to call. The D set is exactly KV_STREAM_HEAD_DIMS - the same set the reject check and
-// the build-side capability probe use.
+// the build-side capability probe use, and the same set every pair's instance file declares.
 static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         int64_t head_dim, ggml_type type_k, ggml_type type_v) {
     switch (head_dim) {
         case 64:  return kv_stream_resolve_native_partial_dim<64> (type_k, type_v);
         case 128: return kv_stream_resolve_native_partial_dim<128>(type_k, type_v);
         case 256: return kv_stream_resolve_native_partial_dim<256>(type_k, type_v);
+        case 512: return kv_stream_resolve_native_partial_dim<512>(type_k, type_v);
         default:  return nullptr;
     }
 }
 
-// Pair-level question (independent of D): compiled instance files declare 64/128/256 together, so
-// one successful dim means every dim in the table has one.
+// Pair-level question (independent of D): compiled instance files declare 64/128/256/512 together,
+// so one successful dim means every dim in the table has one.
 static bool kv_stream_pair_has_native_partial(ggml_type type_k, ggml_type type_v) {
     for (const int head_dim : KV_STREAM_HEAD_DIMS) {
         if (kv_stream_resolve_native_partial(head_dim, type_k, type_v) != nullptr) {
@@ -1260,13 +1270,46 @@ static bool kv_stream_pair_has_native_partial(ggml_type type_k, ggml_type type_v
 }
 #undef KV_STREAM_NATIVE_PARTIAL_CASE
 
+// Can this (K,V) pair reach the streamed attention kernel after converting its pages to f16?
+// This is the second branch of ggml_backend_cuda_kv_stream_get_attention_mode(); it lives in its
+// own function because the head-dim gate asks the same question and the two answers must not drift.
+static bool kv_stream_pair_f16_convertible(ggml_type type_k, ggml_type type_v) {
+    const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
+    const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
+    return capabilities_k.storage && capabilities_v.storage &&
+           capabilities_k.online_write && capabilities_v.online_write &&
+           capabilities_k.decode_f16 && capabilities_v.decode_f16 &&
+           !capabilities_k.requires_importance_matrix && !capabilities_v.requires_importance_matrix;
+}
+
+// Does this (K,V) pair have a streamed kernel at this exact head dim?
+//
+// The mode is a property of the pair (no head dim), so the dim has to be asked separately:
+//   - DIRECT: a native partial instance for (pair, dim). Every D in the table is compiled together
+//     for a given pair, so this normally answers the same for all four; it is asked per dim anyway
+//     because that is what the launcher will actually call, and a mismatch must fall back to the
+//     regular attention path instead of reaching an instance that was never linked.
+//   - f16: pages converted to f16 and run through the f16/f16 partial instance at this dim.
+static bool kv_stream_dim_supported(ggml_type type_k, ggml_type type_v, int64_t head_dim) {
+    if (!kv_stream_head_dim_supported(head_dim)) {
+        return false;
+    }
+    if (kv_stream_pair_has_native_partial(type_k, type_v)) {
+        return kv_stream_resolve_native_partial(head_dim, type_k, type_v) != nullptr;
+    }
+    // The f16 route runs the f16/f16 partial instance at this dim, so that instance - not just a
+    // convertible pair - is what has to exist.
+    return kv_stream_pair_f16_convertible(type_k, type_v) &&
+           kv_stream_resolve_native_partial(head_dim, GGML_TYPE_F16, GGML_TYPE_F16) != nullptr;
+}
+
 // --- head-dim dispatch for the three streamed launches -------------------------------------
 //
 // ggml_cuda_flash_attn_ext_streamed() merges its per-chunk results with kernels templated on the
 // head dim, and the f16-conversion route calls the f16 vec partial kernel. Both used to be bound
 // to the single dim the streamed path was validated on; the dispatch below is what makes a model
 // with any head dim in KV_STREAM_HEAD_DIMS eligible. The reject check guarantees the dim is in
-// the table, so the "default" arm may assert on 256.
+// the table, so the "default" arms may assert on 512.
 static void kv_stream_vec_partial_f16(
         int64_t head_dim, ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         float * parts, float2 * meta, int nparts) {
@@ -1279,9 +1322,13 @@ static void kv_stream_vec_partial_f16(
             ggml_cuda_flash_attn_ext_vec_partial_case<128, GGML_TYPE_F16, GGML_TYPE_F16>(
                 ctx, dst, parts, meta, nparts);
             return;
-        default:
-            GGML_ASSERT(head_dim == 256);
+        case 256:
             ggml_cuda_flash_attn_ext_vec_partial_case<256, GGML_TYPE_F16, GGML_TYPE_F16>(
+                ctx, dst, parts, meta, nparts);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 512);
+            ggml_cuda_flash_attn_ext_vec_partial_case<512, GGML_TYPE_F16, GGML_TYPE_F16>(
                 ctx, dst, parts, meta, nparts);
             return;
     }
@@ -1316,9 +1363,13 @@ static void kv_stream_accumulate_dispatch(
             kv_stream_accumulate_launch<128>(ctx, dst, parts, meta, accumulator,
                 accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
             return;
-        default:
-            GGML_ASSERT(head_dim == 256);
+        case 256:
             kv_stream_accumulate_launch<256>(ctx, dst, parts, meta, accumulator,
+                accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 512);
+            kv_stream_accumulate_launch<512>(ctx, dst, parts, meta, accumulator,
                 accumulator_meta, tile_nrows, row_offset, initialize, partial_count);
             return;
     }
@@ -1346,9 +1397,12 @@ static void kv_stream_normalize_dispatch(
         case 128:
             kv_stream_normalize_launch<128>(ctx, dst, accumulator, accumulator_meta, nrows);
             return;
-        default:
-            GGML_ASSERT(head_dim == 256);
+        case 256:
             kv_stream_normalize_launch<256>(ctx, dst, accumulator, accumulator_meta, nrows);
+            return;
+        default:
+            GGML_ASSERT(head_dim == 512);
+            kv_stream_normalize_launch<512>(ctx, dst, accumulator, accumulator_meta, nrows);
             return;
     }
 }
@@ -1524,10 +1578,7 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
             kv_stream_pair_has_native_partial(type_k, type_v)) {
         return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
     }
-    if (capabilities_k.storage && capabilities_v.storage &&
-            capabilities_k.online_write && capabilities_v.online_write &&
-            capabilities_k.decode_f16 && capabilities_v.decode_f16 &&
-            !capabilities_k.requires_importance_matrix && !capabilities_v.requires_importance_matrix) {
+    if (kv_stream_pair_f16_convertible(type_k, type_v)) {
         return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
     }
     return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED;
@@ -1579,8 +1630,12 @@ bool ggml_cuda_kv_stream_page_bytes(
     return true;
 }
 
-bool ggml_cuda_kv_stream_head_dim_supported(uint32_t head_dim) {
-    return kv_stream_head_dim_supported(int64_t(head_dim));
+// Per (pair, dim): the streamed path is reachable for this KV pair at this head dim. The dim alone
+// is not enough -- the pairs above 256 and the pairs at 256 are not the same set (see
+// kv_stream_dim_supported).
+bool ggml_cuda_kv_stream_head_dim_supported(
+        ggml_type type_k, ggml_type type_v, uint32_t head_dim) {
+    return kv_stream_dim_supported(type_k, type_v, int64_t(head_dim));
 }
 
 bool ggml_cuda_kv_stream_workspace_bytes(
@@ -1624,11 +1679,13 @@ const char * ggml_cuda_flash_attn_ext_streamed_reject_reason(const ggml_tensor *
             GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED) {
         return "this (K,V) type pair has no streamed attention mode";
     }
-    if (!kv_stream_head_dim_supported(Q->ne[0])) {
-        return "Q head dim has no streamed attention kernel instance (supported: 64, 128, 256)";
+    if (!kv_stream_dim_supported(K->type, V->type, Q->ne[0])) {
+        return "this (K,V) pair has no streamed attention kernel at the Q head dim "
+               "(64, 128, 256, 512 for every streamed pair)";
     }
-    if (!kv_stream_head_dim_supported(V->ne[0])) {
-        return "V head dim has no streamed attention kernel instance (supported: 64, 128, 256)";
+    if (!kv_stream_dim_supported(K->type, V->type, V->ne[0])) {
+        return "this (K,V) pair has no streamed attention kernel at the V head dim "
+               "(64, 128, 256, 512 for every streamed pair)";
     }
     if (Q->ne[0] != V->ne[0]) {
         return "Q and V have different head dims";

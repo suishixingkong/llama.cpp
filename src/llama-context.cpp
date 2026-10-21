@@ -584,7 +584,7 @@ llama_context::llama_context(
         if (stream_validation.enabled) {
             using page_bytes_fn_t = bool (*)(
                 ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
-            using head_dim_supported_fn_t = bool (*)(uint32_t);
+            using head_dim_supported_fn_t = bool (*)(ggml_type, ggml_type, uint32_t);
             using arena_new_fn_t = void * (*)(ggml_backend_dev_t, size_t);
             using arena_free_fn_t = void (*)(void *);
             using arena_set_compute_fn_t = bool (*)(void *, size_t, size_t);
@@ -653,10 +653,12 @@ llama_context::llama_context(
                 const uint32_t head_dim_k = llama_kv_cache_padded_head_dim(type_k, hparams.n_embd_head_k(il));
                 const uint32_t head_dim_v = llama_kv_cache_padded_head_dim(type_v, hparams.n_embd_head_v(il));
                 // The streamed attention kernels exist per head dim (K and V must share it), and the
-                // backend is the only place that knows which instances this build compiled. The
-                // architecture is deliberately not part of this decision: any model whose attention
-                // layers have a streamed instance and one uniform page geometry is eligible.
-                if (head_dim_k != head_dim_v || !head_dim_supported_fn(head_dim_k)) {
+                // backend is the only place that knows which instances this build compiled. The dim
+                // alone is not enough to ask: a pair whose instance file was left out of this build
+                // streams through the f16-conversion route instead, so the pair goes with the dim.
+                // The architecture is deliberately not part of this decision: any model whose
+                // attention layers have a streamed kernel and one uniform page geometry is eligible.
+                if (head_dim_k != head_dim_v || !head_dim_supported_fn(type_k, type_v, head_dim_k)) {
                     throw std::runtime_error(
                         "block KV streaming has no streamed attention kernel for layer " +
                         std::to_string(il) + " (head_dim_k = " + std::to_string(head_dim_k) +

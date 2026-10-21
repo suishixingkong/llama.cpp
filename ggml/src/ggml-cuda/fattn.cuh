@@ -102,9 +102,12 @@ bool ggml_cuda_kv_stream_page_bytes(
     ggml_type type_k, ggml_type type_v,
     uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
     uint32_t page_tokens, size_t * page_bytes);
-// Whether this build has a streamed attention kernel instance for that (padded) head dim. The
-// streamed path is templated on the head dim, so capability is a build property, not a model one.
-bool ggml_cuda_kv_stream_head_dim_supported(uint32_t head_dim);
+// Whether this build has a streamed attention kernel for that (padded) head dim *and* KV pair. The
+// streamed path is templated on the head dim, so capability is a build property, not a model one;
+// the pair is part of the question because a pair whose instance file this build did not compile
+// can still stream through the f16-conversion route.
+bool ggml_cuda_kv_stream_head_dim_supported(
+    ggml_type type_k, ggml_type type_v, uint32_t head_dim);
 bool ggml_cuda_kv_stream_workspace_bytes(
     ggml_type type_k, ggml_type type_v,
     uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,

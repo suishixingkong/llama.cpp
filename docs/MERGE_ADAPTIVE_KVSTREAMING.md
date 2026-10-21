@@ -64,12 +64,23 @@ capability: it even rejected `LLM_ARCH_QWEN35MOE`. The gate is now a probe, run 
 | condition | reported as |
 |---|---|
 | every streamed attention (KV-carrying, non-recurrent, **non-SWA**) layer on **one** CUDA device | `requires every attention layer on one CUDA device` |
-| same padded K and V head dim, with a compiled streamed instance (64 / 128 / 256) | `no streamed attention kernel for layer N (head_dim_k = …, head_dim_v = …)` |
+| same padded K and V head dim, with a streamed instance for that `(K,V)` pair at that dim (64 / 128 / 256 / 512 for every streamed pair) | `no streamed attention kernel for layer N (head_dim_k = …, head_dim_v = …)` |
 | one page geometry for all streamed layers (same head dim / head count / K,V types) | `requires uniform attention-layer geometry` |
 | a streamed attention mode for the `(K,V)` type pair | `invalid block KV streaming page geometry` |
 | at least one full-attention layer to stream | `found no full-attention layers to stream` |
 | no sliding-window cache, or a sliding-window cache with a streamable dense half | `does not support hybrid models with sliding-window layers yet` / `does not combine with --swa-full` |
 | `-np 1`, Flash Attention, `--no-kv-offload` absent, target context only | as before |
+
+Head dim 512 (gemma-4's dense half) is a partial-only instance for **every** streamed pair: block
+streaming always runs the chunked partial kernel, never the regular vec case, and at D = 512 that
+regular case does not fit the register budget. Two consequences worth knowing:
+
+- The pair set at 512 is the same as at 64/128/256, so a turbo/q8 KV cache can stream a 512-dim
+  model instead of being forced onto f16.
+- Turbo V needs the columns-per-iteration setting halved at this dim: the per-warp transpose buffer
+  is `nwarps * V_cols_per_iter * D` floats, i.e. 64 KiB at eight columns, over the 48 KiB a kernel
+  may allocate statically. `D >= 512` keeps four columns (32 KiB, no spill); 128/256 codegen is
+  unchanged.
 
 Memory types that carry the runtime: `llama_memory_hybrid` (attention child), the plain
 `llama_kv_cache` of a **dense, non-SWA** model, and `llama_kv_cache_iswa` (**dense half only**).
