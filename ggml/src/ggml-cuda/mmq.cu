@@ -354,13 +354,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0) {
-        // PTQ1_0 keeps the tile path at every batch: the fp16 dequantize + cuBLAS fallback
-        // is what cost the fork accuracy on CUDA. GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH is the A/B
-        // knob for deployments that would rather trade that accuracy for prefill speed.
-        static const int64_t max_batch = [] {
+        // Turing and newer keep the tile path at every batch: there the branch-free tile loader beats
+        // both the mat-vec and the fp16 dequantize + cuBLAS fallback, and that fallback is what cost
+        // the fork accuracy on CUDA.
+        // Volta and older cross over instead of picking a side. Measured on V100-SXM2 with
+        // qwen35 2B PTQ1_0: the tiles win while the batch stays short (up to ~200 columns) and lose
+        // clearly above it (pp2048 x10: 7190 t/s vs the fallback's 9619, -25%). A batch that small
+        // leaves cuBLAS unable to fill the tensor cores, while the tile kernel still has enough tiles
+        // to keep a block busy; past ~200 the tensor cores dominate. So the cap there is 200, which
+        // also means the accuracy side follows the batch: short prompts get the tiles (PPL 6.3368 on
+        // the 66-chunk file) and long ones the fallback (6.3371).
+        // Batches up to MMVQ_MAX_BATCH_SIZE never arrive here (mmvq is asked first).
+        // GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH overrides the default on every architecture: a batch size
+        // caps the tile path, a very large value forces it on.
+        struct ptq1_0_batch_cfg {
+            int64_t max_batch;
+            bool    from_env;
+        };
+        static const ptq1_0_batch_cfg cfg = [] {
             const char * e = getenv("GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH");
-            return e ? (int64_t) atoll(e) : (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE;
+            if (e != nullptr) {
+                return ptq1_0_batch_cfg{ (int64_t) atoll(e), true };
+            }
+            return ptq1_0_batch_cfg{ 0, false };
         }();
+        const int64_t max_batch = cfg.from_env ? cfg.max_batch :
+            (cc > GGML_CUDA_CC_VOLTA ? (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE : (int64_t) 200);
         return ne11 <= max_batch;
     }
 #endif

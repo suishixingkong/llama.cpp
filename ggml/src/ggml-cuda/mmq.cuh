@@ -6,7 +6,7 @@
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
-#define MMQ_PTQ1_0_MAX_BATCH_SIZE (1 << 30) // PTQ1_0 keeps MMQ at every batch; GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH can lower it
+#define MMQ_PTQ1_0_MAX_BATCH_SIZE (1 << 30) // PTQ1_0 default cap on Turing+: every batch. Volta and older default to 200; GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH overrides both
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
