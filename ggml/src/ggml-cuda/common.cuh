@@ -1067,15 +1067,27 @@ struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
     static constexpr int qi = QI_PTQ1_0;
 };
 
-// Activation (src1) q8_1 layouts produced by quantize_row_q8_1_cuda and consumed by the MMVQ kernels.
-// Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are valid
-// for all of them; only the byte order inside a column differs.
+// Activation (src1) q8_1 layouts produced by quantize_row_q8_1_cuda and consumed by the MMVQ kernels
+// (plus the mul_mat_q ones at the end, which the fused FWHT quantizer writes straight into the tile
+// layout). Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are
+// valid for all of them; only the byte order inside a column differs.
 enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0/Q2_0 cases below)
     GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
+    // mul_mat_q layouts (block_q8_1_mmq, 128 values per block, see mmq.cuh). Same bytes per row as
+    // the above (128 int8 + 16 scale bytes) but a different grouping, so they are only ever produced
+    // by the fused transform and only ever read by quantize_mmq_q8_1_cuda's consumer.
+    GGML_CUDA_Q8_1_MMQ_D4   = 4, // one float scale per 32 values (Q1_0/Q2_0/PQ2_0/PTQ1_0/Q5_0/Q8_0/...)
+    GGML_CUDA_Q8_1_MMQ_DS4  = 5, // half2 (scale, partial sum) per 32 values (Q4_0/Q4_1/Q5_1/Q4_K/Q5_K/...)
+    GGML_CUDA_Q8_1_MMQ_D2S6 = 6, // 2 half scales per 64 values + 6 partial sums per 16 (Q2_K)
 };
+
+// mul_mat_q asks for a block_q8_1_mmq layout; the first three are the MMVQ ones.
+static constexpr __host__ __device__ bool ggml_cuda_q8_1_is_mmq(ggml_cuda_q8_1_layout layout) {
+    return layout >= GGML_CUDA_Q8_1_MMQ_D4 && layout <= GGML_CUDA_Q8_1_MMQ_D2S6;
+}
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar
 // kernel. One column returns the Ada default (SOA_ISUM). Ampere and GGML_CUDA_BATCH_INVARIANT
@@ -1619,6 +1631,85 @@ struct ggml_cuda_vbr_transcode_workspace {
     size_t              vmm_hw = 0;
 };
 
+// A Hadamard transform (MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD, optionally preceded by the sign
+// flip) whose only consumers are mat-muls that re-encode the activation writes the encoded rows into
+// its own output buffer instead of the F32 result, and those consumers skip their quantize launch.
+// Which encoding depends on the route the consumers take:
+//   - MMVQ (PTQ1_0 mat-vec): q8_1 in the layout ggml_cuda_q8_1_layout_host picks for the column
+//     count. The quantized rows are 9/8 bytes per element, so they fit in the F32 allocation.
+//   - mul_mat_q: block_q8_1_mmq rows (144 bytes per 128 values, also 9/8 per element), including the
+//     tile loader's tail block.
+// The output buffer's lifetime is exactly the consumers' lifetime, so nothing about allocation
+// changes. Keyed by tensor identity (the transform output and every reshape view of it that a
+// mat-vec consumes), never by data pointer: ggml-alloc recycles a dead output's block for later
+// tensors in the same graph, and a later PTQ1_0 mat-vec whose src1 landed there must not mistake its
+// F32 rows for q8_1. Valid for one graph evaluation.
+enum ggml_cuda_fwht_q8_kind : int {
+    GGML_CUDA_FWHT_Q8_MMVQ, // consumed by ggml_cuda_mul_mat_vec_q
+    GGML_CUDA_FWHT_Q8_MMQ,  // consumed by ggml_cuda_mul_mat_q
+};
+
+struct ggml_cuda_fwht_q8 {
+    ggml_cuda_fwht_q8_kind kind   = GGML_CUDA_FWHT_Q8_MMVQ;
+    ggml_cuda_q8_1_layout  layout = GGML_CUDA_Q8_1_AOS;
+    int64_t                ne0    = 0;       // padded row width the quantizer wrote (what the mat-vec expects)
+    int64_t                ncols  = 0;       // rows quantized (src1->ne[1] of every consumer)
+    const void *           data   = nullptr; // the q8_1 rows: the transform's own output buffer, or a pool block
+                                             // held for the rest of the graph when that buffer aliases the input
+};
+
+struct ggml_cuda_fwht_q8_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_fwht_q8> entries;
+    std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> held; // released at reset(), newest first (VMM pool is LIFO)
+
+    // the implicit destructor would release `held` oldest first, which the VMM pool asserts on. The
+    // owning context also calls reset() before its pools go away (this member is declared before them).
+    ~ggml_cuda_fwht_q8_context() {
+        reset();
+    }
+
+    void reset() {
+        entries.clear();
+        while (!held.empty()) {
+            held.pop_back();
+        }
+    }
+
+    void set(const ggml_tensor * out, const ggml_cuda_fwht_q8 & e) {
+        entries[out] = e;
+    }
+
+    const ggml_cuda_fwht_q8 * find(const ggml_tensor * out) const {
+        const auto it = entries.find(out);
+        return it == entries.end() ? nullptr : &it->second;
+    }
+};
+
+// A Hadamard transform of an activation whose only consumers are cuBLAS GEMMs does not have to exist in
+// F32 either: the GEMM's first move is to convert its src1 to f16/bf16 into a temporary, so the transform
+// can write that temporary directly and the F32 rows are neither written nor read. Registered by the
+// matcher when the transform node is reached and consumed inside ggml_cuda_mul_mat_cublas_impl, which is
+// why the F32 output tensor may stay untouched for the rest of the graph.
+struct ggml_cuda_fwht_cast {
+    const float * src   = nullptr; // transform input, contiguous rows of `n` floats
+    const float * signs = nullptr; // optional +-1 vector folded in before the transform
+    int64_t       n     = 0;       // transform width, equal to the GEMM's K
+    int64_t       rows  = 0;       // number of rows (activation columns of the GEMM)
+};
+
+struct ggml_cuda_fwht_cast_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_fwht_cast> entries;
+
+    void reset() { entries.clear(); }
+
+    void set(const ggml_tensor * out, const ggml_cuda_fwht_cast & e) { entries[out] = e; }
+
+    const ggml_cuda_fwht_cast * find(const ggml_tensor * out) const {
+        const auto it = entries.find(out);
+        return it == entries.end() ? nullptr : &it->second;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1698,6 +1789,8 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_fwht_q8_context fwht_q8_context;
+    ggml_cuda_fwht_cast_context fwht_cast_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1712,6 +1805,9 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+
+    ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
+    ggml_cuda_fwht_cast_context & fwht_cast() { return fwht_cast_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {

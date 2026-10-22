@@ -144,13 +144,24 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        // src1 may be a Hadamard transform output whose producer already wrote the block_q8_1_mmq rows
+        // in exactly this layout (ggml_cuda_fwht_q8, kind MMQ, into src1's buffer or a held pool block);
+        // nothing to quantize then.
+        const ggml_cuda_fwht_q8 * pre_q8 = !use_native_fp4 ? ctx.fwht_q8().find(src1) : nullptr;
+        if (pre_q8) {
+            ggml_cuda_q8_1_layout want      = GGML_CUDA_Q8_1_AOS;
+            const bool            layout_ok = ggml_cuda_fwht_mmq_layout(src0->type, want);
+            GGML_ASSERT(layout_ok && pre_q8->kind == GGML_CUDA_FWHT_Q8_MMQ && pre_q8->layout == want &&
+                        pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1);
+        } else {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -175,7 +186,8 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, pre_q8 ? (const int *) pre_q8->data : (const int *) src1_q8_1.ptr,
+            nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

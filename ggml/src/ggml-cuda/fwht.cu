@@ -1,9 +1,15 @@
 #include "common.cuh"
 #include "fwht.cuh"
 
-template <int N>
+#include <cuda_bf16.h>
+
+// Tout is what the row is written as: F32 for the standalone transform, f16/bf16 for the fused transform
+// + conversion that a cuBLAS GEMM consumes. `has_signs` folds the +-1 sign vector into the load, which is
+// where the graph's separate MUL would have applied it; +-1 products are exact, so the moved multiply
+// cannot change the result.
+template <int N, typename Tout, bool has_signs>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, const float scale) {
+__global__ void fwht_cuda(const float * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -23,6 +29,9 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         reg[i] = src[i * warp_size + lane] * scale;
+        if (has_signs) {
+            reg[i] *= signs[i * warp_size + lane];
+        }
     }
 
 #pragma unroll
@@ -54,7 +63,133 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        dst[i * warp_size + lane] = reg[i];
+        dst[i * warp_size + lane] = (Tout) reg[i];
+    }
+}
+
+// Wide rows at small row counts (decode): one row per block instead of per warp. The warp kernel
+// above serialises every stage on one warp, which is fine for the narrow widths but leaves most of
+// the block idle as N grows, so from 512 up a row is spread over FWHT_BLOCK_THREADS threads and the
+// stages above the warp width go through shared memory. Same butterfly (ggml_cuda_fwht_block_butterfly),
+// same stage order, same place for the scale: the result is bit-identical to the warp kernel, which
+// is also what the fused FWHT + q8_1 quantizer relies on.
+#define FWHT_BLOCK_THREADS 256
+
+template <int N, int NT, typename Tout, bool has_signs>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block(const float * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    dst += r * N;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+
+    ggml_cuda_pdl_sync();
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = src[i * NT + tid] * scale;
+        if (has_signs) {
+            reg[i] *= signs[i * NT + tid];
+        }
+    }
+
+    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s, tid, lane);
+
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        dst[i * NT + tid] = (Tout) reg[i];
+    }
+}
+
+// Shared launcher: one instantiation set per (Tout, has_signs), one switch on the width.
+template <typename Tout, bool has_signs>
+static bool fwht_launch(const float * src_d, const float * signs_d, Tout * dst_d, const int64_t rows,
+                        const int n, const int warp_size, cudaStream_t stream) {
+    const float scale = 1 / sqrtf((float) n);
+
+    const int rows_per_block = 4;
+    const dim3 grid_warp((unsigned) ((rows + rows_per_block - 1) / rows_per_block), 1, 1);
+    const dim3 block_warp(warp_size, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params warp_params = ggml_cuda_kernel_launch_params(grid_warp, block_warp, 0, stream);
+
+    // One block per row from 512 up (see fwht_cuda_block); the narrow widths keep the warp kernel.
+    const dim3 grid_row((unsigned) rows, 1, 1);
+    const dim3 block_row(FWHT_BLOCK_THREADS, 1, 1);
+    const ggml_cuda_kernel_launch_params row_params = ggml_cuda_kernel_launch_params(grid_row, block_row, 0, stream);
+
+    switch (n) {
+        case 64:
+            ggml_cuda_kernel_launch((fwht_cuda<64, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 128:
+            ggml_cuda_kernel_launch((fwht_cuda<128, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 256:
+            ggml_cuda_kernel_launch((fwht_cuda<256, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 512:
+            ggml_cuda_kernel_launch((fwht_cuda_block<512, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 1024:
+            ggml_cuda_kernel_launch((fwht_cuda_block<1024, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 2048:
+            ggml_cuda_kernel_launch((fwht_cuda_block<2048, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        case 4096:
+            ggml_cuda_kernel_launch((fwht_cuda_block<4096, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale);
+            return true;
+        default:
+            return false;
+    }
+}
+
+template <typename Tout>
+static bool fwht_launch_signed(const float * src_d, const float * signs_d, Tout * dst_d, const int64_t rows,
+                               const int n, const int warp_size, cudaStream_t stream) {
+    return signs_d ? fwht_launch<Tout, true> (src_d, signs_d, dst_d, rows, n, warp_size, stream)
+                   : fwht_launch<Tout, false>(src_d, signs_d, dst_d, rows, n, warp_size, stream);
+}
+
+bool ggml_cuda_fwht_cast_supported(int n) {
+    switch (n) {
+        case 64:
+        case 128:
+        case 256:
+        case 512:
+        case 1024:
+        case 2048:
+        case 4096:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_fwht_cast_to(const ggml_cuda_fwht_cast & plan, void * dst, ggml_type dst_type, cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int n = (int) plan.n;
+    switch (dst_type) {
+        case GGML_TYPE_F32:
+            return fwht_launch_signed<float>(plan.src, plan.signs, (float *) dst, plan.rows, n, warp_size, stream);
+        case GGML_TYPE_F16:
+            return fwht_launch_signed<half>(plan.src, plan.signs, (half *) dst, plan.rows, n, warp_size, stream);
+        case GGML_TYPE_BF16:
+            return fwht_launch_signed<nv_bfloat16>(plan.src, plan.signs, (nv_bfloat16 *) dst, plan.rows, n, warp_size, stream);
+        default:
+            return false;
     }
 }
 
@@ -70,32 +205,6 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
     float *       dst_d = (float *) dst->data;
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int rows_per_block = 4;
 
-    const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
-
-    cudaStream_t                         stream = ctx.stream();
-    dim3                                 grid_dims(num_blocks, 1, 1);
-    dim3                                 block_dims(warp_size, rows_per_block, 1);
-    const ggml_cuda_kernel_launch_params launch_params =
-        ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-
-    const float scale = 1 / sqrtf(n);
-
-    switch (n) {
-        case 64:
-            ggml_cuda_kernel_launch(fwht_cuda<64>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 128:
-            ggml_cuda_kernel_launch(fwht_cuda<128>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 256:
-            ggml_cuda_kernel_launch(fwht_cuda<256>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 512:
-            ggml_cuda_kernel_launch(fwht_cuda<512>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        default:
-            return false;
-    }
+    return fwht_launch<float, false>(src_d, nullptr, dst_d, rows, n, warp_size, ctx.stream());
 }

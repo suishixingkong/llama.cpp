@@ -790,6 +790,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // pool blocks held across a graph go back to the pool before the pools are destroyed below
+    fwht_q8_context.reset();
+    fwht_cast_context.reset();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2632,12 +2636,31 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    // A Hadamard transform registered by ggml_cuda_try_fwht_fuse(): the graph skipped its F32 output, so
+    // this is where the rows come into existence -- straight as the converted copy the GEMM wants.
+    const ggml_cuda_fwht_cast * fwht_cast = ctx.fwht_cast().find(src1);
+
     if (src1->type == compute_type) {
+        if (fwht_cast != nullptr) {
+            // the only way to get here is a GEMM with no conversion to do, i.e. F32 in and out, and the
+            // rows have to be produced here because the graph never wrote them
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+            const bool ok = ggml_cuda_fwht_cast_to(*fwht_cast, src1->data, GGML_TYPE_F32, main_stream);
+            GGML_ASSERT(ok);
+        }
         src1_ptr = (const cuda_t *) src1->data;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
-        if (ggml_is_contiguously_allocated(src1)) {
+        if (fwht_cast != nullptr) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src1) && ggml_is_contiguous(src1));
+            const bool ok = ggml_cuda_fwht_cast_to(*fwht_cast, src1_alloc.get(), compute_type, main_stream);
+            GGML_ASSERT(ok);
+            const size_t src1_bs = ggml_blck_size(src1->type);
+            s11 *= src1_bs;
+            s12 *= src1_bs;
+            s13 *= src1_bs;
+        } else if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
@@ -3041,6 +3064,302 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     return use_mul_mat_vec_q;
+}
+
+// A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
+// never has to exist in F32: nothing in the graph reads it as F32, every consumer re-encodes it first.
+// Which encoding depends on the route ggml_cuda_mul_mat picks for those consumers:
+//   - PTQ1_0 mat-vec on the mmvq path (decode, ncols <= 8) quantizes it to q8_1 straight away, so the
+//     transform kernel quantizes as it goes and writes the q8_1 rows in the layout the mat-vecs expect;
+//     the mat-vecs then skip their quantize launch (ggml_cuda_fwht_q8). On Bonsai 2 that removes ~390
+//     launches per decode step.
+//   - cuBLAS GEMM (prefill) converts it to f16/bf16 into a temporary as its first move, so the transform
+//     kernel writes that temporary directly and the F32 rows are neither written nor read; the
+//     conversion launch goes away too (ggml_cuda_fwht_cast).
+//   - mul_mat_q (tile path) quantizes it to its own block_q8_1_mmq layout, so the transform kernel writes
+//     those rows (in the transform's buffer, which has the room: 9/8 bytes per element against 4) and the
+//     tile path skips its quantize launch (ggml_cuda_fwht_q8, kind MMQ). This is the prefill route for
+//     every weight type that is not PTQ1_0, and for PTQ1_0 too once the batch is past the mat-vec window.
+// The check walks every later node, so any other use of the output (or of a view of it) keeps the plain
+// transform, and use counts guard against consumers outside this graph. Every consumer has to want the
+// same encoding; in practice they do, because ncols is uniform across a graph.
+// Returns the number of nodes consumed (3 or 1) or 0 to fall through.
+// GGML_CUDA_FWHT_FUSION=0 disables all forms, =2 keeps the decode (mat-vec) form only, =3 the GEMM copy
+// only, =4 the mul_mat_q rows only.
+static int ggml_cuda_try_fwht_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_FWHT_FUSION");
+        return e != nullptr ? atoi(e) : 1;
+    }();
+    const bool want_q8   = mode == 1 || mode == 2;
+    const bool want_cast = mode == 1 || mode == 3;
+    const bool want_mmq  = mode == 1 || mode == 4;
+    if (!want_q8 && !want_cast && !want_mmq) {
+        return 0;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    // Volta is included on purpose. The gate used to stop at Turing because that is where the PTQ1_0
+    // mat-vec threshold had been calibrated (ne11 <= 4, tuned on Ada); below Turing
+    // ggml_cuda_should_use_mmvq() falls through to the generic ne11 <= MMVQ_MAX_BATCH_SIZE, which is
+    // a wider window, not a narrower one. Nothing in either fused kernel wants Turing: they are fp32
+    // adds, warp shuffles and a float->half/bfloat16 store, SOA_ISUM -- the layout a one-column PTQ1_0
+    // mat-vec consumes on Volta -- is one of the layouts the quantizer writes, and the GEMM form only
+    // needs the conversion the GEMM was going to do anyway.
+    // Pascal is excluded on validation grounds, not capability: sm_61+ has dp4a and the mul_mat_q
+    // tile path now carries PTQ1_0 there too (mmq-config-pascal-dp4a.cuh), so the fusion would very
+    // likely be correct, but neither fused kernel has ever been run on pre-Volta hardware. Such cards
+    // get the plain transform followed by the same quantization, i.e. the unfused route.
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_VOLTA) {
+        return 0;
+    }
+
+    const ggml_tensor * x     = nullptr;
+    const ggml_tensor * signs = nullptr;
+    ggml_tensor *       mm    = nullptr;
+    int consumed = 0;
+    int i_mm     = -1;
+
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        mm    = cgraph->nodes[node_idx + 2];
+        x     = mul->src[0];
+        signs = mul->src[1];
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 && mul->type == x->type &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+        if (!pattern_ok) {
+            return 0;
+        }
+        consumed = 3;
+        i_mm     = node_idx + 2;
+    } else {
+        mm = cgraph->nodes[node_idx];
+        if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+            return 0;
+        }
+        x = mm->src[1];
+        if (!ggml_is_contiguous(x) || !ggml_are_same_shape(x, mm)) {
+            return 0;
+        }
+        consumed = 1;
+        i_mm     = node_idx;
+    }
+
+    const int n = (int) mm->src[0]->ne[0];
+    if (mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || ggml_nelements(mm) != ggml_nelements(x)) {
+        return 0;
+    }
+
+    // The fused kernel reads x (and signs) in the same launch that writes its output. The separate transform
+    // and quantize launches never needed those apart, and ggml-alloc does hand mm the block of x when x is a
+    // reshape view (no in-place reuse through a view parent, so the viewed tensor is released at the MUL and
+    // mm takes it two nodes later - the output-projection input on every Bonsai layer). Blocks storing q8_1
+    // rows early would then overwrite f32 input other blocks have not loaded yet: sporadic garbage that on a
+    // hybrid model lands in the recurrent state and poisons the rest of the sequence. In that case the rows
+    // go to a pool block held until the next graph evaluation instead of mm's buffer.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+
+    // every use of the transform output (directly or through a reshape view of the whole tensor) must be
+    // src1 of a mat-mul whose route re-encodes it: a PTQ1_0 mat-vec (q8_1 form), a mul_mat_q tile GEMM
+    // (block_q8_1_mmq rows) or a cuBLAS GEMM (f16 or bf16 copy). All of them must want the same encoding.
+    // The consumers' src1 shape [K, ncols] is what gets encoded (x is only known to be contiguous with
+    // the same element count; in the unsigned pattern it is the [n, rows] reshape).
+    const ggml_tensor * aliases[8] = { mm };
+    int     n_aliases     = 1;
+    int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+    int     uses_found    = 0;
+    int64_t K             = 0;
+    int64_t ncols         = 0;
+    int64_t ne0_padded    = 0;
+    int     consumers_kind = 0; // 0 = none seen yet, 1 = mat-vec q8_1 rows, 2 = f16/bf16 copy, 3 = mul_mat_q rows
+    int64_t mmq_tail       = 0; // tile-loader tail bytes mul_mat_q reads past the last row (kind 3)
+    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
+    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) {
+                continue;
+            }
+            bool is_alias = false;
+            for (int a = 0; a < n_aliases; ++a) {
+                if (src == aliases[a]) {
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (!is_alias) {
+                continue;
+            }
+            uses_found++;
+            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                if (n_aliases == 8) {
+                    return 0;
+                }
+                aliases[n_aliases++] = t;
+                uses_expected += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] ||
+                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                    src->ne[2] != 1 || src->ne[3] != 1 ||
+                    (K != 0 && (src->ne[0] != K || src->ne[1] != ncols))) {
+                return 0;
+            }
+            const ggml_tensor * w = t->src[0];
+            // The route ggml_cuda_mul_mat takes for this consumer, in its dispatch order
+            // (MMVF, MMF, MMVQ, the Hopper Q1 tile path, MMQ, cuBLAS). A consumer that lands on a route
+            // this fusion does not write would read rows that were never produced.
+            const bool route_mmvf = ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, src->ne[1]);
+            const bool route_mmf  = ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb,
+                                                             (int) src->ne[1], false);
+            const bool route_mmvq = !route_mmvf && !route_mmf &&
+                ggml_cuda_should_use_mmvq(w->type, cc, src->ne[1]);
+            const bool mmq_ok     = ggml_cuda_should_use_mmq(w->type, cc, src->ne[1], 0);
+            const bool route_mmq  = !route_mmvf && !route_mmf && !route_mmvq && mmq_ok;
+            // q8_1 form: a mat-vec, the route ggml_cuda_mul_mat_vec_q takes. Every quantized type works:
+            // the fused quantizer writes the layout that mat-vec's own quantizer would have written (AOS
+            // for most types, SOA_ISUM/PT for PTQ1_0, PQ2 for PQ2_0 at 3-8 columns on Ada). TQ weights
+            // stay out because ggml_cuda_mul_mat hands them to ggml_cuda_mul_mat_tq, which reads F32 rows.
+            const bool as_q8 = want_q8 && ggml_is_quantized(w->type) &&
+                w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S && route_mmvq;
+            if (as_q8) {
+                const ggml_cuda_q8_1_layout q8_layout =
+                    ggml_cuda_q8_1_layout_host(w->type, (int) src->ne[1], /*has_ids=*/false);
+                if (consumers_kind == 1 && layout != q8_layout) {
+                    return 0; // consumers of different weight types want different layouts
+                }
+                layout = q8_layout;
+            }
+            // mul_mat_q rows: q8_1 form for the tile path. Excluded, besides the routes above:
+            //   - Q1_0/PQ2_0 at ncols >= 128 on Hopper, where ggml_cuda_mul_mat_q1_hopper reads src1 as
+            //     F32 and quantizes it itself (bailing unconditionally is the safe side: that path is
+            //     compile- and env-gated, so it cannot be ruled out from here);
+            //   - types whose tile layout the fused quantizer does not write (see ggml_cuda_fwht_mmq_layout).
+            const bool hopper_q1 = (w->type == GGML_TYPE_Q1_0 || w->type == GGML_TYPE_PQ2_0) &&
+                src->ne[1] >= 128 && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+            ggml_cuda_q8_1_layout mmq_layout = GGML_CUDA_Q8_1_AOS;
+            const bool as_mmq = !as_q8 && want_mmq && route_mmq && !hopper_q1 &&
+                ggml_cuda_fwht_mmq_layout(w->type, mmq_layout);
+            // f16/bf16 form: a GEMM, i.e. the route ggml_cuda_mul_mat_cublas takes once every route above
+            // has declined
+            const bool as_cast = want_cast && !as_q8 && !as_mmq && !route_mmvf && !route_mmf && !route_mmvq &&
+                !mmq_ok && ggml_is_quantized(w->type) &&
+                w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S &&
+                ggml_is_contiguously_allocated(src);
+            if (!as_q8 && !as_mmq && !as_cast) {
+                return 0;
+            }
+            const int kind = as_q8 ? 1 : (as_mmq ? 3 : 2);
+            if (consumers_kind != 0 && consumers_kind != kind) {
+                return 0; // consumers want different encodings: keep the plain transform
+            }
+            if (as_mmq) {
+                if (consumers_kind == 3 && layout != mmq_layout) {
+                    return 0; // consumers disagree on the scale layout the tile kernels read
+                }
+                layout = mmq_layout;
+                // same fallback flag and J_max ggml_cuda_mul_mat_q sizes its own buffer with
+                mmq_tail = (int64_t) ggml_cuda_mmq_get_J_max(w->type, w->ne[1] % 128 != 0, cc, src->ne[1]) *
+                    (int64_t) sizeof(block_q8_1_mmq);
+            }
+            consumers_kind = kind;
+            K     = src->ne[0];
+            ncols = src->ne[1];
+            // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
+            if (as_q8 &&
+                    ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                    ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
+                return 0;
+            }
+        }
+    }
+    if (uses_found == 0 || uses_found != uses_expected || K == 0) {
+        return 0;
+    }
+    if (consumers_kind == 2) {
+        // The GEMM reads [K, ncols] rows of the transform output and converts them to its own type. The
+        // transform width has to be the row width for the fused copy to line up (ggml_cuda_op_fwht uses
+        // src->ne[0], so a wider input row would mean a different transform), and the input has to be F32
+        // -- the warp/block kernels load floats.
+        if (K != n || x->ne[0] != n || x->type != GGML_TYPE_F32 || !ggml_cuda_fwht_cast_supported((int) n) ||
+                (signs && (signs->ne[0] != n || !ggml_is_contiguous(signs)))) {
+            return 0;
+        }
+        // No buffer is handed over here: the GEMM allocates its own f16/bf16 temporary and calls
+        // ggml_cuda_fwht_cast_to() to fill it, so unlike the q8_1 form nothing has to be held across
+        // nodes and the F32 output of the transform is simply never touched.
+        ggml_cuda_fwht_cast plan;
+        plan.src   = (const float *) x->data;
+        plan.signs = signs ? (const float *) signs->data : nullptr;
+        plan.n     = n;
+        plan.rows  = ggml_nelements(mm) / n;
+        for (int a = 0; a < n_aliases; ++a) {
+            ctx.fwht_cast().set(aliases[a], plan);
+        }
+        return consumed;
+    }
+    if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
+        return 0;
+    }
+
+    ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    if (consumers_kind == 1) {
+        // same (type, ncols, ids) -> padding as ggml_cuda_mul_mat_vec_q; `layout` was taken from
+        // ggml_cuda_q8_1_layout_host() for the consumers' weight type inside the loop
+        if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+            ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);
+        }
+    } else if (ne0_padded % QK8_1_MMQ != 0) {
+        return 0; // mul_mat_q pads to MATRIX_ROW_PADDING, which holds whole 128-value blocks
+    }
+    if (ne0_padded % n != 0) {
+        return 0; // the fused quantizer writes pad blocks in transform-width units
+    }
+    // The q8_1 rows are 9/8 bytes per element in both layouts (block_q8_1 and block_q8_1_mmq). The
+    // mul_mat_q form also needs the tile loader's tail: ggml_cuda_mul_mat_q allocates
+    // ggml_cuda_mmq_get_J_max() * sizeof(block_q8_1_mmq) past the last row and the kernel reads it
+    // (masked on write-back, but a real read), so the rows cannot sit at the end of the F32 buffer
+    // unless that much room is left in it.
+    const bool   mmq_rows = consumers_kind == 3;
+    const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1 + (size_t) mmq_tail;
+    void * out = mm->data;
+    if (out_aliases_in) {
+        auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+        out = blk->get();
+        ctx.fwht_q8().held.push_back(std::move(blk));
+    } else if ((int64_t) q8_bytes > (int64_t) ggml_nbytes(mm)) {
+        return 0; // the quantized rows must fit in the F32 output allocation
+    }
+
+    fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
+                                out, layout, K, ne0_padded, ncols, ctx.stream());
+
+    ggml_cuda_fwht_q8 e;
+    e.kind   = mmq_rows ? GGML_CUDA_FWHT_Q8_MMQ : GGML_CUDA_FWHT_Q8_MMVQ;
+    e.layout = layout;
+    e.ne0    = ne0_padded;
+    e.ncols  = ncols;
+    e.data   = out;
+    for (int a = 0; a < n_aliases; ++a) {
+        ctx.fwht_q8().set(aliases[a], e);
+    }
+    return consumed;
 }
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -5045,6 +5364,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Hadamard rotation that encodes its own output for its consumers: a q8_1 form the PTQ1_0 mat-vecs
+    // then use as-is, or the f16/bf16 copy a cuBLAS GEMM would have built. Returns the number of nodes
+    // consumed after this one, like every other fusion here.
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) {
+        const int consumed = ggml_cuda_try_fwht_fuse(*cuda_ctx, cgraph, i);
+        if (consumed > 0) {
+            return consumed - 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -5891,6 +6220,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // per KV runtime before issuing any attention work.
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
                 cgraph, cuda_ctx->stream());
+
+            // the fwht_q8 registrations (and any pool block they hold) are per graph evaluation
+            cuda_ctx->fwht_q8().reset();
+            cuda_ctx->fwht_cast().reset();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
