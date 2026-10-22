@@ -294,9 +294,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     switch (type) {
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            // the fp16 dequantize + cuBLAS fallback is where PTQ1_0's extra CUDA error came
-            // from on the fork's side, so the tile path is the default at every batch
-            mmq_supported = turing_mma_available(cc);
+            // The fp16 dequantize + cuBLAS fallback is where PTQ1_0's extra CUDA error came from on
+            // the fork's side, so the tile path is the default at every batch.
+            // Every arch-selected table that reaches here carries PTQ1_0: arch >= Volta picks the
+            // ampere table, and the pascal-dp4a table (arch >= DP4A, i.e. sm_61+) lists the same tile
+            // shapes. The tile kernel keys its instruction set on __CUDA_ARCH__ < 750 (mmq.cuh) and
+            // ggml_cuda_mmq_load_tiles_ptq1_0() has a matching dp4a branch, so sm_61 and sm_70 run the
+            // same int8 walk instead of HMMA. Below DP4A the table is pascal-older, which has no
+            // PTQ1_0 -- enabling the type there would end in J_best == 0 and an abort.
+            mmq_supported = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
             break;
 #endif
         case GGML_TYPE_Q1_0:

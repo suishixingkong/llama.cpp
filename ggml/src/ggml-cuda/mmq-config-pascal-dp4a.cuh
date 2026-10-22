@@ -23,8 +23,10 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
 
-    // PQ2_0 shares the Q2_0 tile shapes and the Q8_0 dp4a util body. PTQ1_0 is not
-    // listed here on purpose: ggml_cuda_should_use_mmq() only takes it on Turing+.
+    // PQ2_0 reuses the Q2_0 tile shapes and the Q8_0 dp4a util body (MMQ_DP4A_TXS_Q8_0, q8_1 ds
+    // layout D4): its 128-element block carries exactly the four scale entries four Q2_0 blocks do, so
+    // the shared-memory budget per tile is identical. Every entry must exist on both the host and the
+    // device side of ggml_cuda_mmq_get_config(), otherwise mul_mat_q_switch_J() finds J_best == 0.
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
@@ -36,6 +38,22 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+
+    // PTQ1_0 shares those shapes as well: ggml_cuda_mmq_load_tiles_ptq1_0() expands qs/qh to signed
+    // bytes in shared memory (so the Q8_0 dp4a tile sizing above applies) and the dp4a vec-dot runs the
+    // same int8 walk, i.e. everything the tile path needs exists for arch < 750 already -- it was
+    // ggml_cuda_should_use_mmq() that kept PTQ1_0 from Volta up, and the only reason was this table.
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
 
     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
