@@ -440,34 +440,34 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
 
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
+    // Extract the convolved V from conv_output
     ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_v_dim),
             nb1_qkv,
             nb1_qkv * n_seq_tokens,
             ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
-
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent head groups of the same width inside every token of the conv output,
+    // so one norm over the joint view normalises both (one kernel per layer instead of two);
+    // q and k are then views into its result.
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_seq_tokens,
+            0);
+    cb(qk_conv, "qk_conv", il);
+
+    qk_conv = build_gdn_l2_norm(ctx0, qk_conv, eps_norm);
+    cb(qk_conv, "qk_conv_norm", il);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], num_k_heads * qk_conv->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
