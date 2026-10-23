@@ -1622,6 +1622,35 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Fused recurrent-state gather for GATED_DELTA_NET. build_rs materialises GET_ROWS(cache, s_copy)
+// into a temp per layer that only the GDN kernel reads; when the graph evaluator can prove that, it
+// skips the GET_ROWS and records the gather here so the kernel reads cache row ids[seq] directly.
+struct ggml_cuda_gated_delta_net_gather {
+    const float *   base       = nullptr; // cache rows [row_stride floats each]
+    const int32_t * ids        = nullptr; // per-seq row index
+    int64_t         row_stride = 0;       // in floats
+};
+
+// Owned by the backend context that evaluates the graph: registrations are keyed by node pointer,
+// so they are only meaningful for the evaluation that made them. Reset at the start of every
+// graph evaluation/capture; never shared between contexts or threads.
+struct ggml_cuda_gdn_gather_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gated_delta_net_gather> gathers;
+
+    void reset() {
+        gathers.clear();
+    }
+
+    void set(const ggml_tensor * gdn, const ggml_cuda_gated_delta_net_gather & gather) {
+        gathers[gdn] = gather;
+    }
+
+    const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
+        const auto it = gathers.find(gdn);
+        return it == gathers.end() ? nullptr : &it->second;
+    }
+};
+
 struct ggml_cuda_vbr_transcode_workspace {
     uint8_t * cuda_buf  = nullptr;
     size_t    cuda_size = 0;
@@ -1789,6 +1818,7 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_fwht_q8_context fwht_q8_context;
     ggml_cuda_fwht_cast_context fwht_cast_context;
 
@@ -1805,6 +1835,8 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+
+    ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
 
     ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
     ggml_cuda_fwht_cast_context & fwht_cast() { return fwht_cast_context; }
