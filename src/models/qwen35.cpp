@@ -269,9 +269,13 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
-    return ggml_mul(ctx0, normalized, gated_silu);
+    // silu(gate) * normalized as one GLU op instead of a unary followed by a mul. The CUDA backend already
+    // fuses that pair into one gated launch, so this is not about the launch count: it is that a real GLU
+    // node has two sources and so cannot run in place, which keeps the layer output in a block of its own.
+    // Downstream that matters -- ggml-alloc otherwise lets the rotation's input share a block with the
+    // multiply's input, and the fused Hadamard transform has to decline the in-place fold it could take.
+    return ggml_swiglu_split(ctx0, gate, normalized);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
