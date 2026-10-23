@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstring>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -135,6 +137,27 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // The fused gated_delta_net can absorb the gate/beta activation (two elementwise ops fewer per
+    // layer), but only backends with a kernel that implements it know how: CUDA, ROCm, MUSA and the
+    // CPU reference. Any other backend in the split keeps the explicit chain.
+    // GGML_GDN_RAW_GATES_DISABLE=1 forces the explicit chain (A/B switch).
+    static const bool raw_gates_disabled = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr &&
+                                           atoi(getenv("GGML_GDN_RAW_GATES_DISABLE")) != 0;
+    gdn_raw_gates = cparams.fused_gdn_ar && cparams.fused_gdn_ch && !raw_gates_disabled;
+    for (const auto & ldev : model.devices) {
+        if (ldev.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+        const char * reg_name  = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr ||
+            (strcmp(reg_name, "CPU")  != 0 && strcmp(reg_name, "CUDA") != 0 &&
+             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0)) {
+            gdn_raw_gates = false;
+            break;
+        }
+    }
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -359,21 +382,38 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
-
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+    // the gate is -exp(A_log) * softplus(alpha + dt_bias) and beta goes through a sigmoid; with raw
+    // gates the gated_delta_net kernel applies both, so the graph skips four elementwise ops
+    const bool raw_gates = gdn_raw_gates &&
+        model.layers[il].ssm_dt->type == GGML_TYPE_F32 && ggml_is_contiguous(model.layers[il].ssm_dt) &&
+        model.layers[il].ssm_a->type  == GGML_TYPE_F32 && ggml_is_contiguous(model.layers[il].ssm_a);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+    ggml_tensor * gate    = nullptr;
+    ggml_tensor * raw_dt  = nullptr;
+    ggml_tensor * raw_a   = nullptr;
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    if (raw_gates) {
+        gate   = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
+        raw_dt = model.layers[il].ssm_dt;
+        raw_a  = model.layers[il].ssm_a;
+        cb(gate, "gate_raw", il);
+    } else {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
+
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -445,7 +485,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
+            raw_dt, raw_a);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

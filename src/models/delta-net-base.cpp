@@ -377,7 +377,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * raw_dt,
+        ggml_tensor * raw_a) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -400,6 +402,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    if (raw_dt != nullptr) {
+        // g and b are pre-activation: the kernel applies softplus/sigmoid, four elementwise ops fewer
+        ggml_gated_delta_net_set_raw_gates(result, raw_dt, raw_a);
+    }
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -429,8 +435,16 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        ggml_tensor * raw_dt,
+        ggml_tensor * raw_a) {
     const int64_t n_seq_tokens = q->ne[2];
+
+    if (raw_dt != nullptr) {
+        // only the fused operator can take pre-activation gates
+        GGML_ASSERT(cparams.fused_gdn_ar && cparams.fused_gdn_ch);
+        return build_delta_net_fused(q, k, v, g, b, s, il, raw_dt, raw_a);
+    }
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
@@ -536,7 +550,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        raw_dt,
+        ggml_tensor *        raw_a) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -550,7 +566,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             !(cparams.rs_rollback_prompt_only && n_seq_tokens == 1);
 
     if (!keep) {
-        auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+        auto attn_out = build_delta_net(q, k, v, g, b, s, il, raw_dt, raw_a);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);
@@ -569,6 +585,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (raw_dt != nullptr) {
+        ggml_gated_delta_net_set_raw_gates(gdn_out, raw_dt, raw_a);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

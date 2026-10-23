@@ -4707,17 +4707,18 @@ struct test_gated_delta_net : public test_case {
     const int     v_repeat;
     const bool    permuted;
     const bool    kda;
-    const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const int64_t K;   // snapshot slot count: 1 = final-only, >1 = last K states
+    const bool    raw; // g/beta arrive pre-activation (ggml_gated_delta_net_set_raw_gates)
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, raw);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool raw = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), raw(raw) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4743,10 +4744,20 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
+        // pre-activation gates: the kernel applies softplus(g + dt[h]) * a[h] and sigmoid(beta)
+        ggml_tensor * dt = raw ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_count * v_repeat) : nullptr;
+        ggml_tensor * a  = raw ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_count * v_repeat) : nullptr;
+        if (raw) {
+            ggml_set_name(dt, "dt");
+            ggml_set_name(a,  "a");
+        }
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (raw) {
+            ggml_gated_delta_net_set_raw_gates(out, dt, a);
+        }
         return out;
     }
 
@@ -4754,9 +4765,14 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                // activated gates live in the log domain; raw ones are plain projections
+                if (raw) { init_tensor_uniform(t, -5.0f, 5.0f); } else { init_tensor_uniform(t, -20.0f, -1e-4f); }
             } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, 1.0f);
+                if (raw) { init_tensor_uniform(t, -3.0f, 3.0f); } else { init_tensor_uniform(t, 0.0f, 1.0f); }
+            } else if (strcmp(t->name, "dt") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -1.0f, -1e-3f); // -A_log.exp() is negative: the gate decays
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else {
@@ -11105,6 +11121,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // pre-activation gates: the kernel applies sigmoid(beta) and a[h]*softplus(g + dt[h]) itself
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, /*K=*/1, /*raw=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 8, 1, 1, false, false, /*K=*/1, /*raw=*/true)); // Volta prefill kernel
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8,   64, 4, 2, 1, false, false, /*K=*/1, /*raw=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8,   32, 4, 2, 2, false, false, /*K=*/1, /*raw=*/true)); // H_v > H_k
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8,  128, 4, 1, 1, false, false, /*K=*/4, /*raw=*/true)); // snapshot slots
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));

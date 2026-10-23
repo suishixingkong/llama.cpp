@@ -64,7 +64,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * raw_dt = nullptr,
+                ggml_tensor * raw_a  = nullptr);
 
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
@@ -74,7 +76,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                ggml_tensor * raw_dt = nullptr,
+                ggml_tensor * raw_a  = nullptr);
 
     // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
     // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
@@ -97,7 +101,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        raw_dt = nullptr,
+            ggml_tensor *        raw_a  = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2348,6 +2354,9 @@ struct llama_model_qwen35 : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+        // the gate/beta elementwise chain is folded into the gated_delta_net kernel; only backends
+        // that implement ggml_gated_delta_net_set_raw_gates may take it (see the graph constructor)
+        bool gdn_raw_gates = false;
     };
 
     struct graph_mtp : public llm_graph_context {

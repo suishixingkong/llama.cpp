@@ -2685,6 +2685,17 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // Declare that the gate and beta inputs of a scalar-gate gated_delta_net arrive pre-activation,
+    // so the kernel applies them itself instead of the graph building two extra elementwise ops per
+    // layer:
+    //   beta  -> sigmoid(beta)
+    //   g     -> exp(a[h] * softplus(g + dt_bias[h]))     (with the softplus the unary op uses)
+    // dt_bias and a are F32 [H_v] vectors, a is the already exponentiated -A_log.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a);
+
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
     // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)
