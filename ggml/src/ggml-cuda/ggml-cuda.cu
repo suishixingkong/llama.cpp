@@ -5272,6 +5272,43 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    // RMS_NORM followed by a scalar SCALE (the GDN q/k normalisation is written that way): the
+    // factor goes into the norm kernel, which then writes into the SCALE node's buffer.
+    // GGML_CUDA_RMS_NORM_SCALE=0 disables it.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        static const bool scale_fusion_disabled = getenv("GGML_CUDA_RMS_NORM_SCALE") != nullptr &&
+                                                  atoi(getenv("GGML_CUDA_RMS_NORM_SCALE")) == 0;
+        if (scale_fusion_disabled) {
+            return false;
+        }
+
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
+
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (scale->src[0] != rms_norm || !ggml_are_same_shape(rms_norm, scale)) {
+            return false;
+        }
+
+        // rms_norm kernel assumes contiguous rows, and the write goes to scale's own buffer
+        if (!ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+
+        // only the plain y = s*x form: a bias needs the fused add path
+        float bias = 0.0f;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        if (bias != 0.0f) {
+            return false;
+        }
+
+        return true;
+    }
+
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
@@ -6157,6 +6194,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
