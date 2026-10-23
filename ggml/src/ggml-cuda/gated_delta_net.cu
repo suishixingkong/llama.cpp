@@ -1,7 +1,9 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-template <int S_v, bool KDA, bool keep_rs_t>
+#include <type_traits>
+
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -79,7 +81,7 @@ gated_delta_net_cuda(const float * q,
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
         float beta_val = *beta_t;
-        if (raw_dt_bias != nullptr) {
+        if constexpr (RAW) {
             beta_val = 1.0f / (1.0f + expf(-beta_val));
         }
 
@@ -95,7 +97,7 @@ gated_delta_net_cuda(const float * q,
 
         if constexpr (!KDA) {
             float g0 = *g_t;
-            if (raw_dt_bias != nullptr) {
+            if constexpr (RAW) {
                 // raw gates: g arrives pre-activation, apply a[h] * softplus(g + dt_bias[h]) here
                 const float x = g0 + raw_dt_bias[h_idx];
                 g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
@@ -189,7 +191,7 @@ gated_delta_net_cuda(const float * q,
 // q/k/g/beta across them, so the recurrent state is streamed once instead of four times.
 // Scalar-gate only (KDA=false) and multi-token only; decode keeps the generic kernel.
 // Not selected by default -- see gdn_volta_prefill_enabled().
-template <bool keep_rs_t>
+template <bool keep_rs_t, bool RAW>
 __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * 4, 2)
 gated_delta_net_cuda_128x4_volta(const float * q,
                                  const float * k,
@@ -266,7 +268,7 @@ gated_delta_net_cuda_128x4_volta(const float * q,
         const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
         float beta_val = beta[gb_offset];
         float g0       = g[gb_offset];
-        if (raw_dt_bias != nullptr) {
+        if constexpr (RAW) {
             // raw gates: beta and g arrive pre-activation (see the generic kernel)
             beta_val = 1.0f / (1.0f + expf(-beta_val));
             const float x = g0 + raw_dt_bias[h_idx];
@@ -370,7 +372,7 @@ static bool gdn_volta_prefill_enabled() {
     return enabled;
 }
 
-template <bool KDA, bool keep_rs_t>
+template <bool KDA, bool keep_rs_t, bool RAW>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -395,19 +397,19 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, raw_dt_bias, raw_a);
             break;
         case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, raw_dt_bias, raw_a);
             break;
         case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, raw_dt_bias, raw_a);
@@ -421,7 +423,7 @@ static void launch_gated_delta_net(
                     dim3 volta_grid(H, n_seqs, 8); // 4 warps * 4 columns = 16 columns/CTA
                     const ggml_cuda_kernel_launch_params volta_params =
                         ggml_cuda_kernel_launch_params(volta_grid, block_dims, 0, stream);
-                    ggml_cuda_kernel_launch(gated_delta_net_cuda_128x4_volta<keep_rs_t>, volta_params,
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda_128x4_volta<keep_rs_t, RAW>, volta_params,
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                         sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, raw_dt_bias, raw_a);
@@ -429,7 +431,7 @@ static void launch_gated_delta_net(
                 }
             }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, raw_dt_bias, raw_a);
@@ -531,26 +533,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    // raw gates are defined for the scalar gate only, so KDA never combines with RAW: the pair is
+    // resolved at compile time, which keeps the per-token branch (and its registers) out of the
+    // hot loop. Same shape as the prism line's gated_delta_net_cuda<S_v, KDA, keep_rs_t, RAW, ...>.
+    const auto launch = [&](auto kda_v, auto keep_v, auto raw_v) {
+        launch_gated_delta_net<kda_v.value, keep_v.value, raw_v.value>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, rb_d, ra_d, stream);
+    };
+    constexpr std::true_type  yes{};
+    constexpr std::false_type no{};
     if (kda) {
-        if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, rb_d, ra_d, stream);
-        } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, rb_d, ra_d, stream);
-        }
+        if (keep_rs) { launch(yes, yes, no); } else { launch(yes, no, no); }
+    } else if (raw) {
+        if (keep_rs) { launch(no, yes, yes); } else { launch(no, no, yes); }
     } else {
-        if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, rb_d, ra_d, stream);
-        } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, rb_d, ra_d, stream);
-        }
+        if (keep_rs) { launch(no, yes, no); } else { launch(no, no, no); }
     }
 }
 
