@@ -697,7 +697,7 @@ static __device__ __forceinline__ void vec_dot_q5_K_q8_1_x4(
     }
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool q5_x4 = false, int rows_per_block_override = 0>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate = false, bool small_k = false, bool halve_iters = false, bool q5_x4 = false, int rows_per_block_override = 0>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -741,7 +741,10 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
-    bool use_gate = false;
+    // Compile-time gate selection: the launch site picks has_gate from fusion.gate, so the gate
+    // accumulation and the gate*activation tail are absent for the plain fused variants. Keeping it
+    // as a runtime bool costs a few percent on the fused instantiations (measured on Volta).
+    constexpr bool use_gate = has_gate;
     bool use_bias = false;
     bool use_gate_bias = false;
     bool use_scale = false;
@@ -755,7 +758,6 @@ static __global__ void mul_mat_vec_q(
     float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
-        use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = fusion.gate;
@@ -1318,10 +1320,17 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout);
+            if (fusion.gate != nullptr) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, true, small_k, halve_iters>, launch_params,
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, small_k, halve_iters>, launch_params,
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout);
+            }
             return;
         }
     }
@@ -1332,14 +1341,14 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (type == GGML_TYPE_Q5_K && c_ncols_dst == 4) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (cc == GGML_CUDA_CC_VOLTA && ids == nullptr && std::getenv("GGML_CUDA_VOLTA_Q5_X4") != nullptr) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout);
             return;
         }
     }
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters, false>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, y_layout);
@@ -1572,7 +1581,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const dim3 block_dims(warp_size, calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GENERIC), 1);
                     const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
                     ggml_cuda_kernel_launch(
-                        mul_mat_vec_q<type, c_ncols_dst, false, false, false, false, rows_per_block>, launch_params,
+                        mul_mat_vec_q<type, c_ncols_dst, false, false, false, false, false, rows_per_block>, launch_params,
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, false);
