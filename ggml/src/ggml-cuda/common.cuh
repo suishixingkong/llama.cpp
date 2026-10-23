@@ -1724,6 +1724,7 @@ struct ggml_cuda_fwht_cast {
     const float * signs = nullptr; // optional +-1 vector folded in before the transform
     int64_t       n     = 0;       // transform width, equal to the GEMM's K
     int64_t       rows  = 0;       // number of rows (activation columns of the GEMM)
+    int64_t       n_blk = 1;       // transform rows per sign block: row r uses signs + (r % n_blk) * n
 };
 
 struct ggml_cuda_fwht_cast_context {

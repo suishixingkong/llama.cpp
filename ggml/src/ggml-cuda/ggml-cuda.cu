@@ -3177,189 +3177,226 @@ static int ggml_cuda_try_fwht_fuse(ggml_backend_cuda_context & ctx, const ggml_c
     // (block_q8_1_mmq rows) or a cuBLAS GEMM (f16 or bf16 copy). All of them must want the same encoding.
     // The consumers' src1 shape [K, ncols] is what gets encoded (x is only known to be contiguous with
     // the same element count; in the unsigned pattern it is the [n, rows] reshape).
-    const ggml_tensor * aliases[8] = { mm };
-    int     n_aliases     = 1;
-    int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
-    int     uses_found    = 0;
-    int64_t K             = 0;
-    int64_t ncols         = 0;
-    int64_t ne0_padded    = 0;
-    int     consumers_kind = 0; // 0 = none seen yet, 1 = mat-vec q8_1 rows, 2 = f16/bf16 copy, 3 = mul_mat_q rows
-    int64_t mmq_tail       = 0; // tile-loader tail bytes mul_mat_q reads past the last row (kind 3)
-    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
-    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
-        ggml_tensor * t = cgraph->nodes[j];
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            const ggml_tensor * src = t->src[s];
-            if (!src) {
-                continue;
-            }
-            bool is_alias = false;
-            for (int a = 0; a < n_aliases; ++a) {
-                if (src == aliases[a]) {
-                    is_alias = true;
-                    break;
+    // Which encoding the consumers want, and the single launch that produces it. This can refuse: a
+    // consumer that is not a plain mat-mul, or a sign vector the encodings cannot describe. A refusal
+    // must not cost the fold of the sign flip itself, which is what the fallback below is for.
+    auto encode = [&]() -> int {
+        const ggml_tensor * aliases[8] = { mm };
+        int     n_aliases     = 1;
+        int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+        int     uses_found    = 0;
+        int64_t K             = 0;
+        int64_t ncols         = 0;
+        int64_t ne0_padded    = 0;
+        int     consumers_kind = 0; // 0 = none seen yet, 1 = mat-vec q8_1 rows, 2 = f16/bf16 copy, 3 = mul_mat_q rows
+        int64_t mmq_tail       = 0; // tile-loader tail bytes mul_mat_q reads past the last row (kind 3)
+        ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
+        for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = t->src[s];
+                if (!src) {
+                    continue;
                 }
-            }
-            if (!is_alias) {
-                continue;
-            }
-            uses_found++;
-            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
-                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
-                if (n_aliases == 8) {
+                bool is_alias = false;
+                for (int a = 0; a < n_aliases; ++a) {
+                    if (src == aliases[a]) {
+                        is_alias = true;
+                        break;
+                    }
+                }
+                if (!is_alias) {
+                    continue;
+                }
+                uses_found++;
+                if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                        ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                    if (n_aliases == 8) {
+                        return 0;
+                    }
+                    aliases[n_aliases++] = t;
+                    uses_expected += ggml_node_get_use_count(cgraph, j);
+                    continue;
+                }
+                if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] ||
+                        ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                        t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                        src->ne[2] != 1 || src->ne[3] != 1 ||
+                        (K != 0 && (src->ne[0] != K || src->ne[1] != ncols))) {
                     return 0;
                 }
-                aliases[n_aliases++] = t;
-                uses_expected += ggml_node_get_use_count(cgraph, j);
-                continue;
-            }
-            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] ||
-                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
-                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
-                    src->ne[2] != 1 || src->ne[3] != 1 ||
-                    (K != 0 && (src->ne[0] != K || src->ne[1] != ncols))) {
-                return 0;
-            }
-            const ggml_tensor * w = t->src[0];
-            // The route ggml_cuda_mul_mat takes for this consumer, in its dispatch order
-            // (MMVF, MMF, MMVQ, the Hopper Q1 tile path, MMQ, cuBLAS). A consumer that lands on a route
-            // this fusion does not write would read rows that were never produced.
-            const bool route_mmvf = ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, src->ne[1]);
-            const bool route_mmf  = ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb,
-                                                             (int) src->ne[1], false);
-            const bool route_mmvq = !route_mmvf && !route_mmf &&
-                ggml_cuda_should_use_mmvq(w->type, cc, src->ne[1]);
-            const bool mmq_ok     = ggml_cuda_should_use_mmq(w->type, cc, src->ne[1], 0);
-            const bool route_mmq  = !route_mmvf && !route_mmf && !route_mmvq && mmq_ok;
-            // q8_1 form: a mat-vec, the route ggml_cuda_mul_mat_vec_q takes. Every quantized type works:
-            // the fused quantizer writes the layout that mat-vec's own quantizer would have written (AOS
-            // for most types, SOA_ISUM/PT for PTQ1_0, PQ2 for PQ2_0 at 3-8 columns on Ada). TQ weights
-            // stay out because ggml_cuda_mul_mat hands them to ggml_cuda_mul_mat_tq, which reads F32 rows.
-            const bool as_q8 = want_q8 && ggml_is_quantized(w->type) &&
-                w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S && route_mmvq;
-            if (as_q8) {
-                const ggml_cuda_q8_1_layout q8_layout =
-                    ggml_cuda_q8_1_layout_host(w->type, (int) src->ne[1], /*has_ids=*/false);
-                if (consumers_kind == 1 && layout != q8_layout) {
-                    return 0; // consumers of different weight types want different layouts
+                const ggml_tensor * w = t->src[0];
+                // The route ggml_cuda_mul_mat takes for this consumer, in its dispatch order
+                // (MMVF, MMF, MMVQ, the Hopper Q1 tile path, MMQ, cuBLAS). A consumer that lands on a route
+                // this fusion does not write would read rows that were never produced.
+                const bool route_mmvf = ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, src->ne[1]);
+                const bool route_mmf  = ggml_cuda_should_use_mmf(w->type, cc, warp_size, w->ne, w->nb,
+                                                                 (int) src->ne[1], false);
+                const bool route_mmvq = !route_mmvf && !route_mmf &&
+                    ggml_cuda_should_use_mmvq(w->type, cc, src->ne[1]);
+                const bool mmq_ok     = ggml_cuda_should_use_mmq(w->type, cc, src->ne[1], 0);
+                const bool route_mmq  = !route_mmvf && !route_mmf && !route_mmvq && mmq_ok;
+                // q8_1 form: a mat-vec, the route ggml_cuda_mul_mat_vec_q takes. Every quantized type works:
+                // the fused quantizer writes the layout that mat-vec's own quantizer would have written (AOS
+                // for most types, SOA_ISUM/PT for PTQ1_0, PQ2 for PQ2_0 at 3-8 columns on Ada). TQ weights
+                // stay out because ggml_cuda_mul_mat hands them to ggml_cuda_mul_mat_tq, which reads F32 rows.
+                const bool as_q8 = want_q8 && ggml_is_quantized(w->type) &&
+                    w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S && route_mmvq;
+                if (as_q8) {
+                    const ggml_cuda_q8_1_layout q8_layout =
+                        ggml_cuda_q8_1_layout_host(w->type, (int) src->ne[1], /*has_ids=*/false);
+                    if (consumers_kind == 1 && layout != q8_layout) {
+                        return 0; // consumers of different weight types want different layouts
+                    }
+                    layout = q8_layout;
                 }
-                layout = q8_layout;
-            }
-            // mul_mat_q rows: q8_1 form for the tile path. Excluded, besides the routes above:
-            //   - Q1_0/PQ2_0 at ncols >= 128 on Hopper, where ggml_cuda_mul_mat_q1_hopper reads src1 as
-            //     F32 and quantizes it itself (bailing unconditionally is the safe side: that path is
-            //     compile- and env-gated, so it cannot be ruled out from here);
-            //   - types whose tile layout the fused quantizer does not write (see ggml_cuda_fwht_mmq_layout).
-            const bool hopper_q1 = (w->type == GGML_TYPE_Q1_0 || w->type == GGML_TYPE_PQ2_0) &&
-                src->ne[1] >= 128 && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
-            ggml_cuda_q8_1_layout mmq_layout = GGML_CUDA_Q8_1_AOS;
-            const bool as_mmq = !as_q8 && want_mmq && route_mmq && !hopper_q1 &&
-                ggml_cuda_fwht_mmq_layout(w->type, mmq_layout);
-            // f16/bf16 form: a GEMM, i.e. the route ggml_cuda_mul_mat_cublas takes once every route above
-            // has declined
-            const bool as_cast = want_cast && !as_q8 && !as_mmq && !route_mmvf && !route_mmf && !route_mmvq &&
-                !mmq_ok && ggml_is_quantized(w->type) &&
-                w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S &&
-                ggml_is_contiguously_allocated(src);
-            if (!as_q8 && !as_mmq && !as_cast) {
-                return 0;
-            }
-            const int kind = as_q8 ? 1 : (as_mmq ? 3 : 2);
-            if (consumers_kind != 0 && consumers_kind != kind) {
-                return 0; // consumers want different encodings: keep the plain transform
-            }
-            if (as_mmq) {
-                if (consumers_kind == 3 && layout != mmq_layout) {
-                    return 0; // consumers disagree on the scale layout the tile kernels read
+                // mul_mat_q rows: q8_1 form for the tile path. Excluded, besides the routes above:
+                //   - Q1_0/PQ2_0 at ncols >= 128 on Hopper, where ggml_cuda_mul_mat_q1_hopper reads src1 as
+                //     F32 and quantizes it itself (bailing unconditionally is the safe side: that path is
+                //     compile- and env-gated, so it cannot be ruled out from here);
+                //   - types whose tile layout the fused quantizer does not write (see ggml_cuda_fwht_mmq_layout).
+                const bool hopper_q1 = (w->type == GGML_TYPE_Q1_0 || w->type == GGML_TYPE_PQ2_0) &&
+                    src->ne[1] >= 128 && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+                ggml_cuda_q8_1_layout mmq_layout = GGML_CUDA_Q8_1_AOS;
+                const bool as_mmq = !as_q8 && want_mmq && route_mmq && !hopper_q1 &&
+                    ggml_cuda_fwht_mmq_layout(w->type, mmq_layout);
+                // f16/bf16 form: a GEMM, i.e. the route ggml_cuda_mul_mat_cublas takes once every route above
+                // has declined
+                const bool as_cast = want_cast && !as_q8 && !as_mmq && !route_mmvf && !route_mmf && !route_mmvq &&
+                    !mmq_ok && ggml_is_quantized(w->type) &&
+                    w->type != GGML_TYPE_TQ4_1S && w->type != GGML_TYPE_TQ3_1S &&
+                    ggml_is_contiguously_allocated(src);
+                if (!as_q8 && !as_mmq && !as_cast) {
+                    return 0;
                 }
-                layout = mmq_layout;
-                // same fallback flag and J_max ggml_cuda_mul_mat_q sizes its own buffer with
-                mmq_tail = (int64_t) ggml_cuda_mmq_get_J_max(w->type, w->ne[1] % 128 != 0, cc, src->ne[1]) *
-                    (int64_t) sizeof(block_q8_1_mmq);
-            }
-            consumers_kind = kind;
-            K     = src->ne[0];
-            ncols = src->ne[1];
-            // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
-            if (as_q8 &&
-                    ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                    ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
-                return 0;
+                const int kind = as_q8 ? 1 : (as_mmq ? 3 : 2);
+                if (consumers_kind != 0 && consumers_kind != kind) {
+                    return 0; // consumers want different encodings: keep the plain transform
+                }
+                if (as_mmq) {
+                    if (consumers_kind == 3 && layout != mmq_layout) {
+                        return 0; // consumers disagree on the scale layout the tile kernels read
+                    }
+                    layout = mmq_layout;
+                    // same fallback flag and J_max ggml_cuda_mul_mat_q sizes its own buffer with
+                    mmq_tail = (int64_t) ggml_cuda_mmq_get_J_max(w->type, w->ne[1] % 128 != 0, cc, src->ne[1]) *
+                        (int64_t) sizeof(block_q8_1_mmq);
+                }
+                consumers_kind = kind;
+                K     = src->ne[0];
+                ncols = src->ne[1];
+                // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
+                if (as_q8 &&
+                        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                        ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
+                    return 0;
+                }
             }
         }
-    }
-    if (uses_found == 0 || uses_found != uses_expected || K == 0) {
-        return 0;
-    }
-    if (consumers_kind == 2) {
-        // The GEMM reads [K, ncols] rows of the transform output and converts them to its own type. The
-        // transform width has to be the row width for the fused copy to line up (ggml_cuda_op_fwht uses
-        // src->ne[0], so a wider input row would mean a different transform), and the input has to be F32
-        // -- the warp/block kernels load floats.
-        if (K != n || x->ne[0] != n || x->type != GGML_TYPE_F32 || !ggml_cuda_fwht_cast_supported((int) n) ||
-                (signs && (signs->ne[0] != n || !ggml_is_contiguous(signs)))) {
+        if (uses_found == 0 || uses_found != uses_expected || K == 0) {
             return 0;
         }
-        // No buffer is handed over here: the GEMM allocates its own f16/bf16 temporary and calls
-        // ggml_cuda_fwht_cast_to() to fill it, so unlike the q8_1 form nothing has to be held across
-        // nodes and the F32 output of the transform is simply never touched.
-        ggml_cuda_fwht_cast plan;
-        plan.src   = (const float *) x->data;
-        plan.signs = signs ? (const float *) signs->data : nullptr;
-        plan.n     = n;
-        plan.rows  = ggml_nelements(mm) / n;
+        if (consumers_kind == 2) {
+            // The GEMM reads [K, ncols] rows of the transform output and converts them to its own type. The
+            // transform width has to be the row width for the fused copy to line up (ggml_cuda_op_fwht uses
+            // src->ne[0], so a wider input row would mean a different transform), and the input has to be F32
+            // -- the warp/block kernels load floats.
+            // x is the multiply's input, so it can be several transform blocks wide (the graph applies the
+            // sign vector before reshaping); the fused load takes the block for the row it is on.
+            if (K != n || x->ne[0] % n != 0 || x->type != GGML_TYPE_F32 || !ggml_cuda_fwht_cast_supported((int) n) ||
+                    (signs && (signs->ne[0] != x->ne[0] || !ggml_is_contiguous(signs)))) {
+                return 0;
+            }
+            // No buffer is handed over here: the GEMM allocates its own f16/bf16 temporary and calls
+            // ggml_cuda_fwht_cast_to() to fill it, so unlike the q8_1 form nothing has to be held across
+            // nodes and the F32 output of the transform is simply never touched.
+            ggml_cuda_fwht_cast plan;
+            plan.src   = (const float *) x->data;
+            plan.signs = signs ? (const float *) signs->data : nullptr;
+            plan.n     = n;
+            plan.rows  = ggml_nelements(mm) / n;
+            plan.n_blk = x->ne[0] / n;
+            for (int a = 0; a < n_aliases; ++a) {
+                ctx.fwht_cast().set(aliases[a], plan);
+            }
+            return consumed;
+        }
+        if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
+            return 0;
+        }
+
+        ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+        if (consumers_kind == 1) {
+            // same (type, ncols, ids) -> padding as ggml_cuda_mul_mat_vec_q; `layout` was taken from
+            // ggml_cuda_q8_1_layout_host() for the consumers' weight type inside the loop
+            if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+                ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);
+            }
+        } else if (ne0_padded % QK8_1_MMQ != 0) {
+            return 0; // mul_mat_q pads to MATRIX_ROW_PADDING, which holds whole 128-value blocks
+        }
+        if (ne0_padded % n != 0) {
+            return 0; // the fused quantizer writes pad blocks in transform-width units
+        }
+        // The q8_1 rows are 9/8 bytes per element in both layouts (block_q8_1 and block_q8_1_mmq). The
+        // mul_mat_q form also needs the tile loader's tail: ggml_cuda_mul_mat_q allocates
+        // ggml_cuda_mmq_get_J_max() * sizeof(block_q8_1_mmq) past the last row and the kernel reads it
+        // (masked on write-back, but a real read), so the rows cannot sit at the end of the F32 buffer
+        // unless that much room is left in it.
+        const bool   mmq_rows = consumers_kind == 3;
+        const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1 + (size_t) mmq_tail;
+        void * out = mm->data;
+        if (out_aliases_in) {
+            auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+            out = blk->get();
+            ctx.fwht_q8().held.push_back(std::move(blk));
+        } else if ((int64_t) q8_bytes > (int64_t) ggml_nbytes(mm)) {
+            return 0; // the quantized rows must fit in the F32 output allocation
+        }
+
+        fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
+                                    out, layout, K, ne0_padded, ncols, ctx.stream());
+
+        ggml_cuda_fwht_q8 e;
+        e.kind   = mmq_rows ? GGML_CUDA_FWHT_Q8_MMQ : GGML_CUDA_FWHT_Q8_MMVQ;
+        e.layout = layout;
+        e.ne0    = ne0_padded;
+        e.ncols  = ncols;
+        e.data   = out;
         for (int a = 0; a < n_aliases; ++a) {
-            ctx.fwht_cast().set(aliases[a], plan);
+            ctx.fwht_q8().set(aliases[a], e);
         }
         return consumed;
-    }
-    if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
-        return 0;
+    };
+    if (const int encoded = encode(); encoded > 0) {
+        return encoded;
     }
 
-    ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
-    if (consumers_kind == 1) {
-        // same (type, ncols, ids) -> padding as ggml_cuda_mul_mat_vec_q; `layout` was taken from
-        // ggml_cuda_q8_1_layout_host() for the consumers' weight type inside the loop
-        if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
-            ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);
+    if (consumed == 3) {
+        // Fold the multiply only: transform (x * signs) row by row and write F32. That is exactly what the
+        // MUL launch followed by the plain transform produced -- a +-1 product is exact, so moving it to
+        // the other side of the transform's 1/sqrt(n) scale changes no bit -- and because nothing is
+        // registered for the consumers they all keep their own conversion. This is the branch that runs
+        // when the encoding analysis declines: on Bonsai 2 at prefill batch sizes every rotation has a
+        // consumer that is not a plain mat-mul, or a sign vector spanning more than one transform block,
+        // and each of those left a 12-us MUL launch per layer on the table.
+        const bool plain_ok = x->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(x) &&
+            x->ne[0] % n == 0 && ggml_cuda_fwht_cast_supported((int) n) &&
+            (!signs || (ggml_is_contiguous(signs) && signs->ne[0] == x->ne[0])) &&
+            !overlaps(x, mm) && (!signs || !overlaps(signs, mm));
+        if (plain_ok) {
+            ggml_cuda_fwht_cast plan;
+            plan.src   = (const float *) x->data;
+            plan.signs = signs ? (const float *) signs->data : nullptr;
+            plan.n     = n;
+            plan.n_blk = signs ? x->ne[0] / n : 1;
+            plan.rows  = ggml_nelements(mm) / n;
+            if (ggml_cuda_fwht_cast_to(plan, mm->data, GGML_TYPE_F32, ctx.stream())) {
+                return consumed;
+            }
         }
-    } else if (ne0_padded % QK8_1_MMQ != 0) {
-        return 0; // mul_mat_q pads to MATRIX_ROW_PADDING, which holds whole 128-value blocks
     }
-    if (ne0_padded % n != 0) {
-        return 0; // the fused quantizer writes pad blocks in transform-width units
-    }
-    // The q8_1 rows are 9/8 bytes per element in both layouts (block_q8_1 and block_q8_1_mmq). The
-    // mul_mat_q form also needs the tile loader's tail: ggml_cuda_mul_mat_q allocates
-    // ggml_cuda_mmq_get_J_max() * sizeof(block_q8_1_mmq) past the last row and the kernel reads it
-    // (masked on write-back, but a real read), so the rows cannot sit at the end of the F32 buffer
-    // unless that much room is left in it.
-    const bool   mmq_rows = consumers_kind == 3;
-    const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1 + (size_t) mmq_tail;
-    void * out = mm->data;
-    if (out_aliases_in) {
-        auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
-        out = blk->get();
-        ctx.fwht_q8().held.push_back(std::move(blk));
-    } else if ((int64_t) q8_bytes > (int64_t) ggml_nbytes(mm)) {
-        return 0; // the quantized rows must fit in the F32 output allocation
-    }
-
-    fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
-                                out, layout, K, ne0_padded, ncols, ctx.stream());
-
-    ggml_cuda_fwht_q8 e;
-    e.kind   = mmq_rows ? GGML_CUDA_FWHT_Q8_MMQ : GGML_CUDA_FWHT_Q8_MMVQ;
-    e.layout = layout;
-    e.ne0    = ne0_padded;
-    e.ncols  = ncols;
-    e.data   = out;
-    for (int a = 0; a < n_aliases; ++a) {
-        ctx.fwht_q8().set(aliases[a], e);
-    }
-    return consumed;
+    return 0;
 }
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
