@@ -188,6 +188,7 @@ gated_delta_net_cuda(const float * q,
 // Volta prefill specialization for S_v=128: each warp owns 4 state columns and reuses
 // q/k/g/beta across them, so the recurrent state is streamed once instead of four times.
 // Scalar-gate only (KDA=false) and multi-token only; decode keeps the generic kernel.
+// Not selected by default -- see gdn_volta_prefill_enabled().
 template <bool keep_rs_t>
 __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * 4, 2)
 gated_delta_net_cuda_128x4_volta(const float * q,
@@ -354,6 +355,21 @@ gated_delta_net_cuda_128x4_volta(const float * q,
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+// A/B switch for the Volta prefill specialization. Off by default: on V100-SXM2 the specialization
+// loses to the generic kernel at every prefill batch we measured (pp512 -4.2%, pp2048 -3.6%).
+// The specialization trades parallelism for register reuse -- one warp keeps four state columns and
+// streams q/k/g/beta once instead of four times -- which shrinks the grid from (H, n_seqs, 32) to
+// (H, n_seqs, 8). At 128 CTAs of 4 warps on 80 SMs that is ~6 warps resident per SM, too few to hide
+// the per-token global reads, while the loads it saves are already coalesced and L2-resident.
+// GGML_CUDA_GDN_VOLTA_PREFILL=1 re-enables it.
+static bool gdn_volta_prefill_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GDN_VOLTA_PREFILL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -401,7 +417,7 @@ static void launch_gated_delta_net(
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             if constexpr (!KDA) {
                 const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-                if (cc == GGML_CUDA_CC_VOLTA && n_tokens > 1) {
+                if (cc == GGML_CUDA_CC_VOLTA && n_tokens > 1 && gdn_volta_prefill_enabled()) {
                     dim3 volta_grid(H, n_seqs, 8); // 4 warps * 4 columns = 16 columns/CTA
                     const ggml_cuda_kernel_launch_params volta_params =
                         ggml_cuda_kernel_launch_params(volta_grid, block_dims, 0, stream);
