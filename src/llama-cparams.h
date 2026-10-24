@@ -81,6 +81,8 @@ struct llama_cparams {
 
     uint32_t kv_stream_arena_mib;
 
+    size_t moe_cache_size;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

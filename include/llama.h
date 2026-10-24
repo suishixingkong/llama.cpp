@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +78,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -441,6 +442,8 @@ extern "C" {
         int32_t moe_cache_expert_parallel;          // -1 = provider policy, 0 = disabled, N = device fanout
         int32_t moe_cache_cpu_overlap;              // -2 = inherit provider, -1 = auto, 0..8 = CPU rows per operation
         const char * moe_cache_profile_path;        // optional versioned expert heatmap
+
+        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

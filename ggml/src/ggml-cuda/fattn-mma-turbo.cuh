@@ -62,9 +62,9 @@ static size_t ggml_cuda_fattn_mma_turbo_shared_bytes(
 
     const bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
 
-    const bool swizzled     = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols1, ncols2, cc);
-    const int stride_tile_K = ggml_cuda_fattn_mma_get_stride_tile(nbatch_K2, swizzled);
-    const int stride_tile_V = V_is_K_view ? stride_tile_K : ggml_cuda_fattn_mma_get_stride_tile(nbatch_V2, swizzled);
+    const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
+    const int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
+    const int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const size_t nbytes_shared_KV = nbatch_fa * std::max(stride_tile_K, stride_tile_V) * sizeof(half2);
     const size_t nbytes_shared_Q  = ncols  * (DKQ/2 + 4)               * sizeof(half2);

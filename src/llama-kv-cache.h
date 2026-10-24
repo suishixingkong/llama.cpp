@@ -1602,8 +1602,8 @@ private:
     const uint32_t n_swa = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
 
     // fork 9l-dsa-indexer-rot: true when the K rotation of this cache is applied by the MODEL
     // itself with a plain ggml_mul_mat rather than through llama_mul_mat_hadamard. ggml_mul_mat

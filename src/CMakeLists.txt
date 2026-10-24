@@ -92,6 +92,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-stream-softmax.cpp
     llama-kv-stream-softmax.h
     llama-memory.cpp
+    llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
