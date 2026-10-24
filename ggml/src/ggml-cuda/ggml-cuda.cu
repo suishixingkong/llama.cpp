@@ -1825,6 +1825,20 @@ struct ggml_backend_cuda_kv_stream_buffer_context {
     void * host_data = nullptr;
 };
 
+// Moves every time any kv-stream runtime's generation moves. A graph launch uses it to decide in O(1)
+// whether the generation scan below can still reach the verdict it reached last time: that scan walks
+// every node and every source of the graph (~650 nodes at 2 B) and cost 19.6 us per launch, on the
+// steady-state path where nothing about the kv-stream has changed. Because every write to a runtime's
+// generation goes through this helper, an unchanged epoch means an unchanged scan result, so skipping
+// the scan is exact rather than a shortcut.
+static std::atomic<uint64_t> g_kv_stream_generation_epoch{0};
+
+static void ggml_cuda_kv_stream_bump_generation(
+        ggml_backend_cuda_kv_stream_runtime_t runtime, const uint64_t delta) {
+    runtime->generation += delta;
+    g_kv_stream_generation_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
 static void ggml_backend_cuda_kv_stream_runtime_release(
         ggml_backend_cuda_kv_stream_runtime_t runtime) {
     if (runtime == nullptr || runtime->references.fetch_sub(1, std::memory_order_acq_rel) != 1) {
@@ -1867,7 +1881,7 @@ static void ggml_backend_cuda_kv_stream_buffer_memset(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(context->runtime, 1);
     memset(static_cast<char *>(tensor->data) + offset, value, size);
 }
 
@@ -1875,7 +1889,7 @@ static void ggml_backend_cuda_kv_stream_buffer_set(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(context->runtime, 1);
     memcpy(static_cast<char *>(tensor->data) + offset, data, size);
 }
 
@@ -1888,7 +1902,7 @@ static void ggml_backend_cuda_kv_stream_buffer_get(
 static void ggml_backend_cuda_kv_stream_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(context->runtime, 1);
     memset(context->host_data, value, buffer->size);
 }
 
@@ -2187,7 +2201,7 @@ bool ggml_backend_cuda_kv_stream_resize_pool(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
-    ++runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(runtime, 1);
     return true;
 }
 
@@ -2230,7 +2244,7 @@ bool ggml_backend_cuda_kv_stream_reconfigure(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
-    ++runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(runtime, 1);
     return true;
 }
 
@@ -2259,7 +2273,9 @@ bool ggml_backend_cuda_kv_stream_repartition(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
-    runtime->generation += changed;
+    if (changed) {
+        ggml_cuda_kv_stream_bump_generation(runtime, 1);
+    }
     return true;
 }
 
@@ -2285,7 +2301,7 @@ bool ggml_backend_cuda_kv_stream_set_decode_layout(
     runtime->dirty_rows_remaining = 0;
     runtime->staged_set_rows = 0;
     runtime->staged_set_rows_bytes = 0;
-    ++runtime->generation;
+    ggml_cuda_kv_stream_bump_generation(runtime, 1);
     return true;
 }
 
@@ -4535,6 +4551,19 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // Reuse needs both the same graph and the same kv-stream state as last time. The epoch settles the
+    // second half without the scan: it only moves when a runtime's generation does, and the scan below
+    // reports nothing new in that case. Reading it before the scan keeps a bump that lands mid-scan
+    // visible to the next call.
+    const uint64_t kv_stream_epoch = g_kv_stream_generation_epoch.load(std::memory_order_relaxed);
+    if (cgraph->uid != 0 &&
+        cgraph->uid == graph->uid &&
+        kv_stream_epoch == graph->kv_stream_epoch) {
+        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
+        GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+        return false;
+    }
+
     uint64_t kv_stream_generation = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
@@ -4551,6 +4580,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         previous_kv_stream_generation = std::max(
             previous_kv_stream_generation, prop.kv_stream_generation);
     }
+    graph->kv_stream_epoch = kv_stream_epoch;
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&

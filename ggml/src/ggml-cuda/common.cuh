@@ -1454,6 +1454,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t kv_stream_epoch = 0; // kv-stream generation epoch the node_props above were filled at
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
