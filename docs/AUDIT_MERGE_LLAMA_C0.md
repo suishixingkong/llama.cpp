@@ -203,3 +203,40 @@ cmake -S tmp/wt-c0 -B tmp/build-c1 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build tmp/build-c1 -- -k 0
 ```
 ⚠️ 本机 `cl.exe` 传 `/nologo` 会被 MSYS 改写路径 ⇒ 一律用 `-nologo` 形式。
+
+## 10 C2 执行记录（段末 `552f18f91`，23 文件 / 56 段，提交 `56565e159`）
+
+### 10.1 逐文件处置（按「重复功能保留 master」规矩）
+| 文件 | 处置 | 理由 |
+|---|---|---|
+| `mmq.cuh` | ours | master Volta `== GGML_CUDA_CC_VOLTA` Q6_K dp4a 特例保留，上游只加 `!defined(GGML_USE_MUSA)` 守卫 |
+| `norm.cu`/`norm.cuh` | ours | master `post_scale` / `rms_norm_scale_f32_cuda`；上游 scale_out 是重复功能 |
+| `mmvq.cu` | ours | master `MMVQ_PARAMETERS_VOLTA` 表 |
+| `fwht.cu`/`fwht.cuh` | ours + 上游谓词 | master 富版 `fwht_cuda<N,Tout,has_signs>`+block butterfly（64–4096）；补上游 `ggml_cuda_op_mul_mat_use_fwht` 谓词 + **TSrc 模板参**（F16 输入），否则上游 impl<T> 与 master fwht_launch 混拼 `const half*`→`const float*` 直接崩 |
+| `ggml-cuda.cu` | 并集 | `GGML_OP_TURBO_WHT`+`GGML_OP_SCALE` 都留；删重复 `_fused` RMS_NORM+SCALE dispatch |
+| `generate_cu_files.py` | 并集 | PTQ1_0 CUDA-only 实例 + MXFP4/NVFP4 W4A4 |
+| `ggml-cpu.c` | ours | `ggml_cpu_vec_dot_type`（PQ2_0→Q8_0）是 Bonsai 验收门硬依赖 |
+| `llama-kv-cells.h` | 并集 | `seq_pos_get`（上游）+ master `seq_pos_tok_le` 注释 |
+| `include/llama.h` | 并集 | master `llama_decode_phase`+`llama_set_decode_phase` + 上游 `llama_batch_ext` 块 |
+| `llama-graph.{h,cpp}` | 并集 | hadamard_rotations/inverses + prec_policy；build_attn 保留 TurboQuant Q 预旋转 |
+| `llama-context.cpp` | ours 骨架 + 上游签名 | `vbr_decode_txn` 保留；`decode()` 收 `llama_batch_ext` |
+| `common/common.{h,cpp}` | 并集 + 恢复 | fs_* 返回 path；`common_moe_cache_profile_file` 转 utf8；**恢复 `common_batch_add`/`common_batch_clear`** |
+| `common/fit.cpp` | ours | moe_tensors / fit_selected / vbr_costs |
+| `common/speculative.cpp` | ours 逻辑 + 上游 API | MTP preflight 生命周期适配 extended batch |
+| `conversion/base.py` | 并集 | hadamard_folded_names/add_hadamard_metadata + `_tag_prec_a4` |
+| `server-context.cpp` | ours + 上游 API | decode() hard-seal 三特性保留；`llama_batch_view`→`llama_process`/`common_batch`；swap-aware mmproj fit |
+| `test-llama-archs.cpp` | 并集 | `test_qwen4_vbr_*`×3 + `check_causal_attn_toggle` |
+| `test-recurrent-state-rollback.cpp` | ours（延 C4） | `a17e94d22`(#30023) 在 C4 并入 cases-rs.cpp |
+| `llama-bench.cpp` | 并集 | kv-stream/n-parallel + repack；quiet 日志回调取 master |
+| `docs/build.md` | 并集 | FA_MMA + MMQ_PREC 两段都留 |
+
+### 10.2 ⭐ 新发现：上游删除 `common_batch_add`/`common_batch_clear`（C0 漏抓的静默删除）
+上游把 `llama_batch` 迁移到 `common_batch` 类时删掉了这两个 helper，但 master 的
+`test-recurrent-state-rollback` / `test-vbr-representation-epoch` / `test-vbr-swa-window` 以及
+`server-context.cpp` 的「尾部 frontier 补解码」仍走 `llama_batch`+compat `llama_decode`，共 14 处调用点
+静默失效（构建 C3861）。修法 = 在 common.h/cpp 恢复这两个 20 行 helper，不重写调用点（`llama_batch` 结构仍在）。
+
+### 10.3 验证
+- `cmake --build -- -k 0`：**RC=0，0 FAILED**（sm_70 全量）。
+- ctest：**103/111**；8 红与 C1 完全同集（无 GPU `0xc0000409` / 无网 / 无 jinja2），无新回归。
+- 零损失标记 vs master：`fork 9l-` 593/593、PQ2_0 292→301、PTQ1_0 372→380、TURBO_WHT 59/59、vbr_pools_ 154→155、kv_stream 1371→1372（全 merged≥master）。
