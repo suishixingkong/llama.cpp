@@ -240,3 +240,48 @@ cmake --build tmp/build-c1 -- -k 0
 - `cmake --build -- -k 0`：**RC=0，0 FAILED**（sm_70 全量）。
 - ctest：**103/111**；8 红与 C1 完全同集（无 GPU `0xc0000409` / 无网 / 无 jinja2），无新回归。
 - 零损失标记 vs master：`fork 9l-` 593/593、PQ2_0 292→301、PTQ1_0 372→380、TURBO_WHT 59/59、vbr_pools_ 154→155、kv_stream 1371→1372（全 merged≥master）。
+
+## 11 C3 执行记录（段末 `03aa006ac`，21 文件 / 53 段，提交 `c07179456`）
+
+### 11.1 唯一需要「重挂」而非「取边」的文件：`fattn-mma-f16.cuh`
+上游 C3 第三次重构了 `mma.cuh` 的 swizzle/ldmatrix API（`mma.cuh` 本身 fork 从未改过，故直接取上游）：
+删 `ggml_cuda_fattn_mma_bank_aligned` / `_get_stride_tile`，`get_swizzled()` 改收 `ncols`，
+`swizzle_bytes<swz,T>` → `swizzle<stride,T>`，`load_ldmatrix<swz>` → `load_ldmatrix_swizzled<stride>`。
+fork 的 turbo loader 写于旧 API 上，`git checkout --ours` 后无法编译。
+处置：**把上游的 API 迁移应用到 ours**（而非把 fork 特性重挂到上游文件上——上游 delta 仅 247 行，
+fork delta 1113 行，方向取小的一侧）：
+| 变更 | 说明 |
+|---|---|
+| 删 `bank_aligned`/`get_stride_tile` | stride 内联为 `swz ? nbatch_2 : nbatch_2 + 4` |
+| 两个 loader 去掉 `bool swz` 模板参 | 写入端改走 `swizzle<stride_tile>`；`+4` 填充使非 swizzle 瓦片按构造落回恒等映射 |
+| `load_ldmatrix{,_trans}<swz>` → `_swizzled<stride_tile>` | 含 Volta 分支（上游已删 `static_assert(!swz, "Volta has no ldmatrix")`） |
+| `tile_V_i` 指针 → `tile_V_offset_i` 整数 | 配合上游 `load_ldmatrix_trans_swizzled` 的偏移式 |
+| 新增 Volta `(320,256)` 两档 + `async_kv_preload` 实参 | 上游纯新增，全保留（后者只在 DGX Spark + scan_mask 生效） |
+
+### 11.2 ⭐ 上游 C3 引入第二套 MoE 缓存（决策：保留休眠）
+| | 上游 `src/llama-moe-cache.cpp`（550 行） | fork `ggml/src/ggml-cuda/moe-cache.cu`（4474 行） |
+|---|---|---|
+| 机制 | host slot map + 设备 bank，miss 在 scheduler copy callback 里上传 | CPU `MUL_MAT_ID` 拦截 `begin/plan/dispatch/collect` |
+| 命中行算在哪 | GPU（用 bank + slot ids 替换专家张量） | GPU（MMV 直接派发） |
+| 未命中行算在哪 | —（全部行都在 GPU，miss 每步重传） | **CPU**（`miss_mask = valid_mask & ~hit_mask`）⇒ 热专家永不重传 |
+| 批量上限 | `max_batch = 32` | 无此硬门 |
+| 融合 | 无 | `fused_begin`：up*GLU(+down) 单核 |
+| 其它 | — | expert-parallel / cpu-overlap / heatmap profile |
+结论：**上游不是超集**，且在「主机↔设备流量」这一关键轴上更差（每 miss 重传专家）。
+两者都改写同一批 `MUL_MAT_ID` 节点，**绝不能同时启用** ⇒ 上游类保留编译（便于下次 rebase），
+用 `use_upstream_moe_cache = false` 挡死实例化；`--moe-cache-mib`（上游旋钮）改喂 provider 预算。
+
+### 11.3 其余处置
+- `gated_delta_net.cu` / `fwht.cu` / `norm.cu`：ours（Volta prefill / per-block FWHT / post_scale）。
+- `ggml-backend.cpp`：ours（MoE session 钩子），补上游 helper 拆分。
+- `llama-cparams.h` / `llama-context.cpp` / `llama-graph.cpp`：并集（`vbr_*`+`hadamard_*` + 上游 `moe_cache_size`）。
+- `llama-kv-cache.cpp`：上游 `n_rot_k/n_rot_v` + fork `attn_rot_k_whole_head`，`build_input_k_rot` 保留 `LLAMA_ATTN_ROT_K_NROT`。
+- `qwen35.cpp`：上游 `crop_before_nextn/crop_after_nextn` 取代本地 `narrow_last`（真值表相同）。
+- `test-quantize-fns.cpp`：ternary dot + 上游 degenerate-imatrix 并集。
+- `tests/test-recurrent-state-rollback.cpp`：ours（延 C4）。
+
+### 11.4 验证
+- `cmake --build -- -k 0`：**RC=0，228/228 链接，0 错误**，162 处 fattn 重编（sm_70）。
+- ctest：**103/111**，8 红与 C1/C2 同集（无 GPU `0xc0000409` / 无网 / 无 jinja2），无新回归。
+- 零损失：`fork 9l-` 593→598、PQ2_0 292→303、PTQ1_0 372→382、TURBO_WHT 59→61、
+  vbr_pools_ 154→156、kv_stream 1371→1373、MMVQ_PARAMETERS_VOLTA 11→13、hadamard_rotations 21→24。
