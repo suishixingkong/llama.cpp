@@ -463,6 +463,14 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // the (pos, cell) pairs of sequence seq_id, ordered by position
+    const std::set<std::pair<llama_pos, uint32_t>> & seq_pos_get(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id];
+    }
+
     // Token in the sequence cell at the greatest position <= p. When several cells
     // share a temporal position (M-RoPE), the highest physical index wins, matching
     // the previous ascending-cell scan. Returns LLAMA_TOKEN_NULL when no predecessor

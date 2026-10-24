@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "fwht.cuh"
 
 #include <cuda_bf16.h>
@@ -6,10 +7,11 @@
 // Tout is what the row is written as: F32 for the standalone transform, f16/bf16 for the fused transform
 // + conversion that a cuBLAS GEMM consumes. `has_signs` folds the +-1 sign vector into the load, which is
 // where the graph's separate MUL would have applied it; +-1 products are exact, so the moved multiply
-// cannot change the result.
-template <int N, typename Tout, bool has_signs>
+// cannot change the result. TSrc is what the row is read as: the fused copies always come from the F32
+// rows of the graph, while the standalone transform may be handed an F16 row.
+template <int N, typename Tout, bool has_signs, typename TSrc = float>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_cuda(const float * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale,
+__global__ void fwht_cuda(const TSrc * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale,
                           const int n_blk) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -32,7 +34,7 @@ __global__ void fwht_cuda(const float * src, const float * signs, Tout * dst, co
     const float * signs_row = has_signs ? signs + (int64_t) (r % n_blk) * N : nullptr;
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * warp_size + lane] * scale;
+        reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
         if (has_signs) {
             reg[i] *= signs_row[i * warp_size + lane];
         }
@@ -79,9 +81,9 @@ __global__ void fwht_cuda(const float * src, const float * signs, Tout * dst, co
 // is also what the fused FWHT + q8_1 quantizer relies on.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT, typename Tout, bool has_signs>
+template <int N, int NT, typename Tout, bool has_signs, typename TSrc = float>
 __launch_bounds__(NT, 1)
-__global__ void fwht_cuda_block(const float * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale,
+__global__ void fwht_cuda_block(const TSrc * src, const float * signs, Tout * dst, const int64_t n_rows, const float scale,
                                 const int n_blk) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
@@ -107,7 +109,7 @@ __global__ void fwht_cuda_block(const float * src, const float * signs, Tout * d
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        reg[i] = src[i * NT + tid] * scale;
+        reg[i] = ggml_cuda_cast<float>(src[i * NT + tid]) * scale;
         if (has_signs) {
             reg[i] *= signs_row[i * NT + tid];
         }
@@ -122,8 +124,8 @@ __global__ void fwht_cuda_block(const float * src, const float * signs, Tout * d
 }
 
 // Shared launcher: one instantiation set per (Tout, has_signs), one switch on the width.
-template <typename Tout, bool has_signs>
-static bool fwht_launch(const float * src_d, const float * signs_d, Tout * dst_d, const int64_t rows,
+template <typename Tout, bool has_signs, typename TSrc = float>
+static bool fwht_launch(const TSrc * src_d, const float * signs_d, Tout * dst_d, const int64_t rows,
                         const int n, const int n_blk, const int warp_size, cudaStream_t stream) {
     const float scale = 1 / sqrtf((float) n);
 
@@ -139,25 +141,25 @@ static bool fwht_launch(const float * src_d, const float * signs_d, Tout * dst_d
 
     switch (n) {
         case 64:
-            ggml_cuda_kernel_launch((fwht_cuda<64, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda<64, Tout, has_signs, TSrc>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 128:
-            ggml_cuda_kernel_launch((fwht_cuda<128, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda<128, Tout, has_signs, TSrc>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 256:
-            ggml_cuda_kernel_launch((fwht_cuda<256, Tout, has_signs>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda<256, Tout, has_signs, TSrc>), warp_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 512:
-            ggml_cuda_kernel_launch((fwht_cuda_block<512, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda_block<512, FWHT_BLOCK_THREADS, Tout, has_signs, TSrc>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 1024:
-            ggml_cuda_kernel_launch((fwht_cuda_block<1024, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda_block<1024, FWHT_BLOCK_THREADS, Tout, has_signs, TSrc>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 2048:
-            ggml_cuda_kernel_launch((fwht_cuda_block<2048, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda_block<2048, FWHT_BLOCK_THREADS, Tout, has_signs, TSrc>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         case 4096:
-            ggml_cuda_kernel_launch((fwht_cuda_block<4096, FWHT_BLOCK_THREADS, Tout, has_signs>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
+            ggml_cuda_kernel_launch((fwht_cuda_block<4096, FWHT_BLOCK_THREADS, Tout, has_signs, TSrc>), row_params, src_d, signs_d, dst_d, rows, scale, n_blk);
             return true;
         default:
             return false;
@@ -201,18 +203,44 @@ bool ggml_cuda_fwht_cast_to(const ggml_cuda_fwht_cast & plan, void * dst, ggml_t
     }
 }
 
+template <typename T>
+static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+    const int     n    = src->ne[0];
+    const int64_t rows = ggml_nrows(src);
+
+    const T *     src_d = (const T *) src->data;
+    float *       dst_d = (float *) dst->data;
+
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    return fwht_launch<float, false, T>(src_d, nullptr, dst_d, rows, n, /*n_blk=*/1, warp_size, ctx.stream());
+}
+
+bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
+    const struct ggml_tensor * a = op->src[0];
+    const struct ggml_tensor * b = op->src[1];
+
+    return op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+           a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
+           ggml_are_same_shape(b, op);
+}
+
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_shape(src, dst));
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
-    const int     n    = src->ne[0];
-    const int64_t rows = ggml_nrows(src);
+    if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
 
-    const float * src_d = (const float *) src->data;
-    float *       dst_d = (float *) dst->data;
-
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-
-    return fwht_launch<float, false>(src_d, nullptr, dst_d, rows, n, /*n_blk=*/1, warp_size, ctx.stream());
+    switch (src->type) {
+        case GGML_TYPE_F32:
+            return ggml_cuda_op_fwht_impl<float>(ctx, src, dst);
+        case GGML_TYPE_F16:
+            return ggml_cuda_op_fwht_impl<half>(ctx, src, dst);
+        default:
+            return false;
+    }
 }

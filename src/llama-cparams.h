@@ -65,6 +65,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool training;           // set by llama_opt_init()
 
     bool vbr_dynamic;
     enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO;

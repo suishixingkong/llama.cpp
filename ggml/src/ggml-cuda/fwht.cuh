@@ -61,6 +61,11 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
     }
 }
 
+// True when `op` is a Hadamard rotation that ggml_cuda_op_fwht() can perform: the multiply is the
+// transform the graph asked for, and both operands are shaped so the transform can be written straight
+// into the row that the GEMM would have converted.
+bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op);
+
 // Returns whether the Fast Walsh-Hadamard transform could be used.
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
 
