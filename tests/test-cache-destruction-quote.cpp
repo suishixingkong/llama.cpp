@@ -167,6 +167,33 @@ static void test_complete_memoized_and_permutation() {
         common_cache_plan_destruction_reason::effect_drift);
 }
 
+// The counters hold vectors and nested padding, so a byte-wise comparison reports
+// differences that are not mutations: the copy constructor does not duplicate padding.
+// Compare what a mutation would actually change.
+static bool destruction_counters_equal(
+        const common_cache_plan_destruction_counters & a,
+        const common_cache_plan_destruction_counters & b) {
+    return a.quoted                   == b.quoted                   &&
+           a.certified                == b.certified                &&
+           a.executed                 == b.executed                 &&
+           a.refused                  == b.refused                  &&
+           a.lease_verdict            == b.lease_verdict            &&
+           a.actual_yield_unavailable == b.actual_yield_unavailable &&
+           a.recovery_outcome         == b.recovery_outcome         &&
+           a.quote_memo_hits          == b.quote_memo_hits          &&
+           a.quote_memo_misses        == b.quote_memo_misses        &&
+           a.quote_samples            == b.quote_samples            &&
+           a.quote_duration_us_total  == b.quote_duration_us_total  &&
+           a.quote_duration_us_max    == b.quote_duration_us_max    &&
+           a.has_receipt              == b.has_receipt              &&
+           (!a.has_receipt ||
+                (a.last_receipt.state             == b.last_receipt.state             &&
+                 a.last_receipt.reason            == b.last_receipt.reason            &&
+                 a.last_receipt.plan_candidate    == b.last_receipt.plan_candidate    &&
+                 a.last_receipt.admission_sequence== b.last_receipt.admission_sequence&&
+                 a.last_receipt.quote_duration_us == b.last_receipt.quote_duration_us));
+}
+
 static void test_read_only_zero_sequence_quote() {
     common_cache_plan_destruction_counters production_counters;
     production_counters.quote_samples = 41;
@@ -193,9 +220,7 @@ static void test_read_only_zero_sequence_quote() {
     CHECK(rec.destruction_quotes.front().receipt.state ==
           common_cache_plan_destruction_state::quoted);
     CHECK(rec.destruction_quotes.front().receipt.admission_sequence == 0);
-    CHECK(std::memcmp(
-              &production_counters, &production_before,
-              sizeof(production_counters)) == 0);
+    CHECK(destruction_counters_equal(production_counters, production_before));
 
     llama_cache_acct_ledger ledger;
     auto prepared = server_cache_prepare_release_set(

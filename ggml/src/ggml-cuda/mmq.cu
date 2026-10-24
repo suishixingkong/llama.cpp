@@ -9,74 +9,74 @@
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
-            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_0:
-            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_PQ2_0:
-            mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_PQ2_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_PTQ1_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 #endif
         case GGML_TYPE_Q4_0:
-            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_1:
-            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_0:
-            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_1:
-            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
-            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_K:
-            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_IQ1_S:
-            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_NL, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
@@ -85,14 +85,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
                 mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
                 mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -195,7 +195,7 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11, prec_src1) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -276,7 +276,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12, prec_src1) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {

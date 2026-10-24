@@ -990,7 +990,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -1020,7 +1019,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

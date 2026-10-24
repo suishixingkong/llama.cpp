@@ -2,6 +2,12 @@
 
 #include <algorithm>
 
+#include "llama-ext.h"
+#include "llama-io.h"
+
+#include <set>
+#include <vector>
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 
@@ -340,4 +346,31 @@ uint64_t llama_memory_vbr_preflight_tree::merge_count() const noexcept {
 
 uint64_t llama_memory_vbr_preflight_tree::domain_comparison_count() const noexcept {
     return domain_comparison_count_;
+}
+
+// collects the buffers of the tensors that a state write visits, without keeping the data
+struct llama_memory_buffers_writer : public llama_io_write_i {
+    std::set<ggml_backend_buffer_t> buffers;
+    size_t size = 0;
+
+    void write(const void *, size_t n) override {
+        size += n;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t, size_t n) override {
+        buffers.insert(tensor->buffer);
+        size += n;
+    }
+
+    size_t n_bytes() override {
+        return size;
+    }
+};
+
+std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem) {
+    llama_memory_buffers_writer writer;
+
+    mem->state_write(writer);
+
+    return std::vector<ggml_backend_buffer_t>(writer.buffers.begin(), writer.buffers.end());
 }
