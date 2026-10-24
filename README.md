@@ -7,8 +7,8 @@
 > step is recorded in the per-fork `MERGE_*.md` notes (and independently reviewed
 > in the `AUDIT_*.md` notes) listed below.
 
-The integrated work lands on the branch **`turbo-kvstream-merge`**, which is
-published as `origin/master`. Build instructions, supported backends, license,
+The integrated work lands on the branch **`master`** (published as `origin/master`).
+Build instructions, supported backends, license,
 and the rest of the upstream project description are preserved verbatim further
 down under [Upstream llama.cpp README](#upstream-llama-cpp-readme).
 
@@ -23,6 +23,7 @@ down under [Upstream llama.cpp README](#upstream-llama-cpp-readme).
 | [`anyei/llamacpp-v100`](https://github.com/anyei/llamacpp-v100) | Tesla V100 (Volta) CUDA tuning | sm70 `MMVQ_PARAMETERS_VOLTA` table + one-shot P2P NVLink AllReduce for 2-GPU tensor mode (4 files) | [MERGE_V100.md](docs/MERGE_V100.md) · [AUDIT_V100_MERGE.md](docs/AUDIT_V100_MERGE.md) |
 | [`jackjusko/jusko-llama-volta-qwen3flash`](https://github.com/jackjusko/jusko-llama-volta-qwen3flash) | Volta / SM70 Qwen3.8-Flash optimizations | sm70 q8_0 tensor-core FA, 256×256 compact FA specialization, Volta GEMV variants (Q5_K×4, Q6_K W4R4), Q6_K MMQ Pascal-DP4A routing, GDN 128×4 Volta kernel, `--prefill-reuse`, and `--checkpoint-recurrent-prev` recurrent-state replay | [MERGE_JUSKO_VOLTA.md](docs/MERGE_JUSKO_VOLTA.md) · [AUDIT_JUSKO_MERGE.md](docs/AUDIT_JUSKO_MERGE.md) |
 | [`jackinthebox52/qwen38-v100-serve`](https://github.com/jackinthebox52/qwen38-v100-serve) | Qwen3.8-27B V100 serving | `flash_attn_ext_vec` `ncols2 = 3` GQA head packing for GQA ratios with factor 3 (e.g. Qwen3.8-27B 24/4) on Volta (1 file) | [MERGE_QWEN38_V100.md](docs/MERGE_QWEN38_V100.md) |
+| [`PrismML-Eng/llama.cpp`](https://github.com/PrismML-Eng/llama.cpp) | Prism (Bonsai) 私有低比特权重格式 + Hadamard 权重折叠（分支 `prism`） | `PQ2_0`（group-128 2-bit，ggml type 142）/ `PTQ1_0`（group-128 三值，type 143）私有权重格式、`prism.hadamard.*` 折叠运行时，以及配套的 CPU / CUDA / Vulkan 内核（编解码、`get_rows`、MMQ tile、MMVQ、Vulkan 整数 mat-vec） | [MERGE_PRISM_QUANT.md](docs/MERGE_PRISM_QUANT.md) · [AUDIT_PRISM_FEATURES.md](docs/AUDIT_PRISM_FEATURES.md) |
 
 Each fork is a full distribution; this tree takes only the parts relevant to its
 targets (CUDA + Volta / V100, and a backend-agnostic recurrent-checkpoint feature),
@@ -43,10 +44,12 @@ deliberately **excluded**, the integration decisions, and the verification resul
 - **[`MERGE_JUSKO_VOLTA.md`](docs/MERGE_JUSKO_VOLTA.md)** — Volta/SM70 pieces + recurrent checkpoint tail replay from `jusko-llama-volta-qwen3flash`.
 - **[`AUDIT_JUSKO_MERGE.md`](docs/AUDIT_JUSKO_MERGE.md)** — independent audit of the `jusko` port (verdict: faithful, complete, doc/code consistent).
 - **[`MERGE_QWEN38_V100.md`](docs/MERGE_QWEN38_V100.md)** — Qwen3.8-27B GQA packing from `qwen38-v100-serve`.
+- **[`MERGE_PRISM_QUANT.md`](docs/MERGE_PRISM_QUANT.md)** — Prism (Bonsai) `PQ2_0`/`PTQ1_0` weight formats, `prism.hadamard.*` folding, and the per-backend kernels (from `PrismML-Eng/llama.cpp`, branch `prism`).
+- **[`AUDIT_PRISM_FEATURES.md`](docs/AUDIT_PRISM_FEATURES.md)** — inventory of everything the Prism fork adds over upstream; the source-of-truth list for what to port and what to skip.
 
 ## Caveats (read before using)
 
-- **Compile-verified only.** The maintainer's build machine has no NVIDIA GPU, so every CUDA/Volta feature is validated by compilation (incl. `sm_70` PTX checks) but **not** by end-to-end execution. The throughput/latency numbers in the merge notes are the upstream forks' own measurements, not re-measured here.
+- **Mostly compile-verified.** The maintainer's build machine has no NVIDIA GPU, so CUDA/Volta features are validated by compilation (incl. `sm_70` PTX checks), with end-to-end runs only where a merge note says so. The throughput/latency numbers in the merge notes are the upstream forks' own measurements, not re-measured here.
 - **Hardware-specific.** The adaptive-KV-streaming branch targets an RTX 5070 Ti 16 GB; the V100/Volta ports target Tesla V100 (`sm_70`). Build with `GGML_CUDA=ON` and `CMAKE_CUDA_ARCHITECTURES` including `70` for the Volta features to be active.
 - **Model-specific restrictions.** Adaptive KV streaming is restricted to Qwen3.5 by the upstream fork; TurboQuant KV cache types are CUDA-only (Metal/Vulkan reject them); several Volta switches are opt-in and some are GQA-shape-gated. See each merge note.
 - This is an integration sandbox, not a supported distribution. Prefer the upstream llama.cpp for general use.

@@ -12,11 +12,11 @@
 |---|---|
 | 识别并加载 GGUF 里的 type 142/143、ftype 141/142/143 | ✅ |
 | CPU 上完整推理（编码/解码/vec_dot/get_rows/mul_mat） | ✅ |
-| CUDA 反量化 + get_rows（matmul 走 dequant→cuBLAS 兜底） | ✅ 编译通过，未上卡验证 |
+| CUDA 反量化 + get_rows（matmul 走 dequant→cuBLAS 兜底） | ✅ 编译通过；后续已在 V100 上验证，见 §9 |
 | `llama-quantize` 能产出这两种格式 | ✅ |
 | 与 prism 自身的数值行为一致 | ✅ 逐字节 + 逐位 PPL |
 | 直接跑 prism 发布的 Bonsai 2 权重 | ✅ 阶段二（Hadamard 折叠）已落地，见 §5 |
-| CUDA 原生 mmq/mmvq | ✅ 已移植并编译通过，未上卡验证，见 §6 |
+| CUDA 原生 mmq/mmvq | ✅ 已移植；后续已在 V100 上跑通，见 §6 / §9 |
 | `gguf-py` 常量 / HF 转换脚本 | ✅ 见 §7 |
 | Vulkan 后端 | ✅ 已落地；折叠模型 `-ngl 99` 真跑通，PPL 与 CPU 一致，见 §8 / §8.1；q8_1 mat-vec + coopmat 接入见 §6.2 |
 | SYCL 后端 | ❌ 放弃（缺 oneAPI 工具链，3000+ 行 Xe2 专属），见 §8 |
@@ -135,7 +135,7 @@ prism 发布的 Bonsai 权重不是"直接量化"的：转换期把 150 个矩�
 **反向控制**：把 `build_hadamard_activation` 短路后，进程在首次 compute 处直接终止、无输出（守卫生效）；
 还原后 PPL 精确复现 13.9223。
 
-## 6 阶段三：CUDA 原生 mmq/mmvq（已落地，未上卡）
+## 6 阶段三：CUDA 原生 mmq/mmvq（已落地，V100 上已跑通）
 
 | 类型 | mmvq | mmq |
 |---|---|---|
@@ -495,8 +495,9 @@ CUDA 那边要的是"别让 warp 空转"，Vulkan 这边没有空转问题，只
 
 ## 9 仍存缺口
 
-- **CUDA 仍未上卡**：本机没有 NVIDIA 卡，CUDA 侧到 `ggml-cuda.lib` + 解码数学模拟为止，
-  实机判据见 `docs/MERGE_PRISM_TESTPLAN.md`。Vulkan 侧已在 Intel UHD 730 上真跑（§8、§6.4）。
+- **CUDA 侧已上卡（后补）**：开发机没有 NVIDIA 卡，移植期只做到 `ggml-cuda.lib` 编译通过 + 解码数学模拟；
+  之后在 Tesla V100（`sm_70`）上端到端跑通 Bonsai 权重（加载、推理、MMQ/MMVQ 分派）。
+  实机测试方案不入库，见工作区根 `TEST_PRISM_QUANT.md`。Vulkan 侧已在 Intel UHD 730 上真跑（§8、§6.4）。
 - `-np > 1`、把 PQ2_0/PTQ1_0 当 `-ctk/-ctv`：不支持（它们只用于权重）。
 - CPU repack 的 `PQ2_0 4x8` 变体（AVX-512+VNNI 专用）未移植；本机 i5-12400 无 AVX-512，该路径本来也不启用。
 - 测试里的 `test-ptq1_0-cuda-dot.cpp` / `test-ptq1_0-element-map.cpp` 是**转写件**（把 CUDA 侧逻辑抄到主机上跑），
