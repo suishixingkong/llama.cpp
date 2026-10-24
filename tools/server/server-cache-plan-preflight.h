@@ -71,7 +71,7 @@ nlohmann::ordered_json server_cache_plan_preflight_json(
 // middleware authenticates zero/one configured key;  refuses configurations
 // where that middleware represents multiple principals.
 bool server_cache_plan_preflight_exposure_allowed(
-    const std::string & hostname,
+    const std::vector<std::string> & hostnames,
     size_t api_key_count) noexcept;
 
 bool server_cache_plan_preflight_request_field_allowed(

@@ -193,13 +193,23 @@ json server_cache_plan_preflight_json(
 }
 
 bool server_cache_plan_preflight_exposure_allowed(
-        const std::string & hostname,
+        const std::vector<std::string> & hostnames,
         size_t api_key_count) noexcept {
-    const bool local = hostname == "127.0.0.1" || hostname == "::1" ||
-                       hostname == "localhost" ||
-                       (hostname.size() >= 5 &&
-                        hostname.compare(hostname.size() - 5, 5, ".sock") == 0);
-    return local && api_key_count <= 1;
+    // upstream turned --host into a comma-separated list: the surface is trusted-local only if
+    // EVERY bind address is loopback or a unix socket, not just the first one.
+    if (hostnames.empty()) {
+        return false;
+    }
+    for (const auto & hostname : hostnames) {
+        const bool local = hostname == "127.0.0.1" || hostname == "::1" ||
+                           hostname == "localhost" ||
+                           (hostname.size() >= 5 &&
+                            hostname.compare(hostname.size() - 5, 5, ".sock") == 0);
+        if (!local) {
+            return false;
+        }
+    }
+    return api_key_count <= 1;
 }
 
 bool server_cache_plan_preflight_request_field_allowed(

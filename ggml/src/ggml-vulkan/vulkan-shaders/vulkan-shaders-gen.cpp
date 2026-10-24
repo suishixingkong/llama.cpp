@@ -256,7 +256,8 @@ bool has_q8_1_mmvq(const std::string& type_name) {
 // matching per-type table in ggml-vk_matmul_int_shmem_support plus one pipeline registration per
 // type; a type missing here compiles into nothing and the host side then quietly dequantizes.
 bool has_q8_1_mmq(const std::string& type_name) {
-    return has_q8_1_mmvq(type_name) && !string_starts_with(type_name, "iq");
+    // iq1_*/iq2_* have an integer-dot vec shader but no mul_mmq shader yet.
+    return has_q8_1_mmvq(type_name) && type_name != "iq1_s" && type_name != "iq1_m";
 }
 
 bool is_iq_quant(const std::string& type_name) {
@@ -268,7 +269,7 @@ bool is_lut_quant(const std::string& type_name) {
 }
 
 std::string lut_load_vec_a(const std::string& type_name) {
-    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s") {
+    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs") {
         return "8";
     }
     return "4";
@@ -942,6 +943,12 @@ void process_shaders() {
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+
+    string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
+    string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
+
+    string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
+    string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
