@@ -285,3 +285,49 @@ fork delta 1113 行，方向取小的一侧）：
 - ctest：**103/111**，8 红与 C1/C2 同集（无 GPU `0xc0000409` / 无网 / 无 jinja2），无新回归。
 - 零损失：`fork 9l-` 593→598、PQ2_0 292→303、PTQ1_0 372→382、TURBO_WHT 59→61、
   vbr_pools_ 154→156、kv_stream 1371→1373、MMVQ_PARAMETERS_VOLTA 11→13、hadamard_rotations 21→24。
+
+## 12 C4 执行记录（段末 `6afa9a313`，21 文件，提交 `eb867e467`）
+
+### 12.1 ⭐ hadamard 存储统一（fork 的并行 plumbing 退场）
+fork 把折叠权重的变换挂在 `llama_model::hadamard_rotations/hadamard_inverses` 两个裸 map 上；
+上游早已把同一对 map 连同元数据收进 `llama_hadamard hdmd`，并由 `load_tensors_hadamard()` 建张量。
+C4 把该容器带进来 ⇒ 树里同时存在两套：fork 的 map 由 fork 的 hparams 读取段填充，**但已无人读**。
+处置：`hdmd` 作唯一存储，删 fork 的 map 成员 / `llm_graph_params` 字段 / `build_hadamard_activation`
+（改上游 `build_hadamard_input`）与验证调用形态；**保留 fork 独有的 `build_hadamard_inverse`**（接 `hdmd->inv`），
+它的调用者是 qwen35 / qwen35moe / qwen3next 的自有 embedding 查表，上游从无对应。
+图时契约检查仍跑，改用 `hdmd.rot/inv` + 上游的 MoE-cache forward map（穿过缓存的折叠专家也被验到）。
+
+### 12.2 ⭐ MMQ API 迁移 + 被上游静默删除的 fork 符号
+C4 给 `get_config/get_nthreads/get_I/get_sram_stride` 加 `prec_src1`，`mul_mat_q_case` 变双模板参（`<type, prec>`）。
+- PQ2_0 / PTQ1_0 的 case 与两个 tile loader 补 `GGML_PREC_Q8`（这两种类型的配置表只有这一档）。
+- **`ggml_cuda_mmq_get_J_max` 被上游整段删掉**（fork 的 FWHT→q8_1 生产者用它算尾部余量）⇒ 按新签名重加，
+  语义不变。传 Q8 是精确的：`ggml_cuda_fwht_mmq_layout()` 拒绝 NVFP4/MXFP4，而只有这两种类型的配置随 prec 收窄。
+
+### 12.3 ⭐ fork master 自带的重复字典键（顺带修掉）
+`gguf-py/gguf/constants.py` 的 `MODEL_TENSORS` 里 `KIMI_K3` 与 `BAILINGMOE3` 各出现两次（字面量后者覆盖前者）。
+两个 KIMI_K3 内容不同（`OUTPUT/ATTN/FFN_RES_NORM+RES_PROJ` 旧版 vs `*_RES_SCORE` 新版，后者才与 `src/models/kimi-k3.cpp` 对齐），
+两个 BAILINGMOE3 也不同。处置：留生效的那份、删被遮蔽的，并删掉被 fork 副本遮蔽的上游 BAILINGMOE3 副本。
+`MODEL_TENSORS` 157 项、零重复键。
+
+### 12.4 其它
+| 文件 | 处置 |
+|---|---|
+| `llama-model.cpp` | 删 fork 的内联 hadamard 建张量段（175 行），改调上游 `load_tensors_hadamard()`；`buf_ptrs` 与 `GGML_CUDA_PREFER_MODEL_WEIGHTS` 并集 |
+| `server-context.cpp` | 槽文件 checkpoint appendix（C4 新增）改用 `common_shared_byte_buffer`：补两个 `ckpt_{read,write}_buf` 重载 + `data_spec` 成员；`prompt_save` 返回枚举 ⇒ `prompt_save_durable()` |
+| `server-context.cpp` | `gated_delta_net` 的 `ggml_cuda_gdn_mma_launch` 早退：上游按架构/形状自门（Volta 恒 false）⇒ 与 fork 编译期分派并集，Volta 行为不变 |
+| `llama-memory.cpp` / `llama-ext.h` / `llama-hparams.h` / `test-arg-parser.cpp` / `ggml-vulkan.cpp` | 并集 |
+| `tests/test-recurrent-state-rollback.cpp` | **保留 ours 独立 target**：上游 `a17e94d22` 把它并进 `test-llama-context`，但 fork 的 VBR / SWA-prefix / 多序列重放用例上游没有等价物 |
+| `common/chat.cpp` | 恢复被 C4 chat 重构丢弃的 `common_chat_msg_delimiters_parse`（fork 的 cache-plan 预检在用） |
+
+### 12.5 ⚠️ 已知残留（合并后再清）
+fork 的 `hadamard_weight_blocks / hadamard_inverse_blocks / hadamard_sign_data / hadamard_gdn_v_grouped /
+hadamard_tied_output` 成员与 `llama-model.cpp` 里对应的 hparams 装载段仍在，**已被 `hdmd` 取代，实际是死代码**
+（无读者）。删除属独立清理提交，避免在合并段里动 160 行验证逻辑。
+
+### 12.6 验证
+- `cmake --build -- -k 0`：**RC=0，228/228**，0 错误。
+- ctest：**102–103/112**。稳定失败仍为 C1–C3 同一组环境前提（无 GPU `0xc0000409` / 无网 / 无 jinja2）；
+  `test-arg-parser` 新增进集合但属**网络抖动**：它自己的出网探测通过、紧接着的 GET 失败，重跑直接 exit 0（无 SKIP 分支）。
+- 零损失：`fork 9l-` 593→599、PQ2_0 292→304、PTQ1_0 372→383、TURBO_WHT 59→62、vbr_pools_ 154→157、
+  kv_stream 1371→1374、MMVQ_PARAMETERS_VOLTA 11→14、prism.hadamard 58→105。
+  `hadamard_rotations` 21→11 = 有意的 `hdmd` 归并（typedef 保留，fork 的并行 map 成员不再存在）。
