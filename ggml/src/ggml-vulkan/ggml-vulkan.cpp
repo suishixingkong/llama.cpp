@@ -3301,7 +3301,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32_single, "rms_norm_f32_single", rms_norm_f32_single_len, rms_norm_f32_single_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32_single, "rms_norm_mul_f32_single", rms_norm_f32_single_len, rms_norm_f32_single_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -3727,7 +3729,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 lanes_per_column = std::min(gdn_subgroup_size, S_V);
             } else if (S_V >= 128u && device->subgroup_clustered) {
                 // COLS_PER_WG=8: measured optimum (Ampere sg32->4, Vega20 sg64->8).
-                lanes_per_column = std::max(1u, gdn_subgroup_size / 8u);
+                // Pre-Turing NVIDIA parts (no cooperative matrix, i.e. Volta and older) are the
+                // exception: with a 32-wide subgroup they want LANES_PER_COLUMN=8, which halves
+                // COLS_PER_WG to 4 and measures ~20% faster on V100 than the sg/8 value.
+                if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+                    device->architecture == vk_device_architecture::NVIDIA_PRE_TURING) {
+                    lanes_per_column = 8u;
+                } else {
+                    lanes_per_column = std::max(1u, gdn_subgroup_size / 8u);
+                }
             } else {
                 // Use largest power-of-two that divides both S_V and subgroup_size so that
                 // (1) S_V % lanes_per_column == 0 and (2) S_V % (subgroup_size / lanes_per_column) == 0.
@@ -8813,6 +8823,14 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// The rms_norm shaders iterate over the channel/sample axes because the host has to clamp the
+// grid to the device workgroup limit. That iteration is only required when one of those axes
+// actually exceeds the limit, so the single-shot shader can be used for everything else.
+static bool ggml_vk_rms_norm_needs_loop(const ggml_backend_vk_context * ctx, const ggml_tensor * src0) {
+    return src0->ne[2] > ctx->device->properties.limits.maxComputeWorkGroupCount[1] ||
+           src0->ne[3] > ctx->device->properties.limits.maxComputeWorkGroupCount[2];
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -9052,6 +9070,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+            }
+            // The looping shader is only needed when the grid has to be clamped to the device
+            // workgroup limit. Otherwise the single-shot shader keeps the reduction barriers on a
+            // straight-line path, which is about 2x faster for the per-head norms.
+            if (!ggml_vk_rms_norm_needs_loop(ctx, src0)) {
+                return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32_single : ctx->device->pipeline_rms_norm_f32_single;
             }
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
