@@ -107,7 +107,8 @@ std::string format(const char * fmt, ...);
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+// arrays are rendered only until the result is longer than max_len
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);
 
 // CRC-32 (IEEE, poly 0xEDB88320) of a byte buffer
 uint32_t llama_crc32(const uint8_t * data, size_t n);

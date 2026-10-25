@@ -8,13 +8,14 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    8
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
-// 102 = upstream 101 + the TurboQuant GGML_OP_TURBO_WHT.
-// Bumped patch version because adding an op shifts the GGML_OP enum used in the RPC
-// wire protocol.
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+// 103 = upstream base 101 + the TurboQuant GGML_OP_TURBO_WHT + upstream GGML_OP_TOP_K_MASK.
+// Both sides added one op on top of 101, so the merged count is 103 and neither side's
+// value is correct on its own. Bumped patch version because adding an op shifts the
+// GGML_OP enum used in the RPC wire protocol.
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

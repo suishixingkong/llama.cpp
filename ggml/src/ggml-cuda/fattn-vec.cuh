@@ -439,7 +439,7 @@ static __global__ void flash_attn_ext_vec(
         // Turbo V keeps KQ in registers and shuffles it, so there is no
         // shared-memory write to publish: the barrier is pure overhead there.
         if constexpr (!V_is_turbo) {
-            ggml_cuda_syncwarp();
+            ggml_cuda_syncwarp(); // Needed for KQ synchronization.
         }
 
 #pragma unroll
@@ -641,6 +641,8 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
     if (sinks && blockIdx.y == 0) {
