@@ -193,6 +193,49 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    // Pick the J tile whose config is instantiated and fits in shared memory, minimizing the number of
+    // tiles along the ne11(MoE: ne12) direction. C5 moved this search up from mul_mat_q_switch_J(), which
+    // now only dispatches on the result; the fork's own edits sit on both call sites, so keeping the
+    // fork's initializers verbatim would leave the search nowhere and the switch would see a raw
+    // ne1/ne12 and abort for any value that is not a multiple of 8.
+    int J_best = 0;
+    {
+        const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+
+        int64_t ncols_opt = ne11;
+        if (ids) {
+            const int64_t n_expert_used = ids->ne[0];
+            ncols_opt = ne12;
+
+            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            }
+        }
+
+        int ntiles_J_best = INT_MAX;
+
+        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+            if (config.type == GGML_TYPE_COUNT) {
+                continue;
+            }
+
+            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+
+            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+
+            if (ntiles_x < ntiles_J_best) {
+                J_best      = J;
+                ntiles_J_best = ntiles_x;
+            }
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11, prec_src1) * sizeof(block_q8_1_mmq);
@@ -244,7 +287,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -317,13 +360,6 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-    int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-    }
-
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -331,7 +367,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, ncols_opt};
+        ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
