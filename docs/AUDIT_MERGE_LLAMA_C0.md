@@ -424,3 +424,44 @@ hadamard_tied_output` 成员与 `llama-model.cpp` 里对应的 hparams 装载段
   `hadamard_rotations` 21→13 = C4 §12.1 的 `hdmd` 归并（fork 的并行 map 成员不再存在，typedef 与读取点保留）。
 - M2（整文件退回 base 的 master 改动）= 0；M5（master 新增文件在结果中缺失）= 0（过滤掉被 master 自己
   改名/删除后又出现在 `--diff-filter=A` 里的噪声项后实测 0）。
+
+### 13.10 ⭐⭐⭐ 合并后才发现：`J_best` 的搜索被两侧改动夹掉（提交 `19036628e`）
+上面 §13.1–§13.9 的核对全部建立在「冲突标记 + 逐文件 diff」上，这一处**两头都没有标记**，
+而且是**构建绿、ctest 绿**的。发现路径是计划里的验收门：跑 `Ternary-Bonsai-2-2B-PQ2_0` 出 token，
+第一次解码就 `mmq.cuh:1589: fatal error`（`J_best=11`）。
+
+成因是上游把一段逻辑**搬了家**，而搬家的两个端点都是 fork 改过的行：
+
+| | 上游 C5 之前（= master） | 上游 C5 |
+|---|---|---|
+| `J_best` 的搜索 | 在 `mul_mat_q_switch_J()` 里自算（`for J=8..128`，按 `smpbo` 过滤 + `ntiles_x` 最小）| **删掉**，函数只剩 `switch (args.J_best)` |
+| 搜索的新位置 | — | `ggml_cuda_mul_mat_q()` 函数体（算完塞进 `mmq_args.J_best`）|
+| 调用点第 22 个字段 | `ne1` / `ncols_opt`（当时没人读）| `J_best` |
+
+fork 改的恰好是 `mmq_args` 的两个初始化器（FWHT pre-q8 走 `dst`、MoE 走 `ids`），
+于是「上游删 switch_J 里的搜索」与「fork 改调用点」撞在同一个 hunk 家族里：**搜索被删、调用点保留旧值**，
+两边各自都自洽，合并结果没有任何一环在算 `J_best`。`ne1` 只要不是 8 的倍数就落 default 分支 abort。
+
+⚠️ **为什么构建与 ctest 都发现不了**：这段是 host 代码，且**只有 GPU 上跑到 `mul_mat_q` 且列数非 8 的倍数**才触发；
+本机 CI 位置的两类测试（`test-backend-ops` 的 MMQ 用例、ctest 里的 CPU 测试）都不覆盖，
+`test-backend-ops -o MUL_MAT` 在没有 `-b CUDA` 时根本不下发。⇒ **「全绿」不能替代一次真跑**。
+
+处置：把上游的搜索块按函数作用域补回（`ncols_opt` 由 `ne11` 或 MoE 的 `ne12` 派生，RDNA3/4 再按每专家均值折算），
+两个调用点改为传 `J_best`；**padding 仍用 fork 的 `get_J_max()`**，不用上游新引入的
+`src1_q8_1_padding = f(J_best, nthreads_best)` —— fork 的 FWHT→q8_1 生产者（`ggml-cuda.cu:3406`）
+是拿 `get_J_max()` 算尾部余量的，两者必须同一个 J（`mmq.cuh` 的 `get_J_max` 注释已经写明）。
+`get_J_max() >= J_best` 未必成立（`ne11=11` 时前者 8、后者 16），所以这里不是等价替换而是**必须保持一致**的关系。
+
+⭐ **由此得到的通用判据（后续段直接套用）**：合并不是只看冲突标记。对**两侧都改过**的文件，
+把「上游新增的代码行」逐行拿到合并结果里找，找不到的必须逐条解释。本条就是该扫描的第一名
+（`mmq.cu` 45 行新增），而它旁边那些「解释得通」的命中（op 计数断言、checkpoint 判据、
+`rows_per_block_override`）都是本段有意为之的。扫描口径要**只保留含标识符的代码行**
+（丢注释、括号、`#` 行），否则 3 万行级重写文件（CSV、metal/vulkan kernel）会把信号淹没。
+
+### 13.11 验收门（V100，`-c 4096 -ngl 99 --device CUDA0`）
+| 模型 | 结果 |
+|---|---|
+| `Ternary-Bonsai-2-2B-PQ2_0.gguf` | 出 token，prompt 67.8 t/s / gen 180.0 t/s |
+| `Ternary-Bonsai-2-2B-PTQ1_0.gguf` | 出 token，prompt 116.8 t/s / gen 171.7 t/s |
+| `Qwen3.5-0.8B-Q4_K_M.gguf`（对照，stock 量化）| prompt 200.4 t/s / gen 179.9 t/s |
+| `test-backend-ops -o RMS_NORM -b CUDA0` | 53/53 通过（替换 `norm.cu` 后的直接数值回归）|
