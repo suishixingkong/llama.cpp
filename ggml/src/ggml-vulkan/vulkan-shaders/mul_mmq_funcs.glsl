@@ -52,18 +52,26 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 // A PQ2_0 block is 128 weights wide with one scale, so four 32-weight sub-blocks share it.
 // The qs bytes are positional like Q2_0's, hence the same packed-value dot product with the
 // activation sum subtracted for the -1 offset.
-void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
-    const uint block_idx = ib / 4;
-    const uint byte_idx = (ib & 3u) * 8u + iqs;
-    const uint bits = uint(data_a[block_idx].qs[byte_idx]);
-    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
-        int8_t(bits & 3u),
-        int8_t((bits >> 2u) & 3u),
-        int8_t((bits >> 4u) & 3u),
-        int8_t(bits >> 6u)));
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint block_idx = ib / 4;
+        const uint byte_idx = (ib & 3u) * 8u + iqs;
+        const uint bits = uint(data_a[block_idx].qs[byte_idx]);
+        buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
+            int8_t(bits & 3u),
+            int8_t((bits >> 2u) & 3u),
+            int8_t((bits >> 4u) & 3u),
+            int8_t(bits >> 6u)));
 
-    if (iqs == 0) {
-        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+        if (iqs == 0) {
+            buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+        }
+    } else {
+        buf_a[buf_ib].qs[iqs] = 0;
+
+        if (iqs == 0) {
+            buf_a[buf_ib].dm = FLOAT_TYPE(0.0f);
+        }
     }
 }
 
@@ -112,17 +120,25 @@ int8_t ptq1_0_trit(const uint block_idx, const uint e) {
     return int8_t(int((v * 3u) >> 8u) - 1);
 }
 
-void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
-    const uint block_idx = ib / 4;
-    const uint e = (ib & 3u) * 32u + iqs * 4u;
-    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
-        ptq1_0_trit(block_idx, e + 0u),
-        ptq1_0_trit(block_idx, e + 1u),
-        ptq1_0_trit(block_idx, e + 2u),
-        ptq1_0_trit(block_idx, e + 3u)));
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint block_idx = ib / 4;
+        const uint e = (ib & 3u) * 32u + iqs * 4u;
+        buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
+            ptq1_0_trit(block_idx, e + 0u),
+            ptq1_0_trit(block_idx, e + 1u),
+            ptq1_0_trit(block_idx, e + 2u),
+            ptq1_0_trit(block_idx, e + 3u)));
 
-    if (iqs == 0) {
-        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+        if (iqs == 0) {
+            buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
+        }
+    } else {
+        buf_a[buf_ib].qs[iqs] = 0;
+
+        if (iqs == 0) {
+            buf_a[buf_ib].dm = FLOAT_TYPE(0.0f);
+        }
     }
 }
 

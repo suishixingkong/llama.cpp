@@ -247,17 +247,24 @@ bool is_k_quant(const std::string& type_name) {
 // Types with an integer-dot (q8_1) mat-vec shader. Two places need this list -- the
 // string_to_spv() loop that compiles the shader and the arr_dmmv_*_q8_1_f32 symbol
 // emission that follows -- and they drifted apart once, so keep them on one predicate.
+// Note this list is NOT the same as has_q8_1_mmq(): iq1_s/iq1_m have a vec shader but no
+// mat-mul shader, while iq3_s is the other way round (mat-mul only -- its 512-entry grid
+// does not fit the vec path). Listing the two sets separately keeps both in step with the
+// host side.
 bool has_q8_1_mmvq(const std::string& type_name) {
     return is_legacy_quant(type_name) || type_name == "mxfp4" || is_k_quant(type_name) ||
-           type_name == "iq1_s" || type_name == "iq1_m" || type_name == "ptq1_0" || type_name == "pq2_0";
+           type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq4_xs" ||
+           type_name == "ptq1_0" || type_name == "pq2_0";
 }
 
 // Types with an integer-dot (q8_1) matrix-multiply shader (mul_mmq.comp). The host side has a
 // matching per-type table in ggml-vk_matmul_int_shmem_support plus one pipeline registration per
 // type; a type missing here compiles into nothing and the host side then quietly dequantizes.
 bool has_q8_1_mmq(const std::string& type_name) {
-    // iq1_*/iq2_* have an integer-dot vec shader but no mul_mmq shader yet.
-    return has_q8_1_mmvq(type_name) && type_name != "iq1_s" && type_name != "iq1_m";
+    // iq1_*/iq2_*/iq3_xxs have an integer-dot vec shader but no mul_mmq shader yet.
+    return is_legacy_quant(type_name) || type_name == "mxfp4" || is_k_quant(type_name) ||
+           type_name == "iq3_s" || type_name == "iq4_xs" ||
+           type_name == "ptq1_0" || type_name == "pq2_0";
 }
 
 bool is_iq_quant(const std::string& type_name) {
