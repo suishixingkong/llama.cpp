@@ -4196,19 +4196,35 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_rs - i0}
     const int64_t i0 = n_rs - state_copy->ne[0];
 
-    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+    // extra states are the cells this ubatch does not touch and must survive at the end of the row
+    const bool has_extra = n_rs > n_seqs;
 
-    ggml_tensor * output_states = get_state_rows ?
-        get_state_rows(ctx0, states, state_copy_main) :
-        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    // when the ubatch owns every cell there is nothing to preserve, so the gather IS the output and
+    // no view is sliced off it. That matters beyond saving a node: the backend's GDN gather fusion
+    // (ggml_cuda_try_gdn_gather_skip) elides this GET_ROWS only while its sole consumer reaches
+    // GATED_DELTA_NET through RESHAPEs, and a view in between both breaks that chain and adds a
+    // second reader. Leaving it in costs a materialised state row per recurrent layer - 18 per
+    // graph on Qwen3.5 - and the tail copy below would be a 0-row no-op in that same case.
+    ggml_tensor * states_all = (has_extra || !get_state_rows) ? ggml_get_rows(ctx0, states, state_copy) : nullptr;
+
+    ggml_tensor * output_states = nullptr;
+    if (get_state_rows) {
+        output_states = get_state_rows(ctx0, states, state_copy_main);
+    } else if (has_extra) {
+        output_states = ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    } else {
+        output_states = states_all;
+    }
     ggml_build_forward_expand(gf, output_states);
 
-    // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    if (has_extra) {
+        // copy extra states which won't be changed further (between n_seqs and n_rs)
+        ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0,
+                states_extra,
+                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+    }
 
     return output_states;
 }
