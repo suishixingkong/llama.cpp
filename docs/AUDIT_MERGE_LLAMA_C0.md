@@ -331,3 +331,96 @@ hadamard_tied_output` 成员与 `llama-model.cpp` 里对应的 hparams 装载段
 - 零损失：`fork 9l-` 593→599、PQ2_0 292→304、PTQ1_0 372→383、TURBO_WHT 59→62、vbr_pools_ 154→157、
   kv_stream 1371→1374、MMVQ_PARAMETERS_VOLTA 11→14、prism.hadamard 58→105。
   `hadamard_rotations` 21→11 = 有意的 `hdmd` 归并（typedef 保留，fork 的并行 map 成员不再存在）。
+
+## 13 C5 执行记录（段末 `6b9ba4f2e`，176 提交 / 525 文件 / 9 冲突文件 / 20 冲突段）
+
+本段是计划里的最后一段，覆盖 10-16 → 10-24 的上游。规模上 `git diff --shortstat` 相对 C4 tip 为
+`525 files changed, 60126 insertions(+), 29128 deletions(-)`；真正落到人工判断的只有 9 个文件。
+
+### 13.1 ⭐⭐⭐ 双方各加一个 `ggml_op` ⇒ 合并后必须是 103，不是任何一侧的 102
+`ggml-rpc.h` 的冲突只有三行注释，但三行注释下面压着一个**双方都不可能单独算对**的常量：
+
+| 侧 | base | 该侧新增 | 该侧 `GGML_OP_COUNT` |
+|---|---|---|---|
+| base `6afa9a313` | — | — | 101（patch 0）|
+| master | 101 | `GGML_OP_TURBO_WHT` | 102（patch 1）|
+| 上游 | 101 | `GGML_OP_TOP_K_MASK` | 102（patch 1）|
+| **合并结果** | | 两者都在 | **103（patch 2）** |
+
+两边的 `static_assert` 都写 102，`ggml.h` 的枚举却被 git 自动并成了 103 项（两个新增落在不同位置，
+互不冲突），于是**自动合并没有冲突、断言值两边一致、但两者都是错的**。这类冲突在 diff 里看不到任何标记。
+处置：`RPC_PROTO_PATCH_VERSION 1 → 2`、`GGML_OP_COUNT == 103`；`ggml.c` 里两处同名断言
+（`GGML_OP_NAME` / `GGML_OP_SYMBOL` 表各一条）同步改 103 —— 它们同样由自动合并留下陈旧值。
+两张表都已含 `TOP_K_MASK`（枚举、名称、符号三条一致，符号表 103 项）。
+
+### 13.2 ⭐⭐ `norm.cu`：上游的 float4 路径整体接管，fork 的 warp-per-row 只补在融合 scale 分支
+上游把 6 处启动点收敛成 `rms_norm_f32_dispatch<do_multiply, do_add, do_scale>`，并在 kernel 内加了
+`do_vec` + `vpt` 的 float4 快路；fork 这边的改动是**相反方向**的：把 base 里
+`for (sample) { for (channel) { ... } }` 的钳位循环拆掉（改 1 block = 1 行直接索引）、`scale_out → post_scale`、
+`do_scale` 单独一轮乘。两侧改的是同一段的两端，硬拼会得到「没有钳位循环、却引用 `xc/dstc`」的半成品。
+
+判据：fork 拆循环在 master 历史里 `git log -S` 追不到对应提交（是整文件搬入时带进来的），没有测量记录；
+而上游的快路有明确收益，且保留了 `grid.y/z` 钳位（`nchannels > 65535` 不再越界）。⇒ **整文件取上游**，
+只把 fork 唯一有测量的改动补回去：`rms_norm_scale_f32_cuda` 的 `ncols < 1024` 分支用 `WARP_SIZE` 而不是 256
+（`523b6cf03`，42.0 → 31.9 us/launch）。补在 dispatch 的 else-if 里并以 `if constexpr (do_scale)` 收窄，
+其它融合形态（mul / mul+add）行为不变。`do_scale` 的两次舍入语义两侧本就等价（`scale*x` 一次、`*post_scale` 一次）。
+
+### 13.3 ⭐⭐ `ggml_cuda_op_rms_norm_scale` 改名：链接器抓到的静默不一致
+`norm.cu` 取上游后，定义是 `ggml_cuda_op_rms_norm_scale_fused`（base 与上游同名），而 `norm.cuh` 声明和
+`ggml-cuda.cu:6679` 的调用点仍是 master 改名后的 `ggml_cuda_op_rms_norm_scale`。
+`norm.cuh` 的改名单侧变更、自动合并保留 → 头文件与实现不同名，**编译期全绿，链接期 `LNK2019`**。
+判定：该改名是纯装饰（base 就是 `_fused`），fork 侧无第二用途 ⇒ 声明与调用点都改回 `_fused`，归一为上游命名。
+
+### 13.4 `mmvq.cu`：两处都是「上游重构 + fork 表项」的并集
+- `calc_rows_per_block`：上游把 `ncols_dst == 1` 拆出 `mmvq_two_rows_ncols1()`（Q1_0/Q2_K/Q3_K/IQ1_S/IQ1_M 两行）
+  与 GB10 的 IQ2_S/IQ3_S 特例；fork 加了 PTQ1_0 的 PT 分支与 `MMVQ_PARAMETERS_VOLTA`。**并集**：
+  PTQ 门在前，表列表含 VOLTA（否则 Volta 掉到 `return 1`），`case 1` 取上游新分支 ——
+  VOLTA 命中最后的 `table_id == GENERIC && ...` 为假，仍返回 1，与 master 行为一致。
+- 内核里 `rows_per_cuda_block`：保留 fork 的 `rows_per_block_override` 模板参数（上游是纯 constexpr）。
+
+### 13.5 `ggml-cuda.cu`：`WARP_SIZE` 让位给运行时 `warp_size`
+`ggml_cuda_should_use_mmf(...)` 的第 3 参 master 传编译期 `WARP_SIZE`，上游传运行时
+`ggml_cuda_info().devices[ctx.device].warp_size`。取上游：CDNA 是 wave64，编译期 32 会让 mmf 判定错。
+
+### 13.6 其余并集
+| 文件 | 处置 |
+|---|---|
+| `src/llama-impl.h` | `gguf_kv_to_str(..., size_t max_len = SIZE_MAX)`（上游的截断参数）+ fork 的 `llama_crc32` 声明，两条并存；定义侧 `llama-impl.cpp:169` 已带 `max_len` |
+| `tools/server/server-task.h` | fork 的 `server-cache-lease.h` / `server-retention-sidecar.h` / `server_cache_plan_payload_kind` / `server_cache_lease_build_identity` 与上游新增的 `mtmd-helper.h` 并存 |
+| `tests/CMakeLists.txt` | fork 的 20+ 个 target（vbr / kv-stream / turbo / cache-control / llama-archs…）全部保留；采纳上游新增的 `LABEL behavior` 分级与 `test-gelu-quick.cpp`；`test-arg-parser` / `test-model-resolution` 用带上游 LABEL 的形式，避免同一 target 注册两次 |
+| `server-context.cpp` §1 | 上游新插的 `process_tts_slots()` try/catch 与 fork 的「空 batch 告警（含 diffusion 豁免）」是同一锚点上的两段独立代码 ⇒ 顺序并集 |
+| `server-context.cpp` §2 | checkpoint 失效判定取 fork：`prompt_pos_end`/`true LCP` 双判据 + `checkpoint_drop(..., checkpoint_invalidated)` 记账，上游那版只比 `pos_next / n_prefix` 且直接 `erase` |
+| `server-context.cpp` §3 | 投机解码：fork 的 `verified_output_rows` 快照 + 上游把 `slot.spec_i_batch` move 进局部 `spec_i_batch`。**先快照再 move**，两处读者都能拿到 |
+| `server-context.cpp` §4 | `server_context_meta` 指定初始化器：上游新增 `has_cap_chat/has_cap_tts/has_audio_stream` + `server_model_output_modalities(model, chat, tts)`，fork 的 17 个 VBR 字段全保留，顺序按 `server-context.h:250` 的声明（C++20 指定初始化器要求声明序） |
+| `ggml/src/ggml-cuda/fattn-vec.cuh` | 保留 fork 的 `if constexpr (!V_is_turbo)` 屏障豁免，采纳上游的注释 |
+| `ggml/src/ggml.c` | 两处 `static_assert(GGML_OP_COUNT == ...)` 见 13.1 |
+
+### 13.7 ⭐ 补记 C2 的一处静默删除（本段核对时发现）
+`ggml/src/ggml-cpu/iqp.cpp` / `iqp.h`（1253 + 39 行）在 **C2（`56565e159`）** 就没了：上游
+`d834d44e6`（tiled mul_mat for k-quants #27851）在 base 之前就把这两个文件删了，C2 合 `ggml-cpu/CMakeLists.txt`
+时按上游的源码列表走，于是 fork 树里残留的副本一起消失。
+判定**不是损失**：master 里 `IQP` 只出现在 `iqp.cpp` 自己（61 次），没有 `GGML_TYPE_IQP`、没有 type traits、
+没有任何调用点，唯一的外部引用就是那份 CMake 源列表。属上游已废弃的实验实现，跟随上游删除。
+
+### 13.8 逐段核过但判为「非损失」的两处
+- `ggml/src/ggml-cuda/argsort.cu`：合并结果与上游整文件相同（`101afeba2`），master 侧是 `24115da0`。
+  原因是**上游先修了同一个 bug**（`b23701f77` "fix CUB argsort corruption caused by in-place keys" #28389），
+  base 已含该修复，master 的 `ce579daec` 是同一修复的独立实现；上游版本还多带 `ggml_cuda_chunk_nrows` 重构与
+  bitonic 辅助函数整理 ⇒ 取上游严格更优。`temp_keys_out` 在合并结果里 14 处，修复仍在。
+- `ggml/src/ggml-cuda/norm.cuh`：与上游逐字节相同 —— 即 13.3 的改名归一，是有意为之。
+
+### 13.9 验证
+- `cmake --build tmp/build-c1 -- -k 0`：**RC=0，159/159**（增量），0 error / 0 LNK。
+  中途两次失败的成因都记一笔，避免下次误判：①`ninja: failed recompaction: Permission denied` = 上一段遗留的
+  C4 后台 `ninja` 进程仍持有 `.ninja_log`（PID 存活但 CPU 不再增长）⇒ 杀进程重跑；②`LNK2019` 见 13.3。
+- ctest：**104/113 通过，9 失败**，与 C4 的失败集合**逐项相同**（`diff` 空集差异）：无 GPU `0xc0000409`
+  （`test-arg-parser` / `test-backend-meta-replay` / `test-opt`）、无网（`test-download-model` /
+  `test-eval-callback-download-model`）、无模型（`test-llama-context-model` / `test-thread-safety` /
+  `test-eval-callback`）、无 jinja2（`test-jinja-py`）。总数 112 → 113 是上游新增 `test-gelu-quick`。
+- 零损失：`fork 9l-` 593→601、PQ2_0 292→306、PTQ1_0 372→385、`GGML_TYPE_PQ2_0` 117→118、
+  `GGML_TYPE_PTQ1_0` 113→113、TURBO_WHT 59→63、`vbr_pools_` 154→158、kv_stream 1371→1375、
+  `MMVQ_PARAMETERS_VOLTA` 11→15、`prism.hadamard` 58→106、`llama_verify_hadamard_graph` 5→6，
+  以及 test-vbr / test-kv-stream / test-moe 全部 ≥ master。
+  `hadamard_rotations` 21→13 = C4 §12.1 的 `hdmd` 归并（fork 的并行 map 成员不再存在，typedef 与读取点保留）。
+- M2（整文件退回 base 的 master 改动）= 0；M5（master 新增文件在结果中缺失）= 0（过滤掉被 master 自己
+  改名/删除后又出现在 `--diff-filter=A` 里的噪声项后实测 0）。
