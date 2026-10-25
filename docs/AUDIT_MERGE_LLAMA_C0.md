@@ -465,3 +465,16 @@ fork 改的恰好是 `mmq_args` 的两个初始化器（FWHT pre-q8 走 `dst`、
 | `Ternary-Bonsai-2-2B-PTQ1_0.gguf` | 出 token，prompt 116.8 t/s / gen 171.7 t/s |
 | `Qwen3.5-0.8B-Q4_K_M.gguf`（对照，stock 量化）| prompt 200.4 t/s / gen 179.9 t/s |
 | `test-backend-ops -o RMS_NORM -b CUDA0` | 53/53 通过（替换 `norm.cu` 后的直接数值回归）|
+
+### 13.12 A1 的 sm_52 复验：本机环境阻塞，只做到 sm_70
+`argsort.cu` 整文件取上游后，A1 要求在 GTX 950（sm_52）上复验一次，理由是该文件的原 fork 提交是
+Maxwell 上的非法访存问题。当前状态：
+
+- `tmp/build-c1` 的 `CMAKE_CUDA_ARCHITECTURES=70` ⇒ 在 CUDA1（GTX 950）上跑任何 kernel 都是
+  `no kernel image is available for execution on the device`，**这不是新问题**，是构建配置。
+- 另开 `tmp/build-sm52`（`-DCMAKE_CUDA_ARCHITECTURES=52`，只编 `test-backend-ops`，配置 50 s 成功），
+  编译推进到 `197/204` 后**卡在 `mmvq.cu`**：`nvcc` / `cicc` / `cl` 子进程存活但 CPU 在 10 s 内零增长。
+  与之前同类的沙箱拦截一起看（`ninja/cmake/nvcc` 探测链会 fork `reg.exe`，而 `reg.exe` 在程序黑名单里），
+  判定为**环境阻塞**而非编译错误 —— 日志里 0 个 `error C####` / `FAILED:`。
+- 已完成的等价覆盖：V100（sm_70）`test-backend-ops -o ARGSORT -b CUDA0` 与 `-o TOP_K -b CUDA0` **全过**，
+  `-o RMS_NORM -b CUDA0` 53/53。**sm_52 这一条仍是开口项**，需要在解除 `reg.exe` 拦截的环境（或别的机器）上补。
