@@ -151,6 +151,11 @@ public:
 
     float scale_tok = 1.0f;
 
+    // the mixed path is only built when the ubatch actually mixes token and embd rows, so a cached
+    // graph may only be reused for the same content type (see llm_graph_input_embd::can_reuse)
+    bool mixed_capable = false; // arch and ctx type allow the mixed path at all
+    bool mixed_path    = false; // this graph was built with the 3-path select
+
     const int64_t n_embd = 0;
 };
 

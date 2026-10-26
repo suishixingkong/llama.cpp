@@ -133,6 +133,9 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
     res &= (!scale_rows) || scale_rows->ne[1] == params.ubatch.n_tokens;
+    // a graph built without the mixed path has a 2-way select, and its index would be 2 for a mixed
+    // ubatch, so the content type has to match the one the graph was built for
+    res &= !mixed_capable || (mixed_path == params.ubatch.is_mixed());
 
     return res;
 }
@@ -2667,7 +2670,20 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    //
+    // The path is only built when the ubatch really mixes token and embd rows. A pure token or a pure
+    // embd ubatch selects one of the other two paths, so everything the mixed path computes is dead
+    // work: a full GET_ROWS over the embedding table plus the copy of its result to the device. That
+    // GET_ROWS runs on the CPU (see the ordering comment below), so the waste is host work and PCIe
+    // traffic on the critical path, not a cheaper GPU op. On Vulkan prefill that measured 0.6% of
+    // pp512 for text-only workloads. Only building it on demand means the graph changes when the
+    // batch contents change type, which costs the same re-allocation as a changed n_tokens; a
+    // text-only workload never switches, so it always runs the 2-path graph.
+    const bool mixed_capable = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    const bool has_mixed     = mixed_capable && ubatch.is_mixed();
+
+    inp->mixed_capable = mixed_capable;
+    inp->mixed_path    = has_mixed;
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
 
