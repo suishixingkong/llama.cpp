@@ -16168,6 +16168,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET:
             {
+                // op_params[1] == 1 marks "raw gates" (ggml_gated_delta_net_set_raw_gates): g and
+                // beta arrive pre-activation, so the op also reads src[7]/src[8] (dt_bias, a). Only
+                // the CUDA kernel implements that fold - this shader reads g/beta as activations,
+                // so claiming support here silently produces a wrong result instead of a skip.
+                if (ggml_get_op_params_i32(op, 1) != 0) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
@@ -16235,6 +16242,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const int64_t cout = !transpose ? op->src[0]->ne[3] : op->src[0]->ne[2];
                 const int64_t cin  = !transpose ? op->src[0]->ne[2] : op->src[0]->ne[3];
 
+                // A zero-sized kernel dimension is degenerate, and the kernel dimensions are
+                // specialization constants: specialized with 0 the shader's inner loop has a
+                // zero trip count, and the NVIDIA compiler recurses until the host stack
+                // overflows (0xC00000FD, ~2400 frames, all inside nvoglv64). Some backends
+                // produce a (meaningless) result for it - refuse the device instead of
+                // letting the whole process die.
+                if (op->src[0]->ne[0] == 0 || op->src[0]->ne[1] == 0) {
+                    return false;
+                }
+
                 // Channel-contiguous format is not supported yet.
                 return ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                     (op->src[0]->nb[0] == sizeof(float) || op->src[0]->nb[0] == sizeof(ggml_fp16_t) ) &&
@@ -16247,6 +16264,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     ggml_is_contiguous(op));
             }
         case GGML_OP_CONV_3D:
+            // See the CONV_2D case above: KW/KH/KD are specialization constants, so a zero
+            // kernel dimension makes the driver compile a zero-trip-count loop and blow the
+            // host stack (observed on sm_70). ggml_conv_3d_direct() happily builds such a
+            // graph (output size 3 in the degenerate dimension), so this has to be gated here.
+            if (op->src[0]->ne[0] == 0 || op->src[0]->ne[1] == 0 || op->src[0]->ne[2] == 0) {
+                return false;
+            }
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32 &&

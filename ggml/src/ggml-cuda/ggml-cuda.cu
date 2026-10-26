@@ -7846,6 +7846,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                     return false;
                 }
+                // Below DP4A there is no tile path, so this op is served by the fp16 dequantize +
+                // cuBLAS fallback, and that fallback needs a per-type converter. The k-quant /
+                // i-quant family only provides the contiguous one (ggml_get_to_fp16_nc_cuda), so a
+                // non-contiguously allocated source would GGML_ASSERT mid-dispatch and take the
+                // process down. Report the combination as unsupported instead - the scheduler then
+                // places the node on a backend that can run it.
+                // The mat-vec path (ggml_cuda_should_use_mmvq) dequantizes inline and needs no
+                // converter, so short batches keep running on the device. Only quantized types can
+                // miss the converter (f16/f32 are converted by other tables), so the check is
+                // restricted to them - a plain f16 source is handed to cuBLAS as-is.
+                {
+                    const int cc_fallback = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    if (GGML_CUDA_CC_IS_NVIDIA(cc_fallback) &&
+                        ggml_cuda_highest_compiled_arch(cc_fallback) < GGML_CUDA_CC_DP4A &&
+                        ggml_is_quantized(a->type) &&
+                        ggml_get_to_fp16_nc_cuda(a->type) == nullptr &&
+                        !ggml_cuda_should_use_mmvq(a->type, cc_fallback, b->ne[1]) &&
+                        !ggml_is_contiguously_allocated(a)) {
+                        return false;
+                    }
+                }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
                 }
