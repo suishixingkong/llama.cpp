@@ -1249,8 +1249,24 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
-        result.block_rows /= 2;
+    // Shared-memory feasibility has to be enforced for EVERY shape, not only for the ones that
+    // still have rows to spare. Two independent holes used to remain:
+    //   - when reduce_block_rows is set (n_kv < 1024, D & 8, Intel) the check was skipped entirely,
+    //     yet it only covers the ROW side of the request: the K/V staging buffer is
+    //     Bc * (D/4 + 1) * 4 * sizeof(FLOAT_TYPE), i.e. it grows with the HEAD SIZE. On a device
+    //     without fp16 storage (FLOAT_TYPE stays float) hsk/hsv = 192 alone asks for 50176 B
+    //     (54096 B total) against a 48 KiB limit, while hsk = 128 needs 37456 B and hsk = 256 is
+    //     not staged at all — exactly the observed boundary. That config reached the device and
+    //     hung it (VK_ERROR_DEVICE_LOST / "device lost", e.g. GTX 950 = Vulkan1, hsk = 192, nb = 1).
+    //   - the row halving itself is unsafe for single-row decodes: block_rows is already 1 there,
+    //     and 1/2 = 0 reaches ggml_vk_create_pipeline as a zero workgroup denominator.
+    // Staging is a read optimization, not a correctness requirement, so it is the first thing to
+    // give up; only then shrink the row block, and never below one row.
+    if (!ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+        result.shmem_staging = 0;
+        if (!ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+            result.block_rows = std::max(1u, result.block_rows / 2);
+        }
     }
 
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
