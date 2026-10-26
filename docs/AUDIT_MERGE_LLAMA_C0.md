@@ -568,3 +568,47 @@ Maxwell 上的非法访存问题。当前状态：
   ⇒ 应 SKIP 而非失败。能力门用**后端接口声明**
   （`ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC)`），不靠失败推断。
   详见工作区根 `FIX_VBR_TEST_BACKEND_GATES.md`。
+
+### 14.6 §14.5 三条开口项的结论（2026-10-26 晚，前两条已修）
+
+前一节记录的三条开口项，逐条追到根因后的处理：
+
+1. **`test-backend-ops -b Vulkan0` 栈溢出（0xC00000FD）→ 已修（`e7aeb029e`）**
+   - 崩点是 **CONV_3D 的退化用例**（`KW=0` / `KH=0` / `KD=0`，上游本次新增的三条，各带 f32/f16 两版）。
+     `KW/KH/KD` 是**特化常量**，特化成 0 时着色器内层循环零次，NVIDIA 编译器递归到栈溢出：
+     gdb 抓到 **~2400 帧全在 `nvoglv64.dll`**，由 `ggml-vulkan.dll` 建 pipeline 时进入。
+   - ⛔ 不是「`-j 16` 并发」问题、也不是 CONV_TRANSPOSE_1D；`-j 1` 同样崩。
+   - ⛔ **不是合并回归**：把同一条退化用例加进合并前的树（`ce579daec`，Vulkan-only 构建），
+     在同一块 V100 上同样 `-1073741571`。合并只是把上游的新用例带了进来。
+   - 修法：`supports_op` 拒绝零尺寸卷积核（CONV_3D 三维 + CONV_2D/TRANSPOSE_2D 二维）。
+     设备相关：sm_52（GTX 950）恰好不崩，sm_70（V100）必崩。
+2. **`test-backend-ops -b CUDA1` 撞 `GGML_ASSERT(convert_func != nullptr)`（ggml-cuda.cu:2719）→ 已修（`e7aeb029e`）**
+   - 只在 **sm_52** 上发生：同一套 `-o MUL_MAT` 在 CUDA0（V100, sm_70）3263 例全过。
+   - 机理：DP4A 以下没有 tile 路径 ⇒ 走 fp16 dequantize + cuBLAS 回退 ⇒ 需要逐类型转换器，
+     而 k-quant/i-quant 只提供**连续**版本（`ggml_get_to_fp16_nc_cuda`）⇒ 非连续 src0 触发断言。
+   - 修法：只在「量化类型 + 无 nc 转换器 + 不走 mat-vec（`ggml_cuda_should_use_mmvq`）+ src0 非连续」
+     时报不支持。**影响面 9 条**（`q4_K/q5_K/q6_K` × `n=9/13/16` × `k_v=1280`），正是崩过的那一族；
+     f16 不受影响（判据限定量化类型）。
+   - ⭐ 中途踩过一次：初版判据没有 `ggml_is_quantized` 也没有排除 mat-vec 路径，误拒 82 条
+     （含 `type_a=f16` 与 `n≤8` 的 k-quant），靠「与 CUDA0 的拒绝集合做差集」才发现。
+3. **`test-llama-context` 的 `cp_d`（设备侧 state）失败 → 已定性，未修（fork 域）**
+   - 矩阵（本机 V100 16 GB + GTX 950 2 GB）：
+     | 配置 | 结果 |
+     |---|---|
+     | 默认（fork 的 VBR/turbo KV） | `cp_h` 之后崩 `0xC0000409` |
+     | 默认 + `GGML_CUDA_DISABLE_GRAPHS=1` | 同样崩 ⇒ 与 CUDA graph 无关 |
+     | 默认 + `-dev CUDA0`（单卡） | `state_read_data: mismatched key type (1 != -1, layer 7)` ⇒ `failed to restore kv cache` ⇒ 崩 |
+     | `-ctk f16 -ctv f16 -dev CUDA0` | **15 passed / 0 failed** |
+     | `-ctk f16 -ctv f16`（多卡） | GTX 950 上 KV 512 MiB 分配失败（环境：显存不够） |
+   - 根因：**VBR 层的 `k->type` 在物化前是 `-1`**（不是 `GGML_TYPE_COUNT`=144 那个哨兵）。
+     `state_write_data` 写的是 `k->type`，`state_read_data` 又拿 `k->type` 去比
+     （`src/llama-kv-cache.cpp:14131` / `:14471`）⇒ 保存时记下 -1、恢复时该层已物化成 F16 ⇒ 必然不匹配。
+     这是 fork 的 VBR 与上游 state 序列化的接口缺口，不是合并回归：
+     `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`（`d6e7b033a`）与 `failed to restore kv cache`（`4c676c85e`）
+     **两侧都早于合并**（`git log -S` + `merge-base --is-ancestor` 判定），
+     合并只是把覆盖从 fork 的 `tests/test-save-load-state.cpp::test_seq_cp_device`
+     换成了上游的 `tests/test-llama-context.cpp`（后者当前注册在 ctest，前者依赖模型下载 fixture，
+     本机历史上从未跑到）。
+   - ⛔ 不建议在这一轮盲改：正确修法要么在保存前强制物化 VBR 各层（类型 + 行宽都要稳定），
+     要么让 state 序列化携带与类型无关的表示；两者都属 fork 的 VBR 内部改造。
+     临时规避：`-ctk f16 -ctv f16`（单卡）。
