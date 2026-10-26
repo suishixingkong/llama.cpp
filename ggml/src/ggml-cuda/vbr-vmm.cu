@@ -19,6 +19,9 @@
 
 #if defined(GGML_USE_VMM)
 
+#include <mutex>
+#include <unordered_map>
+
 struct ggml_vbr_vmm_pool {
     int         device;
     CUdeviceptr base    = 0;
@@ -30,6 +33,23 @@ struct ggml_vbr_vmm_pool {
     void * mapping_guard = nullptr;
 #endif
 };
+
+// The buffer interface only sees (device, base, size): a partially committed pool VA range looks
+// exactly like a plain device range. Keep base -> pool so a whole-range operation (clear, and the
+// buffer-level fill the state tests use to poison an empty cache) can be routed to the MAPPED
+// chunks instead of walking unmapped VA and failing with cudaErrorInvalidValue.
+static std::mutex g_vmm_pool_map_mutex;
+static std::unordered_map<const void *, ggml_vbr_vmm_pool *> g_vmm_pool_map;
+
+static void vmm_pool_register(ggml_vbr_vmm_pool * pool) {
+    std::lock_guard<std::mutex> lock(g_vmm_pool_map_mutex);
+    g_vmm_pool_map[(const void *) pool->base] = pool;
+}
+
+static void vmm_pool_unregister(ggml_vbr_vmm_pool * pool) {
+    std::lock_guard<std::mutex> lock(g_vmm_pool_map_mutex);
+    g_vmm_pool_map.erase((const void *) pool->base);
+}
 
 static void vmm_pool_mapping_boundary(ggml_vbr_vmm_pool * pool) {
 #if defined(GGML_USE_HIP) && defined(__linux__)
@@ -86,6 +106,7 @@ ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) 
         return nullptr;
     }
 #endif
+    vmm_pool_register(pool);
     return pool;
 }
 
@@ -199,9 +220,13 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
 }
 
 void ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool * pool) {
+    ggml_backend_cuda_vmm_pool_fill(pool, 0);
+}
+
+void ggml_backend_cuda_vmm_pool_fill(ggml_vbr_vmm_pool * pool, uint8_t value) {
     ggml_cuda_set_device(pool->device);
     for (size_t c : pool->chunks) {
-        CUDA_CHECK(cudaMemset((void *)((char *) pool->base + c), 0, pool->gran));
+        CUDA_CHECK(cudaMemset((void *)((char *) pool->base + c), value, pool->gran));
     }
     if (!pool->chunks.empty()) {
         // order the legacy-stream memsets against the non-blocking ggml streams (see pool_map)
@@ -209,10 +234,30 @@ void ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool * pool) {
     }
 }
 
+// NOTE: the returned pool is only kept alive by its owner (the llama KV cache that reserved it),
+// which also owns every buffer view over this VA. A caller that is running on that owner's thread
+// — the buffer interface always is — cannot race a free.
+ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_for_ptr(const void * ptr) {
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_vmm_pool_map_mutex);
+    const uintptr_t p = (uintptr_t) ptr;
+    for (const auto & [base, pool] : g_vmm_pool_map) {
+        const uintptr_t b = (uintptr_t) base;
+        if (p >= b && p - b < pool->va_size) {
+            return pool;
+        }
+    }
+    return nullptr;
+}
+
 void ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool * pool) {
     if (!pool) {
         return;
     }
+    // before the VA goes away: a stale base -> pool row would hand out a dangling pool
+    vmm_pool_unregister(pool);
     ggml_cuda_set_device(pool->device);
     // cuMemUnmap/cuMemAddressFree are host-immediate with no implicit device sync (unlike
     // cudaFree): under -sm layer pipeline parallelism a prior ubatch's kernels can still be
@@ -241,6 +286,8 @@ size_t ggml_backend_cuda_vmm_pool_mapped_in_range(ggml_vbr_vmm_pool *, size_t, s
 bool   ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool *, size_t, size_t)  { return false;   }
 bool   ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool *, size_t, size_t){ return false;   }
 void   ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool *)                {                 }
+void   ggml_backend_cuda_vmm_pool_fill(ggml_vbr_vmm_pool *, uint8_t)        {                 }
+ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_for_ptr(const void *)        { return nullptr; }
 void   ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool *)                 {                 }
 
 #endif // GGML_USE_VMM

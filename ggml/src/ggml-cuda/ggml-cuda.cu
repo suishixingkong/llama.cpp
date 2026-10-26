@@ -1104,6 +1104,12 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        // cudaStreamPerThread is the per-thread default stream OF THE CURRENT DEVICE, so the copy has
+        // to run with one of the two buffers' devices selected. Callers are not required to have done
+        // that: a deferred copy (e.g. the on-device sequence-state io, whose destructor walks every
+        // buffer of the cache at once) can be copying a CUDA1 buffer while device 0 is still current,
+        // and cudaMemcpyAsync then rejects the foreign pointer with cudaErrorInvalidValue.
+        ggml_cuda_set_device(dst_ctx->device);
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -1134,6 +1140,16 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    // A VBR KV pool is ONE VA reservation with only the committed chunks mapped, so a memset over
+    // [base, base+size) walks unmapped VA and fails (cudaErrorInvalidValue). The buffer interface
+    // cannot tell such a range from a plain device range on its own — ask the pool registry.
+    // Legitimate callers of a whole-buffer clear do exist (llama_memory_get_buffers() exposes these
+    // buffers, and the state tests poison an empty cache before a restore), so this must degrade to
+    // "fill what is mapped" instead of aborting.
+    if (ggml_vbr_vmm_pool * pool = ggml_backend_cuda_vmm_pool_for_ptr(ctx->dev_ptr)) {
+        ggml_backend_cuda_vmm_pool_fill(pool, value);
+        return;
+    }
     CUDA_CHECK(cudaMemset(ctx->dev_ptr, value, buffer->size));
 }
 

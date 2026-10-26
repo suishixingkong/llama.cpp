@@ -57,6 +57,12 @@ GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_mapped_in_range(
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_map(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_unmap(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_clear(struct ggml_vbr_vmm_pool * pool);
+// fill the MAPPED chunks of the pool with `value` — the pool's VA range is only partly
+// committed, so a plain memset over [base, base+va_size) walks unmapped VA (cudaErrorInvalidValue)
+GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_fill(struct ggml_vbr_vmm_pool * pool, uint8_t value);
+// pool whose VA range contains ptr, NULL if none — lets the buffer interface tell a plain
+// device range from a partially-mapped VMM pool
+GGML_BACKEND_API struct ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_for_ptr(const void * ptr);
 
 // wrap externally-managed device memory (e.g. a VMM VA range) as a CUDA backend buffer; the buffer
 // does NOT take ownership — freeing it never cudaFree's ptr.
