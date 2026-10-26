@@ -478,3 +478,62 @@ Maxwell 上的非法访存问题。当前状态：
   判定为**环境阻塞**而非编译错误 —— 日志里 0 个 `error C####` / `FAILED:`。
 - 已完成的等价覆盖：V100（sm_70）`test-backend-ops -o ARGSORT -b CUDA0` 与 `-o TOP_K -b CUDA0` **全过**，
   `-o RMS_NORM -b CUDA0` 53/53。**sm_52 这一条仍是开口项**，需要在解除 `reg.exe` 拦截的环境（或别的机器）上补。
+
+## 14 落地记录：merge-llama → master（2026-10-26）
+
+| 项 | 值 |
+|---|---|
+| 方式 | `git merge --ff-only merge-llama`（**纯 fast-forward，无冲突面**） |
+| 前 | `ce579daec`（`master` == `origin/master`） |
+| 后 | **`7170dd674`**（= `merge-llama`） |
+| 提交量 | 897 提交（C1–C5 五段 + C5 收尾 + 三笔 Vulkan/llama-graph 修复） |
+| tree hash | 两侧同为 `9216de8d68aebc9d0159a6131984aa488e6d4890` ⇒ **内容逐字节一致** |
+
+### 14.1 为什么是 fast-forward 而不是解冲突合并
+落地前核对：`git rev-list --count merge-llama..master` = **0** ⇒ `master` 是 `merge-llama` 的
+**严格祖先**，`master..merge-llama` = 897。即 C1–C5 的五段合并本身已在 `merge-llama` 上完成，
+落回主线**不需要再解一次冲突**，也就不会引入「二次合并」的新冲突面。
+⚠️ 若哪天 `master` 领先了 `merge-llama`（本例之外的常态），这一步就会退化成真合并，
+届时**必须重跑 §13 的逐段核对**，不能只信 `--ff-only` 失败。
+
+### 14.2 落地后的验证（在本机重新构建，不复用旧产物）
+- **构建**：`build-vk-master`（Vulkan，`GGML_CUDA=OFF`）892 目标 **RC=0**；
+  `build-cpu-master`（CPU）605 目标 **RC=0**。两者都指向 `llama.cpp`（master 本体）。
+- **测试**：聚焦子集 `batch-alloc|meta-replay|tokenizer-0|llama-archs|backend-sampler|backend-ops`
+  **17/17 通过**；完整 `ctest -j 4` 107 项 **7 红**，逐条归因**全部是环境/网络**：
+  `test-jinja-py`（缺 python jinja2）、`test-download-model` / `test-eval-callback-download-model`（需联网）、
+  `test-llama-context-model` / `test-thread-safety` / `test-eval-callback`（依赖前述 ⇒ Not Run）、
+  `test-arg-parser`（`tests/test-arg-parser.cpp:1309` 断言 `res.first == 200`，即联网 GET 失败）。
+  ⛔ `test-arg-parser` 属**已记录在案的出网抖动**（§C3：探测通过、紧接着的 GET 失败，重跑直接 exit 0）
+  —— 在 merge 树构建上跑同一组用例，失败集合**完全一致**（该例重跑即过）。
+- **冒烟（Vulkan1，`-p 512 -n 128 -r 3`）**：
+
+  | 模型 | pp512 (t/s) | tg128 (t/s) |
+  |---|---|---|
+  | Qwen3.5-2B-Q8_0 | 2933.28 ± 11.97 | 191.92 ± 1.97 |
+  | Ternary-Bonsai-2-2B-PQ2_0 | 2998.45 ± 46.17 | 177.28 ± 3.44 |
+  | Ternary-Bonsai-2-2B-PTQ1_0 | 1542.58 ± 2.99 | 80.09 ± 0.14 |
+  | gemma-4-E2B-it-qat-Q4_0（MoE） | 3062.35 ± 63.76 | 144.38 ± 0.95 |
+
+  ⛔ 这些是**绝对值**，跨会话不可比（§记忆「固定顺序测量必然造假差距」）。
+  可比的**相对结论**是 5 轮交替逐轮配对的那组：稠密/三值三模型 **99.5~99.6%**、
+  gemma(MoE) **101.6%**、tg **+1.3~5.2%**（见工作区根 `ANALYSIS_CPU_VULKAN_BENCH.md` §10.2）。
+  落地**没有改动任何文件内容**（tree hash 相同），故这组相对结论原样成立。
+- **冒烟（CPU，`-dev none`）**：`Qwen3.5-0.8B-Q4_K_M` pp512 = **466.20 ± 27.87 t/s**
+  ⇒ 落地后 master 已带上游 `d834d44e6` 的 **k-quant tiled mul_mat**（落地前 master 同一模型仅 351 t/s）。
+
+### 14.3 有意保留 / 未做的事
+- **`merge-llama` 分支与 worktree `tmp/wt-c0` 保留**（只读参照）。原因：`build-c1`（CUDA，V100 用）、
+  `build-vk-merge` / `build-cpu-merge` 的源码指向都是 `tmp/wt-c0`，删 worktree 会让这些构建失效。
+  ⚠️ 两棵树内容已完全相同 ⇒ 这几个构建与 `build-vk-master` / `build-cpu-master` **等价**，
+  后续可以把 `build-c1` 重新指向 `llama.cpp` 后再删 worktree（需重配 CUDA 工具链，单独排期）。
+- **未推送远端**：落地后 `master` 领先 `origin/master` **897 提交**。推送与否由维护者决定。
+- ⚠️ `origin/master` 上**不含**这 897 提交 ⇒ 若从 `origin/master` 重新拉取会看到「落后」，
+  这是预期的（本地已落地、未推送）。
+
+### 14.4 落地时仍未闭环的开口项（沿用 §13.12，不在本次范围内）
+1. A1 的 **sm_52（GTX 950）复验**只做到 sm_70 —— `tmp/build-sm52` 卡在 `mmvq.cu`，判定为环境阻塞。
+2. **pinned 上限**挡死 1M 上下文（`cudaHostAllocMapped` 8 GiB OOM；上游已定 4 GiB `get_max_size`）。
+3. `build-c1` 是 `CUDA_ARCHITECTURES=70` ⇒ GTX 950 上恒 `no kernel image`。
+4. 远端 `gitcode/buun-port` 仍含作废的 `c3feaf01e`（领先 37 ⇒ 需 force-with-lease）。
+5. gemma 的 PPL 两树不同（master 9.8112 / merge 9.8220）属**既存图结构差异**，非本次引入。
