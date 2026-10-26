@@ -8,6 +8,9 @@
 #include "llama-vbr-explicit-capture.h"
 #include "llama.h"
 
+#include "ggml-backend.h"
+#include "ggml-vbr.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -3958,6 +3961,27 @@ static int run_vbr_epoch(const char * model_path, bool partition_typed, bool par
     return 0;
 }
 
+// Capability gate for the dynamic VBR path: only a backend that exports the ggml-vbr
+// interface can host a turbo/VBR KV cache (today: CUDA). Other GPU backends - Vulkan in
+// particular - refuse such a cache at init time, so the test must skip them by name
+// instead of failing the run. The gate is declared by the backend interface, not inferred
+// from a failure, so a real defect on a VBR-capable device still fails.
+static bool vbr_capable_device(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+
+    const auto get = (ggml_backend_vbr_iface_fn_t)
+        ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC);
+
+    return get != nullptr && get() != nullptr;
+}
+
 int main(int argc, char ** argv) {
     if (!unmet_report_self_check()) {
         return 1;
@@ -4028,27 +4052,31 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    bool have_gpu = false;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            have_gpu = true;
-            break;
-        }
-    }
-    if (!have_gpu) {
-        fprintf(stderr, "SKIP: VBR representation epoch requires a GPU VBR backend (currently CUDA)\n");
-        return 0;
-    }
-
-    // Run the epoch once per visible GPU so both cards are exercised in turn. Pinning the
+    // Run the epoch once per VBR-capable GPU so both cards are exercised in turn. Pinning the
     // model to one device is what keeps every pass inside the projected-capture harness's
     // single-device model; with one visible GPU this is a single, unchanged pass.
+    // A GPU whose backend cannot host a turbo/VBR KV cache is reported as skipped: the KV
+    // cache refuses such a device at init time, and that is a property of the backend, not
+    // a defect of the epoch logic.
     std::vector<ggml_backend_dev_t> gpus;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpus.push_back(dev);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
         }
+
+        if (vbr_capable_device(dev)) {
+            gpus.push_back(dev);
+        } else {
+            printf("SKIP: %s (%s) has no VBR backend support - the dynamic VBR KV cache needs a "
+                   "backend that exports the ggml-vbr interface (currently CUDA)\n",
+                   ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        }
+    }
+
+    if (gpus.empty()) {
+        fprintf(stderr, "SKIP: VBR representation epoch requires a GPU VBR backend (currently CUDA)\n");
+        return 0;
     }
     int device_failures = 0;
     for (size_t i = 0; i < gpus.size(); ++i) {

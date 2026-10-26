@@ -8,7 +8,9 @@
 #include "server-vbr-artifact-store.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-turbo-meansub.h"
+#include "ggml-vbr.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5861,15 +5863,28 @@ static void test_cuda_ring() {
     ggml_backend_dev_t device = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * candidate = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(candidate) ==
+        if (ggml_backend_dev_type(candidate) !=
                 GGML_BACKEND_DEVICE_TYPE_GPU) {
-            device = candidate;
-            break;
+            continue;
         }
+        // The ring gate drives the VBR streaming ring, which only a backend that exports
+        // the ggml-vbr interface provides (currently CUDA). A GPU without it is skipped:
+        // the gate is a property of the backend, not a defect of the ring logic.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(candidate);
+        const auto get = reg != nullptr
+            ? (ggml_backend_vbr_iface_fn_t) ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC)
+            : nullptr;
+        if (get == nullptr || get() == nullptr) {
+            fprintf(stderr, "SKIP: %s has no VBR backend support - the streaming ring gate needs "
+                    "a backend that exports the ggml-vbr interface (currently CUDA)\n",
+                    ggml_backend_dev_name(candidate));
+            continue;
+        }
+        device = candidate;
+        break;
     }
     if (!device) {
-        fprintf(stderr, "FAIL: no GPU backend for VBR streaming CUDA synthetic gate\n");
-        failures++;
+        fprintf(stderr, "SKIP: no VBR-capable GPU backend for the VBR streaming CUDA synthetic gate\n");
         return;
     }
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
