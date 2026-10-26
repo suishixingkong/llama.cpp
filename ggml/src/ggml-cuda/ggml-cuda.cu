@@ -2982,14 +2982,41 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
+    // Converting src0 to the compute type costs a temporary of ggml_nelements(src0) elements. For a
+    // large weight (e.g. the output layer) that is hundreds of MiB, so the conversion is done in
+    // row chunks. Quantized weights land here too whenever the device has no fast fp16 (Maxwell and
+    // consumer Pascal), which is exactly the class of device with the least free memory: a Q4_K
+    // output layer of 254 M elements becomes a 970 MiB f32 temporary that a 2 GiB card cannot hold
+    // (#29442 only covered F16/BF16 inputs). The chunk budget therefore follows what is actually
+    // free on the device instead of being a fixed 512 MiB, and the quantized types must satisfy the
+    // same "one row is self-contained" property the chunking relies on, which they do because nb[1]
+    // is a whole number of blocks.
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
+    constexpr size_t min_src0_convert_size =   8ull * 1024 * 1024;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
 
-    if (compute_type == GGML_TYPE_F32 &&
-            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
-            src0_f32_size > max_src0_convert_size) {
+    const bool src0_needs_convert = compute_type == GGML_TYPE_F32 &&
+        (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1; // a chunked dst is only contiguous_1 for a plain 2-D weight
+
+    if (src0_needs_convert && src0_f32_size > min_src0_convert_size) {
+        size_t convert_budget = max_src0_convert_size;
+        {
+            ggml_cuda_set_device(ctx.device);
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+                // leave the rest of the free memory to the rest of the graph
+                convert_budget = std::min(convert_budget, free_bytes/4);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+
+        // one row of src0 is a whole number of blocks for quantized types too, so the row loop is
+        // valid for every convertible type; the budget only has to leave at least one row in a chunk
         const size_t f32_row_size = src0_f32_size / src0->ne[1];
-        const int64_t rows_per_chunk = std::max<int64_t>(1, (int64_t) (max_src0_convert_size / f32_row_size));
+        const int64_t rows_per_chunk = std::max<int64_t>(1, (int64_t) (convert_budget / f32_row_size));
 
         if (rows_per_chunk < src0->ne[1]) {
             ggml_tensor src0_chunk = *src0;
