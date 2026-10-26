@@ -537,3 +537,34 @@ Maxwell 上的非法访存问题。当前状态：
 3. `build-c1` 是 `CUDA_ARCHITECTURES=70` ⇒ GTX 950 上恒 `no kernel image`。
 4. 远端 `gitcode/buun-port` 仍含作废的 `c3feaf01e`（领先 37 ⇒ 需 force-with-lease）。
 5. gemma 的 PPL 两树不同（master 9.8112 / merge 9.8220）属**既存图结构差异**，非本次引入。
+
+### 14.5 落地后的例行测试暴露的三条开口项（2026-10-26，均已定性，未修）
+
+1. **`test-backend-ops -b CUDA1`（GTX 950, sm_52）撞 `GGML_ASSERT(convert_func != nullptr)`**
+   （`ggml/src/ggml-cuda/ggml-cuda.cu:2719`）。**只在 sm_52 上发生**：同一套 `-o MUL_MAT` 在
+   CUDA0（V100, sm_70）**3263 例全过、RC=0**。机理：MMQ 需要 sm_75+，GTX 950 落到
+   「dequant + cuBLAS」回退路径，该路径要 `traits::convert_nc`，而触发类型没有实现它 ⇒ assert。
+   正确行为应是报 “not supported”。归属：**既存缺口**，即 §13.12 那个「sm_52 复验只到 sm_70」的
+   开口项——sm_52 路径从未被验证过。
+2. **`test-backend-ops -b Vulkan0 -j 16` 崩溃（0xC00000FD，栈溢出）**。**不是 CONV_2D 本身**：
+   单独 `-o CONV_2D` 在 Vulkan0 上 1178 例全部 `not supported`、RC=0；全套并行跑时最后打印的
+   一组恰是 CONV_2D（其余算子类型已跑完），故崩在别的算子上。归属待定（需先定位到算子）。
+3. **`test-llama-context` 崩在 `cp_d`（设备侧 io path）**，同批还暴露
+   `mismatched key type (1 != -1, layer 7)` / `failed to restore kv cache` /
+   `sequence state file checksum mismatch` / `auto VBR entry must be one of: f16, turbo8, ...`
+   ⇒ 指向 **fork 的 turbo/VBR KV 缓存与上游状态保存/恢复路径不兼容**（fork 域功能缺口，非合并
+   引入的上游回归；合并前 fork 自带的 `tests/test-save-load-state.cpp` 同一条 device-io 用例在
+   本次合并中被上游 #30023 的用例整合取代，见 §12 的「上游已删除的 12 个文件」清单）。
+   ⚠️ 多设备机器上跑这类上游多设备测试前要先确认它是否假设单卡（fork 自己的 VBR 测试都显式
+   pin 单卡）。
+
+同批修掉的两条（测试侧的门控，不改运行时语义）：
+
+- `6da9f0dd5`：`test-thread-safety` 原先自己枚举全部 GPU 设备、每设备放一份模型 ⇒ 用户传的
+  `-dev` 被无视，落在 Vulkan 上的副本撞上「VBR 只支持 CUDA」门控 ⇒ 整个测试红。修：显式 `-dev`
+  优先 + 按 `props.device_id` 去重同一物理卡 + 装不下/能力不足 ⇒ 显式 SKIP；但**用户 `-dev`
+  点名的设备仍算硬失败**（不让 SKIP 掩盖真缺陷）。
+- `388128712`：VBR epoch / artifact-capture 测试原先遍历所有可见 GPU，Vulkan 设备没有 VBR 能力
+  ⇒ 应 SKIP 而非失败。能力门用**后端接口声明**
+  （`ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC)`），不靠失败推断。
+  详见工作区根 `FIX_VBR_TEST_BACKEND_GATES.md`。
