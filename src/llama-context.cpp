@@ -1239,8 +1239,14 @@ bool llama_context::kv_stream_switch_phase(
 
     // Releasing the scheduler returns the only borrowed compute lease.
     sched.reset();
+
+    // the two slots are created on first use by get_gf_res_prev(), so the very first arena
+    // activation - which happens inside sched_reserve() before any graph has been built -
+    // finds them empty
     for (auto & r : gf_res_prev) {
-        r->reset();
+        if (r) {
+            r->reset();
+        }
     }
 
     const size_t old_kv_bytes = arena.current_kv_bytes;
