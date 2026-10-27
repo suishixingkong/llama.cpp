@@ -403,7 +403,17 @@ struct case_state_restore_failure : ctx_test {
 
         auto ctx = mr.ctx(opts);
         if (!ctx) {
-            return case_result::fail();
+            // a quantized V cache requires flash attention, so with such a cache the FA-off probe
+            // cannot be built at all; only a context that also fails with FA on is a defect
+            ctx_opts probe = opts;
+            probe.fa    = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            probe.quiet = true;
+
+            if (!mr.ctx(probe)) {
+                return case_result::fail();
+            }
+
+            return case_result::skip("this V cache type requires flash attention, so restoring with FA off cannot be tested");
         }
 
         llama_memory_t mem = llama_get_memory(ctx.get());

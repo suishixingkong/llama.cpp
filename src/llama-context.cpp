@@ -4113,6 +4113,21 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// The element count of a byte range inside a tensor.
+//
+// ggml_element_size() is ggml_type_size(), which for the quantized types is the size of a whole
+// block, not of an element: dividing a range by it yields blocks. Passing that as ne0 builds a
+// view that is ggml_blck_size() times too small - and empty for a range shorter than one block -
+// so the copy silently moves a fraction of the data. Ranges produced by the state writers are
+// always whole multiples of a row, hence of a block.
+static int64_t llama_io_nelem(const ggml_tensor * t, size_t size) {
+    const size_t type_size = ggml_type_size(t->type);
+
+    GGML_ASSERT(size % type_size == 0);
+
+    return (int64_t) (size/type_size*ggml_blck_size(t->type));
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -4144,12 +4159,15 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = llama_io_nelem(winfo.tensor, winfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
             mbuf.org.push_back(ggml_view_1d      (mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
             mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
+
+            GGML_ASSERT(ggml_nbytes(mbuf.org.back()) == winfo.size);
+            GGML_ASSERT(ggml_nbytes(mbuf.cpy.back()) == winfo.size);
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
@@ -4275,11 +4293,13 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = llama_io_nelem(rinfo.tensor, rinfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
             mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+
+            GGML_ASSERT(ggml_nbytes(mbuf.org.back()) == rinfo.size);
 
             ggml_backend_view_init(mbuf.org.back());
         }
@@ -4342,8 +4362,11 @@ public:
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                // both sides walk the same bytes, so both must see the same element count; the
+                // cursor only ever advances by whole chunks, which keeps it block-aligned
+                const int64_t n_el = llama_io_nelem(src_t, n_copy);
+
+                GGML_ASSERT(n_el == llama_io_nelem(dst_t, n_copy));
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
