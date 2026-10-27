@@ -13851,25 +13851,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
                 p.be->sync_device(p.device);
             }
         }
-        // a degraded-tier snapshot can never restore (state_read requires the fresh context's
-        // entry tiers) — refuse at SAVE time instead of failing the user at load time
-        for (const auto & p : vbr_pools_) {
-            if (p.vmm == nullptr) {
-                continue;
-            }
-            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                for (int side = 0; side < 2; ++side) {
-                    const vbr_extent  & e = side ? p.v[ikv] : p.k[ikv];
-                    const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-                    if (e.t != nullptr && t != nullptr && t->type != e.type0) {
-                        throw std::runtime_error(
-                            "cannot serialize a dynamic-VBR KV cache after tier degrades — the "
-                            "snapshot could never restore; save before the budget triggers, or "
-                            "run without dynamic VBR");
-                    }
-                }
-            }
-        }
+        // a degraded-tier snapshot is legal: the size and the tier of every (layer, side) travel
+        // with it, and state_read_data translates the rows when the restoring cache sits at a
+        // different tier (see kv_state_read_transcoded). Refusing here only took session save away
+        // from every user whose device is small enough to need the degrade controller.
     }
 
     io.write(&n_stream, sizeof(n_stream));
@@ -14397,14 +14382,100 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+// a contiguous run of destination cells, from inclusive to exclusive - same convention as
+// cell_ranges_t. Contiguous cells yield a single run covering the whole block
+struct kv_state_run { uint32_t from; uint32_t to; };
+
+// ggml_type_name() asserts on out-of-range values, and a snapshot that failed to restore can
+// legitimately carry a garbage type tag - name it instead of indexing the table
+static const char * kv_state_type_name(ggml_type type) {
+    return type >= 0 && type < GGML_TYPE_COUNT ? ggml_type_name(type) : "(invalid)";
+}
+
+// A sequence-state snapshot stores each (layer, side) in whatever representation the cache had when
+// it was taken, tagged with that type. A dynamic-VBR cache does not stay at its entry tier: the
+// degrade controller flips tensors down the price order as the VRAM budget fills, so the restoring
+// cache may hold a different type than the snapshot does (fresh contexts always start at the entry
+// tier; a context that kept decoding may have degraded further). Rows are independent, so the
+// translation is per row: dequantize from the stored type, re-quantize into the live one.
+// The stored row width is taken from the snapshot, not from the live tensor: turbo tiers pad ne[0],
+// so the element count of the stored row can be larger than the live row's logical width.
+static bool kv_state_read_transcoded(
+        llama_io_read_i & io,
+        ggml_tensor * t,
+        ggml_type type_ref,
+        uint64_t size_row_ref,
+        const std::vector<kv_state_run> & runs,
+        int64_t n_el_logical) {
+    const ggml_type type_dst = t->type;
+
+    if (type_ref < 0 || type_ref >= GGML_TYPE_COUNT || type_dst < 0 || type_dst >= GGML_TYPE_COUNT) {
+        return false;
+    }
+
+    const ggml_type_traits * tr_ref = ggml_get_type_traits(type_ref);
+    const ggml_type_traits * tr_dst = ggml_get_type_traits(type_dst);
+    if (tr_ref == nullptr || tr_dst == nullptr || tr_ref->to_float == nullptr) {
+        return false;
+    }
+    const ggml_from_float_t from_float = tr_dst->from_float_ref;
+    if (from_float == nullptr) {
+        return false;
+    }
+
+    const int64_t blck_ref = ggml_blck_size(type_ref);
+    const int64_t blck_dst = ggml_blck_size(type_dst);
+
+    const int64_t n_el_ref = (int64_t) (size_row_ref / ggml_type_size(type_ref)) * blck_ref;
+    if (ggml_row_size(type_ref, n_el_ref) != size_row_ref) {
+        return false;
+    }
+    // the stored row cannot be narrower than the values it is supposed to carry
+    if (n_el_logical > n_el_ref || n_el_logical > (int64_t) t->ne[0]) {
+        return false;
+    }
+
+    // quantize whole blocks only; the live row's padding stays as it is (zeroed when mapped)
+    int64_t n_el_dst = (n_el_logical + blck_dst - 1)/blck_dst*blck_dst;
+    if (n_el_dst > (int64_t) t->ne[0]) {
+        n_el_dst = (int64_t) t->ne[0]/blck_dst*blck_dst;
+    }
+    if (n_el_dst <= 0) {
+        return false;
+    }
+
+    const size_t size_row_dst = ggml_row_size(type_dst, n_el_dst);
+    if (size_row_dst > t->nb[1]) {
+        return false;
+    }
+
+    std::vector<uint8_t> row_ref(size_row_ref);
+    std::vector<float>   f_ref(n_el_ref);
+    std::vector<float>   f_dst(n_el_dst);
+    std::vector<uint8_t> row_dst(size_row_dst);
+
+    LLAMA_LOG_DEBUG("%s: %s -> %s, %zu elements per row\n", __func__,
+            ggml_type_name(type_ref), ggml_type_name(type_dst), (size_t) n_el_logical);
+    for (const auto & r : runs) {
+        for (uint32_t i = r.from; i < r.to; ++i) {
+            io.read(row_ref.data(), row_ref.size());
+            tr_ref->to_float(row_ref.data(), f_ref.data(), n_el_ref);
+
+            std::fill(f_dst.begin(), f_dst.end(), 0.0f);
+            memcpy(f_dst.data(), f_ref.data(), (size_t) std::min(n_el_ref, n_el_dst)*sizeof(float));
+            from_float(f_dst.data(), row_dst.data(), n_el_dst);
+
+            ggml_backend_tensor_set(t, row_dst.data(), (size_t) i*t->nb[1], size_row_dst);
+        }
+    }
+
+    return true;
+}
+
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
-    // batch the scatter reads per contiguous run of destination indices
-    // from inclusive, to exclusive - same convention as cell_ranges_t
-    // contiguous cells yield a single run covering the whole block
-    struct cell_run { uint32_t from; uint32_t to; };
-    std::vector<cell_run> runs;
+    std::vector<kv_state_run> runs;
     if (cell_count > 0) {
         const auto & idxs = sinfo.idxs[0];
         uint32_t i0 = 0;
@@ -14417,6 +14488,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             i0 = i1;
         }
     }
+
+    // what the snapshot holds vs what this cache holds now (dynamic VBR: a restore may have to
+    // requantize). The TCQ footer presence has to follow the SNAPSHOT's types, not the live ones:
+    // the writer appended it based on the tiers it had at save time.
+    bool      requantized  = false;
+    ggml_type requant_from = GGML_TYPE_COUNT;
+    ggml_type requant_to   = GGML_TYPE_COUNT;
+    bool      has_tcq_ref  = false;
 
     uint32_t v_trans;
     uint32_t n_layer;
@@ -14466,14 +14545,30 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         int32_t k_type_i_ref;
         io.read(&k_type_i_ref, sizeof(k_type_i_ref));
         const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
-        }
+        has_tcq_ref = has_tcq_ref || ggml_type_is_turbo_tcq((ggml_type) k_type_i_ref);
 
         // Read row size of key
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
+
+        if (k_type_i != k_type_i_ref) {
+            // the snapshot was taken at a different tier than the cache is at now (dynamic VBR:
+            // the degrade wave moved the tensor, or this is a fresh context still at the entry
+            // tier) - translate the rows instead of rejecting the snapshot
+            if (!kv_state_read_transcoded(io, k, (ggml_type) k_type_i_ref, k_size_row_ref, runs,
+                        (int64_t) hparams.n_embd_k_gqa(il))) {
+                LLAMA_LOG_ERROR("%s: cannot restore key layer %d: snapshot holds %s, cache holds %s\n",
+                        __func__, il, kv_state_type_name((ggml_type) k_type_i_ref), kv_state_type_name((ggml_type) k_type_i));
+                return false;
+            }
+            if (!requantized) {
+                requantized  = true;
+                requant_from = (ggml_type) k_type_i_ref;
+                requant_to   = (ggml_type) k_type_i;
+            }
+            continue;
+        }
+
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
@@ -14500,15 +14595,30 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             int32_t v_type_i_ref;
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
-            if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
-            }
+            has_tcq_ref = has_tcq_ref || ggml_type_is_turbo_tcq((ggml_type) v_type_i_ref);
 
             // Read row size of value
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
-            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+
+            if (v_type_i != v_type_i_ref) {
+                // see the key branch: a snapshot from another tier is translated, not rejected
+                if (!kv_state_read_transcoded(io, v, (ggml_type) v_type_i_ref, v_size_row_ref, runs,
+                            (int64_t) n_embd_v_gqa)) {
+                    LLAMA_LOG_ERROR("%s: cannot restore value layer %d: snapshot holds %s, cache holds %s\n",
+                            __func__, il, kv_state_type_name((ggml_type) v_type_i_ref), kv_state_type_name((ggml_type) v_type_i));
+                    return false;
+                }
+                if (!requantized) {
+                    requantized  = true;
+                    requant_from = (ggml_type) v_type_i_ref;
+                    requant_to   = (ggml_type) v_type_i;
+                }
+                continue;
+            }
+
+            // the writer used the tensor's own width (turbo tiers pad it) - mirror that here
+            const size_t v_size_row = ggml_row_size(v->type, (int64_t) v->ne[0]);
             if (v_size_row != v_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                 return false;
@@ -14535,8 +14645,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             int32_t v_type_i_ref;
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
             const int32_t v_type_i = (int32_t) v->type;
+            has_tcq_ref = has_tcq_ref || ggml_type_is_turbo_tcq((ggml_type) v_type_i_ref);
             if (v_type_i != v_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d): a transposed V cache "
+                        "is stored element-wise, so a snapshot from another tier cannot be translated\n",
+                        __func__, v_type_i, v_type_i_ref, il);
                 return false;
             }
 
@@ -14566,14 +14679,15 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
-    // Turbo TCQ safety: verify codebook fingerprint matches current process.
-    bool has_tcq = false;
-    for (const auto & layer : layers) {
-        if (ggml_type_is_turbo_tcq(layer.k_stream[strm]->type)) { has_tcq = true; break; }
-        auto * v = layer.v_stream[strm];
-        if (v && ggml_type_is_turbo_tcq(v->type)) { has_tcq = true; break; }
+    if (requantized) {
+        LLAMA_LOG_INFO("%s: restored a snapshot saved at another KV representation (%s -> %s): the "
+                "rows were requantized into this cache's current tiers\n",
+                __func__, kv_state_type_name(requant_from), kv_state_type_name(requant_to));
     }
-    if (has_tcq) {
+
+    // Turbo TCQ safety: verify codebook fingerprint matches the one the snapshot process used.
+    // Presence follows the SNAPSHOT's types: the writer appended the footer based on its own tiers.
+    if (has_tcq_ref) {
         uint32_t magic_ref = 0;
         io.read(&magic_ref, sizeof(magic_ref));
         if (magic_ref != 0x54514346) { // "TQCF"

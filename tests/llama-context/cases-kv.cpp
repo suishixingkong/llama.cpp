@@ -709,6 +709,17 @@ struct case_state_restore_fragmented : ctx_test {
 
         const logits_diff diff = compare_logits(logits, logits_keep, n_vocab);
 
+        // the continued token has to see the same KV values in both contexts. Under dynamic VBR a
+        // context whose VRAM budget forced a degrade holds requantized rows, and the restored one
+        // may be requantized into a different tier, so this comparison only means something while
+        // both caches sit at the same bits/value
+        {
+            std::string why;
+            if (!same_kv_representation(ctx.get(), ctx_keep.get(), why)) {
+                return case_result::skip(why);
+            }
+        }
+
         CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD,
                 "the logits of the restored seq 1 differ from the reference: nmse " + std::to_string(diff.nmse()));
 

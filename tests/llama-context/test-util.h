@@ -98,6 +98,16 @@ bool load_state_replay_last(llama_context * ctx, const std::string & path, const
 // false when the sizes differ or any byte differs, the first difference is logged
 bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b);
 
+// effective KV bits/value of a context (see llama_memory_kv_bpv), -1 when it has no attention KV
+double kv_bpv(llama_context * ctx);
+
+// Whether two contexts hold the same KV representation. Under dynamic VBR the tier follows each
+// context's own live VRAM budget, so two contexts of the same configuration can end up at different
+// bits/value; and restoring a snapshot into a cache whose tier moved requantizes the rows. Logits
+// from different representations differ by the quantization error, not because of a defect, so
+// exactness checks have to know the difference. Sets `why` to a one-line explanation when false.
+bool same_kv_representation(llama_context * a, llama_context * b, std::string & why);
+
 // overwrite the tensor data with 0xff bytes (NaN when read as f16/f32), so that the restore fails
 bool corrupt_state(std::vector<uint8_t> & data);
 

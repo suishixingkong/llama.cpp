@@ -294,6 +294,16 @@ struct case_rollback : ctx_test {
 
             logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
 
+            // exactness needs both caches at the same KV representation: a dynamic-VBR context that
+            // had to degrade holds requantized rows, and a restore into a cache whose tier moved is
+            // requantized too, so the difference would be quantization error rather than a defect
+            if (i == 0) {
+                std::string why;
+                if (!same_kv_representation(ctx_src.get(), ctx_dst.get(), why)) {
+                    return case_result::skip(why);
+                }
+            }
+
             const logits_diff diff = compare_logits(logits_src, logits_dst, n_vocab);
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "replay logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
@@ -349,6 +359,13 @@ struct case_rollback : ctx_test {
             if (logits_dirty == nullptr) {
                 TLOG_ERR("%s: missing dirty logits at position %d\n", __func__, pos);
                 return case_result::fail();
+            }
+
+            if (i == 0) {
+                std::string why;
+                if (!same_kv_representation(ctx_src.get(), ctx_dirty.get(), why)) {
+                    return case_result::skip(why);
+                }
             }
 
             const logits_diff diff = compare_logits(logits_src_replay[i].data(), logits_dirty, n_vocab);

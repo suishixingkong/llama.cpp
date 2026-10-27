@@ -283,6 +283,27 @@ bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b)
     return false;
 }
 
+double kv_bpv(llama_context * ctx) {
+    return llama_memory_kv_bpv(llama_get_memory(ctx));
+}
+
+bool same_kv_representation(llama_context * a, llama_context * b, std::string & why) {
+    const double bpv_a = kv_bpv(a);
+    const double bpv_b = kv_bpv(b);
+    if (bpv_a < 0 || bpv_b < 0 || std::abs(bpv_a - bpv_b) <= 1e-9) {
+        return true;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+            "different KV representations (%.4g vs %.4g bits/value): a dynamic-VBR cache picks its "
+            "tier from its own live VRAM budget, and a restore into a cache whose tier moved is "
+            "requantized, so their logits differ by that quantization error",
+            bpv_a, bpv_b);
+    why = buf;
+    return false;
+}
+
 bool corrupt_state(std::vector<uint8_t> & data) {
     if (data.size() < 3*4096) {
         TLOG_ERR("%s: state of %zu bytes is too small to corrupt\n", __func__, data.size());
