@@ -518,6 +518,21 @@ static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_b
                 break;
             }
         }
+        // A derived buffer type (e.g. the CUDA KV-stream host buffer) is not enumerated by
+        // buffer_type(j), yet it still lives on one of the backend's devices.  Resolve the
+        // ordinal by device identity so the scratch/registration path obtains a valid index
+        // instead of leaving d.device at -1.
+        if (d.device < 0) {
+            const ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
+            if (dev != nullptr) {
+                for (int j = 0; j < d.be->get_device_count(); ++j) {
+                    if (ggml_backend_buft_get_device(d.be->buffer_type(j)) == dev) {
+                        d.device = j;
+                        break;
+                    }
+                }
+            }
+        }
         ret.push_back(d);
     }
     return ret;
