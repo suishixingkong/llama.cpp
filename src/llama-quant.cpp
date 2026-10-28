@@ -354,6 +354,17 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_v_b.weight")         == std::string::npos;
     }
 
+    // qwen3.5: the GDN gate projections are [n_embd, n_v_heads] (2048x16 on the 2B model)
+    // and feed the per-head forget/write rates of the recurrent state directly, so a
+    // low-bit error there is amplified over the whole sequence instead of being averaged
+    // out by a wide activation. The ternary reference checkpoint for this arch keeps
+    // exactly these two tensors in F32, so mirror that rather than spending 1.75 bpw on
+    // 16 outputs per layer.
+    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+        quantize &= name.find("ssm_alpha.weight") == std::string::npos;
+        quantize &= name.find("ssm_beta.weight")  == std::string::npos;
+    }
+
     // the decision head of vllm-decision2 is small and computed in F32
     if (arch == LLM_ARCH_VLLM_DECISION2) {
         quantize &= name.compare(0, 9, "decision.") != 0;
