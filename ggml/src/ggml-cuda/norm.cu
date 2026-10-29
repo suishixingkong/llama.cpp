@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -227,6 +228,43 @@ static __global__ void rms_norm_f32(const float * x,
             }
         }
     }
+}
+
+// RMS_NORM -> MUL (per-column weight) -> GLU(SWIGLU), i.e. the gated norm of the delta-net layers.
+// The weight multiply is already folded into the norm kernel, but the GLU still reads the
+// normalised tensor back from memory; doing all three in one launch halves that traffic.
+// The matcher in ggml-cuda.cu only selects it for 128-wide contiguous rows, which is what makes
+// the flat row index below valid.
+static __global__ void rms_norm_mul_glu_f32(
+        const float * x, const float * weight, const float * gate, float * dst,
+        const int64_t s01, const int64_t s02, const int64_t s03, const float eps) {
+    ggml_cuda_pdl_lc();
+
+    // one block per row of 128 columns, four columns per lane; grid.x/y/z are the row/channel/sample
+    // counts and the matcher keeps them below the CUDA limits, so nothing has to be clamped here
+    const int64_t row = ((int64_t(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 128;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    const int i = threadIdx.x;
+
+    const float4 xv = ((const float4 *) (x + blockIdx.x * s01 + blockIdx.y * s02 + blockIdx.z * s03))[i];
+
+    const float sum   = block_reduce<block_reduce_method::SUM, 32>(xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w, s_sum);
+    const float scale = rsqrtf(sum / 128.0f + eps);
+
+    const float4 wv = ((const float4 *) weight)[i];
+    const float4 gv = ((const float4 *) (gate + row))[i];
+
+    float4 r;
+    r.x = ggml_cuda_op_silu_single(gv.x) * (scale * xv.x * wv.x);
+    r.y = ggml_cuda_op_silu_single(gv.y) * (scale * xv.y * wv.y);
+    r.z = ggml_cuda_op_silu_single(gv.z) * (scale * xv.z * wv.z);
+    r.w = ggml_cuda_op_silu_single(gv.w) * (scale * xv.w * wv.w);
+
+    ((float4 *) (dst + row))[i] = r;
 }
 
 template <int block_size>
@@ -700,6 +738,39 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_mul_glu(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm,
+                                   ggml_tensor * mul_tensor, ggml_tensor * glu_tensor) {
+    const ggml_tensor * rms_norm_src = rms_norm->src[0];
+    const ggml_tensor * mul_src      = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * gate         = glu_tensor->src[0];
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_src->type      == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type         == GGML_TYPE_F32);
+    GGML_ASSERT(glu_tensor->type   == GGML_TYPE_F32);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    // the kernel reads and writes float4 windows
+    GGML_ASSERT(s01 % 4 == 0 && s02 % 4 == 0 && s03 % 4 == 0);
+
+    const ggml_cuda_kernel_launch_params launch_params{
+        dim3(rms_norm_src->ne[1], rms_norm_src->ne[2], rms_norm_src->ne[3]), dim3(32), 32 * sizeof(float), ctx.stream()};
+
+    ggml_cuda_kernel_launch(rms_norm_mul_glu_f32, launch_params,
+        static_cast<const float *>(rms_norm_src->data), static_cast<const float *>(mul_src->data),
+        static_cast<const float *>(gate->data), static_cast<float *>(glu_tensor->data),
+        s01, s02, s03, eps);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

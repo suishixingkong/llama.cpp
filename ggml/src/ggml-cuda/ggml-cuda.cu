@@ -5740,6 +5740,56 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    // RMS_NORM -> MUL(weight) -> GLU(SWIGLU): the gated norm of the delta-net layers. Both of the
+    // first two nodes are already served by one kernel each way, but the GLU still reads the
+    // normalised tensor back from memory, so folding all three into one launch halves the traffic.
+    // GGML_CUDA_RMS_NORM_GLU=0 disables it.
+    std::initializer_list<enum ggml_op> rms_norm_mul_glu_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_GLU };
+
+    if (is_equal(rms_norm_mul_glu_ops, ops)) {
+        static const bool glu_fusion_disabled = getenv("GGML_CUDA_RMS_NORM_GLU") != nullptr &&
+                                                atoi(getenv("GGML_CUDA_RMS_NORM_GLU")) == 0;
+        if (glu_fusion_disabled) {
+            return false;
+        }
+
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
+
+        // only the unswapped layout is handled: src[1] is the normalised branch, src[0] the gate
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] != mul) {
+            return false;
+        }
+
+        const ggml_tensor * x      = rms_norm->src[0];
+        const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor * gate   = glu->src[0];
+
+        if (x->ne[0] != 128 || weight->ne[0] != 128 || ggml_nelements(weight) != 128 ||
+            x->ne[1] > 65535 || x->ne[2] > 65535 || x->ne[3] > 65535) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_rows(x) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(gate) ||
+            !ggml_is_contiguous(glu) || !ggml_are_same_shape(x, gate) || !ggml_are_same_shape(x, glu)) {
+            return false;
+        }
+
+        for (const ggml_tensor * t : { x, weight, gate, rms_norm, mul, glu }) {
+            if (t->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -6721,6 +6771,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_GLU }, {})) {
+        ggml_cuda_op_rms_norm_mul_glu(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
