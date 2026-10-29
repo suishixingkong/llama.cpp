@@ -150,6 +150,15 @@ set_source_files_properties(fit.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+if (LLAMA_KVMEM)
+    # KVMem params are an out-of-tree struct; common fills it through the same
+    # header the adapter builds against (LLAMA_KVMEM_ROOT/src/adapter).
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_KVMEM=1)
+    # hooks.h also reaches into the kvmem host library for its option types.
+    target_include_directories(${TARGET} PRIVATE
+        ${LLAMA_KVMEM_ROOT}/src/adapter
+        ${LLAMA_KVMEM_ROOT}/kvmem/include)
+endif()
 
 if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)

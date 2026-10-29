@@ -3329,6 +3329,174 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_stream_arena_mib = value;
         }
     ).set_env("LLAMA_ARG_KV_STREAM_ARENA_MIB"));
+#if defined(LLAMA_KVMEM)
+    // KVMem knobs. Only exist in builds that carry the out-of-tree memory
+    // adapter: accepting --kvmem in any other build would silently do nothing.
+    add_opt(common_arg(
+        {"--kvmem"},
+        "enable KVMem slot-pool memory (requires a LLAMA_KVMEM build)",
+        [](common_params & params) {
+            params.kvmem.enabled = true;
+        }
+    ).set_env("LLAMA_ARG_KVMEM"));
+    add_opt(common_arg(
+        {"--kvmem-block-tokens"}, "N",
+        string_format("KVMem block size in tokens; 0 uses 32 (default: %d)", params.kvmem.block_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem block size must be non-negative");
+            }
+            params.kvmem.block_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_BLOCK_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-budget"}, "N",
+        string_format("KVMem GPU working-set tokens; 0 keeps every block resident (default: %d)", params.kvmem.budget),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem budget must be non-negative");
+            }
+            params.kvmem.budget = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_BUDGET"));
+    add_opt(common_arg(
+        {"--kvmem-gen-reserve"}, "N",
+        string_format("extra GPU tokens reserved for decode (default: %d)", params.kvmem.gen_reserve),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem gen-reserve must be non-negative");
+            }
+            params.kvmem.gen_reserve = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_GEN_RESERVE"));
+    add_opt(common_arg(
+        {"--kvmem-sink-tokens"}, "N",
+        string_format("always-kept prefix in tokens; 0 keeps one block (default: %d)", params.kvmem.sink_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem sink tokens must be non-negative");
+            }
+            params.kvmem.sink_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_SINK_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-recent-tokens"}, "N",
+        string_format("always-kept suffix tokens; 0 keeps only the newest tail under pressure (default: %d)", params.kvmem.recent_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem recent tokens must be non-negative");
+            }
+            params.kvmem.recent_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_RECENT_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-method"}, "{recency,retrieval}",
+        string_format("KVMem block selection: recency keeps the newest blocks, retrieval scores every block against the query (default: %s)", params.kvmem.method.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "recency" && value != "retrieval") {
+                throw std::invalid_argument("KVMem method must be recency or retrieval");
+            }
+            params.kvmem.method = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_METHOD"));
+    add_opt(common_arg(
+        {"--kvmem-mtp-state"}, "{snapshots,auto,replay}",
+        string_format("KVMem MTP rollback state: snapshots rides the upstream n_rs_seq planes (default: %d)", params.kvmem.mtp_state),
+        [](common_params & params, const std::string & value) {
+            if (value == "snapshots") {
+                params.kvmem.mtp_state = 0;
+            } else if (value == "auto") {
+                params.kvmem.mtp_state = 1;
+            } else if (value == "replay") {
+                // Rejecting build-out beats a silent downgrade: the fold kernel
+                // this needs is not part of the port.
+                throw std::invalid_argument("KVMem MTP replay is not available in this build; use snapshots or auto");
+            } else {
+                throw std::invalid_argument("KVMem MTP state must be snapshots, auto or replay");
+            }
+        }
+    ).set_env("LLAMA_ARG_KVMEM_MTP_STATE"));
+    add_opt(common_arg(
+        {"--kvmem-gpu-ratio"}, "R",
+        "cap the KVMem slot pool at this fraction of the first GPU's VRAM; 0 uses 0.50",
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (value < 0.0 || value > 1.0) {
+                throw std::invalid_argument("KVMem GPU ratio must be within [0, 1]");
+            }
+            params.kvmem.gpu_ratio = (float) value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_GPU_RATIO"));
+    add_opt(common_arg(
+        {"--kvmem-gpu-high"}, "R",
+        "prefill offload high watermark; 0 uses 0.95",
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (value < 0.0 || value > 1.0) {
+                throw std::invalid_argument("KVMem GPU high watermark must be within [0, 1]");
+            }
+            params.kvmem.gpu_high = (float) value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_GPU_HIGH"));
+    add_opt(common_arg(
+        {"--kvmem-gpu-low"}, "R",
+        "documented target after prefill offload; 0 uses 0.85",
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (value < 0.0 || value > 1.0) {
+                throw std::invalid_argument("KVMem GPU low watermark must be within [0, 1]");
+            }
+            params.kvmem.gpu_low = (float) value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_GPU_LOW"));
+    add_opt(common_arg(
+        {"--kvmem-host-mib"}, "N",
+        string_format("shared native KV budget in host RAM (MiB) (default: %d)", params.kvmem.host_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem host budget must be non-negative");
+            }
+            params.kvmem.host_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_HOST_MIB"));
+    add_opt(common_arg(
+        {"--kvmem-disk-mib"}, "N",
+        string_format("shared native KV budget on SSD (MiB); 0 disables it (default: %d)", params.kvmem.disk_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem disk budget must be non-negative");
+            }
+            params.kvmem.disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_DISK_MIB"));
+    add_opt(common_arg(
+        {"--kvmem-disk-path"}, "PATH",
+        "process-local spill directory; pair it with --kvmem-disk-mib",
+        [](common_params & params, const std::string & value) {
+            params.kvmem.disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_DISK_PATH"));
+    add_opt(common_arg(
+        {"--kvmem-cpu-gb"}, "G",
+        "CPU spill arena in GiB; 0 disables it",
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (value < 0.0) {
+                throw std::invalid_argument("KVMem CPU arena must be non-negative");
+            }
+            params.kvmem.cpu_gb = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_CPU_GB"));
+    add_opt(common_arg(
+        {"--kvmem-harvest-v"},
+        {"--no-kvmem-harvest-v"},
+        "capture V into the host store during prefill (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kvmem.harvest_v = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_HARVEST_V"));
+#endif // LLAMA_KVMEM
+
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},

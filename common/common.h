@@ -501,6 +501,29 @@ struct common_moe_cache_params {
     std::string profile_path;
 };
 
+// KVMem: sidecar sparse/retrieval KV memory (LLAMA_KVMEM builds drive it; the
+// fields stay here unconditionally so arg.cpp, the priority arbitration and the
+// tests share one layout, and only the translation to llama_kvmem_params is
+// compiled under LLAMA_KVMEM). Zero means "adapter default".
+struct common_params_kvmem {
+    bool enabled          = false;
+    int32_t block_tokens  = 0;    // 0 -> 32
+    int32_t budget        = 0;    // working-set tokens; 0 -> n_ctx (identity, no sparsity)
+    int32_t gen_reserve   = 0;    // extra GPU tokens for decode; 0 -> 256
+    int32_t sink_tokens   = 0;    // always-kept prefix; 0 -> one block
+    int32_t recent_tokens = 0;    // always-kept suffix blocks; 0 -> newest tail under pressure
+    std::string method    = "retrieval"; // recency | retrieval
+    int32_t mtp_state     = 0;    // 0 snapshots, 1 auto, 2 replay (not ported)
+    float gpu_ratio       = 0.0f; // 0 -> 0.50 of device VRAM
+    float gpu_high        = 0.0f; // 0 -> 0.95 prefill-offload high watermark
+    float gpu_low         = 0.0f; // 0 -> 0.85 documented target after offload
+    int32_t host_mib      = 16384; // shared native KV RAM quota, MiB
+    int32_t disk_mib      = 0;    // shared native KV SSD quota, MiB; 0 -> off
+    std::string disk_path;        // process-local spill directory; empty -> off
+    double cpu_gb         = 0.0;  // CPU spill arena, GiB; 0 -> off
+    bool harvest_v        = false; // prefill D2H V capture
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -759,6 +782,7 @@ struct common_params {
     bool vbr_pin_v() const { return vbr_dynamic() && !vbr_cache_type_v && vbr_cache_type_k; }
 
     uint32_t kv_stream_arena_mib = 0;        // shared CUDA KV + compute arena, 0 = disabled [EXPERIMENTAL]
+    common_params_kvmem kvmem;               // KVMem sidecar memory (LLAMA_KVMEM builds)
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 

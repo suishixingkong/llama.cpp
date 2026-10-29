@@ -17,6 +17,9 @@
 #include "../src/llama-ext.h" // staging API: llama_vram_load_begin/end/complete
 #include "../src/llama-sha256.h" // fork 9l-d4b7j: the control-vector applied digest (fork common.cpp 10)
 #include "../src/llama-vbr-codec.h" // fork 9l-vbr-auto-ladder: name the resolved ladder in the log
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 
 #include <algorithm>
 #include <cinttypes>
@@ -2018,6 +2021,107 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// Memory-mode arbitration: KVMem > KV stream arena > VBR (user requirement).
+//
+// Two stages, not one `if`: priority first, then admission -- a mode that cannot
+// run this configuration yields to the next one instead of failing hard.
+// Dropping a mode MUST also clear its knobs; a warning alone would leave the
+// user with a half-open configuration, which is the failure this function
+// exists to prevent. It sits here because this is the last point that holds
+// both the parsed flags and the cparams they turn into.
+#if defined(LLAMA_KVMEM)
+// llama_kvmem_set_params() is a process-wide setter rather than a cparams field,
+// and its contract is "call before llama_init_from_model". Building cparams is
+// the last moment that satisfies both, so the arming happens right here.
+static void common_arm_kvmem(const common_params & params, bool enable) {
+    if (!enable) {
+        llama_kvmem_set_params(nullptr);
+        return;
+    }
+
+    llama_kvmem_params kp = {};
+    kp.enabled            = true;
+    kp.block_tokens       = (uint32_t) std::max(params.kvmem.block_tokens,  0);
+    kp.budget             = (uint32_t) std::max(params.kvmem.budget,        0);
+    kp.gen_reserve        = (uint32_t) std::max(params.kvmem.gen_reserve,   0);
+    kp.sink_tokens        = (uint32_t) std::max(params.kvmem.sink_tokens,   0);
+    kp.recent_tokens      = (uint32_t) std::max(params.kvmem.recent_tokens, 0);
+    kp.method             = params.kvmem.method == "recency" ? 0 : 1;
+    kp.mtp_state          = params.kvmem.mtp_state;
+    kp.gpu_memory_ratio   = params.kvmem.gpu_ratio;
+    kp.gpu_high_watermark = params.kvmem.gpu_high;
+    kp.gpu_low_watermark  = params.kvmem.gpu_low;
+    kp.harvest_v          = params.kvmem.harvest_v;
+    kp.payload_host_bytes = (uint64_t) std::max(params.kvmem.host_mib, 0) << 20;
+    kp.payload_disk_bytes = (uint64_t) std::max(params.kvmem.disk_mib, 0) << 20;
+    kp.cpu_bytes          = (uint64_t) (params.kvmem.cpu_gb * 1024.0 * 1024.0 * 1024.0);
+    // The struct is copied by value but keeps the pointer, and these three have
+    // no in-struct default: an unset query span must read as -1, not as 0.
+    kp.query_begin = -1;
+    kp.query_end   = -1;
+    kp.force_pos   = -1;
+    // The path pointer must outlive every context of this process.
+    static std::string disk_dir;
+    disk_dir            = params.kvmem.disk_path;
+    kp.payload_disk_dir = disk_dir.empty() ? nullptr : disk_dir.c_str();
+
+    llama_kvmem_set_params(&kp);
+}
+#else
+static void common_arm_kvmem(const common_params &, bool) {
+    // A build without the adapter has nothing to arm; --kvmem is not even parsed.
+}
+#endif // LLAMA_KVMEM
+
+static void common_resolve_memory_modes(const common_params & params, llama_context_params & cparams) {
+    bool kv_stream = cparams.kv_stream_arena_mib != 0;
+    const bool vbr = cparams.vbr_dynamic;
+
+    bool kvmem = false;
+    if (params.kvmem.enabled) {
+        if (cparams.n_seq_max > 1) {
+            // Stage 2, for the part cparams can judge; the arch/SWA half is the
+            // adapter's call, because only it sees the model. KVMem and the KV
+            // stream arena share the single-sequence requirement, so a parallel
+            // context can only ride VBR or the native cache -- and it must be
+            // cleared here, not left for the arena validator to reject later.
+            if (kv_stream) {
+                COM_WRN("%s: KVMem and the KV stream arena both need n_seq_max=1 (got %u) -- "
+                        "--kv-stream-arena-mib %u cleared, falling back to %s\n",
+                        __func__, cparams.n_seq_max, cparams.kv_stream_arena_mib,
+                        vbr ? "VBR" : "the native cache");
+                cparams.kv_stream_arena_mib = 0;
+                kv_stream = false;
+            } else {
+                COM_WRN("%s: KVMem needs n_seq_max=1 (got %u) -- falling back to %s\n",
+                        __func__, cparams.n_seq_max, vbr ? "VBR" : "the native cache");
+            }
+        } else {
+            kvmem = true;
+            if (kv_stream) {
+                COM_WRN("%s: KVMem outranks the KV stream arena -- --kv-stream-arena-mib %u cleared\n",
+                        __func__, cparams.kv_stream_arena_mib);
+                cparams.kv_stream_arena_mib = 0;
+                kv_stream = false;
+            }
+            if (vbr) {
+                COM_WRN("%s: KVMem outranks VBR -- the dynamic KV ladder is off for this context\n", __func__);
+                // The same static-cache shape the coupled-cache resolver builds.
+                cparams.vbr_dynamic               = false;
+                cparams.vbr_codec                 = LLAMA_VBR_CODEC_TURBO;
+                cparams.vbr_min_bits              = 0.0;
+                cparams.vbr_vram_budget_bytes     = 0;
+                cparams.vbr_growth_headroom_bytes = 0;
+                cparams.vbr_min_bits_explicit     = false;
+                cparams.vbr_budget_explicit       = false;
+                cparams.vbr_pin_k                 = false;
+                cparams.vbr_pin_v                 = false;
+            }
+        }
+    }
+    common_arm_kvmem(params, kvmem);
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -2095,6 +2199,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         ? nullptr : params.moe_cache.profile_path.c_str();
 
     cparams.moe_cache_size = params.moe_cache_size;
+
+    // last stop before these knobs become a context: decide who runs
+    common_resolve_memory_modes(params, cparams);
 
     return cparams;
 }
