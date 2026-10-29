@@ -1524,17 +1524,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             throw std::runtime_error("DFlash native cache checkpoint failed");
         return true;
     }
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (data.size() < sizeof(llama_pos)) throw std::runtime_error("DFlash checkpoint is truncated");
         // The driver resets carry after clearing both contexts.
         if (std::all_of(data.begin(), data.end(), [](uint8_t b) { return b == 0; })) {
             synced_rows.at(seq_id) = 0; verify_start.at(seq_id) = 0;
-            return;
+            return true;
         }
         const size_t size = data.size() - sizeof(llama_pos);
         if (llama_state_seq_set_data_ext(params.ctx_dft, data.data() + sizeof(llama_pos), size, seq_id, 0) != size)
             throw std::runtime_error("DFlash native cache restore failed");
         std::memcpy(&synced_rows.at(seq_id), data.data(), sizeof(llama_pos));
+        return true;
     }
 };
 
@@ -2149,13 +2150,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
         synced_rows[seq_id] = verify_start[seq_id] + i_h + 1;
-    }
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
-        if (seq_id < 0 || (uint32_t) seq_id >= n_seq) return false;
-        data.resize(sizeof(llama_pos) + (size_t) n_embd*sizeof(float));
-        std::memcpy(data.data(), &synced_rows[seq_id], sizeof(llama_pos));
-        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
-        return true;
     }
 
     // fork 9l-mtp-carry-state: fork common/speculative.cpp:3098/3106. Without these the base

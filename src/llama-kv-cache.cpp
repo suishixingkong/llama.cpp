@@ -4625,6 +4625,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         vbr_attention_content_changed(reused_sequences);
     }
 
+#if defined(LLAMA_KVMEM)
     // SWA reuses cells by sliding the window; overwriting a cell means every position below the
     // overwritten one is gone, so purge the gap. Non-SWA (including kvmem's bounded slot-pool)
     // may hold holes: resurrected blocks sit at their original pos while the tail stays at high
@@ -4633,6 +4634,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // that would have been empty anyway.
     // ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
     if (swa_type != LLAMA_SWA_TYPE_NONE) {
+#else
+    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
+    //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
+    {
+#endif
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq_pos_max_rm[s] == -1) {
                 continue;
@@ -13424,6 +13431,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             auto & idxs = seq_idxs[seq_id];
 
+#if defined(LLAMA_KVMEM)
             // The copy-and-patch shortcut only records cells near seq_pos_min.
             // KVMem resurrects mid-document holes far below that window; they
             // would keep a stale mask (or never be patched). Skip the shortcut
@@ -13432,8 +13440,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos sp_max = cells.seq_pos_max(seq_id);
             const bool holes = sp_min >= 0 && sp_max >= sp_min &&
                 cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+            const bool mask_shortcut_ok = !holes;
+#else
+            const bool mask_shortcut_ok = true;
+#endif
 
-            if (!alibi && !holes) {
+            if (!alibi && mask_shortcut_ok) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
@@ -13520,26 +13532,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 continue;
 skip:
                 data[idst + j] = mask_drop;
-            }
-            if (getenv("KVMEM_TRACE") && i + 1 == ubatch->n_tokens && ubatch->n_tokens > 1) {
-                int keep = 0;
-                llama_pos nmin = INT32_MAX;
-                llama_pos nmax = -1;
-                for (uint32_t j = 0; j < (uint32_t) n_kv; ++j) {
-                    if (data[idst + j] != mask_keep) {
-                        continue;
-                    }
-                    keep++;
-                    if (j < cells.size() && !cells.is_empty(j)) {
-                        const llama_pos p = cells.pos_get(j);
-                        nmin = std::min(nmin, p);
-                        nmax = std::max(nmax, p);
-                    }
-                }
-                fprintf(stderr,
-                        "KVMEM_TRACE mask last_pos=%d n_kv=%d keep=%d holes=%d keep_pos=[%d,%d]\n",
-                        (int) p1, (int) n_kv, keep, (int) holes,
-                        nmin == INT32_MAX ? -1 : (int) nmin, (int) nmax);
             }
         }
     }
