@@ -81,6 +81,7 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+    llama_pos n_past_logical = -1; // optional cache row cursor for multimodal input
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -246,11 +247,13 @@ struct common_speculative_deleter {
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
 
 struct common_speculative_init_result {
-    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                   std::shared_ptr<llama_model> model_dft = {});
     ~common_speculative_init_result();
 
     llama_model   * model();
     llama_context * context();
+    std::shared_ptr<llama_model> shared_model();
 
 private:
     struct impl;
@@ -259,4 +262,5 @@ private:
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                      std::shared_ptr<llama_model> model_dft = {});

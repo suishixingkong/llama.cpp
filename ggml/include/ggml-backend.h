@@ -369,6 +369,10 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Put node->src back to the tensors the graph was built with. Call this before
+    // destroying a graph that was previously passed to ggml_backend_sched_alloc_graph.
+    GGML_API void                 ggml_backend_sched_restore_graph_srcs(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
@@ -448,6 +452,9 @@ extern "C" {
     GGML_API size_t                     ggml_backend_meta_n_backends       (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t             ggml_backend_meta_simple_backend   (ggml_backend_t meta_backend, size_t index);
 
+    // kvmem adapter spells these two the fork way (forwarded in ggml-backend-meta.cpp)
+    GGML_API size_t ggml_backend_meta_device_count(ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_device_get(ggml_backend_dev_t meta_dev, size_t index);
 
     //
     typedef ggml_backend_buffer_t (*ggml_backend_meta_alloc_simple_t)(

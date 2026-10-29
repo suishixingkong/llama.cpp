@@ -1381,6 +1381,7 @@ struct common_batch {
         llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        llama_pos logical_pos = -1; // optional cache row cursor, separate from M-RoPE
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i

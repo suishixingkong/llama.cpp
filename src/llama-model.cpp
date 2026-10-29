@@ -20,6 +20,7 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-vram-demand.h"
+#include "llama-kvmem-factory.h"
 
 #include "llama.h"
 #include "models/models.h"
@@ -3132,6 +3133,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
         return nullptr;
     }
+#if defined(LLAMA_KVMEM)
+    if (llama_memory_i * kvmem = llama_memory_kvmem_maybe_create(*this, params, cparams)) {
+        return kvmem;
+    }
+#endif
 
 
     switch (arch) {

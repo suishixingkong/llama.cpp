@@ -2624,6 +2624,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
             llama_batch_ext_set_pos(res, idx, t.pos.data());
         }
         GGML_ASSERT(idx == i - off);
+        if (t.logical_pos >= 0) llama_batch_ext_set_logical_pos(res, idx, t.logical_pos);
 
         for (const llama_seq_id seq_id : t.seq_ids_extra) {
             if (!llama_batch_ext_add_seq(res, idx, seq_id)) {
