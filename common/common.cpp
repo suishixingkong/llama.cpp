@@ -2078,13 +2078,23 @@ static void common_arm_kvmem(const common_params & params, bool enable) {
     // which surfaces as a failed load far from the flag that caused it. Refuse
     // the tier here instead, and let the context run on the remaining tiers.
     uint64_t disk_bytes = (uint64_t) std::max(params.kvmem.disk_mib, 0) << 20;
+    // cparams are built more than once per process (context, then the fit and
+    // draft passes), so warn once instead of once per build.
+    static bool warned_disk = false;
     if (disk_bytes && params.kvmem.disk_path.empty()) {
-        COM_ERR("%s: --kvmem-disk-mib needs --kvmem-disk-path; the SSD tier stays off\n", __func__);
+        if (!warned_disk) {
+            warned_disk = true;
+            COM_ERR("%s: --kvmem-disk-mib needs --kvmem-disk-path; the SSD tier stays off\n", __func__);
+        }
         disk_bytes = 0;
     }
     uint64_t cpu_bytes = (uint64_t) (params.kvmem.cpu_gb * 1024.0 * 1024.0 * 1024.0);
+    static bool warned_cpu = false;
     if (disk_bytes && cpu_bytes) {
-        COM_ERR("%s: the shared SSD tier cannot be combined with --kvmem-cpu-gb; the CPU spill arena stays off\n", __func__);
+        if (!warned_cpu) {
+            warned_cpu = true;
+            COM_ERR("%s: the shared SSD tier cannot be combined with --kvmem-cpu-gb; the CPU spill arena stays off\n", __func__);
+        }
         cpu_bytes = 0;
     }
     kp.payload_disk_bytes = disk_bytes;
