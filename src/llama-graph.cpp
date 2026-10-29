@@ -1616,8 +1616,8 @@ static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tenso
         return;
     }
     // Recency/identity does not need host raw-K. Skip pinning intermediates
-    // unless retrieval is on, harvest-V is on (V only), or an explicit dump.
-    if (kp->method != 1 && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+    // unless retrieval is on, or harvest-V asked for the V side.
+    if (kp->method != 1) {
         if (!kp->harvest_v || tag[0] != 'v') {
             return;
         }
@@ -1680,7 +1680,7 @@ void llm_graph_context::kvmem_capture_v(ggml_tensor * v, int il) const {
         return;
     }
     const llama_kvmem_params * kp = llama_kvmem_get_params();
-    if (!(kp && kp->harvest_v) && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
+    if (!(kp && kp->harvest_v)) {
         return;
     }
 #else

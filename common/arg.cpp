@@ -3400,6 +3400,88 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVMEM_METHOD"));
     add_opt(common_arg(
+        {"--kvmem-query-scorer"}, "{page-softmax,meanq-cosine}",
+        string_format("KVMem Query scorer: page-softmax scores each block row, meanq-cosine compares the mean query vector against it (default: %s)", params.kvmem.scorer.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "page-softmax" && value != "meanq-cosine") {
+                throw std::invalid_argument("KVMem query scorer must be page-softmax or meanq-cosine");
+            }
+            params.kvmem.scorer = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_QUERY_SCORER"));
+    add_opt(common_arg(
+        {"--kvmem-score-agg"}, "{mean,max}",
+        "how scores collapse within a GQA group; omit for the scorer default (mean for page-softmax, max for meanq-cosine)",
+        [](common_params & params, const std::string & value) {
+            if (value != "mean" && value != "max") {
+                throw std::invalid_argument("KVMem score aggregation must be mean or max");
+            }
+            params.kvmem.score_agg = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_SCORE_AGG"));
+    add_opt(common_arg(
+        {"--kvmem-lrfu"},
+        {"--no-kvmem-lrfu"},
+        "weight blocks by query history; omit for the scorer default (off for page-softmax, on for meanq-cosine)",
+        [](common_params & params, bool value) {
+            params.kvmem.lrfu = value ? 1 : 0;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_LRFU"));
+    add_opt(common_arg(
+        {"--kvmem-lrfu-lambda"}, "X",
+        string_format("LRFU history decay in [0,1] (default: %.2f)", params.kvmem.lrfu_lambda),
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (!(value >= 0.0 && value <= 1.0)) {
+                throw std::invalid_argument("KVMem LRFU lambda must be within [0, 1]");
+            }
+            params.kvmem.lrfu_lambda = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_LRFU_LAMBDA"));
+    add_opt(common_arg(
+        {"--kvmem-lrfu-top-frac"}, "X",
+        string_format("LRFU history hit fraction in (0,1] (default: %.2f)", params.kvmem.lrfu_top_frac),
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (!(value > 0.0 && value <= 1.0)) {
+                throw std::invalid_argument("KVMem LRFU top fraction must be within (0, 1]");
+            }
+            params.kvmem.lrfu_top_frac = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_LRFU_TOP_FRAC"));
+    add_opt(common_arg(
+        {"--kvmem-graph-alpha"}, "X",
+        "spread each block score to its neighbours in [0,1]; omit for the scorer default (0.2 page-softmax, 0 meanq-cosine)",
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (!(value >= 0.0 && value <= 1.0)) {
+                throw std::invalid_argument("KVMem graph alpha must be within [0, 1]");
+            }
+            params.kvmem.graph_alpha = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_GRAPH_ALPHA"));
+    add_opt(common_arg(
+        {"--kvmem-query-begin"}, "N",
+        "first token of the retrieval query, in original positions; -1 uses the caller's span",
+        [](common_params & params, const std::string & v) {
+            params.kvmem.query_begin = std::stoi(v);
+        }
+    ).set_env("LLAMA_ARG_KVMEM_QUERY_BEGIN"));
+    add_opt(common_arg(
+        {"--kvmem-query-end"}, "N",
+        "one past the last token of the retrieval query; -1 runs to the end of the prompt",
+        [](common_params & params, const std::string & v) {
+            params.kvmem.query_end = std::stoi(v);
+        }
+    ).set_env("LLAMA_ARG_KVMEM_QUERY_END"));
+    add_opt(common_arg(
+        {"--kvmem-force-pos"}, "N",
+        "pin the block containing this original position, whatever it scores",
+        [](common_params & params, const std::string & v) {
+            params.kvmem.force_pos = std::stoi(v);
+        }
+    ).set_env("LLAMA_ARG_KVMEM_FORCE_POS"));
+    add_opt(common_arg(
         {"--kvmem-mtp-state"}, "{snapshots,auto,replay}",
         string_format("KVMem MTP rollback state: snapshots rides the upstream n_rs_seq planes (default: %d)", params.kvmem.mtp_state),
         [](common_params & params, const std::string & value) {

@@ -153,7 +153,9 @@ target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 if (LLAMA_KVMEM)
     # KVMem params are an out-of-tree struct; common fills it through the same
     # header the adapter builds against (LLAMA_KVMEM_ROOT/src/adapter).
-    target_compile_definitions(${TARGET} PRIVATE LLAMA_KVMEM=1)
+    # PUBLIC: the server publishes the per-request query span, so its own
+    # translation units need the same guard as this library.
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_KVMEM=1)
     # hooks.h also reaches into the kvmem host library for its option types.
     target_include_directories(${TARGET} PRIVATE
         ${LLAMA_KVMEM_ROOT}/src/adapter

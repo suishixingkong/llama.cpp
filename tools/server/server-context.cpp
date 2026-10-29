@@ -14,6 +14,16 @@
 
 #include "build-info.h"
 #include "common.h"
+#if defined(LLAMA_KVMEM)
+// Only the request-span setter is needed here. The adapter header is not on
+// this target's include path on purpose: the server owns no KVMem state.
+extern "C" void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
+extern "C" void llama_kvmem_begin_retrieval_round(void);
+extern "C" void llama_kvmem_accept_retrieval_round(void);
+extern "C" void llama_kvmem_apply_retrieval(struct llama_context * ctx);
+extern "C" void llama_kvmem_pin_working_set(void);
+extern "C" void llama_kvmem_end_prefill_capture(void);
+#endif
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-context.h"
@@ -1180,6 +1190,11 @@ static inline bool prompt_save_durable(prompt_save_result r) {
 }
 
 struct server_slot {
+#if defined(LLAMA_KVMEM)
+    // Task whose retrieval query span was already published to KVMem. The
+    // setter flushes pending harvest, so it must run once per request.
+    int32_t kvmem_span_task = -1;
+#endif
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -10807,6 +10822,30 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+#if defined(LLAMA_KVMEM)
+                    // KVMem scores retrieval against the last user message, and
+                    // this request already carries its span. Publish it once,
+                    // before the first ubatch: the setter flushes pending harvest.
+                    if (params_base.kvmem.enabled && slot.kvmem_span_task != slot.task->id) {
+                        slot.kvmem_span_task = slot.task->id;
+                        int32_t q_begin = -1;
+                        int32_t q_end   = -1;
+                        for (auto it = spans.spans.rbegin(); it != spans.spans.rend(); ++it) {
+                            if (it->role != COMMON_CHAT_ROLE_USER) {
+                                continue;
+                            }
+                            q_begin = (int32_t) (it->pos + slot.task->params.message_span_lead);
+                            q_end   = (int32_t) (it->pos + it->len);
+                            if (q_begin >= q_end) {
+                                q_begin = (int32_t) it->pos;
+                            }
+                            break;
+                        }
+                        llama_kvmem_set_request_span(q_begin, q_end, -1);
+                        llama_kvmem_begin_retrieval_round();
+                    }
+#endif
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -12270,6 +12309,26 @@ private:
                 // fork 9l-d4b6x: wait_for_prompt_capture assignment (fork server-context.cpp 18861-18862)
                 wait_for_prompt_capture = capture_vbr_swa_prompt_frontier(
                     slot, slot.i_batch-off);
+
+#if defined(LLAMA_KVMEM)
+                // Prefill is done and every Query-span Q/K is still harvested,
+                // so this is the only point where KVMem can score the prompt
+                // and cut the working set down before decode pins it. Recency
+                // (method 0) leaves the cutting to the pressure path, which
+                // already ran while appending.
+                if (params_base.kvmem.enabled && params_base.kvmem.method == "retrieval") {
+                    try {
+                        llama_kvmem_apply_retrieval(ctx_tgt);
+                        llama_kvmem_pin_working_set();
+                        llama_kvmem_accept_retrieval_round();
+                        llama_kvmem_end_prefill_capture();
+                    } catch (const std::exception & e) {
+                        // A refusal keeps the resident view. The request still
+                        // has to produce tokens, so degrade instead of failing.
+                        SLT_WRN(slot, "KVMem retrieval round skipped: %s\n", e.what());
+                    }
+                }
+#endif
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;

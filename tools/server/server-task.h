@@ -154,6 +154,9 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+    // Tokens of the role header that opens a user message. The span starts at
+    // the delimiter, but a retrieval query must start at the content.
+    size_t message_span_lead = 0;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -385,6 +388,12 @@ struct server_task {
         params.chat_format = session.format();
         params.antiprompt.insert(params.antiprompt.end(), session.additional_stops().begin(), session.additional_stops().end());
         params.message_spans = tokens.find_message_spans(session.message_delimiters());
+        params.message_span_lead = 0;
+        for (const auto & d : session.message_delimiters().delimiters) {
+            if (d.role == COMMON_CHAT_ROLE_USER) {
+                params.message_span_lead = std::max(params.message_span_lead, d.tokens.size());
+            }
+        }
     }
 
     void add_child(int id_parent, int id_child) {

@@ -2030,6 +2030,26 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 // exists to prevent. It sits here because this is the last point that holds
 // both the parsed flags and the cparams they turn into.
 #if defined(LLAMA_KVMEM)
+// The two scorers disagree about their useful companions, so the unset values
+// in common_params_kvmem resolve against the chosen scorer rather than being
+// frozen as defaults: page-softmax wants mean aggregation, no LRFU and a
+// little graph propagation, meanq-cosine wants max, LRFU on and no spreading.
+// This mirrors the fork CLI contract, so a ported command line keeps its
+// retrieval quality instead of silently running a different policy.
+static void common_resolve_kvmem_scoring(const common_params_kvmem & in, llama_kvmem_params & kp) {
+    const bool cosine = in.scorer == "meanq-cosine";
+    kp.query_meanq_cosine = cosine;
+    kp.score_agg          = in.score_agg.empty() ? (cosine ? 1 : 0) : (in.score_agg == "max" ? 1 : 0);
+    kp.lrfu               = in.lrfu < 0 ? cosine : (in.lrfu != 0);
+    kp.lrfu_lambda        = in.lrfu_lambda;
+    kp.lrfu_top_fraction  = in.lrfu_top_frac;
+    kp.graph_alpha        = in.graph_alpha < 0.0 ? (cosine ? 0.0 : 0.2) : in.graph_alpha;
+    if (!kp.lrfu && (in.lrfu_lambda != 0.5 || in.lrfu_top_frac != 0.9)) {
+        COM_WRN("%s: LRFU tuning is set but LRFU resolved off for scorer %s; the decay and fraction stay unused\n",
+                __func__, in.scorer.c_str());
+    }
+}
+
 // llama_kvmem_set_params() is a process-wide setter rather than a cparams field,
 // and its contract is "call before llama_init_from_model". Building cparams is
 // the last moment that satisfies both, so the arming happens right here.
@@ -2048,22 +2068,42 @@ static void common_arm_kvmem(const common_params & params, bool enable) {
     kp.recent_tokens      = (uint32_t) std::max(params.kvmem.recent_tokens, 0);
     kp.method             = params.kvmem.method == "recency" ? 0 : 1;
     kp.mtp_state          = params.kvmem.mtp_state;
+    common_resolve_kvmem_scoring(params.kvmem, kp);
     kp.gpu_memory_ratio   = params.kvmem.gpu_ratio;
     kp.gpu_high_watermark = params.kvmem.gpu_high;
     kp.gpu_low_watermark  = params.kvmem.gpu_low;
     kp.harvest_v          = params.kvmem.harvest_v;
     kp.payload_host_bytes = (uint64_t) std::max(params.kvmem.host_mib, 0) << 20;
-    kp.payload_disk_bytes = (uint64_t) std::max(params.kvmem.disk_mib, 0) << 20;
-    kp.cpu_bytes          = (uint64_t) (params.kvmem.cpu_gb * 1024.0 * 1024.0 * 1024.0);
+    // The adapter throws on these two combinations while building the memory,
+    // which surfaces as a failed load far from the flag that caused it. Refuse
+    // the tier here instead, and let the context run on the remaining tiers.
+    uint64_t disk_bytes = (uint64_t) std::max(params.kvmem.disk_mib, 0) << 20;
+    if (disk_bytes && params.kvmem.disk_path.empty()) {
+        COM_ERR("%s: --kvmem-disk-mib needs --kvmem-disk-path; the SSD tier stays off\n", __func__);
+        disk_bytes = 0;
+    }
+    uint64_t cpu_bytes = (uint64_t) (params.kvmem.cpu_gb * 1024.0 * 1024.0 * 1024.0);
+    if (disk_bytes && cpu_bytes) {
+        COM_ERR("%s: the shared SSD tier cannot be combined with --kvmem-cpu-gb; the CPU spill arena stays off\n", __func__);
+        cpu_bytes = 0;
+    }
+    kp.payload_disk_bytes = disk_bytes;
+    kp.cpu_bytes          = cpu_bytes;
+    kp.payload_disk_dir   = nullptr;
     // The struct is copied by value but keeps the pointer, and these three have
     // no in-struct default: an unset query span must read as -1, not as 0.
-    kp.query_begin = -1;
-    kp.query_end   = -1;
-    kp.force_pos   = -1;
+    // The server overwrites them per request with the span it parsed; a CLI
+    // run keeps whatever --kvmem-query-begin/--kvmem-query-end/--kvmem-force-pos
+    // asked for, which is why the defaults are read through here.
+    kp.query_begin = params.kvmem.query_begin;
+    kp.query_end   = params.kvmem.query_end;
+    kp.force_pos   = params.kvmem.force_pos;
     // The path pointer must outlive every context of this process.
     static std::string disk_dir;
     disk_dir            = params.kvmem.disk_path;
-    kp.payload_disk_dir = disk_dir.empty() ? nullptr : disk_dir.c_str();
+    if (kp.payload_disk_bytes) {
+        kp.payload_disk_dir = disk_dir.c_str();
+    }
 
     llama_kvmem_set_params(&kp);
 }
@@ -2098,6 +2138,15 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
             }
         } else {
             kvmem = true;
+            // A prefill chunk that is bigger than the working set cannot be
+            // selected down: the adapter keeps every incoming block and then
+            // refuses the selection. Say so here, where the two flags meet.
+            const int32_t ub = params.n_ubatch > 0 ? params.n_ubatch : params.n_batch;
+            if (params.kvmem.budget > 0 && ub > 0 && params.kvmem.budget < ub) {
+                COM_WRN("%s: --kvmem-budget %d is below the %d-token prefill chunk; lower -ub "
+                        "or raise the budget, or the first prefill step cannot fit the working set\n",
+                        __func__, params.kvmem.budget, ub);
+            }
             if (kv_stream) {
                 COM_WRN("%s: KVMem outranks the KV stream arena -- --kv-stream-arena-mib %u cleared\n",
                         __func__, cparams.kv_stream_arena_mib);

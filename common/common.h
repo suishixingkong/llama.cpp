@@ -522,6 +522,22 @@ struct common_params_kvmem {
     std::string disk_path;        // process-local spill directory; empty -> off
     double cpu_gb         = 0.0;  // CPU spill arena, GiB; 0 -> off
     bool harvest_v        = false; // prefill D2H V capture
+
+    // Retrieval scoring. The two scorers want different companions, so the
+    // unset values below are resolved against the chosen scorer in common.cpp
+    // instead of being frozen as defaults here.
+    std::string scorer    = "page-softmax"; // page-softmax | meanq-cosine
+    std::string score_agg;                  // mean | max; empty -> scorer default
+    int32_t lrfu           = -1;             // -1 -> scorer default, 0 off, 1 on
+    double lrfu_lambda    = 0.5;            // history decay in [0,1]
+    double lrfu_top_frac  = 0.9;            // history hit fraction in (0,1]
+    double graph_alpha    = -1.0;           // -1 -> scorer default (0.2 / 0)
+    // Explicit retrieval query span in original token positions, and a token
+    // that pins its block. -1 leaves the span to the caller: the CLI passes
+    // these through, the server replaces them per request (see update_slots).
+    int32_t query_begin   = -1;
+    int32_t query_end     = -1;
+    int32_t force_pos     = -1;
 };
 
 struct common_params {
