@@ -17,6 +17,9 @@
 #include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
 #include "ggml-turbo-meansub.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -4567,8 +4570,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             if (ubatch.is_pos_2d() || ubatch.token || ubatch.logical_pos || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
                 // kvmem addresses cells by logical position, which differs from pos once the
-                // caller hands us an explicit logical_pos vector; fall back to pos otherwise.
-                ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
+                // caller hands us an explicit logical_pos vector. Left unset (-1) otherwise so
+                // an ordinary batch keeps the exact master cell state.
+                if (ubatch.logical_pos) {
+                    ext.logical_pos = ubatch.logical_pos[i];
+                }
+#if defined(LLAMA_KVMEM)
+                else if (llama_kvmem_get_params()->enabled) {
+                    ext.logical_pos = ubatch.pos[i];
+                }
+#endif
 
                 if (ubatch.is_pos_2d()) {
                     ext.x = ubatch.pos[i + ubatch.n_tokens*2];
@@ -4632,8 +4643,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // pos, and purging [pos_min, overwritten] would delete those holes. For non-SWA caches
     // seq_pos_max_rm stays -1 unless a cell was actually reused, so this guard only skips a loop
     // that would have been empty anyway.
+    //
+    // The hole-tolerant form is a KVMem property, not a build property. With --kvmem off this
+    // cache must purge exactly like master, otherwise an LLAMA_KVMEM=ON build silently rewrites
+    // the KV history of an ordinary context (measured: CPU PPL 12.2387 vs master 12.2560).
     // ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+    if (swa_type != LLAMA_SWA_TYPE_NONE || !llama_kvmem_get_params()->enabled) {
 #else
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
@@ -13400,6 +13415,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+#if defined(LLAMA_KVMEM)
+    // Hole tolerance is a KVMem property: with --kvmem off every position between
+    // [seq_pos_min, seq_pos_max] is present and the copy-and-patch shortcut is always valid,
+    // exactly like master. When it is on, the probe is a per-sequence invariant of this
+    // ubatch, so it is cached: calling seq_pos_min/seq_pos_max once per token was visible in
+    // prefill (LLAMA_KVMEM=ON with --kvmem off measured ~6% below master on pp).
+    const bool kvmem_pool = llama_kvmem_get_params()->enabled;
+    bool seq_holes[LLAMA_MAX_SEQ] = {};
+    bool seq_holes_known[LLAMA_MAX_SEQ] = {};
+#endif
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
@@ -13436,11 +13462,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // KVMem resurrects mid-document holes far below that window; they
             // would keep a stale mask (or never be patched). Skip the shortcut
             // when [pos_min, pos_max] is not fully populated.
-            const llama_pos sp_min = cells.seq_pos_min(seq_id);
-            const llama_pos sp_max = cells.seq_pos_max(seq_id);
-            const bool holes = sp_min >= 0 && sp_max >= sp_min &&
-                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
-            const bool mask_shortcut_ok = !holes;
+            bool mask_shortcut_ok = true;
+            if (kvmem_pool && seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+                if (!seq_holes_known[seq_id]) {
+                    const llama_pos sp_min = cells.seq_pos_min(seq_id);
+                    const llama_pos sp_max = cells.seq_pos_max(seq_id);
+                    seq_holes[seq_id] = sp_min >= 0 && sp_max >= sp_min &&
+                        cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+                    seq_holes_known[seq_id] = true;
+                }
+                mask_shortcut_ok = !seq_holes[seq_id];
+            }
 #else
             const bool mask_shortcut_ok = true;
 #endif
