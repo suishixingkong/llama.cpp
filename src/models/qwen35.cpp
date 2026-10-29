@@ -286,10 +286,6 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
-    static const bool fuse_output = !std::getenv("KVMEM_GDN_OUT_FUSION") || std::atoi(std::getenv("KVMEM_GDN_OUT_FUSION"));
-    if (fuse_output) {
-        ggml_build_forward_expand(gf, gate);
-    }
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
 
     // silu(gate) * normalized as one GLU op instead of a unary followed by a mul. The CUDA backend already
