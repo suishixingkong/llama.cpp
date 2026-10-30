@@ -2197,21 +2197,11 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
                 cparams.vbr_pin_k                 = false;
                 cparams.vbr_pin_v                 = false;
             }
-            // Turbo KV is a VBR type: its rows carry a per-block rotation matrix and the
-            // cache publishes them through the VBR bookkeeping pools, which KVMem's packed
-            // store neither owns nor can score (mean-K/Q reads raw rows). Left alone this
-            // fails deep in the cache ctor ("VBR could not bind KV buffer type ..."), far
-            // from the two flags that caused it, so decide here: KVMem keeps a static f16
-            // pool and the turbo request is named, not silently reinterpreted at f16 speed.
-            if (ggml_is_turbo_kv_type(cparams.type_k) || ggml_is_turbo_kv_type(cparams.type_v)) {
-                COM_WRN_RESOLVE("KVMem packs and scores raw KV rows, so it outranks the turbo KV "
-                        "types -- -ctk/-ctv %s/%s reset to f16 (KV VRAM roughly doubles)\n",
-                        ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v));
-                cparams.type_k   = GGML_TYPE_F16;
-                cparams.type_v   = GGML_TYPE_F16;
-                cparams.vbr_pin_k = false;
-                cparams.vbr_pin_v = false;
-            }
+            // A turbo KV codec needs no arbitration here any more: the adapter sizes its padded
+            // rows, copies them verbatim between slots and scores from the pre-RoPE capture, so
+            // turbo is a first-class KVMem codec. Types the adapter genuinely cannot lay out are
+            // swapped for f16 there, where the model geometry is known -- never by turning the
+            // pool off.
         }
     }
     common_arm_kvmem(params, kvmem);

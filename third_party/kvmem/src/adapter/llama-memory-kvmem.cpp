@@ -547,6 +547,40 @@ static double kvmem_default_ratio(float v, double fallback) {
     return v > 0.0f ? static_cast<double>(v) : fallback;
 }
 
+// A turbo codec pads every head vector up to its block (128 values) when the cache stores it
+// (`n_embd_k_gqa_eff` in llama_kv_cache), so the stored row is wider than n_embd_k_gqa whenever
+// the head dim is not already a multiple. KVMem addresses cache rows by byte, so every row
+// length it derives must be the *stored* one. The logical width stays in use wherever the code
+// reads what the graph produced (mean-K and query rows are captured before RoPE/rotation, in the
+// graph's own f16/f32 type), so the two widths must not be conflated.
+uint32_t kvmem_store_width(const llama_hparams & hp, int32_t il, bool is_k, ggml_type type) {
+    const uint32_t n_embd = is_k ? hp.n_embd_k_gqa(il) : hp.n_embd_v_gqa(il);
+    const uint32_t blck   = (uint32_t) ggml_blck_size(type);
+    if (!ggml_is_turbo_kv_type(type) || blck == 0) {
+        return n_embd;
+    }
+    const uint32_t head = is_k ? hp.n_embd_head_k(il) : hp.n_embd_head_v(il);
+    if (head == 0 || n_embd % head != 0) {
+        return n_embd;
+    }
+    const uint32_t padded = ((head + blck - 1) / blck) * blck;
+    return (n_embd / head) * padded;
+}
+
+// Which cache types KVMem can address by row. Turbo is a first-class codec here: its rows are
+// copied verbatim between slots and its scoring reads the pre-RoPE capture, never the encoded
+// row, so nothing in this adapter needs to understand the codec -- only the cache's own encode
+// path does, and that one demands Flash Attention. Everything else has to be block-regular so a
+// row can be sized; a type that is not is swapped for f16 by the caller instead of turning
+// --kvmem off, because a smaller-than-asked cache beats a pool that silently does not exist.
+static bool kvmem_cache_type_ok(ggml_type type, uint32_t n_embd) {
+    if (type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) {
+        return true;
+    }
+    const int blck = ggml_blck_size(type);
+    return blck > 0 && n_embd % (uint32_t) blck == 0;
+}
+
 static uint64_t kvmem_first_gpu_total_bytes() {
     const size_t n = ggml_backend_dev_count();
     for (size_t i = 0; i < n; ++i) {
@@ -627,6 +661,68 @@ static uint32_t kvmem_n_attn_layers(const llama_model & model) {
     return c == 0 ? n : c;
 }
 
+struct kvmem_kv_types {
+    ggml_type type_k;
+    ggml_type type_v;
+};
+
+// The requested cache types, with the only substitution this adapter makes: if a row cannot be
+// sized (or a turbo cache cannot be built because Flash Attention is off), that side becomes f16
+// and KVMem keeps running. Swapping the codec is the deliberate choice over switching the pool
+// off -- a smaller KV cache the caller can see in the log beats an eviction pool that silently
+// does not exist. Turbo passes through untouched: it pads its head dim and this file sizes rows
+// with that padding, so nothing here needs to decode it.
+ggml_type kvmem_effective_cache_type(
+        const llama_model & model, bool is_k, ggml_type requested, const llama_cparams & cparams) {
+    const int32_t il = (int32_t) kvmem_first_attn_layer(model);
+    const uint32_t width = kvmem_store_width(model.hparams, il, is_k, requested);
+    const bool turbo = ggml_is_turbo_kv_type(requested);
+    if (kvmem_cache_type_ok(requested, width) && !(turbo && !cparams.flash_attn)) {
+        return requested;
+    }
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LLAMA_LOG_WARN("%s: cache_%c type %s cannot be laid out for a KVMem slot row (or needs "
+                "Flash Attention) -- using f16 for the pool instead of disabling KVMem\n",
+                __func__, is_k ? 'k' : 'v', ggml_type_name(requested));
+    }
+    return GGML_TYPE_F16;
+}
+
+static kvmem_kv_types kvmem_effective_types(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) {
+    return {
+        kvmem_effective_cache_type(model, true,  params.type_k, cparams),
+        kvmem_effective_cache_type(model, false, params.type_v, cparams),
+    };
+}
+
+llama_memory_vbr_params kvmem_owned_cache_vbr_params(
+        const llama_memory_params & params, const llama_cparams & cparams) {
+    // Turbo KV publishes a VBR bookkeeping pool for its rows even with the dynamic ladder off
+    // (needs_turbo_layout is decided from the type alone), and that pool resolves a compute
+    // backend through these params. Building the cache with the default, empty set is what made
+    // --kvmem + turbo die with "VBR could not bind KV buffer type". The ladder itself stays off:
+    // KVMem owns residency, and two eviction controllers on one cache would fight.
+    return {
+        /*.dynamic               =*/ false,
+        /*.codec                 =*/ cparams.vbr_codec,
+        /*.budget_bytes          =*/ 0,
+        /*.min_bits              =*/ 0.0,
+        /*.min_bits_explicit     =*/ false,
+        /*.budget_explicit       =*/ false,
+        /*.growth_headroom_bytes =*/ 0,
+        /*.device_share          =*/ 1.0,
+        /*.pin_k                 =*/ false,
+        /*.pin_v                 =*/ false,
+        /*.trace_label           =*/ nullptr,
+        /*.compute_backend_for_buft =*/ params.compute_backend_for_buft,
+    };
+}
+
 struct kvmem_pool_plan {
     uint32_t block_tokens = 32;
     uint32_t budget = 0;
@@ -682,7 +778,7 @@ static std::vector<uint64_t> kvmem_tensor_kv_row_bytes(
         for (bool is_k : {true, false}) {
             // The draft context can choose a wider cache type than the target.
             const ggml_type type = il >= model.hparams.n_layer() ? GGML_TYPE_F32 : is_k ? type_k : type_v;
-            const uint32_t dim = is_k ? model.hparams.n_embd_k_gqa(il) : model.hparams.n_embd_v_gqa(il);
+            const uint32_t dim = kvmem_store_width(model.hparams, (int32_t) il, is_k, type);
             ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, dim, 1);
             ggml_format_name(t, "cache_%c_l%u", is_k ? 'k' : 'v', il);
             auto * ud = const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud);
@@ -707,6 +803,9 @@ static kvmem_pool_plan kvmem_compute_pool(
         const llama_memory_params & params,
         const llama_cparams & cparams,
         uint32_t borrowed_kv_size = 0) {
+    // Price the pool on the types the adapter will actually store (see kvmem_effective_types);
+    // otherwise a substituted side would be budgeted at the width it no longer has.
+    const kvmem_kv_types kv_types = kvmem_effective_types(model, params, cparams);
     kvmem_pool_plan p;
     p.block_tokens = kvmem_current_execution().params.block_tokens ? kvmem_current_execution().params.block_tokens : 32u;
     uint32_t budget = kvmem_current_execution().params.budget;
@@ -751,10 +850,10 @@ static kvmem_pool_plan kvmem_compute_pool(
 
     const uint32_t il0 = kvmem_first_attn_layer(model);
     const uint32_t n_attn = kvmem_n_attn_layers(model);
-    const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(il0);
-    const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(il0);
-    const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
-    const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
+    // Turbo stores a padded row (see kvmem_store_width); price the pool on what is stored,
+    // otherwise the block accounting under-quotes every turbo layer with a small head dim.
+    const uint64_t k_row = ggml_row_size(kv_types.type_k, kvmem_store_width(model.hparams, (int32_t) il0, true,  kv_types.type_k));
+    const uint64_t v_row = ggml_row_size(kv_types.type_v, kvmem_store_width(model.hparams, (int32_t) il0, false, kv_types.type_v));
     p.block_bytes = static_cast<uint64_t>(n_attn) * (k_row + v_row) * p.block_tokens;
 
     const double ratio = kvmem_default_ratio(kvmem_current_execution().params.gpu_memory_ratio, 0.50);
@@ -782,8 +881,8 @@ static kvmem_pool_plan kvmem_compute_pool(
             }
             continue;
         }
-        bytes_per_token[dev] += ggml_row_size(params.type_k, model.hparams.n_embd_k_gqa(il))
-                              + ggml_row_size(params.type_v, model.hparams.n_embd_v_gqa(il));
+        bytes_per_token[dev] += ggml_row_size(kv_types.type_k, kvmem_store_width(model.hparams, (int32_t) il, true,  kv_types.type_k))
+                              + ggml_row_size(kv_types.type_v, kvmem_store_width(model.hparams, (int32_t) il, false, kv_types.type_v));
     }
     ggml_backend_dev_t mtp_owner = nullptr;
     uint64_t mtp_row_bytes = 0;
@@ -798,7 +897,7 @@ static kvmem_pool_plan kvmem_compute_pool(
         }
     }
     if (kvmem_tensor_multi_gpu(model) && borrowed_kv_size == 0) {
-        const auto rows = kvmem_tensor_kv_row_bytes(model, params.type_k, params.type_v, cparams.n_rs_seq > 0);
+        const auto rows = kvmem_tensor_kv_row_bytes(model, kv_types.type_k, kv_types.type_v, cparams.n_rs_seq > 0);
         const auto devices = kvmem_tensor_devices(model);
         uint64_t state_reserve = 0;
         if (cparams.n_rs_seq > 0) {
@@ -971,11 +1070,23 @@ llama_memory_kvmem::llama_memory_kvmem(
     rt_cfg_ = make_runtime_cfg(
             block_tokens_, pool.budget, kvmem_current_execution().params.sink_tokens, kvmem_current_execution().params.recent_tokens,
             pool.block_bytes);
+    // Decided once: the requested types may be substituted for f16 (unsupported layout), and the
+    // turbo flag below must follow what will actually be stored.
+    const kvmem_kv_types kv_types = kvmem_effective_types(model, params, cparams);
+    turbo_kv_ = ggml_is_turbo_kv_type(kv_types.type_k) || ggml_is_turbo_kv_type(kv_types.type_v);
     rt_cfg_.store.estimated_gpu_block_capacity = pool.cap_blocks;
     graph_.block_tokens=block_tokens_;
     graph_.set_budget(std::make_shared<kvmem::GraphStatisticsBudget>(32u<<20,kvmem_current_execution().graph_budget));
     score_agg_ = kvmem_current_execution().params.score_agg;
-    query_meanq_cosine_ = kvmem_current_execution().params.query_meanq_cosine;
+    // Turbo rows are opaque to the block scorer: the exact sampler multiplies the cache tensor
+    // itself, and no mat-vec kernel accepts a turbo src0 (it aborts in mmvq's type switch). Mean-Q
+    // cosine reads the f16 mean-K mirror and the captured query rows instead, so eviction keeps
+    // working and only the scorer becomes approximate.
+    query_meanq_cosine_ = kvmem_current_execution().params.query_meanq_cosine || turbo_kv_;
+    if (turbo_kv_ && !kvmem_current_execution().params.query_meanq_cosine) {
+        LLAMA_LOG_INFO("%s: turbo KV scores blocks by mean-Q cosine; the exact attention sampler "
+                "would multiply turbo cache rows, which no mat-vec kernel accepts\n", __func__);
+    }
     graph_alpha_ = kvmem_current_execution().params.graph_alpha;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
 
@@ -991,11 +1102,18 @@ llama_memory_kvmem::llama_memory_kvmem(
             }
         }
     } else {
+        // Turbo KV publishes a VBR bookkeeping pool for its rows even with the dynamic ladder
+        // off (needs_turbo_layout is decided from the type alone). That pool resolves a compute
+        // backend through these params; the cache used to be built with the default, empty set,
+        // so a turbo cache under --kvmem died with "VBR could not bind KV buffer type". The
+        // ladder itself stays off: KVMem owns residency, and two eviction controllers on one
+        // cache would fight.
+        const llama_memory_vbr_params vbr = kvmem_owned_cache_vbr_params(params, cparams);
         kv_owned_ = std::make_unique<llama_kv_cache>(
                 model,
                 model.hparams,
-                params.type_k,
-                params.type_v,
+                kv_types.type_k,
+                kv_types.type_v,
                 !cparams.flash_attn,
                 cparams.offload_kqv,
                 /* unified */ true,
@@ -1008,7 +1126,8 @@ llama_memory_kvmem::llama_memory_kvmem(
                 nullptr,
                 nullptr,
                 nullptr,
-                kvmem_tensor_multi_gpu(model) ? "" : "kvmem");
+                kvmem_tensor_multi_gpu(model) ? "" : "kvmem",
+                0, nullptr, 0, vbr);
         kv_ = kv_owned_.get();
     }
 
@@ -1064,8 +1183,14 @@ llama_memory_kvmem::llama_memory_kvmem(
     rope_.n_head_kv = n_head_kv_;
     rope_.freq_base = cparams.rope_freq_base;
     rope_.freq_scale = cparams.rope_freq_scale;
-    type_k_ = params.type_k;
-    type_v_ = params.type_v;
+    // The cache itself is authoritative: a type may have been substituted for f16 above (or, in
+    // the hybrid path, by the base class), and every row length below must match what is stored.
+    type_k_ = kv_->type_k();
+    type_v_ = kv_->type_v();
+    n_embd_k_store_ = kvmem_store_width(model.hparams, (int32_t) il0, true,  type_k_);
+    n_embd_v_store_ = kvmem_store_width(model.hparams, (int32_t) il0, false, type_v_);
+    k_row_bytes_ = ggml_row_size(type_k_, n_embd_k_store_);
+    v_row_bytes_ = ggml_row_size(type_v_, n_embd_v_store_);
     v_trans_ = !cparams.flash_attn;
     method_ = kvmem_current_execution().params.method;
     query_begin_ = kvmem_current_execution().params.query_begin;
@@ -1080,11 +1205,11 @@ llama_memory_kvmem::llama_memory_kvmem(
     rcfg.n_embd_v = n_embd_v_;
     rcfg.block_tokens = block_tokens_;
     if (ggml_is_quantized(type_k_)) {
-        rcfg.k_row_bytes = ggml_row_size(type_k_, n_embd_k_);
+        rcfg.k_row_bytes = k_row_bytes_;
     }
-    rcfg.k_gpu_row_bytes = ggml_row_size(type_k_, n_embd_k_);
+    rcfg.k_gpu_row_bytes = k_row_bytes_;
     if (!v_trans_) {
-        rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
+        rcfg.v_gpu_row_bytes = v_row_bytes_;
     }
 
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
@@ -2198,8 +2323,8 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         }
     }
 
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint64_t kspan = static_cast<uint64_t>(block_tokens_) * krow;
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     const uint64_t scratch_stride = kspan + vspan;
@@ -2239,7 +2364,7 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             d2d_ok = false;
             LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
         }
-        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_store_, n_embd_v_store_),
                                 std::max(krow, vrow) * (size_t) block_tokens_);
     }
 
@@ -3901,14 +4026,14 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     if (idx >= cells.size() || cells.is_empty(idx)) {
         return;
     }
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint32_t nt = (uint32_t) std::min<uint64_t>(blk.n_tokens,
             content_->stamp().frontier > blk.orig_pos_start ? content_->stamp().frontier - blk.orig_pos_start : 0);
     if (!nt) return;
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     if (!multi_gpu_) {
-        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_store_, n_embd_v_store_),
                                 std::max(krow, vrow) * (size_t) block_tokens_);
     }
     auto enqueue_or_get = [&](ggml_tensor * t, uint32_t il, uint32_t nget, bool is_k) {
@@ -4365,13 +4490,13 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     ++attention_epoch_;
     occupy_block_cells(block_id);
     const uint32_t nt = blk.n_tokens;
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     std::vector<uint8_t> kpack(static_cast<size_t>(nt) * krow);
     std::vector<uint8_t> vpack(static_cast<size_t>(nt) * vrow);
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     if (!multi_gpu_) {
-        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_store_, n_embd_v_store_),
                                 std::max(krow, vrow) * (size_t) block_tokens_);
     }
     int64_t * sacc = retr_.enabled ? &retr_.set_us : nullptr;
@@ -4436,8 +4561,8 @@ void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_s
     (void) block_id;
     auto * dst = static_cast<uint8_t *>(host);
     uint64_t off = 0;
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nget = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
@@ -4474,8 +4599,8 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     (void) block_id;
     const auto * src = static_cast<const uint8_t *>(host);
     uint64_t off = 0;
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint32_t cell0 = static_cast<uint32_t>(gpu_slot) * block_tokens_;
     const uint32_t nset = (cell0 < kv_size_)
             ? std::min(block_tokens_, kv_size_ - cell0) : 0;
@@ -5103,7 +5228,13 @@ bool llama_memory_kvmem::read_gpu_block(uint32_t block_id, uint32_t il, bool is_
     }
     const uint32_t dim = is_k ? n_embd_k_ : n_embd_v_;
     const ggml_type ty = is_k ? type_k_ : type_v_;
-    const size_t row = ggml_row_size(ty, dim);
+    if (ggml_is_turbo_kv_type(ty)) {
+        // The callers diff these floats against an f16 reference at the logical width; a turbo
+        // row is padded to 128 per head and its dequant stays in the rotated domain, so a
+        // like-for-like diff does not exist. Verification dumps simply skip turbo rows.
+        return false;
+    }
+    const size_t row = is_k ? k_row_bytes_ : v_row_bytes_;
     const uint32_t nt = blk.n_tokens;
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
     out.assign(static_cast<size_t>(nt) * dim, 0.0f);
@@ -5159,8 +5290,8 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
     const uint32_t nt = blk.n_tokens;
     const size_t nk = static_cast<size_t>(nt) * n_embd_k_;
     const size_t nv = static_cast<size_t>(nt) * n_embd_v_;
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint32_t cell0 = (blk.gpu_slot >= 0)
             ? static_cast<uint32_t>(blk.gpu_slot) * block_tokens_ : 0;
     std::vector<float> gpu_k, gpu_v, packed_f;
@@ -6208,12 +6339,12 @@ std::unique_ptr<kvmem::MemoryTransfer> llama_memory_kvmem::NativeBackend::prepar
     // Physical destination capacity is the already allocated, exclusively owned
     // slot pool. Reserve packed host destinations and layout device scratch now.
     for (const auto & b : plan.evict) o.raw_->reserve_packed((uint32_t) b.id, o.kv_->get_layer_ids());
-    if (!kvmem_stagein_gpu_ready((size_t) o.block_tokens_ * std::max(o.n_embd_k_, o.n_embd_v_),
-            o.block_tokens_ * std::max(ggml_row_size(o.type_k_, o.n_embd_k_), ggml_row_size(o.type_v_, o.n_embd_v_))))
+    if (!kvmem_stagein_gpu_ready((size_t) o.block_tokens_ * std::max(o.n_embd_k_store_, o.n_embd_v_store_),
+            o.block_tokens_ * std::max(o.k_row_bytes_, o.v_row_bytes_)))
         throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native copy scratch unavailable");
     if (purpose == NativePurpose::Retrieval && !selected.empty()) {
         const size_t bytes = selected.size() * o.block_tokens_ *
-                (ggml_row_size(o.type_k_, o.n_embd_k_) + ggml_row_size(o.type_v_, o.n_embd_v_));
+                (o.k_row_bytes_ + o.v_row_bytes_);
         if (cudaMalloc(reinterpret_cast<void **>(&transfer->layout), bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded, "native layout scratch unavailable");

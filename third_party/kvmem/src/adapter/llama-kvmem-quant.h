@@ -23,6 +23,12 @@ inline bool kvmem_attn_rot_on(ggml_type ty, int n_embd_head) {
     if (!ggml_is_quantized(ty) || n_embd_head < 64 || (n_embd_head % 64) != 0) {
         return false;
     }
+    // The turbo codecs rotate inside their own encoder (`quantize_row_turbo*`: forward WHT, and
+    // the dequant stays in the rotated domain on purpose). Applying the block Hadamard here as
+    // well would rotate twice, and H^2 = I would turn "invert to compare" into "return as-is".
+    if (ggml_is_turbo_kv_type(ty)) {
+        return false;
+    }
     const char * e = std::getenv("LLAMA_ATTN_ROT_DISABLE");
     return !(e && std::atoi(e) != 0);
 }

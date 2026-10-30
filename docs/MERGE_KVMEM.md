@@ -154,12 +154,27 @@ llama-bench -m model.gguf -p 4096 -n 128 -b 512 --kvmem --kvmem-budget 576
 |---|---|
 | `--kvmem` 且 `n_seq_max == 1` | KVMem 生效；若同时给了 `--kv-stream-arena-mib` 或 VBR 预算，二者被清零并告警（`KVMem outranks …`） |
 | `--kvmem` 但 `n_seq_max > 1` | 告警并回落到 VBR / 原生 cache（KVMem 与 KV stream 都需要单序列） |
-| `--kvmem` + `-ctk/-ctv turbo*` | KVMem 优先：turbo KV 的行带每块旋转矩阵、走 VBR 记账池，KVMem 既不拥有也不评分，故把类型重置为 f16 并告警（KV 显存大约翻倍），而不是在 cache 构造处报 `VBR could not bind KV buffer type …` |
+| `--kvmem` + `-ctk/-ctv turbo*` | **turbo 是 KVMem 的一等 codec**，两种模式同时生效，类型不变（见下节）。KVMem 与 turbo 都不支持的布局才换成 f16，且由 adapter 决定、KVMem 继续跑 |
 | `--kvmem-budget` < 一次 decode batch | 自动抬到 `sink + recent + batch + block` 并告警一次；否则首个 prefill 会在 `mandatory Query content exceeds its selection budget` 处失败（`--kvmem-budget 2048` 只在 `-b ≤ 1984` 时真的是 2048） |
 | 同一条拒绝被打印两次 | 已去重：cparams 每进程会构建 2~3 次（context、fit、draft），`common_resolve_memory_modes` 的连续的相同拒绝现在只打印一行 |
 | 模型是 SWA / 纯 recurrent | adapter 侧拒绝，回落原生 cache |
 
 ⚠️ **KV 口径**：不传 `-ctk/-ctv` 时默认是隐式 VBR 动态档，而 `--kvmem` 会顶掉 VBR 走静态 f16 池。**比较 `--kvmem` 开/关必须显式 `-ctk f16 -ctv f16`**，否则比的是 KV 类型而不是代码。
+
+### turbo 作为一等 codec
+
+turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VBR 阶梯（`--kv-stream-arena-mib` 清掉阶梯后 turbo 照跑）。但它**仍会建一个 VBR 记账池**（`needs_turbo_layout` 只看类型），该池要用 `compute_backend_for_buft` 解析 compute backend —— 这正是 `--kvmem` 以前在 cache 构造处报 `VBR could not bind KV buffer type CUDA0` 的真实原因（adapter 自建 cache 时传的是默认空 `llama_memory_vbr_params`），不是"turbo 需要动态 VBR"。
+
+让两者共存需要四件事，均已落地：
+
+| 环节 | 做法 |
+|---|---|
+| cache 构造 | 传入静态 `llama_memory_vbr_params`（`dynamic=false`，只带 codec 与 `compute_backend_for_buft`），hybrid 的基类与 MTP 跟随缓存同样传 |
+| 行寻址 | turbo 把每个 head 向量 pad 到 128（`n_embd_k_gqa_eff`），adapter 用 `kvmem_store_width()` 得到**存储宽度**算所有 cache 行（行字节、块字节、池容量、MTP 布局校验），逻辑宽度只留给图上采到的 Q/raw-K |
+| 评分 | 块评分读的是 raw store 里的 mean-K 与采到的 Q（都在 RoPE/旋转之前、f16），与 cache 类型无关；**精确注意力采样器**要拿 cache 张量做 `mul_mat`，turbo 没有 mat-vec kernel（`mmvq` 类型 switch 直接 abort）⇒ turbo 下改用 **mean-Q cosine** 评分并跳过采样（`KVMEM_QUERY scorer=meanq-cosine`），驱逐/回填不受影响 |
+| 回填 | 打包块是 cache 行的逐字节副本，turbo 行可直接搬回；`kvmem_attn_rot_on()` 对 turbo 返回 false（编码器内部已做 WHT，再叠一次会转两次） |
+
+⚠️ 因此 turbo 模式下**评分器是近似的**（均值余弦而非精确注意力质量），驱逐策略与 `--kvmem-method` 语义不变。⚠️ 诊断用的 `KVMEM_DUMP`/`read_gpu_block` 对 turbo 行直接跳过（没有可比的 f16 参考）。
 
 ## 验证结果
 

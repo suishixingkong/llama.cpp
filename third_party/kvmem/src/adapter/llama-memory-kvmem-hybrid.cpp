@@ -45,8 +45,11 @@ llama_memory_kvmem_hybrid::llama_memory_kvmem_hybrid(
         const llama_cparams & cparams) :
     llama_memory_hybrid(
             model,
-            params.type_k,
-            params.type_v,
+            // The base class builds the attention cache, so the effective types and the VBR
+            // plumbing have to be decided on this side of the call; the attention adapter below
+            // reads the resulting types back from that cache.
+            kvmem_effective_cache_type(model, true,  params.type_k, cparams),
+            kvmem_effective_cache_type(model, false, params.type_v, cparams),
             !cparams.flash_attn,
             llama_kvmem_pool_cells(model, params, cparams),
             /* n_pad */ 1,
@@ -64,7 +67,8 @@ llama_memory_kvmem_hybrid::llama_memory_kvmem_hybrid(
             },
             [&](int32_t il) {
                 return il < (int32_t) model.hparams.n_layer() && model.hparams.is_recr(il);
-            }, use_gdn_replay(model, cparams)) {
+            }, use_gdn_replay(model, cparams), nullptr, 0,
+            kvmem_owned_cache_vbr_params(params, cparams)) {
     attn_kvmem_ = std::make_unique<llama_memory_kvmem>(
             model, params, cparams, get_mem_attn());
     attn_kvmem_->set_recurrent(get_mem_recr());

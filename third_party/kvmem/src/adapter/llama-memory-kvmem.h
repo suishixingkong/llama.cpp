@@ -29,6 +29,23 @@ struct ggml_tensor;
 class llama_memory_recurrent;
 class llama_memory_kvmem_mtp;
 
+// Shared by the attention adapter and the hybrid wrapper, which builds its attention cache in a
+// base class and therefore has to ask the same two questions before calling it.
+//
+// Effective cache type: the requested one unless KVMem cannot lay a row out for it (or a turbo
+// codec has no Flash Attention), in which case f16 and a warning -- the pool keeps running
+// instead of the codec silently disabling it.
+// Stored row width: a turbo codec pads each head vector up to its block, so this exceeds the
+// logical n_embd_k/v on models whose head dim is not already a multiple of 128.
+uint32_t kvmem_store_width(const llama_hparams & hp, int32_t il, bool is_k, ggml_type type);
+
+ggml_type kvmem_effective_cache_type(
+        const llama_model & model, bool is_k, ggml_type requested, const llama_cparams & cparams);
+// VBR parameters a KVMem-owned cache is built with: static (the pool owns residency), but with
+// the compute-backend resolver turbo's bookkeeping pool needs.
+llama_memory_vbr_params kvmem_owned_cache_vbr_params(
+        const llama_memory_params & params, const llama_cparams & cparams);
+
 // Bounded block-slot pool over a llama_kv_cache.
 //
 // GPU attention cache size = min(n_ctx, budget + gen_reserve). Each logical
@@ -432,6 +449,9 @@ private:
     // Block scores and the raw-K mirror cannot change a decision in that state,
     // and the capture hooks skip themselves (see no_eviction()).
     bool no_eviction_ = false;
+    // A turbo codec stores rows this adapter must never hand to a mat-vec: the scorer falls back
+    // to mean-Q cosine and the exact attention sampler is skipped.
+    bool turbo_kv_ = false;
     bool multi_gpu_ = false;
     bool trace_ = false;
 
@@ -474,6 +494,13 @@ private:
     uint32_t n_layer_ = 0;
     uint32_t n_embd_k_ = 0;
     uint32_t n_embd_v_ = 0;
+    // Stored (cache) row widths and byte lengths. Equal to the logical ones except under a turbo
+    // codec, which pads each head vector up to its 128-value block; every cache-row access uses
+    // these, while the captured raw K/Q keep using the logical widths.
+    uint32_t n_embd_k_store_ = 0;
+    uint32_t n_embd_v_store_ = 0;
+    size_t   k_row_bytes_ = 0;
+    size_t   v_row_bytes_ = 0;
     uint32_t n_head_ = 0;
     uint32_t n_head_kv_ = 0;
     uint32_t n_embd_head_ = 0;

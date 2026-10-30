@@ -271,6 +271,12 @@ void llama_memory_kvmem::observe_attention(uint32_t index,uint32_t accepted,ggml
     rows.erase(std::remove_if(rows.begin(),rows.end(),[&](auto row) {
         return batch.begin+row<graph_.accepted_through;
     }),rows.end());
+    if (turbo_kv_) {
+        // The sampler multiplies the cache rows themselves (`ggml_mul_mat(k, q)`), and a turbo
+        // tensor is not a mat-vec operand any kernel accepts. Skipping the sample still advances
+        // the acceptance watermark below; block scores come from the mean-Q cosine path instead.
+        rows.clear();
+    }
     std::vector<kvmem::AcceptedAttentionRow> observations(rows.size());
     for(size_t i=0;i<rows.size();++i) observations[i].source_position=batch.begin+rows[i];
     if(!rows.empty()) {

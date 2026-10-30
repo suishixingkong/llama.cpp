@@ -192,6 +192,12 @@ private:
     uint32_t il_graph_ = 0;
     uint32_t n_embd_k_ = 0;
     uint32_t n_embd_v_ = 0;
+    // Cache-row widths (turbo pads head vectors); the logical ones above stay for the graph-side
+    // reads, exactly as in the attention adapter.
+    uint32_t n_embd_k_store_ = 0;
+    uint32_t n_embd_v_store_ = 0;
+    size_t   k_row_bytes_ = 0;
+    size_t   v_row_bytes_ = 0;
     ggml_type type_k_ = GGML_TYPE_F16;
     ggml_type type_v_ = GGML_TYPE_F16;
     bool v_trans_ = false;

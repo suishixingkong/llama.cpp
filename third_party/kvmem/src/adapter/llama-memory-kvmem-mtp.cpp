@@ -74,8 +74,12 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     // Only slots follow the target. Byte layout follows the draft cache.
     n_embd_k_ = model.hparams.n_embd_k_gqa(il_graph_);
     n_embd_v_ = model.hparams.n_embd_v_gqa(il_graph_);
-    type_k_ = params.type_k;
-    type_v_ = params.type_v;
+    type_k_ = kvmem_effective_cache_type(model, true,  params.type_k, cparams);
+    type_v_ = kvmem_effective_cache_type(model, false, params.type_v, cparams);
+    n_embd_k_store_ = kvmem_store_width(model.hparams, (int32_t) il_graph_, true,  type_k_);
+    n_embd_v_store_ = kvmem_store_width(model.hparams, (int32_t) il_graph_, false, type_v_);
+    k_row_bytes_ = ggml_row_size(type_k_, n_embd_k_store_);
+    v_row_bytes_ = ggml_row_size(type_v_, n_embd_v_store_);
     v_trans_ = !cparams.flash_attn;
     rope_ = target_->rope();
 
@@ -100,15 +104,16 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             filter,
             nullptr,
             nullptr,
-            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? "" : "kvmem-mtp");
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? "" : "kvmem-mtp",
+            0, nullptr, 0, kvmem_owned_cache_vbr_params(params, cparams));
 
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const ggml_tensor * kt = kv_->get_k_storage(il_graph_);
     const ggml_tensor * vt = kv_->get_v_storage(il_graph_);
     if (!kt || !vt || kt->type != type_k_ || vt->type != type_v_ ||
-            kt->ne[0] != n_embd_k_ || kt->ne[1] != kv_size_ || kt->nb[1] != krow ||
-            (!v_trans_ && (vt->ne[0] != n_embd_v_ || vt->ne[1] != kv_size_ || vt->nb[1] != vrow))) {
+            kt->ne[0] != n_embd_k_store_ || kt->ne[1] != kv_size_ || kt->nb[1] != krow ||
+            (!v_trans_ && (vt->ne[0] != n_embd_v_store_ || vt->ne[1] != kv_size_ || vt->nb[1] != vrow))) {
         throw std::runtime_error("KVMem MTP cache layout does not match packed K/V transfers");
     }
     if (target_->multi_gpu()) {
@@ -151,11 +156,11 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     rcfg.n_embd_v = n_embd_v_;
     rcfg.block_tokens = block_tokens_;
     if (ggml_is_quantized(type_k_)) {
-        rcfg.k_row_bytes = ggml_row_size(type_k_, n_embd_k_);
+        rcfg.k_row_bytes = k_row_bytes_;
     }
-    rcfg.k_gpu_row_bytes = ggml_row_size(type_k_, n_embd_k_);
+    rcfg.k_gpu_row_bytes = k_row_bytes_;
     if (!v_trans_) {
-        rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
+        rcfg.v_gpu_row_bytes = v_row_bytes_;
     }
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
 
@@ -389,7 +394,7 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
     }
     const uint32_t nt = blk.n_tokens;
     const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
-    const size_t row = ggml_row_size(type_k_, n_embd_k_);
+    const size_t row = k_row_bytes_;
     std::vector<uint8_t> packed((size_t) nt * row);
     kvmem_tensor_get(kt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_k_gpu(blk.orig_pos_start, nt, 0, packed.data());
@@ -422,7 +427,7 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     if (!vt) {
         return;
     }
-    const size_t row = ggml_row_size(type_v_, n_embd_v_);
+    const size_t row = v_row_bytes_;
     std::vector<uint8_t> packed((size_t) nt * row);
     kvmem_tensor_get(vt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_v_gpu(blk.orig_pos_start, nt, 0, packed.data());
@@ -441,7 +446,7 @@ bool llama_memory_kvmem_mtp::slot_holds(int32_t slot, uint32_t orig_pos) const {
 }
 
 size_t llama_memory_kvmem_mtp::layout_scratch_bytes(size_t n_moves) const {
-    return n_moves * block_tokens_ * (ggml_row_size(type_k_, n_embd_k_) + ggml_row_size(type_v_, n_embd_v_));
+    return n_moves * block_tokens_ * (k_row_bytes_ + v_row_bytes_);
 }
 
 bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves, uint8_t * prepared_scratch) {
@@ -458,8 +463,8 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     if (vt && !v_trans_ && !vbase) {
         return false;
     }
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint64_t kspan = (uint64_t) block_tokens_ * krow;
     const uint64_t vspan = (uint64_t) block_tokens_ * vrow;
     const uint64_t stride = kspan + vspan;
@@ -475,7 +480,7 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
         }
         return false;
     }
-    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_store_, n_embd_v_store_),
                             std::max(krow, vrow) * (size_t) block_tokens_);
     std::vector<const void *> gsrc;
     std::vector<void *> gdst;
@@ -561,8 +566,8 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     if (!kt) {
         return;
     }
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const uint32_t cell0 = (uint32_t) blk.gpu_slot * block_tokens_;
 
     // Cold blocks: copy the GPU-format K saved at stage-out (already
@@ -596,8 +601,8 @@ bool llama_memory_kvmem_mtp::restore_checkpoint_block(uint32_t block_id) {
     ggml_tensor * vt = kv_->get_v_storage((int32_t) il_graph_);
     if (!kt || !vt) return false;
     harvest_flush();
-    const size_t krow = ggml_row_size(type_k_, n_embd_k_);
-    const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
+    const size_t krow = k_row_bytes_;
+    const size_t vrow = v_row_bytes_;
     const size_t cell0 = (size_t) block.gpu_slot * block_tokens_;
     const size_t kbytes = block.n_tokens * krow, vbytes = block.n_tokens * vrow;
     std::vector<uint8_t> kpack(kbytes), vpack(vbytes);
