@@ -4904,6 +4904,24 @@ std::vector<uint32_t> llama_memory_kvmem::retrieval_mandatory() const {
         const int32_t id = s.block_id_containing(force_pos_);
         if (id >= 0) mandatory.push_back(id);
     }
+    // A query span longer than the pool cannot be mandatory as a whole: the pool
+    // can only ever hold the most recent part of it, so that is the part
+    // selection has to protect. Left alone, query_fixed_blocks() throws
+    // "mandatory Query content exceeds its selection budget" and the driver
+    // skips the whole round, which leaves the working set to recency alone and
+    // drops the rest of the prompt without ever scoring it.
+    const uint32_t reserve = s.config().sink_blocks + s.config().recent_blocks + 1;
+    const uint32_t budget = s.budget_blocks();
+    if (budget > reserve && mandatory.size() > budget - reserve) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: query span covers %zu blocks but the pool holds %u (%u reserved) "
+                    "-- scoring and protecting its last %u blocks only\\n", __func__,
+                    mandatory.size(), budget, reserve, budget - reserve);
+        }
+        mandatory.erase(mandatory.begin(), mandatory.end() - (budget - reserve));
+    }
     return mandatory;
 }
 
