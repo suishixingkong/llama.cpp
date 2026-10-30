@@ -194,6 +194,8 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 功能面（同一批构建）：长会话三连问 16k 上下文 / MTP 草稿回滚 / 图像输入都通过（细节见下面「已修复」与 `AUDIT_KVMEM_PERF_QUALITY.md`）。
 
+**只有会评分的驱动才捕获 prefill K**（`e04bdb5d6`）：检索轮所需的 mean-K 与 query 行来自图中的捕获管道，它把每个 ubatch 的全部 K 行 D2H 到 host 再做打包。`llama-completion` / `llama-bench` / `llama-perplexity` 从不跑检索轮，却仍按检索方法付费搬运没人会读的行。捕获改由 `begin_retrieval_round()` 开启（server 每请求开一次），清轮/重置/重放入口不再重新开启；`harvest_gpu_v` 的 KV 镜像不受影响（换出块靠它回填）。0.8B `-p 4096 -b 512 --kvmem-budget 2048`：pp 9094 → 9710 t/s（+6.8%），server 侧 `KVMEM_QUERY scorer=page-softmax rows=1071 blocks=34` 照旧。
+
 单测：KVMem 的 16 个测试已注册进 ctest（`test-kvmem-store`、`test-kvmem-runtime`、`test-spill-io`、`test-native-residency` 等，`ctest -N` 由 113 涨到 129），16/16 通过。
 
 测量方法、口径陷阱、噪声地板和每条结论的原始数据见 [`AUDIT_KVMEM_PERF_QUALITY.md`](AUDIT_KVMEM_PERF_QUALITY.md)。
