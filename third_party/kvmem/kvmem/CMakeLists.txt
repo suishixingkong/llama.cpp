@@ -1,4 +1,6 @@
-add_library(kvmem
+# One list, two targets: the library, and (on Windows shared builds) a static copy that the
+# allocator-injection test compiles in. Keeping the list here stops the two from drifting.
+set(KVMEM_CORE_SOURCES
     src/host/kvmem_store.cpp
     src/host/kvmem_runtime.cpp
     src/host/raw_kv_store.cpp
@@ -13,6 +15,7 @@ add_library(kvmem
     src/host/prefix_checkpoint.cpp
     src/host/rope.cpp
 )
+add_library(kvmem ${KVMEM_CORE_SOURCES})
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(KVMEM_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "KVMem source root")
 
@@ -59,10 +62,36 @@ if (WIN32)
     set_target_properties(kvmem PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
+function(kvmem_test_target name target)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(${target} PRIVATE cxx_std_17)
+    if (WIN32)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    add_test(NAME ${target} COMMAND ${target})
+endfunction()
+
 function(kvmem_add_test name)
-    add_executable(${name} tests/${name}.cpp)
-    target_link_libraries(${name} PRIVATE kvmem)
-    add_test(NAME ${name} COMMAND ${name})
+    # Same naming as the port's own suite (test-<kebab>) so build/bin holds one
+    # scheme: kvmem_store_test -> test-kvmem-store.
+    string(REGEX REPLACE "_test$" "" base "${name}")
+    string(REPLACE "_" "-" base "${base}")
+    set(target "test-${base}")
+    add_executable(${target} tests/${name}.cpp)
+    target_link_libraries(${target} PRIVATE kvmem)
+    kvmem_test_target(${name} ${target})
+endfunction()
+
+# A test that replaces operator new only sees the allocations that reach its own module.
+# PE DLLs do not interpose on the executable's operator new, so on a shared Windows build
+# the fault injection would silently never fire; compile the core sources into the test
+# instead and it lands on the same allocator it is hooking.
+function(kvmem_add_test_static name)
+    string(REGEX REPLACE "_test$" "" base "${name}")
+    string(REPLACE "_" "-" base "${base}")
+    set(target "test-${base}")
+    add_executable(${target} tests/${name}.cpp ${KVMEM_CORE_SOURCES})
+    kvmem_test_target(${name} ${target})
 endfunction()
 
 kvmem_add_test(backend_rebind_test)
@@ -71,7 +100,11 @@ kvmem_add_test(pinned_kv_tier_test)
 kvmem_add_test(memory_contract_test)
 kvmem_add_test(native_kv_payload_test)
 kvmem_add_test(host_kv_storage_test)
-kvmem_add_test(spill_io_test)
+if (WIN32 AND BUILD_SHARED_LIBS)
+    kvmem_add_test_static(spill_io_test)
+else()
+    kvmem_add_test(spill_io_test)
+endif()
 kvmem_add_test(tiered_kv_storage_test)
 kvmem_add_test(native_residency_test)
 kvmem_add_test(kv_content_test)

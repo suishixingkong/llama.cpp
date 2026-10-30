@@ -128,13 +128,20 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
-# KVMem adapter. Off by default so a vanilla submodule build stays bit-identical
-# to upstream. The sources are vendored under third_party/kvmem so the branch is
-# self-contained: LLAMA_KVMEM_ROOT still takes an external root (libkvmem + src/adapter)
-# for comparing against a different kvmem tree.
-option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
+# KVMem adapter. On by default so the branch is usable without extra flags; turn it off
+# with -DLLAMA_KVMEM=OFF. The sources are vendored under third_party/kvmem so the branch is
+# self-contained, and LLAMA_KVMEM_ROOT still takes an external root (libkvmem + src/adapter)
+# for comparing against a different kvmem tree. The adapter allocates through the CUDA
+# runtime, so a CPU-only build turns the option back off below (after ggml decides
+# GGML_CUDA) instead of failing to link.
+option(LLAMA_KVMEM "llama: compile KVMem memory adapter" ON)
 set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/kvmem"
     CACHE PATH "kvmem root (libkvmem + src/adapter); defaults to the vendored copy")
+if (LLAMA_KVMEM AND LLAMA_KVMEM_ROOT STREQUAL "")
+    # An empty cached value wins over the default above, which then silently points the
+    # include path at "/src/adapter" and breaks common/ instead of failing loudly.
+    set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/kvmem")
+endif()
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
@@ -236,6 +243,14 @@ endif()
 #
 # build the library
 #
+
+# The adapter allocates through the CUDA runtime on every tier (the host tier included: it
+# is a staging buffer for device slots), so a CPU-only build has nothing to link against.
+# Decide once, after ggml has defined GGML_CUDA, so src/ and common/ agree on the answer.
+if (LLAMA_KVMEM AND NOT GGML_CUDA)
+    message(STATUS "LLAMA_KVMEM: disabled -- the adapter needs the CUDA backend (GGML_CUDA=OFF)")
+    set(LLAMA_KVMEM OFF)
+endif()
 
 add_subdirectory(src)
 

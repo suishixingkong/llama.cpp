@@ -28,6 +28,10 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "log.h"
 
 #ifdef _WIN32
@@ -446,6 +450,12 @@ struct cmd_params {
     bool                             vbr_entry_explicit = false;
     bool                             vbr_floor_explicit = false;
     bool                             vbr_vram_explicit = false;
+    // KVMem replaces the whole KV memory rather than a per-test dimension: one flag and
+    // its budget describe the run, the way -vbr does.
+    bool                             kvmem = false;
+    int                              kvmem_budget = 0;
+    std::string                      kvmem_method = "retrieval";
+    int                              kvmem_block_tokens = 0;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -506,6 +516,10 @@ static const cmd_params cmd_params_defaults = {
     /* vbr_entry_explicit   */ false,
     /* vbr_floor_explicit   */ false,
     /* vbr_vram_explicit    */ false,
+    /* kvmem                */ false,
+    /* kvmem_budget         */ 0,
+    /* kvmem_method         */ "retrieval",
+    /* kvmem_block_tokens   */ 0,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -589,6 +603,11 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --kv-stream-arena-mib, --kv-stream-stage-mib <n>  (default: %s)\n", join(cmd_params_defaults.kv_stream_arena_mib, ",").c_str());
     printf("  -np, --n-parallel <n>                             number of parallel sequences (default: %s)\n", join(cmd_params_defaults.n_parallel, ",").c_str());
+    printf("  --kvmem                                           KVMem tiered KV memory: block pool with host/SSD tiers\n");
+    printf("                                                    (forces -ctk/-ctv f16, -np 1 and no VBR/stream arena)\n");
+    printf("  --kvmem-budget <n>                                resident token working set (default: %d = whole context)\n", cmd_params_defaults.kvmem_budget);
+    printf("  --kvmem-method <retrieval|recency>                block selection method (default: %s)\n", cmd_params_defaults.kvmem_method.c_str());
+    printf("  --kvmem-block-tokens <n>                          KVMem block size (default: %d = 32)\n", cmd_params_defaults.kvmem_block_tokens);
     printf("  --repack <0|1>                                    (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
     printf("\n");
     printf(
@@ -1120,6 +1139,30 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.kv_stream_arena_mib.insert(params.kv_stream_arena_mib.end(), p.begin(), p.end());
+            } else if (arg == "--kvmem") {
+                params.kvmem = true;
+            } else if (arg == "--kvmem-budget") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvmem_budget = std::stoi(argv[i]);
+            } else if (arg == "--kvmem-method") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvmem_method = argv[i];
+                if (params.kvmem_method != "retrieval" && params.kvmem_method != "recency") {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--kvmem-block-tokens") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvmem_block_tokens = std::stoi(argv[i]);
             } else if (arg == "-np" || arg == "--n-parallel") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1491,6 +1534,10 @@ struct cmd_params_instance {
     bool               vbr_min_bits_explicit;
     uint64_t           vbr_budget_bytes;
     bool               vbr_budget_explicit;
+    bool               kvmem;
+    int                kvmem_budget;
+    std::string        kvmem_method;
+    int                kvmem_block_tokens;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1588,6 +1635,25 @@ struct cmd_params_instance {
         row.budget_explicit = vbr_budget_explicit;
         llama_bench_vbr_apply_row(row, cparams);
 
+        if (kvmem) {
+            // KVMem is a packed, position-addressed static pool: it outranks VBR, the KV
+            // stream arena and the turbo KV types, exactly as common/'s resolver decides for
+            // the CLI and the server. Keying it here keeps one definition of the interaction.
+            cparams.vbr_dynamic               = false;
+            cparams.vbr_codec                 = LLAMA_VBR_CODEC_TURBO;
+            cparams.vbr_min_bits              = 0.0;
+            cparams.vbr_vram_budget_bytes     = 0;
+            cparams.vbr_growth_headroom_bytes = 0;
+            cparams.vbr_budget_explicit       = false;
+            cparams.vbr_min_bits_explicit     = false;
+            cparams.vbr_pin_k                 = false;
+            cparams.vbr_pin_v                 = false;
+            cparams.kv_stream_arena_mib       = 0;
+            cparams.type_k                    = GGML_TYPE_F16;
+            cparams.type_v                    = GGML_TYPE_F16;
+            cparams.n_seq_max                 = 1;
+        }
+
         return cparams;
     }
 };
@@ -1678,6 +1744,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+                /* .kvmem                 = */ params.kvmem,
+                /* .kvmem_budget          = */ params.kvmem_budget,
+                /* .kvmem_method          = */ params.kvmem_method,
+                /* .kvmem_block_tokens    = */ params.kvmem_block_tokens,
             };
             instances.push_back(instance);
         }
@@ -1728,6 +1798,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+                /* .kvmem                 = */ params.kvmem,
+                /* .kvmem_budget          = */ params.kvmem_budget,
+                /* .kvmem_method          = */ params.kvmem_method,
+                /* .kvmem_block_tokens    = */ params.kvmem_block_tokens,
             };
             instances.push_back(instance);
         }
@@ -1778,6 +1852,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
                 /* .vbr_budget_bytes      = */ vbr.budget_bytes,
                 /* .vbr_budget_explicit   = */ vbr.budget_explicit,
+                /* .kvmem                 = */ params.kvmem,
+                /* .kvmem_budget          = */ params.kvmem_budget,
+                /* .kvmem_method          = */ params.kvmem_method,
+                /* .kvmem_block_tokens    = */ params.kvmem_block_tokens,
             };
             instances.push_back(instance);
         }
@@ -2678,6 +2756,17 @@ int llama_bench(int argc, char ** argv) {
 
     cmd_params params = parse_cmd_params(argc, argv);
 
+    if (params.kvmem) {
+        // KVMem keeps one sequence: the pool, the block table and the retrieval round are
+        // all single-sequence, so a parallel row would measure a different memory.
+        for (int np : params.n_parallel) {
+            if (np != 1) {
+                fprintf(stderr, "%s: error: --kvmem needs -np 1 (got %d)\n", __func__, np);
+                return 1;
+            }
+        }
+    }
+
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         fprintf(stderr, "%s: error: CPU backend is not loaded\n", __func__);
@@ -2721,6 +2810,35 @@ int llama_bench(int argc, char ** argv) {
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
     ctx_state cstate;
+
+#if defined(LLAMA_KVMEM)
+    // llama-bench builds cparams itself, so it publishes the KVMem parameters the same way
+    // common/ does for the CLI and the server: through the process-global slot the adapter
+    // reads at context construction.
+    const auto arm_kvmem = [](const cmd_params_instance & in) {
+        if (!in.kvmem) {
+            llama_kvmem_set_params(nullptr);
+            return;
+        }
+        llama_kvmem_params kp = {};
+        kp.enabled          = true;
+        kp.block_tokens     = (uint32_t) std::max(in.kvmem_block_tokens, 0);
+        kp.budget           = (uint32_t) std::max(in.kvmem_budget, 0);
+        kp.method           = in.kvmem_method == "recency" ? 0 : 1;
+        // An unset span must read as -1, not 0: 0 is a real position.
+        kp.query_begin      = -1;
+        kp.query_end        = -1;
+        kp.force_pos        = -1;
+        llama_kvmem_set_params(&kp);
+    };
+#else
+    const auto arm_kvmem = [](const cmd_params_instance & in) {
+        if (in.kvmem) {
+            fprintf(stderr, "%s: --kvmem needs a build with -DLLAMA_KVMEM=ON\n", __func__);
+            exit(1);
+        }
+    };
+#endif
 
     int  params_idx   = 0;
     auto params_count = params_instances.size();
@@ -2812,6 +2930,7 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        arm_kvmem(inst);
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2968,6 +3087,11 @@ int llama_bench(int argc, char ** argv) {
         llama_perf_context_print(ctx);
 
         llama_free(ctx);
+#if defined(LLAMA_KVMEM)
+        // The execution state outlives the context it described; clear it before the next
+        // case so a later non-kvmem run cannot inherit this one's slots.
+        llama_kvmem_set_params(nullptr);
+#endif
 
         ggml_threadpool_free_fn(threadpool);
     }
