@@ -214,6 +214,16 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 回归面：PPL 12.2387（开/关）、11.9618（budget 2048），贪心 md5 `1e05d115…` 与 master 相同，16 个 kvmem 单测全过。
 
+### 查询跨度装不下时也要评分（`2264cf6c3`）
+
+query span 就是**最后一条 user 消息**（server-context.cpp:10845）。当它覆盖的块数超过池子容量时，`query_fixed_blocks()` 抛 `mandatory Query content exceeds its selection budget`（kvmem_store.cpp:395），server 的 catch 把**整轮检索跳过**，工作集只剩压力路径挑出的尾部——模型因此看不到几十 k 里的绝大部分，表现为「思考正常、输出一点点就停」。
+
+修法是承认池子只能留住跨度的一部分：夹取最后 `budget - sink - recent - 1` 个块作为必选集，一次性告警报出三个数字，然后照常评分。池子仍然留不住整段提示（那是 budget 的语义），但留住的那一部分是**按相关性挑的**，而不是按到达顺序。
+
+### CUDA 评分器必须真的编进 adapter（`88b0d969b`）
+
+检索轮的 page-softmax 评分器走 `#ifdef KVMEM_PAGE_SOFTMAX_CUDA` 二选一，而那个宏由 `kvmem_enable_cuda_recall()` 加上——**只有独立构建会调它，嵌入构建从不调用**，于是 CUDA 的 llama.cpp 仍在 host 上逐页逐层打分：0.8B、3163 token 的一次请求里 `KVMEM_RETR_SUM score_ms=4194.8 / total_ms=4230.3`，检索轮本身就是那个请求（prefill 645 t/s）。在 `src/CMakeLists.txt` 的 kvmem 块里（kvmem 目标已存在、CUDA 已 enable 之后）调用它，同一个请求变成 `score_ms=400.7 / total_ms=427.8`，prefill **4896 ms / 645 t/s → 1039 ms / 3043 t/s**。
+
 ### 半满尾块的前缀回填
 
 池子按块驱逐，**尾块下的块**迟早会被赶走；而服务端的 checkpoint 恢复常在**块中间**裁剪（`CHECKPOINT_ATTN_ONLY_TRIM p0=13207`，13207 % 32 = 23），于是这个块又成了尾块，但只有 packed store 还记得它那 23 行。append 只写自己新增的行（`apply_ubatch` 的 `sinfo.idxs` 是逐行的），前缀就此留空，而 store 仍宣称整块驻留 —— 下一次工作集事务 `snapshot()` 就在那块的第一行报 gap。
