@@ -28,6 +28,15 @@ public:
     void clear(bool data) override;
 
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    // The base hybrid trims the raw attn child, which here is the cache the adapter
+    // wraps: the cells go but the packed store keeps claiming those rows, and every
+    // later transaction then fails the coverage check. An attn-only trim has to reach
+    // the adapter for the same reason a full one does.
+    bool seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    // Same bypass, one level up: the base transient removal also reaches the raw attn
+    // child, and the speculative rollback of a rejected draft is exactly this call.
+    bool seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     llama_memory_kvmem * attn_kvmem() { return attn_kvmem_.get(); }
 

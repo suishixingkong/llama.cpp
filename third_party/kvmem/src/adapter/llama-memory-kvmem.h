@@ -274,6 +274,10 @@ private:
     void apply_native_selection(const llama_kvmem_selection & selection);
     void restore_attached(const kvmem::NativeResidencyPlan & plan);
     bool packed_complete(uint32_t id, uint32_t tokens) const;
+    // Empty when every resident row of `block` still carries its own position/coverage;
+    // otherwise one line naming the first row that does not, so the coverage-gap failure
+    // says which row and which field instead of only that something is wrong.
+    std::string native_cells_gap(const kvmem::BlockDescriptor & block) const;
     bool native_cells_complete(const kvmem::BlockDescriptor & block) const;
     void harvest_pending_impl(struct ggml_backend_sched * sched);
     bool prepare_working_set(uint32_t n_new_tokens);
@@ -504,6 +508,11 @@ private:
     std::vector<llama_pos> decode_mean_pending_pos_;
     uint32_t decode_mean_n_ = 0;
     uint32_t decode_mean_block_ = ~0u;
+    // Store rows whose cells are known to be written. prepare_working_set runs before the
+    // ubatch that materializes the rows of this step, so the coverage check has to stop at
+    // the frontier the previous step left behind -- otherwise the tail of a partially
+    // filled block reads as a hole on every single step.
+    uint32_t cells_materialized_ = 0;
     uint32_t decode_mean_pos0_ = 0;
     std::vector<std::vector<float>> decode_mean_host_;
     std::vector<uint8_t> decode_mean_src_; // 0 none, 1 gpu, 2 host

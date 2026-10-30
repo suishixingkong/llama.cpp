@@ -718,6 +718,34 @@ static kvmem_pool_plan kvmem_compute_pool(
     } else {
         budget = kvmem_align_tokens(budget, p.block_tokens);
     }
+    {
+        // A selection must at least hold the always-kept bands plus one prefill chunk: the
+        // adapter marks every incoming block mandatory and refuses a plan it cannot keep, so a
+        // budget under that floor turns into a per-step "mandatory Query content exceeds its
+        // selection budget" and the caller is left splitting its batch forever. Raise it here,
+        // where the three inputs (bands, chunk, block size) finally meet, and say so once.
+        const auto & kp = kvmem_current_execution().params;
+        // sink_blocks is 1 block when unset (make_runtime_cfg), so the floor has to count that
+        // block, the incoming chunk, and one spare for the partially filled trailing block.
+        const uint32_t sink_tokens_eff = std::max<uint32_t>(kp.sink_tokens, p.block_tokens);
+        // The floor is one *decode batch*, not one ubatch: the append is registered for the
+        // whole batch before the ubatches run, so every block of this call is mandatory at
+        // once and nothing inside it can be evicted. -b is what a user lowers to shrink it.
+        const uint32_t chunk = std::max<uint32_t>(std::max(cparams.n_batch, cparams.n_ubatch),
+                p.block_tokens);
+        const uint32_t floor_tokens = kvmem_align_tokens(
+                sink_tokens_eff + kp.recent_tokens + chunk + p.block_tokens, p.block_tokens);
+        if (kvmem_current_execution().params.budget != 0 && budget < floor_tokens) {
+            static bool warned_floor = false;
+            if (!warned_floor) {
+                warned_floor = true;
+                LLAMA_LOG_WARN("%s: --kvmem-budget %u cannot hold the %u-token bands plus a %u-token "
+                        "chunk; raising the working set to %u tokens\n",
+                        __func__, budget, sink_tokens_eff + kp.recent_tokens, chunk, floor_tokens);
+            }
+            budget = floor_tokens;
+        }
+    }
     uint32_t gen_reserve = kvmem_current_execution().params.gen_reserve ? kvmem_current_execution().params.gen_reserve : 256u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
@@ -1143,6 +1171,7 @@ void llama_memory_kvmem::reset_policy() {
     ++attention_epoch_;
     reset_turn_policy();
     row_positions_.clear();
+    cells_materialized_ = 0;
     decode_mean_reset();
     reset_query_acc();
     if (raw_) {
@@ -1177,6 +1206,7 @@ void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
     evaluation_queue_.clear();
     evaluation_cursor_ = 0;
     if (row_positions_.size() > n_past) row_positions_.resize(n_past);
+    cells_materialized_ = std::min(cells_materialized_, n_past);
     if (mtp_) mtp_->truncate_cached(n_past);
     if (raw_) {
         raw_->truncate_to(n_past);
@@ -2533,7 +2563,7 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
                 perf_.n_pressure_out += static_cast<uint32_t>(plan.stage_out.size());
             }
         } catch (const std::exception & e) {
-            LLAMA_LOG_ERROR("%s: KVMem reselect failed: %s\n", __func__, e.what());
+            LLAMA_LOG_ERROR("%s: KVMem reselect failed: %s (budget_blocks=%u n_blocks=%u incoming=%zu candidates=%zu)\n", __func__, e.what(), budget_blocks, store.block_count(), incoming.size(), candidates.size());
             if (content_->stamp().valid) { runtime_->truncate_to(t0); content_->truncate(t0); }
             return false;
         }
@@ -2569,16 +2599,41 @@ bool llama_memory_kvmem::prepare_ubatches(
         uint32_t n_new_tokens,
         llama_kv_cache::slot_info_vec_t & sinfos) {
     const uint32_t old_rows = store_n_tokens();
+    // Rows are addressed by append order, not by pos. Image patches share the temporal
+    // component of their M-RoPE position (a Qwen-VL image row arrives as 15,15,15,...), so
+    // pos is not a unique row id there; for text the two coincide because positions are
+    // consecutive. A caller that hands us explicit logical positions (query replay,
+    // speculative verify) still decides the rows itself, and keeps its consecutiveness
+    // contract because the spans below are ranges.
+    const bool explicit_rows = !ubatches.empty() && ubatches.front().logical_pos != nullptr;
+    std::vector<std::vector<llama_pos>> rows(ubatches.size());
     uint32_t rewrite_begin = old_rows;
-    for (const auto & ub : ubatches) {
+    uint32_t next_row = old_rows;
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const auto & ub = ubatches[u];
+        rows[u].resize(ub.n_tokens);
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
-            const llama_pos row = ub.logical_pos ? ub.logical_pos[i] : ub.pos[i];
+            const llama_pos row = explicit_rows ? ub.logical_pos[i] : (llama_pos) next_row;
+            if (!explicit_rows) {
+                ++next_row;
+            }
+            rows[u][i] = row;
             if (row >= 0 && (uint32_t) row < old_rows) {
                 rewrite_begin = std::min(rewrite_begin, (uint32_t) row);
             }
         }
+        // A span is a range, so the explicit-row path still owes us consecutive rows.
+        for (size_t i = 1; explicit_rows && i < rows[u].size(); ++i) {
+            if (rows[u][i] != rows[u][0] + (llama_pos) i) {
+                LLAMA_LOG_ERROR("%s: explicit logical rows are not consecutive at token %zu\n",
+                        __func__, i);
+                return false;
+            }
+        }
     }
-    if (!content_->stamp().valid || native_transfer_pending_) return false;
+    if (!content_->stamp().valid || native_transfer_pending_) {
+        return false;
+    }
     if (rewrite_begin < old_rows) {
         harvest_flush();
         harvest_gpu_v_commit();
@@ -2587,23 +2642,38 @@ bool llama_memory_kvmem::prepare_ubatches(
         content_->change_execution();
         ++attention_epoch_;
     }
+    // Rows [0, old_rows) were materialized by the previous step; everything this call
+    // appends is still waiting for its ubatch. Publish that frontier before the working-set
+    // transaction so its coverage check does not read the pending tail as a hole.
+    cells_materialized_ = old_rows;
     if (!prepare_working_set(n_new_tokens)) {
         return false;
     }
-    for (const auto & ub : ubatches) {
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const auto & ub = ubatches[u];
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
-            const llama_pos logical = ub.logical_pos ? ub.logical_pos[i] : ub.pos[i];
-            if (logical < 0 || (uint32_t) logical >= runtime_->store().total_tokens()) return false;
-            if ((size_t) logical >= row_positions_.size()) row_positions_.resize(logical + 1);
-            auto & row = row_positions_[logical];
+            const llama_pos row_id = rows[u][i];
+            if (row_id < 0 || (uint32_t) row_id >= runtime_->store().total_tokens()) {
+                LLAMA_LOG_ERROR("%s: row %d is outside the store (%u rows)\n", __func__,
+                        (int) row_id, runtime_->store().total_tokens());
+                return false;
+            }
+            if ((size_t) row_id >= row_positions_.size()) row_positions_.resize(row_id + 1);
+            auto & row = row_positions_[(size_t) row_id];
             row.spatial = ub.is_pos_2d();
             for (uint32_t j = 0; j < 4; ++j) row.pos[j] = ub.pos[(j < ub.n_pos ? j*ub.n_tokens : 0) + i];
             row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
         }
     }
+    // The slot mapper and the capture batches address blocks the same way the store does,
+    // so they get ubatches whose logical position IS the row.
+    std::vector<llama_ubatch> row_view(ubatches);
+    for (size_t u = 0; u < row_view.size(); ++u) {
+        row_view[u].logical_pos = rows[u].data();
+    }
     sinfos.clear();
     sinfos.reserve(ubatches.size());
-    for (const auto & ubatch : ubatches) {
+    for (const auto & ubatch : row_view) {
         llama_kv_cache::slot_info sinfo;
         if (!kvmem_fill_slot_info(runtime_->store(), block_tokens_, kv_size_, ubatch, sinfo)) {
             return false;
@@ -2614,18 +2684,13 @@ bool llama_memory_kvmem::prepare_ubatches(
     evaluation_queue_.clear();
     evaluation_cursor_ = 0;
     pos_queue_.clear();
-    for (const auto & ubatch : ubatches) {
-        std::vector<llama_pos> p(ubatch.n_tokens);
-        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            p[i] = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
+    for (size_t u = 0; u < row_view.size(); ++u) {
+        if (!rows[u].empty()) {
+            evaluation_queue_.push_back({(uint32_t) rows[u].front(), (uint32_t) rows[u].back() + 1});
         }
-        for (size_t i = 1; i < p.size(); ++i) {
-            if (p[i] != p[0] + (llama_pos) i) return false;
-        }
-        if (!p.empty()) evaluation_queue_.push_back({(uint32_t) p.front(), (uint32_t) p.back() + 1});
-        pos_queue_.push_back(std::move(p));
+        pos_queue_.push_back(rows[u]);
     }
-    prepare_attention_batches(ubatches);
+    prepare_attention_batches(row_view);
     return true;
 }
 
@@ -2682,6 +2747,8 @@ void llama_memory_kvmem::clear(bool data) {
 
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
+    const uint32_t total = runtime_ != nullptr ? runtime_->store().total_tokens() : 0;
+    const bool tail = p1 < 0 || p1 >= static_cast<llama_pos>(total);
     const bool ok = kv_->seq_rm(seq_id, p0, p1);
     if (!ok) {
         return false;
@@ -2689,10 +2756,37 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     // Query replay seq_rm's the query span, which can be the whole prompt on
     // short inputs. That must not wipe KvMemStore metadata / GPU slots.
     if (!replay_ &&
-        seq_id <= 0 && p0 <= 0 &&
-        (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
+        seq_id <= 0 && p0 <= 0 && tail) {
         // A new logical history must not inherit packed rows from the previous
         // incarnation. Drain writers before discarding either half of the store.
+        harvest_flush();
+        harvest_gpu_v_commit();
+        if (mtp_) mtp_->truncate_cached(0);
+        reset_policy();
+        return true;
+    }
+    // This memory object is the only place that sees both halves of the history: the
+    // cells just removed above and the packed store, which addresses blocks by absolute
+    // position. A removal that reaches the live end is a truncation and the store follows
+    // it exactly -- the cache above and the store below keep describing the same rows.
+    if (!replay_ && seq_id <= 0 && tail && p0 >= 0) {
+        if ((uint32_t) p0 < total) {
+            truncate_cached((uint32_t) p0);
+        }
+        return true;
+    }
+    if (!replay_ && seq_id <= 0 && p0 >= 0 && !tail) {
+        // A prefix or interior removal leaves a hole, and a hole cannot be addressed: the
+        // blocks after it keep their baked original positions (RoPE lives in the bytes), so
+        // neither re-basing nor a sparse mapping is available. Dropping the store is the
+        // only correct answer; the caller re-prefills instead of reading rows that are gone.
+        static bool warned_hole = false;
+        if (!warned_hole) {
+            warned_hole = true;
+            LLAMA_LOG_WARN("%s: KVMem cannot keep a prefix/interior removal (p0=%d p1=%d); "
+                    "dropping the packed history so the next pass re-prefills it\n",
+                    __func__, (int) p0, (int) p1);
+        }
         harvest_flush();
         harvest_gpu_v_commit();
         if (mtp_) mtp_->truncate_cached(0);
@@ -5886,6 +5980,52 @@ bool llama_memory_kvmem::packed_complete(uint32_t id, uint32_t tokens) const {
     return true;
 }
 
+std::string llama_memory_kvmem::native_cells_gap(const kvmem::BlockDescriptor & block) const {
+    const auto & b = store().blocks().at((size_t) block.id);
+    if (b.gpu_slot < 0 || b.in_flight || b.tier != kvmem::KvTier::GPU) {
+        return "block is not GPU-resident";
+    }
+    const uint32_t cell0 = b.gpu_slot * block_tokens_;
+    const auto & cells = kv_->get_cells(0);
+    if ((uint64_t) cell0 + block.valid_tokens > cells.size()) {
+        return "block row range is past the cell array";
+    }
+    if (block.original_start + block.valid_tokens > row_positions_.size()) {
+        return "block rows are past the recorded row positions";
+    }
+    // Only the rows the last completed step wrote are knowable here; this step's own rows
+    // are still pending and would read as empty cells.
+    const uint64_t known_rows = cells_materialized_ > block.original_start
+        ? (uint64_t) cells_materialized_ - block.original_start : 0;
+    const uint32_t known = (uint32_t) std::min<uint64_t>(block.valid_tokens, known_rows);
+    char buf[192];
+    for (uint32_t j = 0; j < known; ++j) {
+        const auto & row = row_positions_[(size_t) block.original_start + j];
+        const auto & ext = cells.ext_get(cell0 + j);
+        const char * what = nullptr;
+        if (cells.is_empty(cell0 + j)) {
+            what = "cell is empty";
+        } else if (!cells.seq_has(cell0 + j, 0)) {
+            what = "cell has no seq 0";
+        } else if (ext.logical_pos != (llama_pos) (block.original_start + j)) {
+            what = "logical_pos";
+        } else if (cells.pos_get(cell0 + j) != row.pos[0]) {
+            what = "pos";
+        } else if (row.spatial && (ext.y != row.pos[1] || ext.x != row.pos[2])) {
+            what = "spatial";
+        }
+        if (what == nullptr) {
+            continue;
+        }
+        snprintf(buf, sizeof(buf), "block %u slot %d row %u/%u: %s (cell logical %d pos %d, recorded %d/%d/%d)",
+                (unsigned) block.id, (int) b.gpu_slot, (unsigned) j, (unsigned) block.valid_tokens, what,
+                (int) ext.logical_pos, (int) cells.pos_get(cell0 + j),
+                (int) row.pos[0], (int) row.pos[1], (int) row.pos[2]);
+        return buf;
+    }
+    return {};
+}
+
 bool llama_memory_kvmem::native_cells_complete(const kvmem::BlockDescriptor & block) const {
     const auto & b = store().blocks().at((size_t) block.id);
     if (b.gpu_slot < 0 || b.in_flight || b.tier != kvmem::KvTier::GPU) return false;
@@ -5893,7 +6033,10 @@ bool llama_memory_kvmem::native_cells_complete(const kvmem::BlockDescriptor & bl
     const auto & cells = kv_->get_cells(0);
     if ((uint64_t) cell0 + block.valid_tokens > cells.size() ||
         block.original_start + block.valid_tokens > row_positions_.size()) return false;
-    for (uint32_t j = 0; j < block.valid_tokens; ++j) {
+    const uint64_t known_rows = cells_materialized_ > block.original_start
+        ? (uint64_t) cells_materialized_ - block.original_start : 0;
+    const uint32_t known = (uint32_t) std::min<uint64_t>(block.valid_tokens, known_rows);
+    for (uint32_t j = 0; j < known; ++j) {
         const auto & row = row_positions_[(size_t) block.original_start + j];
         const auto & ext = cells.ext_get(cell0 + j);
         if (cells.is_empty(cell0 + j) || !cells.seq_has(cell0 + j, 0) ||
@@ -5940,8 +6083,10 @@ struct llama_memory_kvmem::NativeBackend final : kvmem::MemoryBackend {
             result.blocks.push_back({b, owner.packed_complete((uint32_t) id, b.valid_tokens) ? b.content_version : 0});
             const auto & physical = owner.store().blocks().at((size_t) id);
             if (physical.gpu_slot >= 0 && physical.tier == kvmem::KvTier::GPU && !physical.in_flight) {
-                if (!owner.native_cells_complete(b))
-                    throw kvmem::MemoryError(kvmem::MemoryErrorCode::Stale, "resident KV has a position/coverage gap");
+                std::string gap = owner.native_cells_gap(b);
+                if (!gap.empty())
+                    throw kvmem::MemoryError(kvmem::MemoryErrorCode::Stale,
+                            "resident KV has a position/coverage gap: " + gap);
                 result.resident.push_back(id);
             }
         }

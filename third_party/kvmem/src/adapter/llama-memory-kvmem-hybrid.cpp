@@ -129,6 +129,26 @@ void llama_memory_kvmem_hybrid::clear(bool data) {
     }
 }
 
+bool llama_memory_kvmem_hybrid::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // The recurrent half must accept the rollback before either side mutates; the
+    // attention half then follows the same path as seq_rm so the packed store stays in
+    // step with the cells.
+    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
+                       : get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_kvmem_hybrid::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
+                       : get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_kvmem_hybrid::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm_attn(seq_id, p0, p1);
+}
+
 bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const llama_pos p0n = p0 < 0 ? 0 : p0;
     const bool full = seq_id <= 0 && p0n == 0 && p1 < 0;
