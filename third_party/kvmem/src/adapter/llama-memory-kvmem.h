@@ -196,6 +196,11 @@ public:
     size_t free_slot_count() const { return free_slots_.size(); }
     void truncate_cached(uint32_t n_past);
     bool restore_checkpoint_tail();
+    // A partial tail block can lose its GPU slot to the pool while it still owns committed
+    // rows; a truncation that lands inside it makes it the tail again, but only the packed
+    // store kept those rows. An append writes just the rows it adds, so the committed prefix
+    // has to be restaged before the append or the block publishes empty cells.
+    bool restore_partial_tail();
     void occupy_in(llama_kv_cache * cache, uint32_t block_id);
     llama_pos model_pos(uint32_t logical_pos) const;
     bool remove_logical(llama_context * ctx, llama_pos begin, llama_pos end);

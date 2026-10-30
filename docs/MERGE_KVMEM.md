@@ -206,8 +206,17 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 | MTP 首个被拒草稿后同样报 gap | 草稿回滚走 `seq_rm_transient`，同样绕过 adapter | 同上 |
 | 图像输入 `failed to decode mtmd chunk, idx = 15` | 图像 patch 的 M-RoPE `pos[0]` 重复，adapter 却要求 ubatch 内的逻辑位置严格递增 | 行号改为**登记顺序**，`pos` 只作为 RoPE/空间信息；显式给 `logical_pos` 的驱动仍由它决定行号 |
 | 每步都可能报 gap（非长会话也会） | 覆盖检查跑在本步 ubatch **之前**，半满块的尾巴必然还没有 cell | 检查只到上一步留下的前沿（`cells_materialized_`），并报出块号/行号/字段名 |
+| 十几 k 上下文连续几轮后，某个**跨裁剪点**的块报 gap（`block 41x slot N row 0/32: cell is empty`），此后每步失败直到 `Context size has been exceeded` | 该块在前一轮生成时被驱逐（`gpu_slot=-1`，行只留在 packed store）；本轮裁剪落在块内又把它变回**半满尾块**，而 append 只写新行，已提交的前缀没人回填 | `restore_partial_tail()`：append 之前若尾块不满且 GPU 侧不完整，就按 packed store 重新落位并物化前缀（无空槽/打包缺失时明确失败，不再发布空行） |
 
 回归面：PPL 12.2387（开/关）、11.9618（budget 2048），贪心 md5 `1e05d115…` 与 master 相同，16 个 kvmem 单测全过。
+
+### 半满尾块的前缀回填
+
+池子按块驱逐，**尾块下的块**迟早会被赶走；而服务端的 checkpoint 恢复常在**块中间**裁剪（`CHECKPOINT_ATTN_ONLY_TRIM p0=13207`，13207 % 32 = 23），于是这个块又成了尾块，但只有 packed store 还记得它那 23 行。append 只写自己新增的行（`apply_ubatch` 的 `sinfo.idxs` 是逐行的），前缀就此留空，而 store 仍宣称整块驻留 —— 下一次工作集事务 `snapshot()` 就在那块的第一行报 gap。
+
+修法是在 `prepare_working_set()` 里、`register_append()` **之前**（此时 `n_tokens` 仍等于已提交行数）调用 `restore_partial_tail()`：尾块不满且 `gpu_kv_complete()` 为假时，从 packed store 落位并物化前缀（`write_block_to_gpu`），MTP 侧同步 `restore_checkpoint_block()`。失败一律 fail-closed —— 发布空行比报错更糟。
+
+复现与验证（Qwen3.5-2B、f16、`-c 262144 --kvmem-budget 1000 -b 512`、13.2k prompt 连续 5 轮各生成 5k）：修复前 3/6 次在第三轮 decode 报 gap；修复后 5 轮全过，且 `KVMEM_TRACE=1` 能看到 `tail_restage` 正好在这些轮次触发（一次运行 3 次）。PPL 1.2126（开/关逐位同）、真驱逐 budget 576 为 1.2135。
 
 ## 已知限制
 

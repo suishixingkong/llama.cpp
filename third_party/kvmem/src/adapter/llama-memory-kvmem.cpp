@@ -1341,6 +1341,70 @@ void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
     }
 }
 
+bool llama_memory_kvmem::restore_partial_tail() {
+    if (!runtime_ || !kv_ || !raw_ || native_transfer_pending_) {
+        return true;
+    }
+    const uint32_t rows = store_n_tokens();
+    const uint32_t keep = rows % block_tokens_;
+    if (rows == 0 || keep == 0) {
+        return true;
+    }
+    const uint32_t id = rows / block_tokens_;
+    auto & store = runtime_->store();
+    if (id >= store.block_count()) {
+        return true;
+    }
+    if (gpu_kv_complete(id, kv_)) {
+        return true;
+    }
+    const kvmem::KvMemBlock b = store.blocks()[id];
+    if (b.n_tokens != keep) {
+        // Only the committed prefix exists before this step's append; anything else means the
+        // store and the boundary disagree and a guess here would publish the wrong rows.
+        LLAMA_LOG_ERROR("%s: tail block %u holds %u rows at boundary %u\n",
+                __func__, id, b.n_tokens, rows);
+        return false;
+    }
+    if (!packed_complete(id, keep)) {
+        LLAMA_LOG_ERROR("%s: tail block %u keeps %u committed rows the packed store lost\n",
+                __func__, id, keep);
+        return false;
+    }
+    if (b.gpu_slot < 0) {
+        const int32_t slot = alloc_slot();
+        if (slot < 0) {
+            LLAMA_LOG_ERROR("%s: no GPU slot to restage tail block %u (%u rows)\n",
+                    __func__, id, keep);
+            return false;
+        }
+        store.set_block_gpu_slot(id, slot);
+        store.set_block_tier(id, kvmem::KvTier::GPU, -1, b.nvme_slot);
+        ++attention_epoch_;
+    } else {
+        // The block kept its slot but lost rows: clear what is left of its range first, or
+        // occupy_in would rewrite cells that still read as occupied (and, on an SWA cache,
+        // purge the positions below them).
+        kv_->seq_rm_logical(0, static_cast<llama_pos>(b.orig_pos_start),
+                static_cast<llama_pos>(b.orig_pos_start + b.n_tokens));
+    }
+    write_block_to_gpu(id);
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    if (!gpu_kv_complete(id, kv_)) {
+        LLAMA_LOG_ERROR("%s: tail block %u still has empty rows after a restage\n", __func__, id);
+        return false;
+    }
+    if (mtp_ && !gpu_kv_complete(id, mtp_->get_kv()) && !mtp_->restore_checkpoint_block(id)) {
+        LLAMA_LOG_ERROR("%s: draft cache could not restage tail block %u\n", __func__, id);
+        return false;
+    }
+    if (trace_) {
+        kvmem_diag("KVMEM_TRACE tail_restage row=%u block=%u slot=%d keep=%u\n", rows, id,
+                (int) store.blocks()[id].gpu_slot, keep);
+    }
+    return true;
+}
+
 bool llama_memory_kvmem::restore_checkpoint_tail() {
     if (!native_contract_supported()) return true;
     const uint32_t rows = store_n_tokens();
@@ -2628,6 +2692,9 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     }
     if (replay_) {
         return true;
+    }
+    if (!restore_partial_tail()) {
+        return false;
     }
     auto & store = runtime_->store();
     const uint32_t t0 = store.total_tokens();
