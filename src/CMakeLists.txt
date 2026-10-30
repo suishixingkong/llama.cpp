@@ -174,6 +174,14 @@ if (LLAMA_KVMEM)
         enable_testing()
         add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
     endif()
+    if (GGML_CUDA)
+        # The retrieval round's page-softmax scorer has a CUDA implementation, and it is
+        # opted in by a compile definition on the kvmem target, not by the backend the
+        # adapter was given. Skipping it leaves the adapter to score every page on the
+        # host, which measured 4195 ms for 3156 rows against 25 ms for the whole round
+        # otherwise: the round then dominates the request's prefill.
+        kvmem_enable_cuda_recall()
+    endif()
     target_link_libraries(llama PRIVATE kvmem)
     if (GGML_CUDA)
         find_package(CUDAToolkit QUIET)
