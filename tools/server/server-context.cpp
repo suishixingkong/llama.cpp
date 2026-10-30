@@ -23,6 +23,7 @@ extern "C" void llama_kvmem_accept_retrieval_round(void);
 extern "C" void llama_kvmem_apply_retrieval(struct llama_context * ctx);
 extern "C" void llama_kvmem_pin_working_set(void);
 extern "C" void llama_kvmem_end_prefill_capture(void);
+extern "C" bool llama_kvmem_want_prefill_capture(void);
 #endif
 #include "fit.h"
 #include "llama.h"
@@ -12316,7 +12317,12 @@ private:
                 // and cut the working set down before decode pins it. Recency
                 // (method 0) leaves the cutting to the pressure path, which
                 // already ran while appending.
-                if (params_base.kvmem.enabled && params_base.kvmem.method == "retrieval") {
+                if (params_base.kvmem.enabled && params_base.kvmem.method == "retrieval" &&
+                        llama_kvmem_want_prefill_capture()) {
+                    // want_prefill_capture() is false when this context can keep every block
+                    // (whole-context pool) or when prefill capture is already closed. In that
+                    // state no query was harvested, so a round could only throw "graph rows
+                    // are not complete" on every request.
                     try {
                         llama_kvmem_apply_retrieval(ctx_tgt);
                         llama_kvmem_pin_working_set();
