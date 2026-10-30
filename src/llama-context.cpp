@@ -2529,9 +2529,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
-        // The previous compute is async. Restore scheduler-rewritten inputs,
-        // then recycle this graph's tensor headers.
-        ggml_backend_sched_synchronize(sched.get());
+        // Restore scheduler-rewritten inputs, then recycle this graph's tensor headers.
+        // No synchronize here: upstream rebuilds the graph while the previous compute is
+        // still in flight and only waits for pipeline parallelism, where set_inputs would
+        // overwrite buffers the previous graph reads. Waiting here serializes every
+        // prefill ubatch with the one before it (measured 15 ms/ubatch, -7% pp).
         ggml_backend_sched_reset(sched.get());
         res->reset();
 

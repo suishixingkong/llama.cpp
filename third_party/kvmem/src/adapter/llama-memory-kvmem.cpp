@@ -3402,12 +3402,18 @@ void llama_memory_kvmem::harvest_pending_impl(ggml_backend_sched_t sched) {
     perf_.last_d2d_us = 0;
     perf_.last_snap_wait_us = 0;
     perf_.last_d2h_submit_us = 0;
+    bool d2h_submitted = false;
     if (d2h_ && d2h_->ok && !harvest_worker_on()) {
         d2h_commit(d2h_->next == 0 ? 1 : 0);
+        d2h_submitted = true;
     }
     if (pending_capture_.empty() || pos_queue_.empty()) {
         harvest_flush();
-        if (sched) {
+        // Waiting here only makes sense for copies this call submitted. When the pool never
+        // captures (full-resident slot pool) there is nothing in flight, and synchronizing
+        // anyway serializes every prefill ubatch with the one before it (measured +7 ms per
+        // 512-token ubatch, ~-8% pp).
+        if (sched && d2h_submitted) {
             ggml_backend_sched_synchronize(sched);
         }
         return;
