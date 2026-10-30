@@ -1281,7 +1281,9 @@ void llama_memory_kvmem::reset_turn_policy() {
     turn_spans_ = {};
     retrieval_pinned_ = false;
     keep_selected_ = false;
-    prefill_capture_ = true;
+    // Not prefill_capture_: a cleared turn is not a driver that scores. The
+    // server re-arms it per request (begin_retrieval_round), and everything
+    // else must not D2H rows no scorer will read.
 }
 
 void llama_memory_kvmem::reset_policy() {
@@ -1318,7 +1320,6 @@ void llama_memory_kvmem::begin_cached_turn() {
     reset_query_acc();
     retrieval_pinned_ = false;
     keep_selected_ = false;
-    prefill_capture_ = true;
 }
 
 void llama_memory_kvmem::truncate_cached(uint32_t n_past) {

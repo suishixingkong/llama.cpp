@@ -134,7 +134,13 @@ public:
     void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
-    void begin_retrieval_round() { runtime_->store().begin_retrieval_round(); }
+    // Only a driver that will actually score can want the prefill K rows: the
+    // server opens a retrieval round before the request's first ubatch, and
+    // without one there is no scoring call to spend the captured bytes on.
+    void begin_retrieval_round() {
+        prefill_capture_ = true;
+        runtime_->store().begin_retrieval_round();
+    }
     void accept_retrieval_round();
     void restore_history(const kvmem::LrfuState& state) { runtime_->store().restore_retrieval(state); }
     kvmem::LrfuState history() const { return runtime_->store().retrieval_checkpoint(); }
@@ -518,7 +524,11 @@ private:
     bool host_mirror_stale_ = false;
     bool retrieval_pinned_ = false;
     bool keep_selected_ = false;
-    bool prefill_capture_ = true;
+    // Armed by begin_retrieval_round(), i.e. by the one driver that scores. A
+    // driver that never retrieves (llama-completion, llama-bench,
+    // llama-perplexity) still pays the eviction policy it asked for, but not
+    // the D2H and the host packing of rows nothing will score.
+    bool prefill_capture_ = false;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
