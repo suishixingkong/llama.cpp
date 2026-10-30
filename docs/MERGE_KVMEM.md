@@ -194,6 +194,8 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 功能面（同一批构建）：长会话三连问 16k 上下文 / MTP 草稿回滚 / 图像输入都通过（细节见下面「已修复」与 `AUDIT_KVMEM_PERF_QUALITY.md`）。
 
+单测：KVMem 的 16 个测试已注册进 ctest（`test-kvmem-store`、`test-kvmem-runtime`、`test-spill-io`、`test-native-residency` 等，`ctest -N` 由 113 涨到 129），16/16 通过。
+
 测量方法、口径陷阱、噪声地板和每条结论的原始数据见 [`AUDIT_KVMEM_PERF_QUALITY.md`](AUDIT_KVMEM_PERF_QUALITY.md)。
 
 ## 长会话 / MTP / 多模态的修复（`471930f69`）
