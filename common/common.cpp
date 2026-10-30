@@ -2123,6 +2123,27 @@ static void common_arm_kvmem(const common_params &, bool) {
 }
 #endif // LLAMA_KVMEM
 
+// cparams are built more than once per process (the context pass, then the fit and
+// draft passes), so every refusal issued from the memory-mode resolver used to print
+// twice in a row and read like a repeated fault. Collapse an immediate repeat; a
+// different message still gets through, because that IS news. The caller's name is
+// threaded through so the log prefix stays the resolver, not this helper.
+static void com_wrn_resolve(const char * where, const char * fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    static std::string last;
+    if (last == buf) {
+        return;
+    }
+    last = buf;
+    LOG_WRN("cmn  %12.*s: %s", 12, where, buf);
+}
+
+#define COM_WRN_RESOLVE(fmt, ...) com_wrn_resolve(__func__, fmt, __VA_ARGS__)
+
 static void common_resolve_memory_modes(const common_params & params, llama_context_params & cparams) {
     bool kv_stream = cparams.kv_stream_arena_mib != 0;
     const bool vbr = cparams.vbr_dynamic;
@@ -2136,15 +2157,15 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
             // context can only ride VBR or the native cache -- and it must be
             // cleared here, not left for the arena validator to reject later.
             if (kv_stream) {
-                COM_WRN("%s: KVMem and the KV stream arena both need n_seq_max=1 (got %u) -- "
+                COM_WRN_RESOLVE("KVMem and the KV stream arena both need n_seq_max=1 (got %u) -- "
                         "--kv-stream-arena-mib %u cleared, falling back to %s\n",
-                        __func__, cparams.n_seq_max, cparams.kv_stream_arena_mib,
+                        cparams.n_seq_max, cparams.kv_stream_arena_mib,
                         vbr ? "VBR" : "the native cache");
                 cparams.kv_stream_arena_mib = 0;
                 kv_stream = false;
             } else {
-                COM_WRN("%s: KVMem needs n_seq_max=1 (got %u) -- falling back to %s\n",
-                        __func__, cparams.n_seq_max, vbr ? "VBR" : "the native cache");
+                COM_WRN_RESOLVE("KVMem needs n_seq_max=1 (got %u) -- falling back to %s\n",
+                        cparams.n_seq_max, vbr ? "VBR" : "the native cache");
             }
         } else {
             kvmem = true;
@@ -2153,18 +2174,18 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
             // refuses the selection. Say so here, where the two flags meet.
             const int32_t ub = params.n_ubatch > 0 ? params.n_ubatch : params.n_batch;
             if (params.kvmem.budget > 0 && ub > 0 && params.kvmem.budget < ub) {
-                COM_WRN("%s: --kvmem-budget %d is below the %d-token prefill chunk; lower -ub "
+                COM_WRN_RESOLVE("--kvmem-budget %d is below the %d-token prefill chunk; lower -ub "
                         "or raise the budget, or the first prefill step cannot fit the working set\n",
-                        __func__, params.kvmem.budget, ub);
+                        params.kvmem.budget, ub);
             }
             if (kv_stream) {
-                COM_WRN("%s: KVMem outranks the KV stream arena -- --kv-stream-arena-mib %u cleared\n",
-                        __func__, cparams.kv_stream_arena_mib);
+                COM_WRN_RESOLVE("KVMem outranks the KV stream arena -- --kv-stream-arena-mib %u cleared\n",
+                        cparams.kv_stream_arena_mib);
                 cparams.kv_stream_arena_mib = 0;
                 kv_stream = false;
             }
             if (vbr) {
-                COM_WRN("%s: KVMem outranks VBR -- the dynamic KV ladder is off for this context\n", __func__);
+                COM_WRN_RESOLVE("KVMem outranks VBR -- the dynamic KV ladder is off for this context\n");
                 // The same static-cache shape the coupled-cache resolver builds.
                 cparams.vbr_dynamic               = false;
                 cparams.vbr_codec                 = LLAMA_VBR_CODEC_TURBO;
@@ -2175,6 +2196,21 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
                 cparams.vbr_budget_explicit       = false;
                 cparams.vbr_pin_k                 = false;
                 cparams.vbr_pin_v                 = false;
+            }
+            // Turbo KV is a VBR type: its rows carry a per-block rotation matrix and the
+            // cache publishes them through the VBR bookkeeping pools, which KVMem's packed
+            // store neither owns nor can score (mean-K/Q reads raw rows). Left alone this
+            // fails deep in the cache ctor ("VBR could not bind KV buffer type ..."), far
+            // from the two flags that caused it, so decide here: KVMem keeps a static f16
+            // pool and the turbo request is named, not silently reinterpreted at f16 speed.
+            if (ggml_is_turbo_kv_type(cparams.type_k) || ggml_is_turbo_kv_type(cparams.type_v)) {
+                COM_WRN_RESOLVE("KVMem packs and scores raw KV rows, so it outranks the turbo KV "
+                        "types -- -ctk/-ctv %s/%s reset to f16 (KV VRAM roughly doubles)\n",
+                        ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v));
+                cparams.type_k   = GGML_TYPE_F16;
+                cparams.type_v   = GGML_TYPE_F16;
+                cparams.vbr_pin_k = false;
+                cparams.vbr_pin_v = false;
             }
         }
     }
