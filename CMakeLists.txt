@@ -128,10 +128,13 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
-# KVMem out-of-tree adapter (kvmem_llamacpp). Off by default so a vanilla
-# submodule build stays bit-identical to upstream.
+# KVMem adapter. Off by default so a vanilla submodule build stays bit-identical
+# to upstream. The sources are vendored under third_party/kvmem so the branch is
+# self-contained: LLAMA_KVMEM_ROOT still takes an external root (libkvmem + src/adapter)
+# for comparing against a different kvmem tree.
 option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
-set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)")
+set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/kvmem"
+    CACHE PATH "kvmem root (libkvmem + src/adapter); defaults to the vendored copy")
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
