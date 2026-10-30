@@ -167,6 +167,11 @@ if (LLAMA_KVMEM)
     )
     target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1)
     if (NOT TARGET kvmem)
+        # KVMem registers its unit tests from inside that subdirectory, but the root only
+        # runs include(CTest) after src/, so add_test() there would be dropped and the
+        # tests would build without ever running under ctest. Enable testing one level
+        # above the kvmem tree instead of reordering the root file.
+        enable_testing()
         add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
     endif()
     target_link_libraries(llama PRIVATE kvmem)
