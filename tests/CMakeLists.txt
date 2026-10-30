@@ -904,3 +904,9 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# The multi-conversation host-store policy is a freestanding header (only std
+# headers), so its decision table can be pinned without a model, a GPU or the
+# adapter: the server is the only thing that has to be right about applying it.
+llama_build_and_test(kvmem-conversation-store-test.cpp)
+target_include_directories(kvmem-conversation-store-test PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
