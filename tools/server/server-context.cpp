@@ -11025,14 +11025,9 @@ private:
                             }
                             break;
                         }
-                        // The scorer costs about 0.13 ms per row, so scoring a
-                        // whole prompt is the difference between 64 ms and 1.3 s
-                        // on a 9.5k-token prefill. Keep the tail, which is what
-                        // the answer actually attends to.
-                        const int32_t q_max = params_base.kvmem.query_max;
-                        if (q_max > 0 && q_end > q_begin && q_end - q_begin > q_max) {
-                            q_begin = q_end - q_max;
-                        }
+                        // --kvmem-query-max is enforced where the span lands, in
+                        // the adapter, so a CLI or perplexity span is capped by
+                        // the same policy. Hand over the whole user turn.
                         llama_kvmem_set_request_span(q_begin, q_end, -1);
                         llama_kvmem_begin_retrieval_round();
                     }

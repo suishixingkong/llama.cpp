@@ -224,10 +224,16 @@ public:
     bool gdn_replay_enabled() const;
     bool gdn_replay_begin(llama_pos start, uint32_t width);
     bool gdn_replay_commit(llama_context * ctx, uint32_t n_keep);
+    // The cap travels with the span, not with one frontend: a server request and
+    // a CLI --kvmem-query-begin/end both land here, so the policy lives here
+    // instead of being re-derived in each tool.
+    static int32_t capped_query_begin(int32_t begin, int32_t end, int32_t cap) {
+        return (cap > 0 && end > begin && end - begin > cap) ? end - cap : begin;
+    }
     void set_query_span(int32_t begin, int32_t end) {
         harvest_flush();
         explicit_spans_ = false;
-        query_begin_ = begin;
+        query_begin_ = capped_query_begin(begin, end, query_max_);
         query_end_ = end;
     }
     void set_force_pos(int32_t pos) { force_pos_ = pos; }
@@ -532,6 +538,7 @@ private:
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
+    int32_t query_max_ = 0;
     int32_t force_pos_ = -1;
     llama_kvmem_turn_spans turn_spans_;
     bool explicit_spans_ = false;

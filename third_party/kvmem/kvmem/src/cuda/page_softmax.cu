@@ -38,7 +38,9 @@ std::array<size_t,5> planned_sizes(uint32_t blocks,uint32_t heads,uint32_t kvhea
     if(!blocks || !heads || !kvheads || !dim || heads%kvheads ||
        uint64_t(blocks)*heads*sizeof(float)>logits_limit)
         throw std::invalid_argument("invalid planned page softmax geometry");
-    const auto batch=std::min<size_t>(64,logits_limit/(size_t(blocks)*heads*sizeof(float)));
+    // 512 rows a batch keeps the stream cadence low without pressing the logits
+    // budget: at 9.5k rows the old 64-row batch meant 148 sync points per layer.
+    const auto batch=std::min<size_t>(512,logits_limit/(size_t(blocks)*heads*sizeof(float)));
     return {batch*heads*dim*sizeof(half),size_t(blocks)*kvheads*dim*sizeof(half),
         batch*blocks*heads*sizeof(float),batch*heads*2*sizeof(float),size_t(blocks)*sizeof(float)};
 }
@@ -126,13 +128,33 @@ __global__ void accumulate_gqa_max(const float* logits, const float* norms, floa
     }
     output[page] += sum*weight;
 }
+
+// recall_fp16() rounds each lane by hand so it can reject operands that a bare
+// conversion would turn into an infinity or a NaN; its rounding *is*
+// round-to-nearest-even, which is what __float2half_rn already does. On a 9.5k
+// row prefill the two run 467M times and the hand-written version dominates the
+// scoring pass, so keep the rejection as one branchless magnitude scan and let
+// the conversion be the intrinsic. Operands that need the exact path -- NaN,
+// and anything at or above the FP16 maximum -- still take it.
+void stage_query_half(const float * src, half * dst, size_t n) {
+    bool exact = false;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = std::fabs(src[i]);
+        exact |= !(a <= 65504.0f);
+    }
+    if (!exact) {
+        for (size_t i = 0; i < n; ++i) dst[i] = __float2half_rn(src[i]);
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) dst[i] = __float2half_rn(recall_fp16(src[i]));
+}
 } // namespace
 
 struct PageSoftmaxCuda::Impl {
     int device;
     cudaStream_t stream=nullptr;
     Buffer queries,means,logits,norms,output;
-    uint32_t max_batch=64;
+    uint32_t max_batch=512;
     explicit Impl(int device):device(device) {
         DeviceBinding binding(device); checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
     }
@@ -166,7 +188,7 @@ PageSoftmaxCuda::PageSoftmaxCuda(int device,void* workspace,size_t bytes,uint32_
         buffer->data=begin+at;buffer->capacity=sizes[index++];buffer->borrowed=true;
         at+=aligned(buffer->capacity);
     }
-    impl_->max_batch=uint32_t(std::min<size_t>(64,logits_limit/(size_t(blocks)*heads*sizeof(float))));
+    impl_->max_batch=uint32_t(std::min<size_t>(512,logits_limit/(size_t(blocks)*heads*sizeof(float))));
 }
 PageSoftmaxCuda::~PageSoftmaxCuda()=default;
 size_t PageSoftmaxCuda::device_bytes() const {
@@ -226,7 +248,7 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
             const auto* base=q.layer_data ? q.layer_data[layer] : q.data+size_t(layer)*q.rows*qw;
             if(!base) throw std::invalid_argument("page softmax CUDA missing active layer storage");
             const auto* input=base+size_t(first)*qw;
-            for(size_t d=0;d<size_t(rows)*qw;++d) host_query[d]=__float2half_rn(recall_fp16(input[d]));
+            stage_query_half(input,host_query.data(),size_t(rows)*qw);
             checked(cudaMemcpyAsync(w.queries.data,host_query.data(),size_t(rows)*qw*sizeof(half),cudaMemcpyHostToDevice,w.stream));
             const int distributions=int(rows*q.query_heads);
             page_logits<<<dim3(unsigned((blocks+3)/4),unsigned(distributions)),128,0,w.stream>>>(

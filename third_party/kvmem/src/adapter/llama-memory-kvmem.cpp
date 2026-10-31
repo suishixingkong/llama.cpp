@@ -1280,8 +1280,10 @@ llama_memory_kvmem::llama_memory_kvmem(
     v_row_bytes_ = ggml_row_size(type_v_, n_embd_v_store_);
     v_trans_ = !cparams.flash_attn;
     method_ = kvmem_current_execution().params.method;
+    query_max_ = kvmem_current_execution().params.query_max;
     query_begin_ = kvmem_current_execution().params.query_begin;
     query_end_ = kvmem_current_execution().params.query_end;
+    query_begin_ = capped_query_begin(query_begin_, query_end_, query_max_);
     force_pos_ = kvmem_current_execution().params.force_pos;
     kvmem::RawKvStoreConfig & rcfg = raw_cfg_;
     if (kvmem_current_execution().params.payload_disk_bytes && v_trans_)
@@ -5808,6 +5810,11 @@ llama_pos llama_kvmem_recr_pos_max(void) {
 }
 
 void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos) {
+    // Cap here, before the span reaches either the params copy or the memory:
+    // a frontend that hands over the whole user turn gets the same trailing
+    // window the server's own requests get.
+    query_begin = llama_memory_kvmem::capped_query_begin(
+            query_begin, query_end, kvmem_current_execution().params.query_max);
     kvmem_current_execution().params.query_begin = query_begin;
     kvmem_current_execution().params.query_end = query_end;
     kvmem_current_execution().params.force_pos = force_pos;

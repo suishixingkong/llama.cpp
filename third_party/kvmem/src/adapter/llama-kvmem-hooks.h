@@ -41,6 +41,7 @@ struct llama_kvmem_params {
     double   graph_alpha = 0.2;
     int32_t  query_begin;   // original token pos, -1 = unset
     int32_t  query_end;     // exclusive, -1 = end of prompt
+    int32_t  query_max;     // cap on the scored span, tail-biased; 0 = whole span
     int32_t  force_pos;     // include block containing this orig pos; -1 = none
     float    gpu_memory_ratio;     // 0 → 0.50; cap pool vs device VRAM
     float    gpu_high_watermark;   // 0 → 0.95; trigger prefill offload

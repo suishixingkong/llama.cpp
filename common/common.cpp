@@ -2107,6 +2107,7 @@ static void common_arm_kvmem(const common_params & params, bool enable) {
     // asked for, which is why the defaults are read through here.
     kp.query_begin = params.kvmem.query_begin;
     kp.query_end   = params.kvmem.query_end;
+    kp.query_max   = params.kvmem.query_max;
     kp.force_pos   = params.kvmem.force_pos;
     // The path pointer must outlive every context of this process.
     static std::string disk_dir;
