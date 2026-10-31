@@ -102,6 +102,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem-lrfu-top-frac X` | 0.9 | 视为「命中」的历史分位，`(0,1]` |
 | `--kvmem-graph-alpha X` | 评分器默认（0.2 / 0） | 图召回项的权重 |
 | `--kvmem-query-begin N` / `--kvmem-query-end N` | −1 | 显式声明 Query 的原始 token 区间。CLI 直接透传；server 每请求覆盖 |
+| `--kvmem-query-max N` | 0（不裁剪） | **仅 server 请求路径**。Query 区间超过 N 时只评分**尾部 N 行**。评分约 0.13 ms/行：9.5k prompt 裁到 512 行把 prefill 从 3.27 s 压到 1.29 s，但⚠️**这是换问题不是省钱**——1.9k 的文档裁到 512 行后，模型丢了开头段落、答不出原本能答的细节。默认不裁剪；只在「prompt 远长于答案需要召回的内容」时开 |
 | `--kvmem-force-pos N` | −1 | 强制钉住某个 token 所在的块 |
 | `--kvmem-mtp-state {snapshots,auto}` | `snapshots` | MTP 回滚状态；`replay` 在本分支不可用（见排除项） |
 | `--kvmem-gpu-ratio R` | 0 → 设备的 0.50 | 池占显存的比例（与绝对值预算二选一，由 fit 解析） |

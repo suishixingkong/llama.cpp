@@ -543,6 +543,14 @@ struct common_params_kvmem {
     int32_t query_begin   = -1;
     int32_t query_end     = -1;
     int32_t force_pos     = -1;
+    // Upper bound on how many trailing rows of the query span are scored, 0
+    // scores all of it. Scoring is linear in rows -- 0.13 ms each, so a 9.5k
+    // prompt spends 1.26 s of a 3.27 s prefill on it -- but a short query is a
+    // different question, not a cheaper one: with only the tail scored, a
+    // 1.9k-token document lost the opening paragraph that answered the prompt
+    // while the uncapped run kept it. Off by default; turn it on when the
+    // prompt is far longer than anything the answer needs to recall.
+    int32_t query_max     = 0;
 };
 
 struct common_params {

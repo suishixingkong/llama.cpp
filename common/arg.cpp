@@ -3485,6 +3485,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVMEM_QUERY_END"));
     add_opt(common_arg(
+        {"--kvmem-query-max"}, "N",
+        string_format("score at most the last N tokens of a request's query span, keeping the tail; 0 scores all of it, which retrieves over long distances better (default: %d)", params.kvmem.query_max),
+        [](common_params & params, int value) {
+            params.kvmem.query_max = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_QUERY_MAX"));
+    add_opt(common_arg(
         {"--kvmem-force-pos"}, "N",
         "pin the block containing this original position, whatever it scores",
         [](common_params & params, const std::string & v) {
