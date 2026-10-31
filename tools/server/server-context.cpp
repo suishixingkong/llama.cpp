@@ -6312,6 +6312,7 @@ private:
             return;
         }
         const std::string client = kvmem_store_client_id(raw_client);
+#if defined(LLAMA_KVMEM)
         // The request's own prompt, not slot.prompt: that ledger still holds the
         // previous turn at this point and is what this function re-bases.
         const llama_tokens & prompt = request;
@@ -6414,6 +6415,13 @@ private:
             st.table.erase(victim);
         }
         SRV_INF("slot %d started a fresh conversation store %d\n", slot.id, id);
+#else
+        // A build without KVMem has no host store to bind, and no store switch
+        // to make: the slot keeps the ordinary prefix match on its own prompt.
+        (void) slot;
+        (void) raw_client;
+        (void) request;
+#endif
     }
 
     bool launch_slot_with_task(
@@ -12513,12 +12521,14 @@ private:
                         llama_kvmem_apply_retrieval(ctx_tgt);
                         llama_kvmem_pin_working_set();
                         llama_kvmem_accept_retrieval_round();
-                        llama_kvmem_end_prefill_capture();
                     } catch (const std::exception & e) {
                         // A refusal keeps the resident view. The request still
                         // has to produce tokens, so degrade instead of failing.
                         SLT_WRN(slot, "KVMem retrieval round skipped: %s\n", e.what());
                     }
+                    // Outside the try: a capture left armed would keep D2H-ing
+                    // every ubatch of a generation that no longer scores them.
+                    llama_kvmem_end_prefill_capture();
                 }
 #endif
 
