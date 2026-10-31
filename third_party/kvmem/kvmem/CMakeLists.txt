@@ -37,7 +37,15 @@ function(kvmem_enable_cuda_recall)
     set_target_properties(kvmem-recall-cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
         POSITION_INDEPENDENT_CODE ON)
     target_sources(kvmem PRIVATE $<TARGET_OBJECTS:kvmem-recall-cuda>)
-    target_link_libraries(kvmem PUBLIC CUDA::cudart)
+    # Mirror ggml-cuda's choice: it links CUDA::cudart_static when GGML_STATIC is on
+    # (the default of a static Windows build), and mixing the static and the shared
+    # CUDA runtime in one executable fails to link - LNK2005/LNK1169 on
+    # __cudaUnregisterFatBinary against cudart64_12.dll.
+    if (GGML_STATIC)
+        target_link_libraries(kvmem PUBLIC CUDA::cudart_static)
+    else()
+        target_link_libraries(kvmem PUBLIC CUDA::cudart)
+    endif()
     target_compile_definitions(kvmem PUBLIC KVMEM_PAGE_SOFTMAX_CUDA=1)
     if (MSVC)
         target_compile_options(kvmem-recall-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
