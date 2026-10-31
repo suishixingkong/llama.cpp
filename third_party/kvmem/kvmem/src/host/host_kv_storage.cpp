@@ -4,24 +4,74 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <list>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace kvmem {
 namespace detail {
+// A size-class cache in front of the heap. Evicting a block and staging it back
+// in is "free N bytes, then allocate N bytes": RawKvStore drops its GPU mirror
+// before it can tell whether the old buffer would do, so the same size comes
+// back asking for a fresh allocation every time. Reusing the pages keeps them
+// mapped, which is where most of the win is -- a fresh 32 KiB block faults in
+// eight pages that the following memcpy then fills. KVMEM_HOST_ARENA_MB=0 turns
+// this off so the two can be compared on one binary.
+struct HostKvArena {
+    explicit HostKvArena(size_t budget_bytes) : budget(budget_bytes) {}
+    uint8_t * acquire(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = reusable.find(bytes);
+        if (it != reusable.end() && !it->second.empty()) {
+            uint8_t * block = it->second.back();
+            it->second.pop_back();
+            cached -= bytes;
+            ++hits;
+            return block;
+        }
+        ++misses;
+        return nullptr;
+    }
+    // True when the block was taken; false means the caller keeps it and must
+    // hand it back to the heap itself.
+    bool release(uint8_t * block, size_t bytes) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (cached + bytes > budget) {
+            ++dropped;
+            return false;
+        }
+        reusable[bytes].push_back(block);
+        cached += bytes;
+        return true;
+    }
+    std::mutex mutex;
+    std::unordered_map<size_t, std::vector<uint8_t *>> reusable;
+    size_t budget = 0;
+    size_t cached = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t dropped = 0;
+};
+
 struct HostKvAccount {
     static constexpr uint64_t write_batch_bytes = 256 * 1024;
-    HostKvAccount(uint64_t capacity, std::shared_ptr<SpillFile> spill)
-        : capacity(capacity), spill(std::move(spill)) {}
+    HostKvAccount(uint64_t capacity, std::shared_ptr<SpillFile> spill);
     std::mutex mutex;
     const uint64_t capacity;
     uint64_t charged = 0;
     const std::shared_ptr<SpillFile> spill;
+    // Blocks parked for reuse are released from the budget above, so this cache
+    // is extra process memory on top of `capacity`: bounded, and small next to a
+    // real host quota.
+    std::shared_ptr<HostKvArena> arena;
     // Catalog selection never waits on a busy record. Physical writes hold only
     // their record lock, so unrelated resident lanes and reservations can run.
     // RAM-only operations never acquire policy/record locks or populate this list.
@@ -77,9 +127,30 @@ struct HostKvAccount {
         }
     }
 };
+struct HostKvBlockDeleter {
+    std::shared_ptr<HostKvAccount> account;
+    size_t bytes = 0;
+    void operator()(uint8_t * block) const noexcept {
+        if (block == nullptr) return;
+        if (account && account->arena && account->arena->release(block, bytes)) return;
+        delete[] block;
+    }
+};
+
+// Single place that turns a byte count into a host block, so the arena cannot be
+// bypassed by one of the two allocation sites. `zero` keeps the old contract of
+// `new uint8_t[n]()`: callers that only write part of the block read the rest.
+inline std::unique_ptr<uint8_t[], HostKvBlockDeleter> host_kv_alloc_block(
+        const std::shared_ptr<HostKvAccount> & account, size_t bytes, bool zero) {
+    uint8_t * block = account && account->arena ? account->arena->acquire(bytes) : nullptr;
+    if (block == nullptr) block = new uint8_t[bytes];
+    if (zero) std::memset(block, 0, bytes);
+    return std::unique_ptr<uint8_t[], HostKvBlockDeleter>(block, HostKvBlockDeleter{account, bytes});
+}
+
 struct HostKvAllocation {
     std::shared_ptr<HostKvAccount> account;
-    std::unique_ptr<uint8_t[]> bytes;
+    std::unique_ptr<uint8_t[], HostKvBlockDeleter> bytes;
     size_t size = 0;
     std::mutex mutex;
     std::atomic<uint32_t> pins{0};
@@ -94,6 +165,26 @@ struct HostKvAllocation {
         if (account && resident) account->release(size);
     }
 };
+HostKvAccount::HostKvAccount(uint64_t capacity, std::shared_ptr<SpillFile> spill)
+    : capacity(capacity), spill(std::move(spill)) {
+    // An eighth of the host quota, capped so a huge or unset quota cannot park
+    // gigabytes of idle blocks. 0 disables the cache, which is how the two paths
+    // are compared on one binary.
+    //
+    // 128 MiB is where a pp8192 run over 0.8B stops dropping blocks: the live set
+    // of 32 KiB size classes settles at ~96 MiB and `dropped` reaches zero, so
+    // anything above that buys nothing here and only delays the memory going back
+    // to the OS. Bigger models with more layers will want the override.
+    uint64_t budget = capacity / 8;
+    const uint64_t cap = 128ull * 1024 * 1024;
+    if (budget > cap) budget = cap;
+    if (const char * e = std::getenv("KVMEM_HOST_ARENA_MB")) {
+        const long mb = std::strtol(e, nullptr, 10);
+        if (mb >= 0) budget = (uint64_t) mb * 1024 * 1024;
+    }
+    if (budget > 0) arena = std::make_shared<HostKvArena>((size_t) budget);
+}
+
 bool HostKvAccount::evict_batch(std::unique_lock<std::mutex> & policy_lock, const HostKvAllocation * exclude) {
     if (!spill) return false;
     struct Candidate {
@@ -313,7 +404,8 @@ uint8_t * HostKvRecord::writable_data() {
             // A cold rewrite must not hold the catalog across a physical read;
             // independent lanes may still allocate or relocate other records.
             policy.unlock();
-            auto bytes = std::unique_ptr<uint8_t[]>(new uint8_t[record.size]);
+            // The disk read covers the whole block, so it needs no zeroing.
+            auto bytes = host_kv_alloc_block(allocation_->account, record.size, false);
             record.disk.read(0, bytes.get(), record.size);
             policy.lock();
             account.register_resident(allocation_);
@@ -363,12 +455,66 @@ HostKvReservation::~HostKvReservation() { release(); }
 void HostKvReservation::release() noexcept {
     if (account_) account_->release(std::exchange(remaining_, 0));
 }
+namespace {
+// Counters behind KVMEM_HOST_PERF=1. Every host KV block is a fresh heap
+// allocation today, so an eviction-heavy run pays new/delete per block; these
+// numbers are what decides whether an arena is worth its invariants.
+struct host_kv_alloc_stats {
+    bool     on    = false;
+    detail::HostKvArena * arena_view = nullptr;
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+    uint64_t ns    = 0;
+    uint64_t calls_copy = 0, bytes_copy = 0, ns_copy_new = 0;
+    uint64_t calls_zero = 0, bytes_zero = 0, ns_zero_new = 0;
+    host_kv_alloc_stats() {
+        const char * e = std::getenv("KVMEM_HOST_PERF");
+        on = e != nullptr && *e != '\0' && *e != '0';
+        if (on) std::atexit(report);
+    }
+    static void report() {
+        host_kv_alloc_stats & s = instance();
+        std::fprintf(stderr, "[host-alloc] calls=%llu bytes=%llu ms=%.3f\n",
+                (unsigned long long) s.calls, (unsigned long long) s.bytes, (double) s.ns / 1e6);
+        std::fprintf(stderr, "[host-alloc]   with-src calls=%llu bytes=%llu new_ms=%.3f copy_ms=%.3f\n",
+                (unsigned long long) s.calls_copy, (unsigned long long) s.bytes_copy,
+                (double) s.ns_copy_new / 1e6,
+                (double) (s.ns - s.ns_copy_new - s.ns_zero_new) / 1e6);
+        std::fprintf(stderr, "[host-alloc]   zeroed   calls=%llu bytes=%llu new_ms=%.3f\n",
+                (unsigned long long) s.calls_zero, (unsigned long long) s.bytes_zero,
+                (double) s.ns_zero_new / 1e6);
+        if (s.arena_view) {
+            std::fprintf(stderr, "[host-alloc]   arena hits=%llu misses=%llu dropped=%llu cached_kb=%zu\n",
+                    (unsigned long long) s.arena_view->hits, (unsigned long long) s.arena_view->misses,
+                    (unsigned long long) s.arena_view->dropped, s.arena_view->cached / 1024);
+        }
+        std::fflush(stderr);
+    }
+    static host_kv_alloc_stats & instance() { static host_kv_alloc_stats s; return s; }
+};
+} // namespace
+
 HostKvRecord HostKvReservation::allocate(size_t bytes, const void * source) {
     if (!account_ || bytes > remaining_)
         throw MemoryError(MemoryErrorCode::BudgetExceeded, "native KV reservation is too small");
     if (!bytes) return {};
+    host_kv_alloc_stats & stats = host_kv_alloc_stats::instance();
+    stats.arena_view = account_->arena.get();
+    const auto t0 = stats.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto allocation = std::make_shared<detail::HostKvAllocation>();
-    allocation->bytes.reset(source ? new uint8_t[bytes] : new uint8_t[bytes]());
+    const auto t_new = stats.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // A parked block still holds the previous tenant's bytes. The old code asked
+    // for zeroed storage whenever there was no source, and callers rely on it:
+    // the partial-tail path allocates a whole block and then copies only the rows
+    // it has, leaving the rest to read as zero. Keep that promise here.
+    allocation->bytes = host_kv_alloc_block(account_, bytes, source == nullptr);
+    if (stats.on) {
+        const auto t_copy = std::chrono::steady_clock::now();
+        auto & slot = source ? stats.ns_copy_new : stats.ns_zero_new;
+        slot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_copy - t_new).count();
+        (source ? stats.calls_copy : stats.calls_zero) += 1;
+        (source ? stats.bytes_copy : stats.bytes_zero) += bytes;
+    }
     if (source) std::memcpy(allocation->bytes.get(), source, bytes);
     if (account_->spill) {
         std::lock_guard<std::mutex> policy(account_->policy);
@@ -378,6 +524,12 @@ HostKvRecord HostKvReservation::allocate(size_t bytes, const void * source) {
     allocation->resident_size.store(bytes, std::memory_order_relaxed);
     allocation->account = account_;
     remaining_ -= bytes;
+    if (stats.on) {
+        stats.calls += 1;
+        stats.bytes += bytes;
+        stats.ns    += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+    }
     return HostKvRecord(std::move(allocation));
 }
 HostKvStorage::HostKvStorage(uint64_t capacity_bytes) : HostKvStorage(capacity_bytes, {}) {}

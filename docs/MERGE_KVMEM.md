@@ -141,6 +141,8 @@ llama-bench -m model.gguf -p 4096 -n 128 -b 512 --kvmem --kvmem-budget 576
 |---|---|
 | `KVMEM_TRACE=1` | 打开 `KVMEM_*` 事件日志。**判断「是否真的启用」看 `KVMEM_KV_BYTES bytes=… cells=… slots=… budget=…`**，没有这行就是被静默降级了 |
 | `KVMEM_PERF=1` | 每 ubatch 的分相计时（捕获/评分/换出/D2H/HARVEST 汇总） |
+| `KVMEM_HOST_PERF=1` | host 块分配的统计：次数/字节、`new` 与 `memcpy` 分相耗时、arena 的 hits/misses/dropped。退出时打到 stderr（这条走 `stderr` 而不是 `LLAMA_LOG_*`，因为它在 CRT 静态析构期执行） |
+| `KVMEM_HOST_ARENA_MB=N` | host 块缓存的预算，默认 `min(host 配额/8, 128 MiB)`；`0` 关闭。只影响性能，不影响数值 |
 | `KVMEM_ATTENTION_VERIFY=1` | 采样器对 FP64 oracle 校验（prefill 与 output 两路），用于改取数方式后的正确性判定 |
 | `KVMEM_DUMP_CAPTURE=1` | 把捕获到的 Q/K/V 落盘 |
 | `KVMEM_DECODE_GRAPH_SLOTS=0` | 关闭固定宽度 decode 图槽（默认 1..8 token 各一槽），用于排查图复用问题 |
