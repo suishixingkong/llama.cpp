@@ -19,6 +19,9 @@
 //              `keep` in run_prefill_multimodal (upstream driver)
 //   found, keep  = the largest checkpoint row <= keep_cap
 //              the st.mm_checkpoints scan that follows it, same function
+//   found, keep  = keep_cap when the store's model has no recurrent state
+//              (a pure transformer stores its whole state in the KV rows, so
+//              the frontier is the checkpoint; the cap still applies)
 //   continuation = (rows - lcp) <= max(0, last_n_gen) + 64
 //              `suffix_slack` in run_prefill_retrieval (upstream server)
 //
@@ -54,6 +57,16 @@ struct kvmem_store_match {
     uint64_t bytes      = 0;  // accounted host bytes of this store
     uint64_t used       = 0;  // LRU stamp; larger is more recent
     std::string client_id;    // bound kvmem.conversation_id, empty when inferred
+    // True when carrying this store to a match point needs a recurrent state
+    // snapshot: a hybrid model's GDN/RNN layers keep state that the KV rows do
+    // not describe, so only a recorded frontier can be resumed.
+    //
+    // A pure transformer holds its whole state in those rows, so the frontier
+    // itself is the checkpoint and `ckpt_rows` stays empty. Defaulting this to
+    // true is what makes "no checkpoint" a miss for a model that has nothing to
+    // miss: every request would fork, the store would never be extended, and
+    // the feature would be unreachable while looking healthy.
+    bool     recurrent  = true;
 };
 
 enum class kvmem_store_action {
@@ -101,9 +114,22 @@ inline int kvmem_store_keep_cap(const kvmem_store_match & store, int eval_end, b
 // Largest checkpoint row at or before keep_cap. False means the hybrid model
 // cannot be carried to the match point, which is a hard constraint and not a
 // policy choice (checkpoint selection in the upstream driver).
+//
+// A store whose model has no recurrent state answers with keep_cap itself: the
+// rows are the state, so any frontier at or below what the request can use is
+// restorable. That branch still refuses a non-positive cap, because there would
+// be nothing left to resume and the caller would be asked to truncate a store
+// to zero.
 inline bool kvmem_store_checkpoint(const kvmem_store_match & store, int keep_cap, int & keep) {
-    bool found = false;
     keep = 0;
+    if (!store.recurrent) {
+        if (keep_cap <= 0) {
+            return false;
+        }
+        keep = keep_cap;
+        return true;
+    }
+    bool found = false;
     for (int row : store.ckpt_rows) {
         if (row <= keep_cap && (!found || row > keep)) {
             keep = row;
@@ -191,8 +217,10 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
     int  best_keep     = 0;
     int  rejected_keep = 0;
     bool any_found     = false;
+    bool any_recurrent = false;
     for (const kvmem_store_match * store : candidates) {
         plan.observed_lcp = std::max(plan.observed_lcp, store->lcp);
+        any_recurrent = any_recurrent || store->recurrent;
         int keep = 0;
         const bool found = kvmem_store_checkpoint(*store, kvmem_store_keep_cap(*store, eval_end, spec_ok), keep);
         if (found) {
@@ -224,7 +252,8 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
     plan.lcp    = 0;
     plan.keep   = 0;
     plan.reason = stores.empty()          ? "new_conversation"
-                : !any_found              ? "no_recurrent_checkpoint"
+                : !any_found              ? (any_recurrent ? "no_recurrent_checkpoint"
+                                                            : "fork_zero_keep")
                 : rejected_keep == 0      ? "fork_zero_keep"
                                           : "fork_shared_prefix";
     kvmem_store_plan_evictions(stores, limits, true, plan);

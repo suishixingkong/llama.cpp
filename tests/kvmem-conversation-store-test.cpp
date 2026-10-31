@@ -22,7 +22,8 @@ static const uint64_t MiB = 1ull << 20;
 static const uint64_t GiB = 1ull << 30;
 
 static kvmem_store_match store_fixture(int id, int rows, int last_n_gen,
-                                       std::vector<int> ckpt_rows, uint64_t bytes, uint64_t used) {
+                                       std::vector<int> ckpt_rows, uint64_t bytes, uint64_t used,
+                                       bool recurrent = true) {
     kvmem_store_match match;
     match.id         = id;
     match.rows       = rows;
@@ -31,6 +32,7 @@ static kvmem_store_match store_fixture(int id, int rows, int last_n_gen,
     match.ckpt_rows  = std::move(ckpt_rows);
     match.bytes      = bytes;
     match.used       = used;
+    match.recurrent  = recurrent;
     return match;
 }
 
@@ -95,6 +97,9 @@ static void test_decision_table() {
     kvmem_store_match A2 = store_fixture(1, 4000, 200, {0, 1000}, 1 * GiB, 10);
     kvmem_store_match A3 = store_fixture(1, 4000, 200, {}, 1 * GiB, 10);
     kvmem_store_match C  = store_fixture(3, 500, 0, {400}, 64 * MiB, 5);
+    // Same shape as A3 but from a model with no recurrent state: the rows are
+    // the whole state, so there is no checkpoint list to consult.
+    kvmem_store_match P  = store_fixture(4, 4000, 200, {}, 1 * GiB, 10, false);
 
     {
         g_row = "T1 empty table";
@@ -148,6 +153,51 @@ static void test_decision_table() {
         CHECK(plan.id == -1 && plan.evict.empty());
         CHECK(std::string(plan.reason) == "no_recurrent_checkpoint");
         CHECK(plan.observed_lcp == 3950);
+    }
+    {
+        // Same store as A3, same empty ckpt_rows, only the model differs: a
+        // pure transformer carries its whole state in those rows, so the
+        // frontier is restorable and the request must extend, not fork. This
+        // is the case that would silently never fire without `recurrent`.
+        g_row = "T5b a pure transformer resumes the frontier with no checkpoint";
+        P.lcp = 3950;
+        const kvmem_store_plan plan = select({P}, 4300, false, "", many);
+        CHECK(plan.action == kvmem_store_action::extend);
+        CHECK(plan.id == 4 && plan.lcp == 3950 && plan.keep == 3950);
+        CHECK(std::string(plan.reason) == "extend");
+        CHECK(plan.evict.empty());
+    }
+    {
+        // The cap still bounds the frontier: keep never runs past live_row,
+        // which is what a store that lost blocks to eviction reports.
+        g_row = "T5c a pure transformer is capped by live_row";
+        P.live_row = 2000;
+        const kvmem_store_plan plan = select({P}, 4300, false, "", many);
+        CHECK(plan.action == kvmem_store_action::extend);
+        CHECK(plan.keep == 2000);
+        P.live_row = P.rows;
+    }
+    {
+        // Continuation is a separate question from the checkpoint: a prompt
+        // matching only the head of a long store is a branch, and extending it
+        // would truncate the rest.
+        g_row = "T5d a non-recurrent store still forks a branch";
+        P.lcp = 300;
+        const kvmem_store_plan plan = select({P}, 20000, false, "", many);
+        CHECK(plan.action == kvmem_store_action::fresh);
+        CHECK(plan.id == -1 && plan.keep == 0);
+        CHECK(std::string(plan.reason) == "fork_shared_prefix");
+    }
+    {
+        // Nothing usable to resume: the cap is zero and there is no frontier.
+        // The reason must not blame a missing recurrent checkpoint, because
+        // this model has none to record.
+        g_row = "T5e a non-recurrent store with nothing to resume forks";
+        P.lcp = 0;
+        const kvmem_store_plan plan = select({P}, 20000, false, "", many);
+        CHECK(plan.action == kvmem_store_action::fresh);
+        CHECK(plan.id == -1 && plan.keep == 0);
+        CHECK(std::string(plan.reason) == "fork_zero_keep");
     }
     {
         g_row = "T6 shared prefix with no usable checkpoint forks";
@@ -409,6 +459,17 @@ static void test_checkpoint_arithmetic() {
                             CHECK(found == expected.first);
                             CHECK(keep == expected.second);
                             ++rows_checked;
+                            // A model with no recurrent state ignores the
+                            // checkpoint list entirely: its rows are the whole
+                            // state, so what it can resume is exactly what the
+                            // cap allows and nothing else bounds it.
+                            kvmem_store_match flat = store;
+                            flat.recurrent = false;
+                            const int cap = kvmem_store_keep_cap(flat, eval_end, spec);
+                            int flat_keep = -1;
+                            const bool flat_found = kvmem_store_checkpoint(flat, cap, flat_keep);
+                            CHECK(flat_found == (cap > 0));
+                            CHECK(flat_keep == (cap > 0 ? cap : 0));
                             // The policy adds the continuation rule and the
                             // keep > 0 rule on top, and nothing else: it never
                             // extends on a row this expression would not pick.
