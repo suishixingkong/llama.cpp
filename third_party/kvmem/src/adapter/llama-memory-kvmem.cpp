@@ -190,7 +190,26 @@ llama_kvmem_execution_state::llama_kvmem_execution_state()
 
 llama_kvmem_execution_state::~llama_kvmem_execution_state() {
     auto * previous = llama_kvmem_execution_exchange(this);
-    GGML_ASSERT(!memory && !mtp && "free target/draft contexts before their execution state");
+    // The only state that reaches this destructor is the process-level one that
+    // kvmem_current_execution() owns as a function-local static: nothing in this
+    // tree calls llama_kvmem_execution_create(), and the free entry point checks
+    // its own contract below. That static is torn down by the C runtime, which
+    // runs *after* the host has stopped. A server stopped with a signal never
+    // returns from main, so the context holding this memory is still on a stack
+    // that is never unwound, and `memory` cannot be null. That is a leak on an
+    // exit path, not a destruction-order bug, so say so instead of aborting --
+    // aborting there turns a clean shutdown into a crash dialog.
+    if (memory != nullptr || mtp != nullptr) {
+        // stderr, not LLAMA_LOG_WARN: this runs after the host has stopped, and by
+        // then the logging callback the process installed may already be gone --
+        // measured on this port, LLAMA_LOG_WARN here printed nothing at all while
+        // the same line via fprintf did. A warning nobody can see is worse than no
+        // warning, since it makes the leak below look like it disappeared.
+        fprintf(stderr, "%s: execution state outlived its memory (memory=%p mtp=%p); "
+                "the process is exiting without unwinding its stacks\n",
+                __func__, (const void *) memory, (const void *) mtp);
+        fflush(stderr);
+    }
     kvmem_gpu_state_free(gpu);
     llama_kvmem_execution_exchange(previous);
 }
@@ -247,7 +266,14 @@ llama_kvmem_execution_state * llama_kvmem_execution_exchange(llama_kvmem_executi
 
 void llama_kvmem_execution_free(llama_kvmem_execution_state * state) {
     if (!state) return;
+    // This is the one place where the order is the caller's to get right: a state
+    // handed out by llama_kvmem_execution_create() has an owner, so a memory or a
+    // draft context still bound to it means the caller freed the state before the
+    // context it belongs to. Check it here rather than in the destructor, which
+    // also runs for the process-level static on exit.
     GGML_ASSERT(state != active_execution && "deactivate before freeing execution state");
+    GGML_ASSERT(state->memory == nullptr && state->mtp == nullptr &&
+            "free target/draft contexts before their execution state");
     delete state;
 }
 
