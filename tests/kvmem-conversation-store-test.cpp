@@ -584,6 +584,65 @@ static void test_table_lru_and_bytes() {
     CHECK(table.erase(ids[1]) == false);
 }
 
+// A store is only matchable through the sequence it was built from. This is the
+// one input the server cannot reconstruct: the adapter holds KV rows, not the
+// prompt that produced them.
+static void test_table_matching() {
+    g_row = "table remembers what each store was built from";
+    std::vector<int32_t> run_a;
+    for (int32_t i = 0; i < 10; ++i) {
+        run_a.push_back(100 + i);
+    }
+    std::vector<int32_t> run_b = run_a;
+    run_b.push_back(999); // a continuation: same 10 rows plus one generated
+
+    kvmem_store_table table;
+    const int a = table.add(7);
+    const int b = table.add(8);
+
+    kvmem_store_match match;
+    // Allocated but never run: it holds no rows, so it matches nothing. The
+    // caller must not read that as "the prompt matches everything".
+    CHECK(table.match(a, run_b, true, match));
+    CHECK(match.id == a && match.lcp == 0 && match.rows == 0);
+    CHECK(match.recurrent);
+
+    table.remember(a, run_a, 0);
+    CHECK(table.match(a, run_b, true, match));
+    CHECK(match.lcp == 10 && match.rows == 10);
+    CHECK(match.last_n_gen == 0);
+
+    // A prompt that diverges mid-sequence matches only the shared head.
+    std::vector<int32_t> other = run_a;
+    other[4] = -1;
+    CHECK(table.match(a, other, true, match));
+    CHECK(match.lcp == 4 && match.rows == 10);
+
+    // A pure transformer says so on the row it produces, so the policy does not
+    // consult a checkpoint list this store will never have.
+    CHECK(table.match(a, run_a, false, match));
+    CHECK(!match.recurrent);
+
+    // The generated tail belongs to the last turn and is replaced, not appended.
+    table.remember(a, run_b, 1);
+    CHECK(table.match(a, run_a, true, match));
+    CHECK(match.rows == 11 && match.lcp == 10 && match.last_n_gen == 1);
+
+    // Ids this table no longer holds cannot be described.
+    CHECK(table.erase(b));
+    CHECK(!table.match(b, run_a, true, match));
+
+    g_row = "prefix_rows boundaries";
+    CHECK(kvmem_store_table::prefix_rows({}, {1, 2, 3}) == 0);
+    CHECK(kvmem_store_table::prefix_rows({1, 2, 3}, {}) == 0);
+    CHECK(kvmem_store_table::prefix_rows({1, 2, 3}, {1, 2, 3}) == 3);
+    CHECK(kvmem_store_table::prefix_rows({1, 2, 3}, {1, 2, 4}) == 2);
+    CHECK(kvmem_store_table::prefix_rows({9, 2, 3}, {1, 2, 3}) == 0);
+    // The shorter sequence bounds the answer in either argument position.
+    CHECK(kvmem_store_table::prefix_rows({1, 2}, {1, 2, 3}) == 2);
+    CHECK(kvmem_store_table::prefix_rows({1, 2, 3}, {1, 2}) == 2);
+}
+
 int main() {
     test_decision_table();
     test_capture_hint_does_not_authorize_restore();
@@ -591,5 +650,6 @@ int main() {
     test_checkpoint_arithmetic();
     test_continuation_clamps_last_n_gen();
     test_table_lru_and_bytes();
+    test_table_matching();
     std::puts("conversation store selection, LRU and byte accounting PASS");
 }

@@ -265,15 +265,22 @@ inline const char * kvmem_store_action_name(kvmem_store_action action) {
 }
 
 // Bookkeeping for the live host stores: the adapter handle, the accounted host
-// bytes and the LRU stamp. Ids are allocated monotonically and never reused, so
-// a stale id from an earlier plan cannot match a later store.
+// bytes, the LRU stamp and the sequence each store was built from. Ids are
+// allocated monotonically and never reused, so a stale id from an earlier plan
+// cannot match a later store.
 class kvmem_store_table {
 public:
     struct entry {
-        int      id       = -1;
-        int32_t  store_id = 0; // adapter host-store handle
-        uint64_t bytes    = 0;
-        uint64_t used     = 0;
+        int      id         = -1;
+        int32_t  store_id   = 0; // adapter host-store handle
+        uint64_t bytes      = 0;
+        uint64_t used       = 0;
+        int      last_n_gen = 0; // rows the last turn generated, for continuation
+        // The prompt+generated rows this store holds, which is the only thing a
+        // later request can be matched against. Empty until the store has run:
+        // an allocated but unrun store matches nothing, and saying so is more
+        // honest than assuming its caller's prompt.
+        std::vector<int32_t> tokens;
     };
 
     int add(int32_t store_id) {
@@ -282,6 +289,49 @@ public:
         added.store_id = store_id;
         entries_.push_back(added);
         return added.id;
+    }
+
+    // Rows shared by two sequences. The caller passes the request's prompt and
+    // the store's own tokens; this is the `lcp` every match row is built from,
+    // kept here so the arithmetic has one home.
+    static int prefix_rows(const std::vector<int32_t> & a, const std::vector<int32_t> & b) {
+        const size_t limit = a.size() < b.size() ? a.size() : b.size();
+        size_t at = 0;
+        while (at < limit && a[at] == b[at]) {
+            ++at;
+        }
+        return (int) at;
+    }
+
+    // Record what the store now holds, after its turn finished. The generated
+    // row count is stored beside the sequence because the continuation rule
+    // needs it on the next request, when the turn is no longer in memory.
+    void remember(int id, std::vector<int32_t> tokens, int last_n_gen) {
+        if (entry * held = mutable_find(id)) {
+            held->tokens     = std::move(tokens);
+            held->last_n_gen = last_n_gen;
+        }
+    }
+
+    // One match row for `prompt`. False when this table no longer holds the id,
+    // which is the caller's signal to drop it from its snapshot rather than to
+    // describe a store it cannot reach.
+    bool match(int id, const std::vector<int32_t> & prompt, bool recurrent, kvmem_store_match & out) const {
+        const entry * held = find(id);
+        if (held == nullptr) {
+            return false;
+        }
+        out             = kvmem_store_match{};
+        out.id          = held->id;
+        out.lcp         = prefix_rows(held->tokens, prompt);
+        out.rows        = (int) held->tokens.size();
+        out.live_row    = out.rows; // a parked store is whole; eviction within it
+                                    // is the adapter's business, not the table's
+        out.last_n_gen  = held->last_n_gen;
+        out.bytes       = held->bytes;
+        out.used        = held->used;
+        out.recurrent   = recurrent;
+        return true;
     }
 
     int count() const { return (int) entries_.size(); }
