@@ -198,13 +198,40 @@ int main(int argc, char ** argv) {
 
     // Continuing on the restaged store must decode, which is what a server's
     // next turn does after a swap: the rows are only useful if the context can
-    // append to them.
-    if (!decode_text(ctx, vocab, "and it continues from the restored prefix. ", 8)) {
+    // append to them. The append is repeated until it crosses a block boundary
+    // (32 rows) so the store has to grow a block that did not exist when it was
+    // drained, which is the shape a conversation takes across turns.
+    const uint32_t rows_before_append = llama_kvmem_store_rows(a);
+    bool appended = true;
+    for (int turn = 0; turn < 4 && appended; ++turn) {
+        appended = decode_text(ctx, vocab, "and it continues from the restored prefix. ", 64);
+    }
+    if (!appended) {
         fail("decode on the restaged store A");
     } else {
-        check(llama_kvmem_store_rows(a) == rows_a + 8, "store A appends after the restage",
-              llama_kvmem_store_rows(a), rows_a + 8);
+        const uint32_t grown = llama_kvmem_store_rows(a);
+        check_positive(grown > 32 && grown > rows_before_append,
+              "store A appends past a block after the restage", grown);
     }
+
+    // Draining a store that was restaged and then appended to is what the
+    // conversation server does on every switch away, and the only place the
+    // coverage check compares the store's rows against cells written by a
+    // decode that started on a restaged frontier. A gap here empties the store
+    // instead of parking it, which the row count catches.
+    const uint32_t rows_a_grown = llama_kvmem_store_rows(a);
+    const bool drained_a = llama_kvmem_store_switch(b);
+    check(drained_a, "switching to B drains the grown store A", drained_a ? 1 : 0, 1);
+    check(llama_kvmem_store_rows(a) == rows_a_grown, "store A keeps every row through the drain",
+          llama_kvmem_store_rows(a), rows_a_grown);
+    check(llama_kvmem_store_rows(b) == rows_b, "store B comes back with its own rows",
+          llama_kvmem_store_rows(b), rows_b);
+
+    // Back to A so the parked handles below are the ones that cannot be active.
+    const bool reattached_a = llama_kvmem_store_switch(a);
+    check(reattached_a, "switching back to A restages the grown store", reattached_a ? 1 : 0, 1);
+    check(llama_kvmem_store_rows(a) == rows_a_grown, "store A survives a second restage",
+          llama_kvmem_store_rows(a), rows_a_grown);
 
     // The active store cannot be destroyed: there would be no store to run on.
     // Each handle is asked once and the answer asserted from the variable: a

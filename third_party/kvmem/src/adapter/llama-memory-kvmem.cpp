@@ -21,6 +21,7 @@
 #include "llama-cparams.h"
 #include "llama-context.h"
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-iswa.h"
@@ -49,6 +50,55 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+
+// Grown-on-demand in-memory io for llama_memory_recurrent::state_write. The
+// recurrent half of a hybrid model is not in the KV rows, so a store bundle
+// that carries only rows cannot be resumed: the GDN/RNN state has to travel
+// beside them or every switch restarts the sequence mid-stream.
+class kvmem_io_write_vec : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const auto * from = static_cast<const uint8_t *>(src);
+        buf.insert(buf.end(), from, from + size);
+    }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (tensor == nullptr) {
+            throw std::runtime_error("recurrent state write of a null tensor");
+        }
+        const size_t at = buf.size();
+        buf.resize(at + size);
+        ggml_backend_tensor_get(tensor, buf.data() + at, offset, size);
+    }
+    size_t n_bytes() override { return buf.size(); }
+    std::vector<uint8_t> buf;
+};
+
+class kvmem_io_read_vec : public llama_io_read_i {
+public:
+    explicit kvmem_io_read_vec(const std::vector<uint8_t> & src) : buf(src) {}
+    void read(void * dst, size_t size) override {
+        need(size);
+        memcpy(dst, buf.data() + at, size);
+        at += size;
+    }
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (tensor == nullptr) {
+            throw std::runtime_error("recurrent state read into a null tensor");
+        }
+        need(size);
+        ggml_backend_tensor_set(tensor, buf.data() + at, offset, size);
+        at += size;
+    }
+    size_t n_bytes() override { return at; }
+private:
+    void need(size_t size) const {
+        if (at + size > buf.size()) {
+            throw std::runtime_error("recurrent state is shorter than its own header claims");
+        }
+    }
+    const std::vector<uint8_t> & buf;
+    size_t at = 0;
+};
 
 struct llama_memory_kvmem::GdnReplay {
     struct Group {
@@ -87,6 +137,12 @@ struct llama_memory_kvmem::ConvStore {
     std::unique_ptr<kvmem::RawKvStore>   raw;
     std::unique_ptr<kvmem::KvContent> content;
     std::vector<RowPosition>             row_positions;
+    // How many rows of row_positions this conversation has actually materialized on
+    // the GPU. It is per-conversation state exactly like row_positions: a detached
+    // store carries it away and an attach installs it, or the coverage check in
+    // native_cells_gap() reads the previous conversation's frontier and calls this
+    // one's live tail a hole.
+    uint32_t cells_materialized = 0;
     std::vector<std::vector<float>>      q_rows;
     std::vector<uint32_t>                q_count;
     kvmem::GraphSnapshot graph;
@@ -97,6 +153,11 @@ struct llama_memory_kvmem::ConvStore {
     // Follower mirror, swapped in lockstep: it is keyed by the trunk's block
     // ids and is meaningless beside another conversation's store.
     std::unique_ptr<kvmem::RawKvStore>   mtp_raw;
+    // Hybrid models only: llama_memory_recurrent::state_write bytes for seq 0.
+    // The GDN/RNN layers keep their state outside the KV rows, so this is what
+    // makes a restaged store resume at the row it was drained at instead of at
+    // position 0. Empty for a pure transformer, where the rows are the state.
+    std::vector<uint8_t>                 recurrent;
     // Block ids that were GPU-resident at detach, ascending.
     std::vector<uint32_t>                resident;
 };
@@ -1748,6 +1809,20 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
     if (kv_) {
         (void) kv_->seq_rm(0, -1, -1);
     }
+    if (recr_) {
+        // The recurrent half of a hybrid model keeps its state in its own cells,
+        // which the attention drain above does not touch. Without these bytes a
+        // restaged store would come back with empty GDN/RNN state while its KV
+        // rows claim rows of history, and the next append would number its
+        // tokens from the wrong frontier -- measured as cells tagged pos 10..18
+        // where rows 11..19 were written.
+        kvmem_io_write_vec state;
+        recr_->state_write(state, 0);
+        conv->recurrent = std::move(state.buf);
+        // Same reason detach clears the attention cells: the next conversation
+        // must not inherit this one's sequence.
+        (void) recr_->seq_rm(0, -1, -1);
+    }
     if (mtp_) {
         mtp_->drop_gpu();
     }
@@ -1789,12 +1864,14 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
         conv->mtp_raw = mtp_->swap_raw(nullptr);
     }
     conv->row_positions = std::move(row_positions_);
+    conv->cells_materialized = cells_materialized_;
     conv->q_rows = std::move(q_rows_);
     conv->q_count = std::move(q_count_);
     conv->graph=std::move(graph_); conv->feedback=std::move(feedback_);
     conv->scope=attention_scope_; conv->output_begin=attention_output_begin_;
     conv->think_open=attention_think_open_; conv->think_close=attention_think_close_;
     row_positions_.clear();
+    cells_materialized_ = 0;
     q_rows_.clear();
     q_count_.clear();
     reset_turn_policy();
@@ -1821,6 +1898,7 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     evaluation_queue_.clear();
     evaluation_cursor_ = 0;
     row_positions_ = std::move(conv->row_positions);
+    cells_materialized_ = conv->cells_materialized;
     q_rows_ = std::move(conv->q_rows);
     q_count_ = std::move(conv->q_count);
     graph_=std::move(conv->graph); feedback_=std::move(conv->feedback);
@@ -1935,6 +2013,19 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
         apply_plan_to_kv(plan);
         restore_attached(plan);
     }
+    if (recr_ && !conv->recurrent.empty()) {
+        // Restore the hybrid half beside the rows it belongs to. state_read
+        // installs the recurrent cell metadata (seq and pos) as well as the
+        // tensors, and that metadata is what seq_pos_max() reads, so this must
+        // land before the caller's first append numbers its tokens. The KV rows
+        // above are addressed by block and are unaffected by it.
+        kvmem_io_read_vec state(conv->recurrent);
+        recr_->state_read(state, 0);
+        if (trace_) {
+            kvmem_diag("KVMEM_STORE_ATTACH_RECURRENT rows=%u bytes=%zu recr_pos=%d\n",
+                    runtime_->store().total_tokens(), conv->recurrent.size(), (int) recr_pos_max());
+        }
+    }
     return true;
 }
 
@@ -1961,6 +2052,13 @@ void llama_memory_kvmem::conv_reset_to_empty(const char * what) noexcept {
             // does: apply_plan_to_kv() may already have admitted cells for a
             // store that is about to be emptied.
             (void) kv_->seq_rm(0, -1, -1);
+        }
+        if (recr_) {
+            // The recurrent half of a hybrid model is cleared beside the
+            // attention cells for the same reason detach_conv() clears both: an
+            // empty store must not sit beside another conversation's GDN/RNN
+            // state, which would make the next prefill continue that sequence.
+            (void) recr_->seq_rm(0, -1, -1);
         }
         // Set before reset_policy(), which clears it again on its way out. A
         // store whose cells are gone while its block table still reads full is
