@@ -195,6 +195,7 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 真的会驱逐时才有代价。`llama-bench -p 4096 -n 128 -b 512`（0.8B，工作集 576 token）：pp **8941.6 t/s** 对无 kvmem 的 13260.8（**−32.6%**），tg 262.1 对 252.0（decoding 反而略快，池子小、注意力带宽低）。质量 PPL 11.9618 对基线 11.9679（−0.05%）。
 这 −32% 里约 32 个百分点是「把待换出块的裸 K 逐层镜像到 host」（5 ms/ubatch，192 次小块拷贝），**可 slab 化，未做**。
+⚠️ 上面这一段的数字已被后续优化改写：capture 门控 + 打分器 staging 之后，同一口径的真驱逐代价是 **−14.3%**（`13662.5 → 11706.5 t/s`），详见本文末「四方复测」。
 
 功能面（同一批构建）：长会话三连问 16k 上下文 / MTP 草稿回滚 / 图像输入都通过（细节见下面「已修复」与 `AUDIT_KVMEM_PERF_QUALITY.md`）。
 
@@ -218,11 +219,33 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 回归面：PPL 12.2387（开/关）、11.9618（budget 2048），贪心 md5 `1e05d115…` 与 master 相同，16 个 kvmem 单测全过。
 
-### 查询跨度装不下时也要评分（`2264cf6c3`）
+### 查询跨度装不下时：退回压力视图，不硬裁（`34063912e`，取代 `2264cf6c3`）
 
 query span 就是**最后一条 user 消息**（server-context.cpp:10845）。当它覆盖的块数超过池子容量时，`query_fixed_blocks()` 抛 `mandatory Query content exceeds its selection budget`（kvmem_store.cpp:395），server 的 catch 把**整轮检索跳过**，工作集只剩压力路径挑出的尾部——模型因此看不到几十 k 里的绝大部分，表现为「思考正常、输出一点点就停」。
 
-修法是承认池子只能留住跨度的一部分：夹取最后 `budget - sink - recent - 1` 个块作为必选集，一次性告警报出三个数字，然后照常评分。池子仍然留不住整段提示（那是 budget 的语义），但留住的那一部分是**按相关性挑的**，而不是按到达顺序。
+`2264cf6c3` 的做法是夹取最后 `budget - sink - recent - 1` 个块当必选集，让那一轮照常评分。这个补丁解决不了问题，而且更糟：夹过的**必选集自己就是完整的**，`selection_fits()` 拿它比对必然通过，于是没有任何一处能让调用方知道「这一轮是撕过的」——store 之后宣称驻留，头部却是空的。
+
+fork 从来不做第三种状态：它拒绝 Query replay，**保留第一遍 prefill 在压力下建好的视图**。port 没有 replay 遍，等价物就是让压力计划继续驻留、跳过这一轮：
+
+| 位置 | 现在的行为 |
+|---|---|
+| `retrieval_mandatory()` | 原名原样返回跨度覆盖的块，**不再夹取**——`selection_fits()` 正是拿它比对，夹取等于把「撕过」这件事从检查里抹掉 |
+| `retrieval_mandatory_over_budget(need, cap)` | 唯一的拒绝判据：跨度 + sink 带 + 边界页 + recent 带 对 `budget_blocks()`，一次告警报出 `need/cap` |
+| `apply_retrieval()` | 判据不过 → `retrieval_skipped reason=mandatory_exceeds_pool`；`selection_fits()` 不过 → `reason=selection_does_not_fit`；两者都 `harvest_flush()` 后返回，压力视图原地保留 |
+| `accept_retrieval_round()` | 拒绝过的那一轮**不评分也不提交**，checkpoint 留给下一个请求，而不是记一个从未驻留过的视图的分数 |
+
+`KVMEM_TRACE=1` 实测（0.8B、4649 token、`--kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024`，池 3072 = 24 槽）：
+
+```
+KVMEM_TRACE retrieval_skipped reason=mandatory_exceeds_pool query=[2,4643) rows=4649
+             budget_blocks=16 block_tokens=128 need=22 cap=14
+W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping the prefill pressure view
+```
+
+### 服务器侧两处修补（`16371170a`）
+
+- `kvmem_conv_bind()` 里的 `llama_kvmem_store_create/switch/current/destroy` 没有 `#if defined(LLAMA_KVMEM)` 守卫，而声明在头文件里只在该宏下可见 ⇒ **`-DLLAMA_KVMEM=OFF` 直接编不过 server**（C3861 ×6）。这条同时也是本节的测试前提：没有 off 构建就没有「kvmem 关」的基准。
+- 检索块把 `llama_kvmem_end_prefill_capture()` 写在 try 里。`apply_retrieval`/`accept_retrieval_round` 一抛异常，捕获管道就一直开着，此后每个 ubatch 都白搬 K 行。改为 catch 之后无条件关闭。
 
 ### CUDA 评分器必须真的编进 adapter（`88b0d969b`）
 
@@ -235,6 +258,102 @@ query span 就是**最后一条 user 消息**（server-context.cpp:10845）。�
 修法是在 `prepare_working_set()` 里、`register_append()` **之前**（此时 `n_tokens` 仍等于已提交行数）调用 `restore_partial_tail()`：尾块不满且 `gpu_kv_complete()` 为假时，从 packed store 落位并物化前缀（`write_block_to_gpu`），MTP 侧同步 `restore_checkpoint_block()`。失败一律 fail-closed —— 发布空行比报错更糟。
 
 复现与验证（Qwen3.5-2B、f16、`-c 262144 --kvmem-budget 1000 -b 512`、13.2k prompt 连续 5 轮各生成 5k）：修复前 3/6 次在第三轮 decode 报 gap；修复后 5 轮全过，且 `KVMEM_TRACE=1` 能看到 `tail_restage` 正好在这些轮次触发（一次运行 3 次）。PPL 1.2126（开/关逐位同）、真驱逐 budget 576 为 1.2135。
+
+## 四方复测：旧版 / port 开 / port 关 / fork 开 / fork 关（`34063912e`）
+
+这一轮问的是三件事：移植后**有没有退化**、真驱逐**还差多少**、回滚语义**与 fork 是否等效**。四棵树、五个单元，同一台机器（Windows + MSVC + CUDA 12.8、`sm_70`、V100 16 GB、`Qwen3.5-0.8B-Q4_K_M`），跑同一批参数。
+
+### 五个单元
+
+| 单元 | 二进制 | 含义 |
+|---|---|---|
+| `old` | `tmp/build-master-cuda`（2026-10-30 02:44） | **未移植 kvmem 的旧版**：`--help` 里没有任何 `kvmem` 字样 |
+| `port-off` | `tmp/build-kvmem-off`（`-DLLAMA_KVMEM=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70`） | port 树，kvmem 代码**不参与编译** |
+| `port-nokv` | `tmp/build-kvmem-on`，不加 `--kvmem` | port 树，kvmem 编入但不启用 |
+| `port-kv` | 同上 + `--kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024` | port 树，真驱逐 |
+| `fork-nokv` / `fork-kv` | `kvmem-llama.cpp/build-v100/bin/llama-kvmem-server.exe` / `llama-bench.exe` | fork 本体，参数同上 |
+
+⚠️ fork 的 `llama-bench` 与 `llama-perplexity` **不注册 `--kvmem`**（`--help` 里 0 个 kvmem 字样），所以 fork 的 kvmem 开/关只能在 server 上比。⚠️ port 的 `llama-bench` 没有 `--kvmem-gen-reserve`，基准表的池子 = budget（16 块），server 表显式给 1024（池 3072 = 24 槽）。
+
+### prefill / decode（`llama-bench -p 4096 -n 128 -b 512 -fa 1 -ctk/-ctv f16 -dev CUDA0 -r 3`）
+
+先热身一轮丢弃（GPU 空闲后的第一次跑的是时钟爬坡，不是代码：同二进制首轮 10728 / 次轮 13530），再**轮换顺序**跑 4 轮（固定顺序会造假差距），取中位数：
+
+| 单元 | pp4096 t/s | 对 `port-nokv` | tg128 t/s | 对 `port-nokv` |
+|---|---|---|---|---|
+| `old`（无 kvmem） | 13637.3 | −0.2% | 273.6 | −0.4% |
+| `port-off` | 13659.7 | −0.02% | 270.4 | −1.6% |
+| `port-nokv` | **13662.5** | — | **274.7** | — |
+| `port-kv`（真驱逐） | 11706.5 | **−14.3%** | 277.6 | +1.0% |
+| `fork-nokv` | 10273.6 | −24.8% | 241.1 | −12.2% |
+
+4 轮原始值（pp）：
+`old` 13628.2 / 13646.4 / 13616.5 / 13648.1；`port-off` 13673.5 / 13584.4 / 13651.6 / 13667.8；`port-nokv` 13650.0 / 13657.0 / 13668.1 / 13668.1；`port-kv` 11841.2 / 11608.2 / 11674.4 / 11738.5；`fork-nokv` 10369.0 / 10171.0 / 10391.0 / 10178.2。
+
+读法：
+- **编入 kvmem 不花钱**：`port-off` / `port-nokv` / `old` 三者互差 ≤0.2%，都在噪声地板（同二进制自比 ±1.5%）内。
+- **真驱逐的代价从 −32.6% 收到 −14.3%**（`94f780e9e` 去掉两处整设备等待、`e04bdb5d6` 只让会评分的驱动捕获 prefill K，`35e773a8c` 的打分器 staging + batch512）。剩下的 −14.3% 全在压力路径：块换出/回填 + 记账。
+- **fork 基线本身慢**：同一台机器、同一个 `llama-bench`，fork 的 pp 低 24.8%、tg 低 12.2%。所以「fork 比 port 快/慢」必须拿 **fork 对 fork、port 对 port** 的比值说话，跨树横比会把 fork 的基线差算到 kvmem 头上。
+
+### 检索轮与答案（server，4649-token 文档、3 次/单元）
+
+请求是同一份 14 000 字中文文档（tokenize 后 4649 token），三个探针分别埋在 **12%**（`H-2298`，落在被驱逐的头部）、**60%**（`M-4471`）、**末尾**（`T-9932`），问题要求三个温度上限全部按格式给出。`-c 16384 -b 512 -np 1 --no-webui`，`temperature 0`，`max_tokens 200`。
+
+| 单元 | pp t/s（中位） | tg t/s（中位） | 检索轮 | H / M / T |
+|---|---|---|---|---|
+| `old` | 9724.6 | 214.4 | 无 | **3/3** |
+| `port-off` | 9680.3 | 209.8 | 无 | **3/3** |
+| `port-nokv` | 9030.3 | 199.9 | 无 | **3/3** |
+| `port-kv`（回滚） | 5655.8 | 202.4 | `mandatory_exceeds_pool`，**回滚** | 2/3，头部答成 87 |
+| `port-kv --kvmem-query-max 512` ¹ | 6027.6 | 205.3 | 应用，`rows=512` | 2/3，头部答成 87 |
+| `port-kv --kvmem-query-max 1024` ¹ | 5681.3 | 201.6 | 应用，`rows=1024 score_ms=83.8` | 2/3，头部答成 87 |
+| `fork-off` | 6154.1 | 143.2 | 无 | **3/3** |
+| `fork-kv` | 4062.9 | 146.3 | 应用，`rows=512 score_ms=66.5` | **3/3** |
+
+¹ 这两档只跑了 1 次（用来分离「上限」与「回滚语义」两个变量），时间数字按单次读，不经中位数。
+
+三次的答案逐字相同（`H-2298=87, M-4471=64, T-9932=64` 或正确的 `51/87/64`），说明这不是采样抖动而是工作集差异：池 3072 token 只装得下 4649 的尾部，12% 处的块被压力路径按新近度扔掉了。**回滚语义本身是对的**——port 与 fork 在「装不下」时都不硬裁；差别在下一节。
+
+### 质量：PPL（200 kB 中文、`-c 8192 -b 512 -fa on`、f16）
+
+| 单元 | PPL | 对 `old` |
+|---|---|---|
+| `old` | 12.0629 ± 0.18749 | — |
+| `port-off` | 12.0629 | ±0 逐位同 |
+| `port-nokv` | 12.0629 | 逐位同 |
+| `port-kv`（budget 2048） | 12.3027 ± 0.19200 | **+2.0%** |
+| `port-kv --kvmem-method recency` | 12.3027 | 同上，逐位同 |
+| `fork-nokv` | 12.0627 | −0.002% |
+
+`recency` 与 `retrieval` 在 PPL 上逐位相同，是因为 **PPL 从不跑检索轮**（每个 chunk 先 `memory_clear`，末尾的检索影响不到本 chunk 的 logits），这是口径限制而非实现等价——要验检索方法只能看上面那张 server 表。
+
+### 结论
+
+1. 移植没有引入退化：`port-nokv` / `port-off` / `old` 的 pp、tg、PPL 三者互相在噪声内（PPL 甚至逐位相同）。
+2. 真驱逐的代价是 **−14.3% prefill / +1.0% decode**（bench）与 **−37% 首字速度**（server，4649 token：9724 → 5656），后者是大头，因为 server 的每请求检索轮 + 压力搬运都压在 prefill 上。
+3. 回滚语义生效且可观测：`need=22 cap=14` → 保留压力视图，不评分、不提交。
+4. **仍未对齐的一处：query 行在 fork 里是工作区，在 port 里算历史。** 同参数下 fork 选中 18 块、port 选中 16 块：
+
+```
+port : selected 0 19 20 21 22 23 24 25 26 27 29 32 33 34 35 36        (16)
+fork : selected 0 7 18 19 20 21 22 23 24 25 26 27 28 29 30 32 33 34 35 36  (18)
+```
+
+port 少掉的两块里，**第 7 块正是埋着头部探针的那一块**。成因是 fork 的检索轮走 Query replay：它的 `fixed` 集由 `retrieval_prefix_mandatory(frontier)` 生成，`frontier` 是**提问之前**的历史末端，所以 Query 自己那几块属于 append 工作区（追加到 16 块之外），16 个语义槽全部留给历史；port 没有 replay 遍，`fixed` 用 `query_fixed_blocks(retrieval_mandatory())` 且 `frontier = total_tokens()`，Query 的尾部块要占同一份 16 个槽，历史因此少两块，第 7 块落榜。补这一处等于移植 replay（要 fork 的两段 prefill 执行器），不在本轮范围；在补上之前，**同 budget 下 port 的可召回历史比 fork 少 2 块**。
+
+### 复现
+
+```bash
+# 基准（轮换、热身、中位数）
+bash tmp/cmp/bench_matrix.sh
+# server 检索轮 + 三段探针答案
+python tmp/cmp/matrix.py m-port-kv 8302 14000 200 tmp/build-kvmem-on/bin/llama-server.exe \
+    --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024
+# 单测
+cd tmp/build-kvmem-on && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|memory-contract|native-kv-payload|host-kv-storage|spill-io|tiered-kv-storage|native-residency|kv-content|prefix-checkpoint|mean-key-retrieval|graph-recall|query-policy|raw-kv-store|conversation-store)"
+```
+
+16 个 kvmem 单测全过。日志在 `tmp/cmp/matrix/`、`tmp/cmp/bench/`、`tmp/cmp/ppl_*.log`。
 
 ## 已知限制
 
