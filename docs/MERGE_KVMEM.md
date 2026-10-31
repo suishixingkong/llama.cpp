@@ -273,6 +273,8 @@ W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping
 | `port-kv` | 同上 + `--kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024` | port 树，真驱逐 |
 | `fork-nokv` / `fork-kv` | `kvmem-llama.cpp/build-v100/bin/llama-kvmem-server.exe` / `llama-bench.exe` | fork 本体，参数同上 |
 
+⚠️ `old` 是一个**冻结的二进制**（构建目录的源现在是 master，master 已含 kvmem）：它的价值就在于是移植前那一刻的快照，重建它就不再是旧版。
+
 ⚠️ fork 的 `llama-bench` 与 `llama-perplexity` **不注册 `--kvmem`**（`--help` 里 0 个 kvmem 字样），所以 fork 的 kvmem 开/关只能在 server 上比。⚠️ port 的 `llama-bench` 没有 `--kvmem-gen-reserve`，基准表的池子 = budget（16 块），server 表显式给 1024（池 3072 = 24 槽）。
 
 ### prefill / decode（`llama-bench -p 4096 -n 128 -b 512 -fa 1 -ctk/-ctv f16 -dev CUDA0 -r 3`）
