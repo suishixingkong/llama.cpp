@@ -334,13 +334,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem_mtp::memory_brea
     return kv_->memory_breakdown();
 }
 
+// Same refusal as the target: the draft cells are a window over a store the image does
+// not carry. See llama_memory_kvmem::state_write().
 void llama_memory_kvmem_mtp::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    kv_->state_write(io, seq_id, flags);
+    (void) io;
+    (void) seq_id;
+    (void) flags;
+    throw std::runtime_error("KVMem draft cache is not serializable as an engine state image");
 }
 
 void llama_memory_kvmem_mtp::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (target_) target_->note_attention_change();
-    kv_->state_read(io, seq_id, flags);
+    (void) io;
+    (void) seq_id;
+    (void) flags;
+    throw std::runtime_error("KVMem draft cache cannot adopt an engine state image");
 }
 
 void llama_memory_kvmem_mtp::register_capture(struct ggml_tensor * t, int il, char which) {

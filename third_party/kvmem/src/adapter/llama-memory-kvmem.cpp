@@ -3146,14 +3146,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdow
     return kv_->memory_breakdown();
 }
 
+// A KVMem history is not an engine state image.
+//
+// The image a llama_context dumps is the attention cells: for a plain cache that is the
+// whole history. Here it is only the pool window -- 1248 of 64k rows, say -- because the
+// rest lives in the host store as packed rows plus a block map, with the recurrent half
+// in a neighbour object this adapter also owns. Writing the cells alone publishes an
+// image that "restores" into a memory whose store still holds whatever conversation came
+// last: the cells claim 64234 positions, the store holds 8228 rows from a shorter
+// conversation, and the packed bytes for the restored frontier no longer exist. Every
+// decode then dies in restore_partial_tail() and the slot never recovers.
+//
+// So the image is refused on both sides. With the writer refusing, the size probe returns
+// 0 and every caller skips the save (server: "prompt cache save skipped: zero-size
+// state"); with the reader refusing, any image that still arrives -- from another build,
+// a --prompt-cache file, a --slot-save-path dump -- fails closed instead of half
+// restoring, and the caller re-prefills.
 void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    kv_->state_write(io, seq_id, flags);
+    (void) io;
+    (void) seq_id;
+    (void) flags;
+    throw std::runtime_error("KVMem keeps the history in the host store; an engine state image "
+            "holds only the pool cells and cannot rebuild it");
 }
 
 void llama_memory_kvmem::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ++attention_epoch_;
-    content_->change_execution();
-    kv_->state_read(io, seq_id, flags);
+    (void) io;
+    (void) seq_id;
+    (void) flags;
+    throw std::runtime_error("KVMem cannot adopt an engine state image: its cells describe a "
+            "resident window of another store, not this sequence's history");
 }
 
 void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {

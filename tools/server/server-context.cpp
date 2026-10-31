@@ -1201,6 +1201,14 @@ static inline bool prompt_save_durable(prompt_save_result r) {
 }
 
 struct server_slot {
+    // False when this slot's memory keeps its history somewhere an engine state image
+    // cannot reach (KVMem: packed host rows + block map + the recurrent half). Both the
+    // prompt cache and the context checkpoints are engine state images, so with this
+    // false they are neither published nor captured -- restoring one would install
+    // cells for a frontier this store cannot describe, which is what used to surface as
+    // "Context size has been exceeded" after switching conversations. The slot then
+    // keeps its live memory and re-prefills what it no longer holds.
+    bool state_image = true;
 #if defined(LLAMA_KVMEM)
     // Task whose retrieval query span was already published to KVMem. The
     // setter flushes pending harvest, so it must run once per request.
@@ -1333,6 +1341,12 @@ struct server_slot {
             *published = prompt_cache.states.end();
         }
         if (prompt.tokens.size() == 0) {
+            return prompt_save_result::failed;
+        }
+        if (!state_image) {
+            // KVMem: the host store is the state, and this image would carry only the
+            // pool window. Returning failed keeps the live slot, which is the only copy
+            // that still describes the history.
             return prompt_save_result::failed;
         }
 
@@ -4238,6 +4252,7 @@ private:
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
+            slots.back().state_image = !params_base.kvmem.enabled;
         }
 
         // try speculative decoding
@@ -7471,6 +7486,11 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
                            bool is_replay_boundary = false, llama_state_seq_flags tgt_extra_flags = 0) {
+        if (!slot.state_image) {
+            // KVMem: see server_slot::state_image. No image is produced, so none is
+            // restored, so no frontier can be installed over a store that cannot cover it.
+            return;
+        }
         const int id_task = slot.task->id;
         const int64_t checkpoint_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -11177,6 +11197,9 @@ private:
                     // for hybrid/recurrent models, lower the checkpoint threshold so short prompts also get checkpointed
                     const int checkpoint_min_tokens = (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
+                    // KVMem: see server_slot::state_image. This is the ONE capture path for
+                    // the live loop, so it is where the images stop being produced.
+                    do_checkpoint = do_checkpoint && slot.state_image;
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
