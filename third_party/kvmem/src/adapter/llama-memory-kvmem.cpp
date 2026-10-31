@@ -4892,6 +4892,21 @@ void llama_memory_kvmem::accept_retrieval_round() {
         }
     }
     if (!query_ready) return;
+    {
+        // The same set apply_retrieval() refused: query_fixed_blocks() would
+        // throw on it here too. Nothing is applied in that case, so there is no
+        // round worth committing; leave the checkpoint uncommitted rather than
+        // recording scores for a view that never became resident.
+        uint32_t need = 0;
+        uint32_t cap = 0;
+        if (retrieval_mandatory_over_budget(need, cap)) {
+            if (trace_) {
+                kvmem_diag("KVMEM_TRACE round_not_committed reason=mandatory_exceeds_pool "
+                        "need=%u cap=%u\n", need, cap);
+            }
+            return;
+        }
+    }
     // Recompute after the final replay. Every probe uses the same prior history.
     score_retrieval();
     runtime_->store().commit_retrieval_round();
@@ -5030,24 +5045,10 @@ std::vector<uint32_t> llama_memory_kvmem::retrieval_mandatory() const {
         const int32_t id = s.block_id_containing(force_pos_);
         if (id >= 0) mandatory.push_back(id);
     }
-    // A query span longer than the pool cannot be mandatory as a whole: the pool
-    // can only ever hold the most recent part of it, so that is the part
-    // selection has to protect. Left alone, query_fixed_blocks() throws
-    // "mandatory Query content exceeds its selection budget" and the driver
-    // skips the whole round, which leaves the working set to recency alone and
-    // drops the rest of the prompt without ever scoring it.
-    const uint32_t reserve = s.config().sink_blocks + s.config().recent_blocks + 1;
-    const uint32_t budget = s.budget_blocks();
-    if (budget > reserve && mandatory.size() > budget - reserve) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            LLAMA_LOG_WARN("%s: query span covers %zu blocks but the pool holds %u (%u reserved) "
-                    "-- scoring and protecting its last %u blocks only\\n", __func__,
-                    mandatory.size(), budget, reserve, budget - reserve);
-        }
-        mandatory.erase(mandatory.begin(), mandatory.end() - (budget - reserve));
-    }
+    // Reported as-is, however many blocks the span covers: selection_fits()
+    // compares the plan against this set, so trimming here would make a torn
+    // plan look complete. retrieval_mandatory_over_budget() is what refuses the
+    // round, and it refuses by rolling back rather than by cutting the span.
     return mandatory;
 }
 
@@ -5235,7 +5236,44 @@ bool llama_memory_kvmem::set_tail_mean(uint32_t row, const llama_kvmem_tail_mean
 
 void llama_memory_kvmem::apply_retrieval() {
     if (method_ != 1) { harvest_flush(); return; }
-    apply_selection(preview_retrieval());
+    // Roll back to the prefill pressure view instead of trimming a plan into
+    // the pool. The fork gets this for free: it refuses the Query replay and
+    // keeps the view the first prefill pass built. There is no replay pass
+    // here, so the equivalent is to leave the pressure plan resident -- whole
+    // bands dropped by recency read in order, a torn span does not.
+    const uint32_t rows = store_n_tokens();
+    auto skip = [&](const char * reason, uint32_t need = 0, uint32_t cap = 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: retrieval round rolled back (%s: %u of %u blocks), "
+                    "keeping the prefill pressure view\n", __func__, reason, need, cap);
+        }
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=%s query=[%d,%d) "
+                    "rows=%u budget_blocks=%u block_tokens=%u need=%u cap=%u\n", reason,
+                    query_begin_, query_end_, rows, store().budget_blocks(), block_tokens_,
+                    need, cap);
+        }
+        harvest_flush();
+    };
+    uint32_t need = 0;
+    uint32_t cap = 0;
+    if (retrieval_mandatory_over_budget(need, cap)) {
+        // The span alone outgrows the pool, so no honest plan exists. Scoring
+        // it would only let query_fixed_blocks() throw on a required block.
+        skip("mandatory_exceeds_pool", need, cap);
+        return;
+    }
+    const llama_kvmem_selection selection = preview_retrieval();
+    if (!selection_fits(selection, rows, 0)) {
+        // The selector trimmed a required block, or the plan plus the append
+        // tail does not fit the slot pool. Either way the plan is not a
+        // continuation-safe view, and neither is a version clipped to fit.
+        skip("selection_does_not_fit", selection.blocks.size(), cap);
+        return;
+    }
+    apply_selection(selection);
 }
 
 void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection) {
@@ -5632,6 +5670,23 @@ bool llama_memory_kvmem::query_replay_fits(uint32_t query_begin, uint32_t prompt
     const uint64_t required =
             boundary_block < sink ? total_blocks : sink + suffix;
     return required <= static_cast<uint64_t>(budget);
+}
+
+bool llama_memory_kvmem::retrieval_mandatory_over_budget(uint32_t & need, uint32_t & cap) const {
+    need = 0;
+    cap = 0;
+    const auto & s = store();
+    const uint32_t budget = s.budget_blocks();
+    if (!budget) {
+        return false;
+    }
+    // query_fixed_blocks() charges the sink band, the boundary page, every
+    // mandatory block and the recency band against the same budget, and throws
+    // on the required ones. Reserve that non-negotiable remainder and compare.
+    const uint32_t reserve = s.config().sink_blocks + s.config().recent_blocks + 1;
+    cap = budget > reserve ? budget - reserve : 0;
+    need = static_cast<uint32_t>(retrieval_mandatory().size());
+    return cap > 0 && need > cap;
 }
 
 bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end) {

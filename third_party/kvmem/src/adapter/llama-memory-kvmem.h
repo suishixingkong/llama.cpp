@@ -163,6 +163,10 @@ public:
     // The follower also invalidates a pending proof when old draft KV changes.
     void note_attention_change() { ++attention_epoch_; }
     bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
+    // True when the Query span is larger than the pool can hold beside the sink
+    // and recency bands. Such a round has no complete plan, and the answer is to
+    // keep what prefill's pressure path built rather than to tear the prompt.
+    bool retrieval_mandatory_over_budget(uint32_t & need, uint32_t & cap) const;
     void dump_kv_compare(int32_t block_id, bool writeback_test = false);
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay);
