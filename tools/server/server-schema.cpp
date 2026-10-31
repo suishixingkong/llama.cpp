@@ -68,6 +68,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_str("kvmem_conversation"))
+        ->set_desc("Bind this request to a host KV store by id. Requests sharing an id share one parked conversation cache; empty matches by token prefix. Only meaningful with --kvmem-conversations")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.kvmem_conversation = data.at("kvmem_conversation").get<std::string>();
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

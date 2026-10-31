@@ -123,6 +123,12 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // Host KV store this request binds to, from `kvmem.conversation_id`. Empty
+    // means "no opinion": the request is matched against the parked stores by
+    // its token prefix, which is what a server with --kvmem-conversations
+    // greater than zero does for every client that never sends the field.
+    std::string kvmem_conversation;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

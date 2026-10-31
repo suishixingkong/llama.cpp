@@ -3350,6 +3350,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVMEM_BLOCK_TOKENS"));
     add_opt(common_arg(
+        {"--kvmem-conversations"}, "N",
+        string_format("host KV stores the server keeps parked for reuse across requests; 0 shares one store (default: %d)", params.kvmem.conversations),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem conversation count must be non-negative");
+            }
+            params.kvmem.conversations = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_CONVERSATIONS"));
+    add_opt(common_arg(
         {"--kvmem-budget"}, "N",
         string_format("KVMem GPU working-set tokens; 0 keeps every block resident (default: %d)", params.kvmem.budget),
         [](common_params & params, int value) {

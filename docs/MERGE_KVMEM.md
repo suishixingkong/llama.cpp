@@ -68,6 +68,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | ggml | `ggml-backend.cpp`、`ggml-backend-meta.cpp`、`getrows.cu`、`ggml-cpu/ops.cpp` | 图输入写回表（`ggml_backend_sched_restore_graph_srcs`）、fork 命名的 meta 转发、空 index 的 `get_rows` 早退、GDN `K=0` 校验 |
 | 驱动 | `common/common.h`、`common/common.cpp`、`common/arg.cpp` | `--kvmem-*` 全套参数、三种 KV 模式的仲裁、`llama_kvmem_set_params()` 的进程级装配 |
 | server | `tools/server/*` | 每请求 Query span、只在 prefill 捕获存活时跑检索轮 |
+| conversation store | `tools/server/kvmem-conversation-store.h`、`tools/server/server-context.cpp` | `--kvmem-conversations N` 的 slot↔store 映射：切走时 drain 到 host、切回时 restage 并命中前缀；请求字段 `kvmem_conversation` 绑定 |
 | 多模态 | `tools/mtmd/mtmd-helper.*` | mmproj 与 kvmem 共存的上下文创建路径 |
 | 测试 | `tests/test-backend-ops.cpp` | KVMem 相关后端用例的形态登记 |
 
@@ -76,7 +77,6 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | 排除项 | 原因 |
 |---|---|
 | GDN / MTP replay（`replay_*` 记录面 + fold kernel） | 本分支的 `llama_memory_recurrent` 只有上游 `n_rs_seq` 快照；`--kvmem-mtp-state replay` 被参数层直接拒绝，不用 `snapshots`/`auto` 也能跑 |
-| conversation store（`--kvmem-conversations N`） | fork 为「KVMem 强制 `n_parallel=1`」设计的多会话热切换，与上游 slot 机制正面冲突；只影响多会话 TTFT，不影响质量 |
 | query replay | 服务的是 fork「prefix/query 两段 prefill + 工具续接复用 Q」的 server 执行器；本分支在 prefill 末尾一次性 `apply_retrieval → pin`，数值上无损失 |
 | SWA / 纯 recurrent 架构 | 池化 + 滑动窗口 / 递归状态没有一致的块语义；`maybe_create()` 直接返回 `nullptr` 并告警，回落到原生 cache |
 
@@ -89,6 +89,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 |---|---|---|
 | `--kvmem` | 关 | 打开 KVMem 池。要求 `n_seq_max == 1`（即 `--parallel 1`），否则告警并回落到 VBR / 原生 cache |
 | `--kvmem-block-tokens N` | 0 → 32 | 块大小（token）。选择、驱逐、检索都以块为粒度 |
+| `--kvmem-conversations N` | 0 → 所有请求共享一个 store | **仅 server**。保留 N 个 park 在 host 的会话 store，配合请求字段 `kvmem_conversation`（相同的 id 共用一个 store；留空则按 token 前缀匹配）。切 store 需要空闲上下文，所以 `--parallel > 1` 时告警并保持单 store 行为 |
 | `--kvmem-budget N` | 0 → `n_ctx` | GPU 常驻工作集（token）。**0 = 全常驻、不驱逐**，此时与原生 cache 数值逐位相同。下限是**一次 decode batch**（`-b`）加恒留带：整批 token 在 ubatch 之前就一次性登记，批内不能驱逐，给得比这小会被自动抬到下限并告警一次 |
 | `--kvmem-gen-reserve N` | 0 → 256 | 给 decode 预留的额外 GPU token |
 | `--kvmem-sink-tokens N` | 0 → 一个块 | 永久保留的前缀（attention sink） |

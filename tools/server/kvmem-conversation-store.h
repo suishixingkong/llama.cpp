@@ -276,6 +276,12 @@ public:
         uint64_t bytes      = 0;
         uint64_t used       = 0;
         int      last_n_gen = 0; // rows the last turn generated, for continuation
+        // The client id this store was bound to, empty when the request that
+        // created it carried none. Kept beside the rows because the match row
+        // needs it: an explicit id restricts the candidate set, and a store
+        // that forgot whose conversation it holds would be matched by prefix
+        // alone, which is the behaviour the id exists to avoid.
+        std::string client_id;
         // The prompt+generated rows this store holds, which is the only thing a
         // later request can be matched against. Empty until the store has run:
         // an allocated but unrun store matches nothing, and saying so is more
@@ -283,12 +289,14 @@ public:
         std::vector<int32_t> tokens;
     };
 
-    int add(int32_t store_id) {
+    int add(int32_t store_id, std::string client_id = {}) {
+        const int id = next_id_++;
         entry added;
-        added.id       = next_id_++;
-        added.store_id = store_id;
-        entries_.push_back(added);
-        return added.id;
+        added.id        = id;
+        added.store_id  = store_id;
+        added.client_id = std::move(client_id);
+        entries_.push_back(std::move(added));
+        return id;
     }
 
     // Rows shared by two sequences. The caller passes the request's prompt and
@@ -331,6 +339,7 @@ public:
         out.bytes       = held->bytes;
         out.used        = held->used;
         out.recurrent   = recurrent;
+        out.client_id   = held->client_id;
         return true;
     }
 

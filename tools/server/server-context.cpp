@@ -11,6 +11,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "kvmem-conversation-store.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -24,6 +25,15 @@ extern "C" void llama_kvmem_apply_retrieval(struct llama_context * ctx);
 extern "C" void llama_kvmem_pin_working_set(void);
 extern "C" void llama_kvmem_end_prefill_capture(void);
 extern "C" bool llama_kvmem_want_prefill_capture(void);
+// Host stores for --kvmem-conversations. Same boundary discipline: declared
+// here rather than by pulling the adapter header into this target.
+extern "C" int32_t  llama_kvmem_store_create(void);
+extern "C" bool     llama_kvmem_store_switch(int32_t store_id);
+extern "C" int32_t  llama_kvmem_store_current(void);
+extern "C" bool     llama_kvmem_store_destroy(int32_t store_id);
+extern "C" uint32_t llama_kvmem_store_rows(int32_t store_id);
+extern "C" uint64_t llama_kvmem_store_bytes(int32_t store_id);
+extern "C" uint32_t llama_kvmem_store_n_tokens(void);
 #endif
 #include "fit.h"
 #include "llama.h"
@@ -3519,6 +3529,19 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // --kvmem-conversations N: host stores parked beside the one the GPU is
+    // bound to. One GPU working set is time-multiplexed between them, so a
+    // switch is a drain plus an attach and needs an idle context: this is only
+    // armed at --parallel 1. `bound` is the table id whose adapter handle the
+    // working set currently holds, or -1 before the first request.
+    struct kvmem_conv_state {
+        bool armed = false;
+        int  max_stores = 0;
+        uint64_t tick = 0;
+        int bound = -1;
+        kvmem_store_table table;
+    } kvmem_conv;
+
     // fork server-context.cpp:15644 (a server_context_impl member there too, among
     // the DFlash cycle flags this port does not carry).  sample_frontier_logits()
     // sets it, pre_decode() clears it at the top of the cycle, and the empty-batch
@@ -3873,6 +3896,7 @@ private:
             vbr_prompt_cache_automatic ||
             vbr_prompt_cache_mode ==
                 common_vbr_prompt_cache_mode::enabled_explicit;
+        kvmem_conv_arm();
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -6238,13 +6262,172 @@ private:
         }
     }
 
+    // ------------------------------------------------------------------
+    // --kvmem-conversations: one parked host store per conversation.
+    // ------------------------------------------------------------------
+
+    // Arm once the parameters are known. A switch drains the GPU working set
+    // and restages the incoming store, which is only safe with an idle
+    // context, so anything above one slot keeps the single-store behaviour and
+    // says so instead of draining underneath a running request.
+    void kvmem_conv_arm() {
+        auto & st = kvmem_conv;
+#if defined(LLAMA_KVMEM)
+        const int want = params_base.kvmem.conversations;
+        if (want <= 0) {
+            return;
+        }
+        if (params_base.n_parallel > 1) {
+            LLAMA_LOG_WARN("%s: --kvmem-conversations %d ignored: a store swap needs --parallel 1\n",
+                    __func__, want);
+            return;
+        }
+        st.max_stores = want;
+        st.armed      = true;
+        LLAMA_LOG_INFO("%s: KVMem conversation stores: up to %d parked host stores\n", __func__, want);
+#else
+        (void) st;
+#endif
+    }
+
+    // Record what the attached store holds now. Must run before the incoming
+    // prompt is installed in slot.prompt, which is the ledger this books.
+    void kvmem_conv_remember(server_slot & slot) {
+        auto & st = kvmem_conv;
+        if (!st.armed) {
+            return;
+        }
+        if (st.bound >= 0 && !slot.prompt.tokens.empty() && !slot.prompt.tokens.has_media()) {
+            st.table.remember(st.bound, slot.prompt.tokens.get_text_tokens(), (int) slot.stats.n_gen);
+        }
+    }
+
+    // Point the slot at the host store this request names before anything reads
+    // slot.prompt: a switch replaces that ledger with the store's rows, which
+    // is exactly what makes the ordinary prefix match resume at the store's
+    // frontier instead of re-prefilling from zero.
+    void kvmem_conv_bind(server_slot & slot, const std::string & raw_client, llama_tokens request) {
+        auto & st = kvmem_conv;
+        if (!st.armed) {
+            return;
+        }
+        const std::string client = kvmem_store_client_id(raw_client);
+        // The request's own prompt, not slot.prompt: that ledger still holds the
+        // previous turn at this point and is what this function re-bases.
+        const llama_tokens & prompt = request;
+
+        // A store may hold more rows than the request matches: the last turn's
+        // answer sits at its tail, and a client that re-sends the same history
+        // continues from the prompt. That tail is dropped below, bounded by the
+        // same slack kvmem_store_continuation() uses -- an absolute bound, so a
+        // prompt matching only part of a long store is a branch and gets a fresh
+        // store instead of a truncation.
+        int best = -1;
+        int best_keep = 0;
+        uint64_t best_used = 0;
+        for (const auto & held : st.table.entries()) {
+            if (!client.empty() && held.client_id != client) {
+                continue;
+            }
+            if (held.tokens.empty()) {
+                continue;
+            }
+            const int lcp = kvmem_store_table::prefix_rows(held.tokens, prompt);
+            if (lcp <= 0) {
+                continue;
+            }
+            if ((int) held.tokens.size() - lcp > std::max(0, held.last_n_gen) + 64) {
+                continue;
+            }
+            if (best < 0 || lcp > best_keep || (lcp == best_keep && held.used > best_used)) {
+                best = held.id;
+                best_keep = lcp;
+                best_used = held.used;
+            }
+        }
+
+        if (best >= 0 && best != st.bound) {
+            const auto * held = st.table.find(best);
+            const int store_rows = (int) held->tokens.size();
+            if (llama_kvmem_store_switch(held->store_id)) {
+                llama_tokens rows(held->tokens.begin(), held->tokens.begin() + best_keep);
+                // Drop the rows this request does not continue (usually the last
+                // turn's answer). Both halves of a hybrid memory follow the
+                // position range, so the recurrent cells go with the rows.
+                if (best_keep < store_rows) {
+                    if (llama_memory_t mem = llama_get_memory(ctx_tgt)) {
+                        llama_memory_seq_rm(mem, 0, best_keep, -1);
+                    }
+                }
+                slot.prompt.tokens = server_tokens(rows, false);
+                slot.prompt.sequence_epoch = 0;
+                st.table.remember(best, rows, 0);
+                st.bound = best;
+                st.table.touch(best, ++st.tick);
+                SRV_INF("conversation store %d resumed, %zu of %d rows kept\n",
+                        best, rows.size(), store_rows);
+                return;
+            }
+            // A refused switch empties whatever was attached, so nothing is.
+            st.bound = -1;
+            st.table.erase(best);
+        } else if (best >= 0) {
+            st.table.touch(best, ++st.tick);
+            return;
+        }
+
+        // Fresh conversation: a new store, or the pool's least recently used one
+        // recycled by destroying it and allocating in its place.
+        const int32_t handle = llama_kvmem_store_create();
+        if (handle < 0) {
+            SRV_WRN("slot %d could not allocate a conversation store; --kvmem-conversations stays idle\n", slot.id);
+            return;
+        }
+        // A fresh store holds no rows, and the adapter reports exactly that:
+        // false means "attached, holding nothing to decode against", not "the
+        // switch failed". Ask for the current handle instead of reading the
+        // boolean as success.
+        const bool attached_rows = llama_kvmem_store_switch(handle);
+        if (!attached_rows && llama_kvmem_store_current() != handle) {
+            llama_kvmem_store_destroy(handle);
+            st.bound = -1;
+            return;
+        }
+        const int id = st.table.add(handle, client);
+        st.bound = id;
+        st.table.touch(id, ++st.tick);
+        slot.prompt_clear();
+
+        while (st.table.count() > st.max_stores) {
+            int victim = -1;
+            for (int candidate : st.table.lru_order()) {
+                if (candidate != st.bound) {
+                    victim = candidate;
+                    break;
+                }
+            }
+            if (victim < 0) {
+                break;
+            }
+            const auto * held = st.table.find(victim);
+            llama_kvmem_store_destroy(held->store_id);
+            st.table.erase(victim);
+        }
+        SRV_INF("slot %d started a fresh conversation store %d\n", slot.id, id);
+    }
+
     bool launch_slot_with_task(
             server_slot & slot,
             server_task && task,
             bool reclaim_before_launch = false) {
         // Defensive backstop for any future caller which does not pass through
         // process_single_task's group-wide preselection admission.
+        // The outgoing store is booked before its ledger is replaced, then the
+        // incoming prompt is installed, then binding may re-base that ledger on
+        // the rows of the host store this request continues.
+        kvmem_conv_remember(slot);
         prepare_prompt_tokens_for_launch(slot, task);
+        kvmem_conv_bind(slot, task.params.kvmem_conversation, task.tokens.get_text_tokens());
         if (!admit_task_for_slot(slot, task)) {
             return false;
         }

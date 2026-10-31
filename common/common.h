@@ -520,6 +520,11 @@ struct common_params_kvmem {
     int32_t host_mib      = 16384; // shared native KV RAM quota, MiB
     int32_t disk_mib      = 0;    // shared native KV SSD quota, MiB; 0 -> off
     std::string disk_path;        // process-local spill directory; empty -> off
+    // Concurrent host-side conversations the server keeps parked, one store
+    // each. 0 keeps the single-store behaviour: every request shares the one
+    // store the memory object was built with. Needs --parallel 1, because a
+    // store swap requires an idle context.
+    int32_t conversations = 0;
     double cpu_gb         = 0.0;  // CPU spill arena, GiB; 0 -> off
     bool harvest_v        = false; // prefill D2H V capture
 
