@@ -104,6 +104,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem-query-begin N` / `--kvmem-query-end N` | −1 | 显式声明 Query 的原始 token 区间。CLI 直接透传；server 每请求覆盖 |
 | `--kvmem-query-max N` | 0（不裁剪） | **仅 server 请求路径**。Query 区间超过 N 时只评分**尾部 N 行**。评分约 0.13 ms/行：9.5k prompt 裁到 512 行把 prefill 从 3.27 s 压到 1.29 s，但⚠️**这是换问题不是省钱**——1.9k 的文档裁到 512 行后，模型丢了开头段落、答不出原本能答的细节。默认不裁剪；只在「prompt 远长于答案需要召回的内容」时开 |
 | `--kvmem-force-pos N` | −1 | 强制钉住某个 token 所在的块 |
+| `--kvmem-query-workspace {on,off}` | `on` | Query 自己的尾部块算**追加工作区**（追加在语义预算之外，历史拿满预算）还是算历史（与 sink/recent 抢同一份槽）。fork 的 replay 是前者；`off` 复现移植早期的记账（同预算下少 2 块可召回历史）。见「Query 行是追加工作区」 |
 | `--kvmem-mtp-state {snapshots,auto}` | `snapshots` | MTP 回滚状态；`replay` 在本分支不可用（见排除项） |
 | `--kvmem-gpu-ratio R` | 0 → 设备的 0.50 | 池占显存的比例（与绝对值预算二选一，由 fit 解析） |
 | `--kvmem-gpu-high R` / `--kvmem-gpu-low R` | 0.95 / 0.85 | 换出高水位 / 换出后目标低水位 |
@@ -334,14 +335,14 @@ W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping
 1. 移植没有引入退化：`port-nokv` / `port-off` / `old` 的 pp、tg、PPL 三者互相在噪声内（PPL 甚至逐位相同）。
 2. 真驱逐的代价是 **−14.3% prefill / +1.0% decode**（bench）与 **−37% 首字速度**（server，4649 token：9724 → 5656），后者是大头，因为 server 的每请求检索轮 + 压力搬运都压在 prefill 上。
 3. 回滚语义生效且可观测：`need=22 cap=14` → 保留压力视图，不评分、不提交。
-4. **仍未对齐的一处：query 行在 fork 里是工作区，在 port 里算历史。** 同参数下 fork 选中 18 块、port 选中 16 块：
+4. **query 行在 fork 里是工作区，在 port 里算历史** —— 已修（`--kvmem-query-workspace`，默认 on）。修前同参数下 fork 选中 18 块、port 选中 16 块：
 
 ```
 port : selected 0 19 20 21 22 23 24 25 26 27 29 32 33 34 35 36        (16)
 fork : selected 0 7 18 19 20 21 22 23 24 25 26 27 28 29 30 32 33 34 35 36  (18)
 ```
 
-port 少掉的两块里，**第 7 块正是埋着头部探针的那一块**。成因是 fork 的检索轮走 Query replay：它的 `fixed` 集由 `retrieval_prefix_mandatory(frontier)` 生成，`frontier` 是**提问之前**的历史末端，所以 Query 自己那几块属于 append 工作区（追加到 16 块之外），16 个语义槽全部留给历史；port 没有 replay 遍，`fixed` 用 `query_fixed_blocks(retrieval_mandatory())` 且 `frontier = total_tokens()`，Query 的尾部块要占同一份 16 个槽，历史因此少两块，第 7 块落榜。补这一处等于移植 replay（要 fork 的两段 prefill 执行器），不在本轮范围；在补上之前，**同 budget 下 port 的可召回历史比 fork 少 2 块**。
+port 少掉的两块里，**第 7 块正是埋着头部探针的那一块**。成因是 fork 的检索轮走 Query replay：它的 `fixed` 集由 `retrieval_prefix_mandatory(frontier)` 生成，`frontier` 是**提问之前**的历史末端，所以 Query 自己那几块属于 append 工作区（追加到 16 块之外），16 个语义槽全部留给历史；port 没有 replay 遍，`fixed` 用 `query_fixed_blocks(retrieval_mandatory())` 且 `frontier = total_tokens()`，Query 的尾部块要占同一份 16 个槽，历史因此少两块，第 7 块落榜。**补这一处不需要移植 replay**，只需要把记账改对——见下一节。
 
 ### 复现
 
@@ -357,8 +358,68 @@ cd tmp/build-kvmem-on && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|mem
 
 16 个 kvmem 单测全过。日志在 `tmp/cmp/matrix/`、`tmp/cmp/bench/`、`tmp/cmp/ppl_*.log`。
 
+## 引擎状态镜像对 KVMem 无效：写入与读取都拒绝
+
+**症状**（用户报告，27B + MTP + hybrid，`--kvmem --kvmem-budget 1000 -np 1 -b 512`）：对话 A 正常，切到对话 B 正常，**切回 A 就永久失败**——
+
+```
+E restore_partial_tail: tail block 257 keeps 4 committed rows the packed store lost
+E init_batch: failed to prepare KVMem attention ubatches
+...（每步 batch 减半重试）
+E srv decode: Context size has been exceeded.
+```
+
+**根因**：`llama_context` 的状态镜像是 attention cells，对普通 cache 那就是全部历史；对 KVMem 只是**池窗口**（例如 1248 行），真正的历史在 host packed store（打包后的 K/V + 块映射）+ recurrent 半边。镜像存出来再读回去，cells 声称 frontier = 64234，而 store 里只有 8228 行来自更短的那段对话，被恢复的 frontier 的 packed 字节根本不存在 ⇒ 每次 decode 死在 `restore_partial_tail()`，槽再也回不来。
+
+**修法**（两侧都 fail closed）：
+
+- `llama_memory_kvmem::state_write/state_read` 直接 `throw`（`llama-memory-kvmem-mtp.cpp` 同）。写入端抛 ⇒ `state_seq_get_size()` 走 dummy io 捕获返回 0 ⇒ 所有调用方跳过保存（server 打 `prompt cache save skipped: zero-size state`）；读取端抛 ⇒ 任何外来的镜像（别的构建、`--prompt-cache`、`--slot-save-path`）**半恢复失败**而不是半恢复成功。
+- server 侧 `server_slot::state_image = !params_base.kvmem.enabled`，关掉三段：`prompt_save()`（返回 `failed`，保留活槽）、`create_checkpoint()`（含 `--checkpoint-recurrent-prev` 那条唯一剩下的调用者）、以及活循环里**唯一**的 inline 捕获点（`do_checkpoint = do_checkpoint && slot.state_image`）。只关前两段不够：inline 段仍在造镜像，日志里照样出现 `CHECKPOINT_ATTN_ONLY_TRIM` 与 `[frontier-validity] skipping context checkpoint`。
+
+**验证**：
+
+| 场景 | 结果 |
+|---|---|
+| 2B，80k token 长文 → 不相交文档 → 切回（`tmp/cmp/conv_disjoint.py`） | `LONG1/LONG2/LONG3/OTHER1` 全 ok，`restore_partial_tail｜failed to prepare KVMem｜Context size` 计数 **0**（修前 LONG2 就 500） |
+| 27B（MTP + hybrid），80484 token，四轮切换 | 四轮全 ok、错误 0 |
+
+**代价**：槽没有镜像就只剩「活内存」，切回旧对话要整段重算。27B / 80k token / `--kvmem-budget 1000` 实测 **34 t/s ≈ 39 分钟**一轮。多会话要复用只能走 `--kvmem-conversations`；`-np 2` 不行——KVMem 在 `n_seq_max > 1` 时**整体不启用**（`KVMem requires n_seq_max=1`，静默退回原生 cache）。
+
+## Query 行是追加工作区，不是历史（`--kvmem-query-workspace`）
+
+**问题**：`score_retrieval()` 的帧用 `frontier = total_tokens()`，Query 的尾部块既当评分对象又当历史候选，`query_fixed_blocks(retrieval_mandatory())` 把它们记进**同一份** `budget_blocks()`。于是「预算 18 块」实际是 16 块历史 + 2 块 Query —— 同预算下比 fork 少 2 块可召回历史（64 token @ block 32）。
+
+**修法**：`preview_retrieval()` 的非前缀分支复用**前缀分支已有的那套记账**（`pick_scored_blocks(candidates, scores, required, budget)` + 之后把后缀当 append workspace 追加），边界取 Query 区间的首行：`explicit_spans_` 时是 `turn_spans_.query` 的最小 `begin`（server 路径），否则是 `--kvmem-query-begin`。`required > budget`（band 自己就装不下）时退回原来的 flat 记账，不抛异常——拒绝留给 `selection_fits()` 的回滚。
+
+**证据**（0.8B，2600 字符 ≈ 1442 token / 45 块，`--kvmem-budget 512 -b 512`，budget 被 floor 抬到 576 = 18 块）：
+
+```
+off : KVMEM_TRACE plan=flat            selected=18 budget_blocks=18            # 16 历史 + 2 Query
+on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspace=2 budget_blocks=18
+```
+
+`history_pages=44` 是 Query 之前的页数，`workspace=2` 是追加的后缀块（≥ 44 的部分），`kept_history=18` = 满预算。fork 同参数（`--kvmem-budget 512 --kvmem-block-tokens 32 -b 256`）选中 `0 1 2 3 4 6 7 13 14 15 16 17 19 28 42 43 44 45`，其中 42–45 是它自己的后缀工作区，历史 14 块 —— **它也是「历史拿预算、后缀追加在预算外」**，只是它的 suffix 更宽（包含 assistant 那轮）。
+
+⚠️ fork 在 `-b 512 --kvmem-budget 512` 下会直接拒（`KVMem reselect failed: mandatory Query content exceeds its selection budget`，它的 budget 不做 chunk floor 抬升，port 抬到 576）。三方横比必须同 `-b`。
+
+**为什么不移植 replay**：replay 相对 port 只有两处差异——(a) 后缀不占预算，(b) 评分帧里没有 Query。port 的 `query_score_frame()` 已把 sink/recent 带的 `score_mask` 置 0，Query 尾块本来就在 recent 带里不参与打分，所以 (b) 在 port 上不存在；(a) 用现成的 `pick_scored_blocks` + append 就能拿到，不需要 fork 的两段 prefill 执行器（那只是实现 (a) 的手段）。
+
+**代价与实测**（3 轮轮换、每轮 3 个不同深度样本、取中位）：
+
+| 配置 | pp (t/s) | tg (t/s) |
+|---|---|---|
+| `--kvmem-query-workspace off` | 7258 | 219.9 |
+| `--kvmem-query-workspace on` | 7571 | 219.7 |
+| fork（`-b 256`，不可与上两行横比） | 3130 | 83.0 |
+
+- **tg 不变**（−0.1%）：decode 只多看 2 块 KV；0.8B 在这个规模是算力受限。
+- **pp +4.3%**（逐轮 −8%~+11%，被噪声主导）：多搬 2 块 + prefill 注意力 span 变长。这是 fork 一直在付的钱，所以对 fork 是持平而不是退步。
+- 驻留 +2 块 ⇒ 生成头寸少 2 块（`--kvmem-gen-reserve` 默认 256 = 8 块，够；把它调到 1~2 块会让计划撞 `selection_fits()` 回滚到压力视图）。
+- **端到端命中率不能当判据**：28 深度针扫掠 on 6/28；同一扫描里连「深度 3%（必然在 sink 带内）」都会答错，0.8B 自身不稳。判据用「可召回历史块数」：18 vs 16。
+
 ## 已知限制
 
+- **状态镜像不可用**：`--kvmem` 下 prompt cache / context checkpoint / `--slot-save-path` 对该槽静默跳过（`state_write/read` 拒绝），切回旧会话要整段重算（27B / 80k token ≈ 39 min）。要多会话复用走 `--kvmem-conversations`，不能用 `-np > 1`（KVMem 会整体不启用）。
 - **单序列**：`--parallel > 1` 时 KVMem 与 KV stream 都不成立，只能回到 VBR / 原生 cache；多会话并发需要 fork 的 conversation store，未移植。
 - **架构**：SWA 模型、纯 recurrent 模型、DFlash 草稿侧都不走 KVMem。
 - **检索轮驱动**：`llama-server` 每请求驱动完整检索轮（前缀 prefill → 采样注意力 → 选择 → 回放后缀）；`llama-completion` 只在 prefill 末尾做一次 `apply_retrieval → pin`。**同一棵树换驱动能差十几个百分点，性能数字不可跨驱动横比**。

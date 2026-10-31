@@ -42,6 +42,11 @@ struct llama_kvmem_params {
     int32_t  query_begin;   // original token pos, -1 = unset
     int32_t  query_end;     // exclusive, -1 = end of prompt
     int32_t  query_max;     // cap on the scored span, tail-biased; 0 = whole span
+    // 1 (default) = the Query's own trailing blocks are append workspace: they
+    // ride on top of the selection budget instead of consuming history slots,
+    // which is what the fork's Query replay does. 0 restores the older
+    // accounting where the suffix shares the budget with history.
+    int32_t  query_workspace = 1;
     int32_t  force_pos;     // include block containing this orig pos; -1 = none
     float    gpu_memory_ratio;     // 0 → 0.50; cap pool vs device VRAM
     float    gpu_high_watermark;   // 0 → 0.95; trigger prefill offload

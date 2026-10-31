@@ -1281,6 +1281,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     v_trans_ = !cparams.flash_attn;
     method_ = kvmem_current_execution().params.method;
     query_max_ = kvmem_current_execution().params.query_max;
+    query_workspace_ = kvmem_current_execution().params.query_workspace != 0;
     query_begin_ = kvmem_current_execution().params.query_begin;
     query_end_ = kvmem_current_execution().params.query_end;
     query_begin_ = capped_query_begin(query_begin_, query_end_, query_max_);
@@ -5097,6 +5098,21 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
     llama_kvmem_selection selection;
     selection.epoch = attention_epoch_;
     selection.rows = store_n_tokens();
+    // Where the append workspace starts: the first row of the Query span. With explicit
+    // spans (the server) the caller says which rows the question is; otherwise it is
+    // --kvmem-query-begin. -1 means "no workspace", i.e. no retrieval round to account for.
+    int32_t workspace_begin = -1;
+    if (method_ == 1 && query_workspace_) {
+        if (explicit_spans_) {
+            for (const auto & r : turn_spans_.query) {
+                if (workspace_begin < 0 || r.begin < workspace_begin) {
+                    workspace_begin = r.begin;
+                }
+            }
+        } else {
+            workspace_begin = query_begin_;
+        }
+    }
     if (prefix && method_==1) {
         const auto& policy=store();
         const auto pages=(prefix->row+block_tokens_-1)/block_tokens_;
@@ -5111,8 +5127,61 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
         std::sort(selection.blocks.begin(),selection.blocks.end());
         selection.blocks.erase(std::unique(selection.blocks.begin(),selection.blocks.end()),selection.blocks.end());
     } else {
-        selection.blocks = method_==1 ? store().pick_graph_blocks(retrieval_mandatory()) :
-            runtime_->preview_reselect(retrieval_mandatory());
+        bool planned = false;
+        if (workspace_begin > 0 && workspace_begin < (int32_t) selection.rows) {
+            // Same accounting as the prefix branch above, with the Query's own start as the
+            // boundary. The Query occupies the tail of the prompt and those rows are not
+            // history: the answer has to read them, but retrieval is not being asked to
+            // choose between them and the past. Passing them as mandatory to
+            // query_fixed_blocks() charges them against the selection budget, so an
+            // 18-block budget ends up holding 16 blocks of history plus the Query -- two
+            // recallable blocks fewer than the fork, whose replay appends the suffix after
+            // selecting (its `fixed` set stops at the pre-query frontier). Selecting up to
+            // the Query's boundary and appending the suffix afterwards reproduces the
+            // fork's plan from the single prefill pass this tree has.
+            const auto & policy = store();
+            const uint32_t history = static_cast<uint32_t>(workspace_begin);
+            const uint32_t pages = history / block_tokens_ + (history % block_tokens_ != 0);
+            const auto required = retrieval_prefix_mandatory(history);
+            // A band set that cannot fit the budget on its own is not a plan. The flat
+            // accounting charges the same bands and would throw out of here; leave the
+            // decision to the caller's rollback instead.
+            if (required.size() <= policy.budget_blocks()) {
+                std::vector<uint32_t> candidates;
+                std::vector<double> scores;
+                candidates.reserve(pages);
+                scores.reserve(pages);
+                for (uint32_t id = 0; id < pages; ++id) {
+                    candidates.push_back(id);
+                    scores.push_back(policy.selection_score(id));
+                }
+                selection.blocks = policy.pick_scored_blocks(candidates, scores,
+                        required, policy.budget_blocks(), true);
+                // These rows are append workspace, not additional historical recall.
+                for (auto id = history / block_tokens_;
+                     id < (selection.rows + block_tokens_ - 1) / block_tokens_; ++id) {
+                    selection.blocks.push_back(id);
+                }
+                std::sort(selection.blocks.begin(), selection.blocks.end());
+                selection.blocks.erase(std::unique(selection.blocks.begin(), selection.blocks.end()), selection.blocks.end());
+                planned = true;
+                if (trace_) {
+                    const auto kept = std::count_if(selection.blocks.begin(), selection.blocks.end(),
+                            [&](uint32_t id) { return id < pages; });
+                    kvmem_diag("KVMEM_TRACE plan=query_workspace history_pages=%u kept_history=%zu "
+                            "workspace=%zu budget_blocks=%u\n", pages, size_t(kept),
+                            selection.blocks.size() - size_t(kept), policy.budget_blocks());
+                }
+            }
+        }
+        if (!planned) {
+            selection.blocks = method_==1 ? store().pick_graph_blocks(retrieval_mandatory()) :
+                runtime_->preview_reselect(retrieval_mandatory());
+            if (trace_ && method_ == 1) {
+                kvmem_diag("KVMEM_TRACE plan=flat selected=%zu budget_blocks=%u\n",
+                        selection.blocks.size(), store().budget_blocks());
+            }
+        }
     }
     if (enabled) {
         retr_.flush_us = t1 - t0;

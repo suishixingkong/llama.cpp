@@ -3492,6 +3492,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVMEM_QUERY_MAX"));
     add_opt(common_arg(
+        {"--kvmem-query-workspace"}, "{on,off}",
+        string_format("treat the Query's own trailing blocks as append workspace instead of history, so retrieval spends the whole selection budget on recallable history (default: %s)", params.kvmem.query_workspace ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                params.kvmem.query_workspace = 1;
+            } else if (value == "off") {
+                params.kvmem.query_workspace = 0;
+            } else {
+                throw std::invalid_argument("invalid value for --kvmem-query-workspace: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_KVMEM_QUERY_WORKSPACE"));
+    add_opt(common_arg(
         {"--kvmem-force-pos"}, "N",
         "pin the block containing this original position, whatever it scores",
         [](common_params & params, const std::string & v) {

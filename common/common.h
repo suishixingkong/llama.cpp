@@ -551,6 +551,12 @@ struct common_params_kvmem {
     // while the uncapped run kept it. Off by default; turn it on when the
     // prompt is far longer than anything the answer needs to recall.
     int32_t query_max     = 0;
+    // Whether the Query's own trailing blocks are append workspace (append on top
+    // of the selection budget) or history (consume its slots). The fork's replay
+    // executor treats them as workspace, so the whole budget stays recallable
+    // history; the sparse selector charged them against the same budget, which
+    // silently cost two blocks of history at a 16-block budget.
+    int32_t query_workspace = 1;
 };
 
 struct common_params {

@@ -543,6 +543,10 @@ private:
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t query_max_ = 0;
+    // Query rows are append workspace, not history: the selection spends its whole
+    // budget on recallable history and the suffix rides on top (see
+    // preview_retrieval). Turned off, the suffix competes for the same slots.
+    bool query_workspace_ = true;
     int32_t force_pos_ = -1;
     llama_kvmem_turn_spans turn_spans_;
     bool explicit_spans_ = false;
