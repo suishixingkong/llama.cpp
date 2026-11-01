@@ -509,7 +509,7 @@ struct common_params_kvmem {
     bool enabled          = false;
     int32_t block_tokens  = 0;    // 0 -> 32
     int32_t budget        = 0;    // working-set tokens; 0 -> n_ctx (identity, no sparsity)
-    int32_t gen_reserve   = 0;    // extra GPU tokens for decode; 0 -> 256
+    int32_t gen_reserve   = 1024; // extra GPU tokens for decode; 0 -> this same default
     int32_t sink_tokens   = 0;    // always-kept prefix; 0 -> one block
     int32_t recent_tokens = 0;    // always-kept suffix blocks; 0 -> newest tail under pressure
     std::string method    = "retrieval"; // recency | retrieval

@@ -29,7 +29,7 @@ struct llama_kvmem_params {
     bool enabled;
     uint32_t block_tokens;  // 0 → 32
     uint32_t budget;        // tokens; 0 → use n_ctx (identity / no sparse)
-    uint32_t gen_reserve;   // tokens; 0 → 256
+    uint32_t gen_reserve;   // tokens; 0 → 1024 (fork default)
     uint32_t sink_tokens;   // 0 → one block
     uint32_t recent_tokens; // 0 → pressure uses newest tail only
     int32_t  method;        // 0 recency, 1 retrieval (CLI default 1)

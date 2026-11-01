@@ -932,7 +932,10 @@ static kvmem_pool_plan kvmem_compute_pool(
             budget = floor_tokens;
         }
     }
-    uint32_t gen_reserve = kvmem_current_execution().params.gen_reserve ? kvmem_current_execution().params.gen_reserve : 256u;
+    // 1024 matches the fork: generation is what makes a working set stop fitting,
+    // so the pool (budget + gen_reserve) has to carry a real decode tail. Keep in
+    // sync with common_params_kvmem::gen_reserve.
+    uint32_t gen_reserve = kvmem_current_execution().params.gen_reserve ? kvmem_current_execution().params.gen_reserve : 1024u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
     const uint32_t il0 = kvmem_first_attn_layer(model);

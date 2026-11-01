@@ -51,6 +51,16 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 测试目标跟随本仓命名：`kvmem_store_test` → `test-kvmem-store`，`spill_io_test` → `test-spill-io`（共 16 个）。
 `spill_io_test` 在 Windows 共享库构建下改为把 core 源直接编进测试：它替换 `operator new` 注入分配失败，而 PE DLL 不会为可执行文件的替换做符号插入，挂在 DLL 上的注入根本不会触发。
 
+### Web UI 资源（`/` 返回 404 时先看这里）
+
+`--ui`（默认开）走的是**内嵌资源表**（`tools/ui` 的 SvelteKit 构建产物），不是磁盘目录。资源在构建时由 `scripts/ui-assets.cmake` 按优先级 provision：`tools/ui/dist` → npm build（`-DLLAMA_BUILD_UI=ON`）→ HF 预构建包（`LLAMA_USE_PREBUILT_UI=ON`）。三者都拿不到时只打一行 WARNING 就继续编译，生成的 `ui.cpp` 是空表、`LLAMA_UI_HAS_ASSETS` 不定义 ⇒ 运行时 `/` 与 `/index.html` 根本没注册路由，浏览器拿到：
+
+```json
+{"error":{"message":"File Not Found","type":"not_found_error","code":404}}
+```
+
+判据：`wc -c build/tools/ui/ui.cpp` 只有几百字节就是空的（正常 ≈ 15 MB，可 `grep -c asset_0` 看到 gzip 字节表）。离线环境把任意 llama.cpp 发布包/自带树里的 UI 解到 `tools/ui/dist` 再重建即可；`dist` 在 `tools/ui/.gitignore` 里，不进仓库。
+
 ## 移植内容
 
 `git diff master` 面：**39 个文件 +1291 / −93**（不含 vendored 副本）。
@@ -91,7 +101,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem-block-tokens N` | 0 → 32 | 块大小（token）。选择、驱逐、检索都以块为粒度 |
 | `--kvmem-conversations N` | 0 → 所有请求共享一个 store | **仅 server**。保留 N 个 park 在 host 的会话 store，配合请求字段 `kvmem_conversation`（相同的 id 共用一个 store；留空则按 token 前缀匹配，且 store 比请求多出的尾巴必须 ≤ 上一轮生成数 + 64 行才算同一段对话，否则视为分支、另起 store）。切 store 需要空闲上下文，所以 `--parallel > 1` 时告警并保持单 store 行为 |
 | `--kvmem-budget N` | 0 → `n_ctx` | GPU 常驻工作集（token）。**0 = 全常驻、不驱逐**，此时与原生 cache 数值逐位相同。下限是**一次 decode batch**（`-b`）加恒留带：整批 token 在 ubatch 之前就一次性登记，批内不能驱逐，给得比这小会被自动抬到下限并告警一次 |
-| `--kvmem-gen-reserve N` | 0 → 256 | 给 decode 预留的额外 GPU token |
+| `--kvmem-gen-reserve N` | **1024**（写 0 取同一默认） | 给 decode 预留的额外 GPU token，与 fork 对齐（port 早期是 256）。⚠️ **GPU 上真正分配的池 = `budget + gen_reserve`**（按块对齐，再受设备 KV 容量约束），所以 `--kvmem-budget 1000` 实际是 `1000 + 1024 = 2024` token ≈ 63 块，而 `budget` 只是其中「可给历史用」的那部分 |
 | `--kvmem-sink-tokens N` | 0 → 一个块 | 永久保留的前缀（attention sink） |
 | `--kvmem-recent-tokens N` | 0 → 压力下保留最新尾部 | 永久保留的后缀 token 数 |
 | `--kvmem-method {recency,retrieval}` | `retrieval` | `recency` 只按新近度选块（不采样、不评分，最省）；`retrieval` 用 Query 注意力给每块打分 |
@@ -524,7 +534,7 @@ on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspac
 
 - **tg 不变**（−0.1%）：decode 只多看 2 块 KV；0.8B 在这个规模是算力受限。
 - **pp +4.3%**（逐轮 −8%~+11%，被噪声主导）：多搬 2 块 + prefill 注意力 span 变长。这是 fork 一直在付的钱，所以对 fork 是持平而不是退步。
-- 驻留 +2 块 ⇒ 生成头寸少 2 块（`--kvmem-gen-reserve` 默认 256 = 8 块，够；把它调到 1~2 块会让计划撞 `selection_fits()` 回滚到压力视图）。
+- 驻留 +2 块 ⇒ 生成头寸少 2 块（`--kvmem-gen-reserve` 现在默认 1024 = 32 块，够；把它调到 1~2 块会让计划撞 `selection_fits()` 回滚到压力视图）。
 - **端到端命中率不能当判据**：28 深度针扫掠 on 6/28；同一扫描里连「深度 3%（必然在 sink 带内）」都会答错，0.8B 自身不稳。判据用「可召回历史块数」：18 vs 16。
 
 ## 检索质量：失忆率实测，和两个把它放大的根因
