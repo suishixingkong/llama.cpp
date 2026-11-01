@@ -536,6 +536,48 @@ slot 0 started a fresh conversation store 1                  ← 于是造了新
 
 ERNIE 的文档轮仍会打一次 `retrieval_skipped reason=no_query_rows query=[-1,-1)`（模板不声明 `message_delimiters`、冷启动不猜），提问轮正常。两模型的 `selected` 都是散开的块号，不是连续后缀 ⇒ 真检索，不是 recency 退化。
 
+## 混合内存的尾部截断：两半必须一起退（`a7b42f96e`）
+
+**症状**（用户报告，27B hybrid + `--kvmem-conversations 4`）：浏览器里两个会话，20k 那个刷新答案正常；切到另一个会话再刷新，**回复只有一两个字**；再点一次刷新，**整段 22853 token 全量 prefill**（36 s）。两个会话都会中招。
+
+**日志指纹**（三条一起出现即确诊）：
+
+```
+conversation store 0 resumed, 22853 of 25195 rows kept
+n_past was set to 22852
+[frontier-validity] skipping context checkpoint: recurrent/hybrid
+    seq_pos_min (25194) != seq_pos_max (22851)
+find_slot: non-consecutive token position 22852 after 25194
+```
+
+**根因**：会话 store 的 frontier（25195）比本次 prompt（22853）长——浏览器把上一轮答案丢掉、重发同一段历史，所以要让出 2342 行。`llama_memory_kvmem_hybrid::seq_rm` 只把 attention 半边截到 22851，recurrent 半边仍停在 25194：
+
+```cpp
+// 改之前
+if (n_rs > 0 && ... && p1x > rmax) {   // n_rs_seq 默认 0 ⇒ 这个门永远不开
+    if (!recr->seq_rm(seq_id, p0, p1)) return false;
+}
+return attn->seq_rm(...);              // 只截了 attention
+```
+
+`n_rs_seq` 默认 0（没有任何回滚快照平面），所以对**一切**尾部截断都不问 recurrent 半边。于是模型拿着「22852 行的 attention + 25194 位置的 GDN 状态」解码：`find_slot` 报非连续，第一条 token 就 EOS；位置区间接不下来，checkpoint 被 `[frontier-validity]` 拒，环清空 ⇒ 下一轮 `forcing full prompt re-processing`。dense 模型不受影响（没有 recurrent 半边）。
+
+**修法**（两处，缺一不可）：
+
+1. `seq_rm` 改成 **fail closed**：凡 `p0n <= rmax < p1`（尾部截断越过 recurrent frontier）就必须先问 `recr->seq_rm`，它自己决定「窗口内回滚 / 窗口外拒绝」，拒绝时什么都不改。内部空洞（`p1 <= rmax`）仍然不碰 GDN——P4-2 的 replay 恢复依赖这一点。
+2. `server-context.cpp` 的 store resume 路径原来**丢弃**了 `llama_memory_seq_rm` 的返回值。改成尊重它：保留 store 绑定（这些行仍是本会话的续写起点），但**不认领 frontier**，走 `prompt_clear()`（连带清两半和 checkpoint 环）再整段 prefill 一次。通用路径（`memory_seq_rm [%d, end) rejected; falling back to full prompt re-processing`）本来就是这么做的，只有 store 这条路忘了。
+
+**代价**：每次「改写回复」要付一次全量 prefill，这正是 upstream 对 hybrid/recurrent 的契约（那条 `forcing full prompt re-processing` 消息就是为它写的）。想便宜就让 `n_rs_seq > 0`（MTP 回滚平面），窗口内的截断会走回滚而不是拒绝。
+
+**证据**（Qwen3.5-2B-Q8_0，hybrid `attn_layers=6`、`n_rs_seq=0`，`--kvmem-budget 512 -np 1 -b 512 --kvmem-conversations 2`，1081-token prompt，三轮：建 store a → 用 b 顶掉 → 重发 a）：
+
+| | 日志 | 回复 |
+|---|---|---|
+| 改之前 | `resumed, 1081 of 1084 rows kept` + `seq_pos_min (1083) != seq_pos_max (1079)` + `non-consecutive 1080 after 1083` | `\nAnswer with the number only.\nAnswer with the number only.\nA`（复读，27B 上直接 EOS） |
+| 改之后 | `resumed, but dropping 3 of 1084 rows was refused by the recurrent half; re-prefilling the prompt` | `\n\n84`，与第一轮逐字节相同，无非连续告警、无 frontier 拒绝 |
+
+复现脚本 `tmp/cmp/hybrid_trunc.py`（不提交）。`ctest -R "kvmem|conversation-store|memory-contract|prefix-checkpoint|server-prompt-cache|hybrid"` 9/9。
+
 ## Query 行是追加工作区，不是历史（`--kvmem-query-workspace`）
 
 **问题**：`score_retrieval()` 的帧用 `frontier = total_tokens()`，Query 的尾部块既当评分对象又当历史候选，`query_fixed_blocks(retrieval_mandatory())` 把它们记进**同一份** `budget_blocks()`。于是「预算 18 块」实际是 16 块历史 + 2 块 Query —— 同预算下比 fork 少 2 块可召回历史（64 token @ block 32）。
