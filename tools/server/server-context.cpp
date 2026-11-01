@@ -1215,6 +1215,16 @@ struct server_slot {
     // image, which is a valid checkpoint for a hybrid/recurrent model and nothing at all for
     // a plain one. See the slot setup in server_context::initialize().
     bool checkpoint_image = true;
+    // Token frontier a --kvmem-conversations store swap just installed, or -1. The
+    // parked store comes back with its whole prefix and, for a hybrid model, its
+    // recurrent half -- but not the checkpoint ring, which belongs to the memory it
+    // was detached from. Without this the "no reusable context checkpoint" path
+    // zeroes n_past and re-prefills the entire prompt on every switch back. Consumed
+    // exactly once, by the request whose common prefix ends at this frontier.
+    int32_t kvmem_swap_frontier = -1;
+    // Generated tokens of the turn that just ended, captured before reset() zeroes
+    // stats. The conversation ledger books its tail after that reset.
+    int32_t kvmem_last_n_gen = 0;
 #if defined(LLAMA_KVMEM)
     // Task whose retrieval query span was already published to KVMem. The
     // setter flushes pending harvest, so it must run once per request.
@@ -1555,6 +1565,9 @@ struct server_slot {
         // fork server-context.cpp:2379 -- a recycled slot must not inherit a
         // stale authenticated row from the task that owned it before.
         frontier_logits.pending = false;
+        // Same rule for a restaged conversation-store frontier: it names one
+        // request's common prefix, never the next task's.
+        kvmem_swap_frontier = -1;
 
         // fork 9l-d4b9e: fork server-context.cpp:2380-2388.  A recycled slot
         // must not inherit the previous request's retention limb either: the
@@ -1594,6 +1607,14 @@ struct server_slot {
         task.reset();
 
         // note: callback_on_reset() must have run before this, see release()
+        // The generated tail of the turn that just ended. --kvmem-conversations
+        // books the store on the *next* launch, and by then stats is zero: a chat
+        // client that does not echo the answer back (or that strips reasoning
+        // before re-sending) leaves exactly this many rows for the next request to
+        // mismatch, and booking them as 0 made the slack test read every such
+        // answer as a branch -- so the switch back was refused and the prompt
+        // re-prefilled in full.
+        kvmem_last_n_gen = (int32_t) stats.n_gen;
         stats = {};
         // fork 9l-d4b9h: fork server-context.cpp:2408.
         n_verify_rollback.clear();
@@ -2720,6 +2741,9 @@ struct server_slot {
         }
         prompt.clear();
         swa_windows.clear();
+        // A cleared ledger has no frontier to describe, and the store swap that
+        // set it is gone with the prompt.
+        kvmem_swap_frontier = -1;
         cache_family = {};
         vbr_reuse_capture_frontier = 0;
         vbr_idle_capture_source_reset();
@@ -6337,7 +6361,9 @@ private:
             return;
         }
         if (st.bound >= 0 && !slot.prompt.tokens.empty() && !slot.prompt.tokens.has_media()) {
-            st.table.remember(st.bound, slot.prompt.tokens.get_text_tokens(), (int) slot.stats.n_gen);
+            // slot.kvmem_last_n_gen, not slot.stats.n_gen: the slot was released
+            // between the turn and this booking, and release() zeroes stats.
+            st.table.remember(st.bound, slot.prompt.tokens.get_text_tokens(), (int) slot.kvmem_last_n_gen);
         }
     }
 
@@ -6352,6 +6378,10 @@ private:
         }
         const std::string client = kvmem_store_client_id(raw_client);
 #if defined(LLAMA_KVMEM)
+        // Only a switch performed by this call may arm the frontier below: an
+        // earlier launch's value must not survive a request that reuses the
+        // already-bound store.
+        slot.kvmem_swap_frontier = -1;
         // The request's own prompt, not slot.prompt: that ledger still holds the
         // previous turn at this point and is what this function re-bases.
         const llama_tokens & prompt = request;
@@ -6373,6 +6403,13 @@ private:
                 continue;
             }
             const int lcp = kvmem_store_table::prefix_rows(held.tokens, prompt);
+            // One line per candidate at debug level: "why did the switch back
+            // re-prefill" is otherwise unanswerable, because a store that loses
+            // the match looks exactly like a conversation the server forgot.
+            SRV_DBG("conversation store %d: rows=%zu lcp=%d tail=%zu slack=%d\n",
+                    held.id, held.tokens.size(), lcp,
+                    (size_t) ((int) held.tokens.size() - lcp),
+                    std::max(0, held.last_n_gen) + 64);
             if (lcp <= 0) {
                 continue;
             }
@@ -6399,8 +6436,30 @@ private:
                         llama_memory_seq_rm(mem, 0, best_keep, -1);
                     }
                 }
+                // The checkpoint ring describes the memory we just detached, not
+                // the one we attached. Its entries are snapshots of the outgoing
+                // conversation's recurrent half, taken at positions this
+                // conversation also has, so restoring one silently installs a
+                // foreign state -- and the scan keeps only the newest entry at or
+                // below the common prefix, which is exactly the one those early
+                // checkpoints populate. That is what made a switch back re-prefill
+                // the whole prompt (a residual system-message checkpoint at pos 62
+                // beat the 4125 rows the store had just restaged). Rebuilding the
+                // ring from empty is not a loss: the store carries the entire
+                // prefix, so the ordinary prefix match resumes at its frontier.
+                if (!slot.prompt.checkpoints.empty()) {
+                    if (slot.lifecycle_authority) {
+                        slot.checkpoint_ring_changed();
+                    }
+                    slot.prompt.checkpoints.clear();
+                }
                 slot.prompt.tokens = server_tokens(rows, false);
                 slot.prompt.sequence_epoch = 0;
+                // The restaged rows are a complete state at this frontier, but no
+                // context checkpoint describes them any more (the ring was just
+                // rebuilt from empty above). Say so, or the checkpoint scan reads
+                // "empty ring" as "no reusable state" and re-prefills everything.
+                slot.kvmem_swap_frontier = (int32_t) rows.size();
                 st.table.remember(best, rows, 0);
                 st.bound = best;
                 st.table.touch(best, ++st.tick);
@@ -10076,7 +10135,29 @@ private:
 
                         // fork 9k-b2-i: !complete_vbr_import guard (fork 16566)
                                 // fork 9k-b2-ii: checkpoint selection rewrite (fork 16566-17144)
-                                if (!complete_vbr_import && pos_min >= pos_min_thold) {
+                                // A --kvmem-conversations swap restaged this conversation's
+                                // whole prefix, recurrent half included
+                                // (KVMEM_STORE_ATTACH_RECURRENT), and the checkpoint ring was
+                                // rebuilt from empty because it described the memory we
+                                // detached. The scan below cannot tell that apart from "this
+                                // slot has no usable state": it would find nothing, zero n_past
+                                // and re-prefill the whole prompt on every switch back. So the
+                                // scan is skipped entirely -- but only when the common prefix
+                                // ends exactly at the frontier the swap installed, so nothing
+                                // claims rows the store did not put back.
+                                const bool kvmem_store_frontier =
+                                    slot.kvmem_swap_frontier > 0 && n_past > 0 &&
+                                    n_past == slot.kvmem_swap_frontier;
+                                if (kvmem_store_frontier) {
+                                    slot.cache_status = "resumed at a restaged conversation store frontier";
+                                    SLT_INF(slot,
+                                            "resuming at the restaged conversation store frontier "
+                                            "(n_past = %d; the store is the state, no checkpoint needed)\n",
+                                            n_past);
+                                }
+                                slot.kvmem_swap_frontier = -1;
+
+                                if (!complete_vbr_import && !kvmem_store_frontier && pos_min >= pos_min_thold) {
                                     // Current attention-content lineage epoch(s). A recurrent-only
                                     // checkpoint remains valid across a lossless in-place retier, but not
                                     // across occupied-cell reuse, clear/reset, or state adoption. All-zero

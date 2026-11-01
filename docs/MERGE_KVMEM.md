@@ -89,7 +89,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 |---|---|---|
 | `--kvmem` | 关 | 打开 KVMem 池。要求 `n_seq_max == 1`（即 `--parallel 1`），否则告警并回落到 VBR / 原生 cache |
 | `--kvmem-block-tokens N` | 0 → 32 | 块大小（token）。选择、驱逐、检索都以块为粒度 |
-| `--kvmem-conversations N` | 0 → 所有请求共享一个 store | **仅 server**。保留 N 个 park 在 host 的会话 store，配合请求字段 `kvmem_conversation`（相同的 id 共用一个 store；留空则按 token 前缀匹配）。切 store 需要空闲上下文，所以 `--parallel > 1` 时告警并保持单 store 行为 |
+| `--kvmem-conversations N` | 0 → 所有请求共享一个 store | **仅 server**。保留 N 个 park 在 host 的会话 store，配合请求字段 `kvmem_conversation`（相同的 id 共用一个 store；留空则按 token 前缀匹配，且 store 比请求多出的尾巴必须 ≤ 上一轮生成数 + 64 行才算同一段对话，否则视为分支、另起 store）。切 store 需要空闲上下文，所以 `--parallel > 1` 时告警并保持单 store 行为 |
 | `--kvmem-budget N` | 0 → `n_ctx` | GPU 常驻工作集（token）。**0 = 全常驻、不驱逐**，此时与原生 cache 数值逐位相同。下限是**一次 decode batch**（`-b`）加恒留带：整批 token 在 ubatch 之前就一次性登记，批内不能驱逐，给得比这小会被自动抬到下限并告警一次 |
 | `--kvmem-gen-reserve N` | 0 → 256 | 给 decode 预留的额外 GPU token |
 | `--kvmem-sink-tokens N` | 0 → 一个块 | 永久保留的前缀（attention sink） |
@@ -419,6 +419,82 @@ struct kvmem_ckpt_header { uint32_t magic, version, frontier, has_recr; };
 
 **checkpoint 捕获的代价（27B，冷启动 4070 token prefill，各 3 次）**：开 checkpoint 472/494/492 t/s（中位 492），关掉 493/486/486（中位 486）——**噪声内，不付钱**。
 
+## 多会话切换仍然全量 prefill：三个账本 bug（`--kvmem-conversations`）
+
+**症状**（用户报告，27B + MTP + hybrid，`--kvmem --kvmem-budget 1000 -np 1 -b 512 --kvmem-conversations 4`）：两个对话来回切，每次切回来都整段重算；而且在**同一个**对话里接着问，也仍然整段重算。日志无告警。
+
+三个缺陷叠在同一处，都是「账本和真状态脱节」，但一个套着一个，修掉上一层的症状才能看见下一层。
+
+### 一、checkpoint 环跨 store 泄漏（把别人的 rec 状态装进自己的位置）
+
+`slot.prompt.checkpoints` 是**它此刻这块 memory** 的快照环，但它跟着 slot 走，不跟着 store 走。`kvmem_conv_bind` 换 store 时只换了 token 账本（`slot.prompt.tokens = rows`），环原样留着：
+
+```
+edit/divergence sample (cached/incoming/lcp/reusable/rewind/append/cache_prompt) = (4125/4150/4125/4125/0/25/1)
+checking checkpoint with [62, 62] against 4125...
+restored context checkpoint (pos_min = 62, pos_max = 62, n_tokens = 63, n_past = 63, size = 149.626 MiB)
+```
+
+store 已经把 A 的 4125 行 restage 回来了，但扫描从 `rbegin()` 找**最新且 `pos_max` 不超过公共前缀**的那条——对话 B 留下的 `[62]` 正好符合，于是 `n_past = 63`，剩下的 4087 行全部重算。这个 62 来自 B 的上一轮（B 的 prompt 只有 67 token，所以它的 checkpoint 落在 62）。
+
+⚠️ **这同时是个正确性缺陷**，不只是慢：hybrid/recurrent 的 checkpoint 携带的是**生成它那一刻的 recurrent 行**。把 B 在位置 62 的 GDN 状态装进 A 的位置 62，数值上通得过、日志全绿，输出却是错的。修前一直靠「别的对话恰好没有 checkpoint 落在前缀里」这种运气。
+
+**修法**：换 store 成功时把环清空（`checkpoint_ring_changed()` 走 lifecycle 记账，和 `prompt_clear()` 同一条路）。环属于刚刚被 detach 的那块 memory，换了就不该留着。
+
+### 二、清空环之后：扫描把「空环」读成「没有可复用状态」
+
+清空环之后 `n_past` 反而被清零——`do_reset = it == checkpoints.rend()` ⇒ `forcing full prompt re-processing`。原因是这套扫描只认 checkpoint：**hybrid/recurrent 模型的 token 前缀本身不被信任**（rec 状态无法从 token 重建），所以环空 = 全丢。
+
+但换 store 这一路是有真状态的：store 带回整个前缀，attach 时 `KVMEM_STORE_ATTACH_RECURRENT` 把 recurrent 半边一起装回来。扫描看不到这件事，得明说：
+
+```cpp
+// 只在公共前缀恰好落在刚装回来的那个 frontier 上时才信它
+const bool kvmem_store_frontier =
+    slot.kvmem_swap_frontier > 0 && n_past > 0 && n_past == slot.kvmem_swap_frontier;
+if (!complete_vbr_import && !kvmem_store_frontier && pos_min >= pos_min_thold) { ...扫描... }
+```
+
+`kvmem_swap_frontier` 一次性（bind 入口清 -1，`prompt_clear()`/`reset()` 也清），所以它只可能施惠于「同一请求、同一 frontier」。不能只把 `do_reset` 翻成 false——那样 `it` 仍是 `rend()`，下面会拿空迭代器去 `state_seq_set_data`，日志里是 `E state_seq_set_data: error loading end of buffer` 后紧跟 `restored context checkpoint (n_tokens = 0)`，等于什么都没修。
+
+### 三、`last_n_gen` 在记账时恒为 0（长答案的对话永远匹配不上）
+
+前两层修完，短答案（24 token）已经正常，但**长答案仍然整段重算**：
+
+```
+conversation store 0: rows=3661 lcp=45 tail=3616 slack=64   ← A 的 store 被判成「分支」
+slot 0 started a fresh conversation store 1                  ← 于是造了新 store
+```
+
+`kvmem_conv_bind` 允许 store 比请求多出一截尾巴（客户端不带回复回来时的答案），界限是 `tail <= max(0, last_n_gen) + 64`。而 `last_n_gen` 取的是 `slot.stats.n_gen`——**`release()` 在下一轮 launch 之前就 `reset()` 过了，`stats = {}`**，所以记进账本的永远是 0，界限退化成固定 64 行。答案一超过 64 token（真实对话全都超），store 就被当成「另一段对话」拒掉，于是每次切回都新建 store、整段重算。
+
+**修法**：`reset()` 里在 `stats = {}` 之前把上一轮的生成数存进 `slot.kvmem_last_n_gen`，记账时用它。
+
+### 效果（27B，两对话交替，A1/B1 冷启动，A2 起应为增量）
+
+| | A1 | B1 | A2 | B2 | A3 | A4 |
+|---|---|---|---|---|---|---|
+| 修前 | 4126 | 67 | **4087** | 28 | **4089** | 27 |
+| 修后 | 4126 | 67 | **25**（4125 cached） | 25（66 cached） | 27（4149 cached） | 27（4172 cached） |
+
+单轮墙钟从 8.1 s 降到 1.5 s，`tg` 不变（31 t/s）。A4 修前就是对的，因为 A3→A4 之间没有换 store（`best == st.bound`，环没被动过）——这也是这个 bug 只在「换回来」时出现、看起来像「偶发」的原因。
+
+长答案 + 需要召回的场景（`tmp/cmp/conv_switch_probe.py`：A 文档开头埋码 → B 不相交 → 回 A 问码，贪心）：
+
+| 配置 | A2 prompt_n | 答案 |
+|---|---|---|
+| 修前（`--kvmem-conversations 4`） | 3659（42 cached，= 整段） | **MISS**（答成别的片段） |
+| 修后（同参数） | **260（3441 cached）** | **HIT**（`ZQ7K-3311`） |
+| 参照（`--kvmem-budget 0 -c 4096`，不换 store） | 3659（42 cached） | HIT |
+
+### 顺带验证的两个新架构（`tmp/cmp/archcheck.py`，2600 字符、`--kvmem-budget 512 -b 512`）
+
+| 模型 | 提问轮 `KVMEM_QUERY` | `plan=` |
+|---|---|---|
+| Qwen3-VL-8B-Instruct | `rows=34 blocks=51` | `query_workspace history_pages=49 kept_history=18 workspace=2` |
+| ERNIE-4.5-21B-A3B-Thinking | `rows=74 blocks=52` | `query_workspace history_pages=50 kept_history=18 workspace=2` |
+
+ERNIE 的文档轮仍会打一次 `retrieval_skipped reason=no_query_rows query=[-1,-1)`（模板不声明 `message_delimiters`、冷启动不猜），提问轮正常。两模型的 `selected` 都是散开的块号，不是连续后缀 ⇒ 真检索，不是 recency 退化。
+
 ## Query 行是追加工作区，不是历史（`--kvmem-query-workspace`）
 
 **问题**：`score_retrieval()` 的帧用 `frontier = total_tokens()`，Query 的尾部块既当评分对象又当历史候选，`query_fixed_blocks(retrieval_mandatory())` 把它们记进**同一份** `budget_blocks()`。于是「预算 18 块」实际是 16 块历史 + 2 块 Query —— 同预算下比 fork 少 2 块可召回历史（64 token @ block 32）。
@@ -576,7 +652,7 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 - **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
 - **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。除非要卡上限，别调它。
 - **每个增量回合都要重规划一次**（`begin_cached_turn()`，否则计划会冻死）：追加回合的 prompt eval +5.7%（27B、192 块存储）。
-- **整段状态镜像不可用，checkpoint 镜像只对 hybrid / recurrent 成立**：`--kvmem` 下 prompt cache / `--slot-save-path` 对该槽静默跳过（整段镜像被拒）；context checkpoint 在 hybrid / recurrent 模型上可用（携带 recurrent 行 + frontier），dense 模型仍然没有 checkpoint、改写回复要整段重算。切回旧会话（跨会话）仍要重算（27B / 80k token ≈ 39 min）；多会话复用走 `--kvmem-conversations`，不能用 `-np > 1`（KVMem 会整体不启用）。
+- **整段状态镜像不可用，checkpoint 镜像只对 hybrid / recurrent 成立**：`--kvmem` 下 prompt cache / `--slot-save-path` 对该槽静默跳过（整段镜像被拒）；context checkpoint 在 hybrid / recurrent 模型上可用（携带 recurrent 行 + frontier），dense 模型仍然没有 checkpoint、改写回复要整段重算。**跨会话复用走 `--kvmem-conversations`**（实测切回只 prefill 新增的 25/27 token），不能用 `-np > 1`（KVMem 会整体不启用）。⚠️ 换 store 会把该槽的 checkpoint 环清空（环属于被 detach 的那块 memory），改用一次性 `kvmem_swap_frontier` 认账；store 记账的尾巴界限依赖 `kvmem_last_n_gen`，取错（恒 0）会让任何超过 64 token 的答案把 store 判成「分支」。
 - **单序列**：`--parallel > 1` 时 KVMem 与 KV stream 都不成立，只能回到 VBR / 原生 cache；多会话并发需要 fork 的 conversation store，未移植。
 - **架构**：SWA 模型、纯 recurrent 模型、DFlash 草稿侧都不走 KVMem。
 - **检索轮驱动**：`llama-server` 每请求驱动完整检索轮（前缀 prefill → 采样注意力 → 选择 → 回放后缀）；`llama-completion` 只在 prefill 末尾做一次 `apply_retrieval → pin`。**同一棵树换驱动能差十几个百分点，性能数字不可跨驱动横比**。
