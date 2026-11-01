@@ -417,8 +417,101 @@ on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspac
 - 驻留 +2 块 ⇒ 生成头寸少 2 块（`--kvmem-gen-reserve` 默认 256 = 8 块，够；把它调到 1~2 块会让计划撞 `selection_fits()` 回滚到压力视图）。
 - **端到端命中率不能当判据**：28 深度针扫掠 on 6/28；同一扫描里连「深度 3%（必然在 sink 带内）」都会答错，0.8B 自身不稳。判据用「可召回历史块数」：18 vs 16。
 
+## 检索质量：失忆率实测，和两个把它放大的根因
+
+在此之前所有「检索质量」的结论都只到块数（18 vs 16）。这一节是端到端的**失忆率**，并顺手挖出两个 bug——它们的破坏力远大于 block 记账那 2 块。
+
+### 测法（三个必须先排除的假象）
+
+一篇文档里埋 8 条格式相同、内容唯一的记录（`【档案 KD-i】…备用解锁码 XXXX`），均匀铺在 4%~92% 深度；每条只问一次，**命中 = 答案里出现该条自己的 4 字符码**。3 轮，每轮的 8 个码做随机置换（文档长度不变），于是同一深度在不同轮次坐不同码——24 次探针是 24 次独立抽样，不是 24 次同一个计划。
+
+三个假象，踩过就知道必须排除：
+
+1. **单轮请求 = 整篇文档当 Query**。`message_spans` 只认最后一个 user 轮；一次问完时 Query 就是文档本身，`mandatory` 盖住全部历史，每轮都 `mandatory_exceeds_pool` 回滚到压力视图——测出来的是 recency，不是检索。必须两轮（先发文档 + `已读`，再提问）。
+2. **增量回合根本不重选块**（本节的根因一）。只追加 36 个 token 的回合如果没有重开检索轮，第一轮的计划就冻在那儿了，后面 7 问全在同一份工作集上答。
+3. **架构没接 `kvmem_capture_q()`，评分永远是空的**（根因二）。
+
+### 根因一：`begin_cached_turn()` 移植了函数，没移植调用点
+
+`apply_retrieval()` 成功（或被跳过）之后 server 会 `llama_kvmem_pin_working_set()`，置 `retrieval_pinned_ = true`。而 `want_prefill_capture()` 里带 `!retrieval_pinned_`，唯一清它的是 `llama_memory_kvmem::begin_cached_turn()`——port 里**全树没有调用点**（fork 由 `tools/llama-kvmem-driver.cpp` 在每个缓存回合边界调用）。后果：**第一个回合之后，`want_prefill_capture()` 恒为 false，`llama_kvmem_apply_retrieval()` 一次都不再执行**，工作集冻死在第一轮的计划上。
+
+判据是「本轮有没有计划行」，不是有没有报错——修复前的日志里 `KVMEM_QUERY`、`KVMEM_TRACE plan=`、`KVMEM_TRACE selected` **三个计数全是 0**，而请求全部成功返回。这种失忆没有任何报错。
+
+修法：server 发布本请求的 span 之前，若 `slot.prompt.n_tokens() > 0`（这个请求在继续一个已有行的序列）就 `llama_kvmem_begin_cached_turn()`——flush 解码期 mean-K、丢掉冻结的 Query、清 `keep_selected_`、解除 pinned。**必须在 `set_request_span()` 之前**，顺序反了就把刚发布的 Query 冲掉。
+
+同二进制 A/B（27B，6.1k token 文档，`--kvmem-budget 2048`，8 针 × 3 轮）：
+
+| ARM | 命中 | 失忆率 |
+|---|---|---|
+| 关掉 `begin_cached_turn()`（= 修复前） | 13/24 | **45.8%** |
+| 打开（现在） | 23/24 | **4.2%** |
+| 对照：`--kvmem-method recency`（只留 sink+最近块） | 13/24 | 45.8% |
+
+修复前**逐位等于 recency**——这正是「计划冻在第一轮压力视图」的形状。代价是每回合重规划一次：追加回合的平均 prompt eval **1532 → 1619 ms（+5.7%）**。
+
+### 根因二：`kvmem_capture_q` 只接在 qwen3 / qwen35 上
+
+评分读的是 Query 自己的 K 行，而这些行由各模型 attention builder 里的 `kvmem_capture_q(Qcur, il)` 送进图。port 里只有 `src/models/qwen3.cpp` 和 `qwen35.cpp` 调了它（各 1 处；K/V 同理）。**其它架构（Qwen3-VL、gemma、ERNIE、OLMoE…）跑 `--kvmem` 时 `q_count_` 恒为 0，`score_retrieval()` 第一行 `if(!rows) return;` 直接返回**，计划退化成 sink+最近块，而日志里一切正常。
+
+这一条现在会自己说出来（不再静默）：
+
+```
+KVMEM_TRACE retrieval_skipped reason=no_query_rows query=[2,12531) rows=12539
+W apply_retrieval: no Query K rows were captured for this model, so the retrieval round has
+  nothing to score and the working set stays on the recency plan (only the architectures that
+  call kvmem_capture_q() can be scored)
+```
+
+实测同一个 8B 文档（Qwen3-VL-8B，30000 字符）在「有捕获」和「无捕获」之间就是 46% 与 4% 的差别——**换模型前先看日志有没有 `no_query_rows`**。
+
+### 27B 实测（Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp，6.1k token 文档 = 192 块，`-fa on -ctk/-ctv f16 -dev CUDA0 -b 512 -c 16384`）
+
+| 配置 | 预算 | 保留比例 | 命中 | 失忆率 |
+|---|---|---|---|---|
+| 不用 `--kvmem`（全上下文注意力） | — | 100% | 24/24 | 0% |
+| `--kvmem`，预算装得下（不驱逐） | 8192 | 100% | 24/24 | 0% |
+| `--kvmem` 真驱逐 | 4096 | 67% | 23/24 | 4.2% |
+| `--kvmem` 真驱逐 | 2048 | 33% | 23/24 | 4.2% |
+| 同上 + `--kvmem-query-workspace off` | 2048 | 33% | 23/24 | 4.2% |
+| 同上 + `--kvmem-method recency` | 2048 | 33% | 13/24 | **45.8%** |
+| `--kvmem` 真驱逐 | 1024 | 17% | 19/24 | 20.8% |
+| `--kvmem` 真驱逐 | 512 | 8% | 8/24 | **66.7%** |
+
+两件事值得单独说：
+
+- **kvmem 本身不伤质量**：不驱逐时 100%，与不用 kvmem 逐位相同（24/24）。伤质量的只有驱逐。
+- **新记账（Query 工作区）在这条轴上测不出差别**：on/off 都是 23/24，且 miss 是同一条记录。它不是为端到端命中率准备的，它是补「同预算少 2 块历史」的记账缺口，在 64 块的预算上占 3%，针探针分辨不出来。
+
+### 保留比例才是自变量（把预算换算成「留了文档的百分之几」）
+
+12k token 文档（14656 token = 458 块）补了另一段：
+
+| 保留比例 | 8.3% | 14% | 17% | 28% | 33% | 67% |
+|---|---|---|---|---|---|---|
+| 命中率（检索） | 33% | 58% | 79% | 88% | 96% | 96% |
+| 命中率（recency，33% 处） | — | — | — | — | 54% | — |
+
+绝对预算不说明问题，**预算 / 上下文比**才说明问题：留到 1/3 就能到 96%，留到 1/12 掉到 33%，而同样留 1/3 时纯 recency 只有 54%。所以「kvmem 会不会失忆」= 「预算够不够文档的 1/3」+ 「检索评分有没有真的在跑」。
+
+### 缓解手段实测（12k 文档、预算固定 2048、基线 58.3%）
+
+| 手段 | 命中 | 结论 |
+|---|---|---|
+| `--kvmem-sink-tokens 512 --kvmem-recent-tokens 512` | 41.7% | **更差**：钉住的两条带是从同一份 64 块里扣的，直接少掉 32 块可打分历史 |
+| `--kvmem-graph-alpha 0.25` | 58.3% | 无变化（邻居扩散改变不到弃块决策） |
+| `--kvmem-query-max 256` | 58.3% | 无变化（Query 本来只有 28 token，够不到上限） |
+
+**只有加预算有效。** 想要「质量不掉 + 性能不掉」的可行组合是：把预算设到工作文档的 1/3 上下，并确认日志里没有 `no_query_rows` / `retrieval_skipped`；预算调不下来就只能接受边缘事实被丢。
+
+### 失败形态：不是「不知道」，是「拿邻近记录顶替」
+
+唯一那次 miss 里问的是 needle 1 的 `ZQ7K`，模型答 `P8VT`——同一轮 needle 5 的码。被驱逐的块不是让模型变空，而是让它用还在驻留的**同类记录**填空。这条对实际使用比命中率更值得警惕：失忆看起来像自信的错误答案，而不是「文档里没有」。
+
 ## 已知限制
 
+- **检索评分只对 qwen3 / qwen35 架构成立**：`kvmem_capture_q/k/v` 只在 `src/models/qwen3.cpp`、`qwen35.cpp` 里接进了图。其它架构（Qwen3-VL、gemma、ERNIE、OLMoE…）`q_count_` 恒为 0，计划退化成 sink+最近块；日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告，但请求本身照常成功。实测差距 46% vs 4%（见「检索质量」一节）。要接一个架构只需在其 attention builder 里补 `kvmem_capture_q/k/v` 三个调用。
+- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣），`graph-alpha`、`query-max` 在这个尺度无效（同节）。
+- **每个增量回合都要重规划一次**（`begin_cached_turn()`，否则计划会冻死）：追加回合的 prompt eval +5.7%（27B、192 块存储）。
 - **状态镜像不可用**：`--kvmem` 下 prompt cache / context checkpoint / `--slot-save-path` 对该槽静默跳过（`state_write/read` 拒绝），切回旧会话要整段重算（27B / 80k token ≈ 39 min）。要多会话复用走 `--kvmem-conversations`，不能用 `-np > 1`（KVMem 会整体不启用）。
 - **单序列**：`--parallel > 1` 时 KVMem 与 KV stream 都不成立，只能回到 VBR / 原生 cache；多会话并发需要 fork 的 conversation store，未移植。
 - **架构**：SWA 模型、纯 recurrent 模型、DFlash 草稿侧都不走 KVMem。

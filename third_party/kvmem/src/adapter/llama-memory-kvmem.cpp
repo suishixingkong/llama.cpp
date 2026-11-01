@@ -5350,6 +5350,27 @@ void llama_memory_kvmem::apply_retrieval() {
     };
     uint32_t need = 0;
     uint32_t cap = 0;
+    // Scoring reads the Query's own K rows, and only the architectures whose
+    // attention builder calls kvmem_capture_q() produce them (today qwen3 and
+    // qwen35). With no rows score_retrieval() returns immediately, the plan
+    // degenerates to sink+recency, and the round still reports success -- a
+    // model that never scored looks exactly like a model that scored badly.
+    // Name the condition here rather than let it pass as a retrieval result.
+    if (q_count_.empty() || *std::max_element(q_count_.begin(), q_count_.end()) == 0) {
+        static bool warned_no_query = false;
+        if (!warned_no_query) {
+            warned_no_query = true;
+            LLAMA_LOG_WARN("%s: no Query K rows were captured for this model, so the retrieval "
+                    "round has nothing to score and the working set stays on the recency plan "
+                    "(only the architectures that call kvmem_capture_q() can be scored)\n", __func__);
+        }
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=no_query_rows query=[%d,%d) rows=%u\n",
+                    query_begin_, query_end_, rows);
+        }
+        harvest_flush();
+        return;
+    }
     if (retrieval_mandatory_over_budget(need, cap)) {
         // The span alone outgrows the pool, so no honest plan exists. Scoring
         // it would only let query_fixed_blocks() throw on a required block.

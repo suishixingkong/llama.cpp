@@ -20,6 +20,7 @@
 // this target's include path on purpose: the server owns no KVMem state.
 extern "C" void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
 extern "C" void llama_kvmem_begin_retrieval_round(void);
+extern "C" void llama_kvmem_begin_cached_turn(void);
 extern "C" void llama_kvmem_accept_retrieval_round(void);
 extern "C" void llama_kvmem_apply_retrieval(struct llama_context * ctx);
 extern "C" void llama_kvmem_pin_working_set(void);
@@ -11040,6 +11041,22 @@ private:
                     // before the first ubatch: the setter flushes pending harvest.
                     if (params_base.kvmem.enabled && slot.kvmem_span_task != slot.task->id) {
                         slot.kvmem_span_task = slot.task->id;
+                        if (slot.prompt.n_tokens() > 0) {
+                            // This request continues a sequence that already holds
+                            // rows. The previous turn ended by pinning the working set
+                            // for decode (llama_kvmem_pin_working_set), and a pinned
+                            // context answers want_prefill_capture() with false -- so
+                            // without this call no later turn ever scores again and
+                            // the working set stays frozen on the plan built for the
+                            // first Query. That is invisible while the first turn's
+                            // question is still the current one; it shows up as the
+                            // model losing facts the second question needs, because
+                            // the blocks that question would have chosen were already
+                            // dropped for the first. The fork does this inside its
+                            // driver at every cached-turn boundary; the port never
+                            // ported the caller, only the function.
+                            llama_kvmem_begin_cached_turn();
+                        }
                         int32_t q_begin = -1;
                         int32_t q_end   = -1;
                         for (auto it = spans.spans.rbegin(); it != spans.spans.rend(); ++it) {
