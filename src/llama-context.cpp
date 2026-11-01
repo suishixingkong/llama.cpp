@@ -3710,6 +3710,17 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+#if defined(LLAMA_KVMEM)
+    // Reserve has to build the widest graph this context can later run, KVMem capture nodes
+    // included. The scheduler never shrinks a compute buffer, so a node that first shows up at
+    // inference time grows the buffer mid-run and the teardown check then reports a size that
+    // no longer matches what was reserved. The probe emits the nodes without registering them.
+    struct reserve_probe_guard {
+        reserve_probe_guard()  { llama_kvmem_set_reserve_probe(true);  }
+        ~reserve_probe_guard() { llama_kvmem_set_reserve_probe(false); }
+    } reserve_probe;
+#endif
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);

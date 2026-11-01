@@ -5952,6 +5952,12 @@ bool llama_kvmem_gdn_replay_commit(llama_context * ctx, uint32_t n_keep) {
 }
 
 bool llama_kvmem_want_decode_mean(void) {
+    if (llama_kvmem_reserve_probe_active()) {
+        // Reserve wants the widest graph, not the current decision: emit the node here and let
+        // the real condition decide at inference time.
+        const llama_kvmem_params * kp = llama_kvmem_get_params();
+        return kp && kp->enabled && (kp->method == 1 || kp->harvest_v);
+    }
     llama_memory_kvmem * mem = kvmem_capture_active();
     return mem && mem->want_decode_mean();
 }
@@ -5991,6 +5997,9 @@ bool llama_kvmem_want_prefill_capture(void) {
     if (kp->method != 1 && !kp->harvest_v && getenv("KVMEM_DUMP_CAPTURE") == nullptr) {
         return false;
     }
+    if (llama_kvmem_reserve_probe_active()) {
+        return true;
+    }
     llama_memory_kvmem * mem = kvmem_capture_active();
     if (!mem) {
         return false;
@@ -5999,6 +6008,10 @@ bool llama_kvmem_want_prefill_capture(void) {
 }
 
 bool llama_kvmem_want_q_capture(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) {
+    if (llama_kvmem_reserve_probe_active()) {
+        const llama_kvmem_params * kp = llama_kvmem_get_params();
+        return kp && kp->enabled && (kp->method == 1 || kp->harvest_v);
+    }
     llama_memory_kvmem * mem = kvmem_capture_active();
     if (!mem || !mem->want_q_capture()) {
         return false;

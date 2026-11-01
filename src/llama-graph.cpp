@@ -1628,7 +1628,11 @@ static void kvmem_capture_impl(ggml_context * ctx0, ggml_cgraph * gf, ggml_tenso
     ggml_format_name(src, "kvmem_%s-%d", tag, il);
     ggml_set_output(src);
     ggml_build_forward_expand(gf, src);
-    llama_kvmem_register_capture(src, il, tag[0]);
+    // A reserve graph carries these nodes to size the compute buffer, but they must never be
+    // registered: the harvest path would later write reserve tensors into a real capture.
+    if (!llama_kvmem_reserve_probe_active()) {
+        llama_kvmem_register_capture(src, il, tag[0]);
+    }
 #else
     GGML_UNUSED(ctx0);
     GGML_UNUSED(gf);

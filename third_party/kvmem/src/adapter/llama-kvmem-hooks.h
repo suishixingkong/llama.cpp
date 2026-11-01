@@ -90,6 +90,14 @@ LLAMA_API bool llama_kvmem_eval_callback(struct ggml_tensor * t, bool ask, void 
 
 // Graph-build / post-compute capture (LLAMA_KVMEM process_ubatch hook).
 LLAMA_API void llama_kvmem_register_capture(struct ggml_tensor * t, int il, char which);
+// A reserve graph has to be a superset of every graph the context can later run: the
+// scheduler never shrinks a compute buffer, so a node that first appears at inference time
+// grows the buffer mid-run and the teardown size check reports a mismatch. While this probe
+// is on, the capture hooks emit their nodes unconditionally and skip registration, because a
+// reserve tensor must never be harvested into a real capture. Nestable (call with false to
+// leave one level).
+LLAMA_API void llama_kvmem_set_reserve_probe(bool on);
+LLAMA_API bool llama_kvmem_reserve_probe_active(void);
 LLAMA_API void llama_kvmem_capture_attention(struct ggml_context*,struct ggml_cgraph*,
     struct ggml_tensor* q,struct ggml_tensor* k,struct ggml_tensor* mask,float scale,
     float max_bias,float softcap,int layer);

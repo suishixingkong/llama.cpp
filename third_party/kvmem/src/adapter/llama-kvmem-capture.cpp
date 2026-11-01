@@ -17,6 +17,24 @@ void kvmem_capture_bind(llama_memory_kvmem * mem) {
     kvmem_current_execution().memory = mem;
 }
 
+namespace {
+// Per build thread: the graph is built and reserved on the thread that owns the context,
+// and nothing else reads this flag. Counted so nested reserves unwind correctly.
+thread_local int g_reserve_probe = 0;
+}
+
+void llama_kvmem_set_reserve_probe(bool on) {
+    if (on) {
+        ++g_reserve_probe;
+    } else if (g_reserve_probe > 0) {
+        --g_reserve_probe;
+    }
+}
+
+bool llama_kvmem_reserve_probe_active(void) {
+    return g_reserve_probe > 0;
+}
+
 llama_memory_kvmem * kvmem_capture_active() {
     return kvmem_current_execution().memory;
 }
