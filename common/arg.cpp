@@ -3405,6 +3405,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVMEM_GEN_RESERVE"));
     add_opt(common_arg(
+        {"--kvmem-coarse-threshold"}, "N",
+        string_format("scored context (tokens) from which a round ranks blocks with a cheap layer "
+                      "subset before the exact pass; 0 always scores every block "
+                      "(default: %d)", params.kvmem.coarse_threshold),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KVMem coarse threshold must be non-negative");
+            }
+            params.kvmem.coarse_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_COARSE_THRESHOLD"));
+    add_opt(common_arg(
         {"--kvmem-sink-tokens"}, "N",
         string_format("always-kept prefix in tokens; 0 keeps one block (default: %d)", params.kvmem.sink_tokens),
         [](common_params & params, int value) {

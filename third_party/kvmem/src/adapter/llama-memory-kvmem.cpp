@@ -1215,6 +1215,7 @@ llama_memory_kvmem::llama_memory_kvmem(
                 "would multiply turbo cache rows, which no mat-vec kernel accepts\n", __func__);
     }
     graph_alpha_ = kvmem_current_execution().params.graph_alpha;
+    coarse_threshold_ = kvmem_current_execution().params.coarse_threshold;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
 
     if (ext_kv) {
@@ -1660,6 +1661,7 @@ bool llama_memory_kvmem::conv_compatible(const llama_memory_kvmem & other) const
         rt_cfg_.store.lrfu_top_fraction == other.rt_cfg_.store.lrfu_top_fraction &&
         score_agg_ == other.score_agg_ &&
         query_meanq_cosine_ == other.query_meanq_cosine_ && graph_alpha_ == other.graph_alpha_ &&
+        coarse_threshold_ == other.coarse_threshold_ &&
         rt_cfg_.store.select_budget == other.rt_cfg_.store.select_budget &&
         rt_cfg_.cpu_bytes == other.rt_cfg_.cpu_bytes;
 }
@@ -4963,26 +4965,81 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
         config.sink_blocks,config.recent_blocks,fixed);
     kvmem::PageQueryView query{nullptr,q_count_.data(),n_layer_,rows,n_head_,n_head_kv_,n_embd_head_,layers.data()};
     std::vector<double> scores;
+    // Two-stage scoring. A round that scores every block exactly costs one read of the
+    // whole mean-K mirror per block per layer; past a few tens of thousands of tokens
+    // that is the largest single item in the round, and most of it is spent on blocks
+    // the selection will not take. So above `coarse_threshold_` the round ranks every
+    // block with a cheap layer subset first and then spends the exact pass on the
+    // survivors only. The shortlist is `4 x budget` (at least 64 blocks): wide enough
+    // that the exact top-K keeps landing inside it, small enough to be worth the split.
+    // Below the threshold the extra pass would cost time and buy nothing, so every
+    // block is still scored exactly -- the only shape with no recall risk.
+    const uint32_t n_blocks = uint32_t(frame.starts.size());
+    std::vector<uint8_t> shortlist;
+    std::vector<uint32_t> subset_rows;
+    uint32_t kept = 0;
+    uint32_t subset_layers = 0;
+    if (coarse_threshold_ && frontier >= coarse_threshold_ && n_blocks > 64) {
+        kept = std::max<uint32_t>(64, 4*policy.budget_blocks());
+        if (kept < n_blocks) {
+            std::vector<uint32_t> active;
+            for (uint32_t il = 0; il < n_layer_; ++il) if (q_count_[il]) active.push_back(il);
+            const uint32_t want_layers = std::min<uint32_t>(4, std::max<uint32_t>(1, (uint32_t) active.size()/4));
+            const uint32_t step = std::max<uint32_t>(1, (uint32_t) active.size()/want_layers);
+            subset_rows.assign(n_layer_, 0);
+            // Evenly spaced participating layers: adjacent ones carry almost the same
+            // direction, so a contiguous slice ranks worse than a spread for the same cost.
+            for (size_t i = 0; i < active.size() && subset_layers < want_layers; i += step) {
+                const uint32_t il = active[i];
+                subset_rows[il] = q_count_[il];
+                ++subset_layers;
+            }
+            shortlist.assign(n_blocks, 0);
+            for (auto id : fixed) if (id < n_blocks) shortlist[id] = 1;
+        }
+    }
+    auto run_scorer = [&](const kvmem::PageQueryView & view, const kvmem::QueryScoreFrame & fr,
+                          const std::vector<uint8_t> * mask) {
+        const auto aggregation = score_agg_ ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
+        const uint32_t n = uint32_t(fr.starts.size());
+        if (query_meanq_cosine_) {
+            return kvmem::mean_query_cosine_scores(*raw_,view,n,aggregation,mask);
+        }
+#ifdef KVMEM_PAGE_SOFTMAX_CUDA
+        if(!query_scorer_) {
+            int device=0;
+            if(cudaGetDevice(&device)!=cudaSuccess) throw std::runtime_error("KVMem Query CUDA device unavailable");
+            query_scorer_=std::make_unique<kvmem::PageSoftmaxCuda>(device);
+        }
+        return query_scorer_->score(*raw_,view,fr,aggregation);
+#else
+        (void) mask;
+        return kvmem::page_softmax_scores(*raw_,view,fr,aggregation);
+#endif
+    };
     // Only the boundary page can have grown during the probe. Restore its
     // prefix mean temporarily; native KV and persistent statistics stay intact.
     const auto previous = prefix ? raw_->mean_checkpoint(frontier) : std::vector<float>{};
     if (prefix) raw_->restore_mean_checkpoint(frontier,prefix->values);
     try {
-        const auto aggregation = score_agg_ ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
-        if (query_meanq_cosine_) {
-            scores=kvmem::mean_query_cosine_scores(*raw_,query,uint32_t(frame.starts.size()),aggregation);
-        } else {
-#ifdef KVMEM_PAGE_SOFTMAX_CUDA
-            if(!query_scorer_) {
-                int device=0;
-                if(cudaGetDevice(&device)!=cudaSuccess) throw std::runtime_error("KVMem Query CUDA device unavailable");
-                query_scorer_=std::make_unique<kvmem::PageSoftmaxCuda>(device);
+        auto exact_frame = frame;
+        if (!shortlist.empty()) {
+            kvmem::PageQueryView subset = query;
+            subset.layer_rows = subset_rows.data();
+            const std::vector<double> coarse = run_scorer(subset, frame, nullptr);
+            std::vector<uint32_t> order;
+            order.reserve(n_blocks);
+            for (uint32_t b = 0; b < n_blocks; ++b) if (!shortlist[b]) order.push_back(b);
+            std::partial_sort(order.begin(), order.begin() + std::min<size_t>(kept, order.size()),
+                    order.end(), [&](uint32_t a, uint32_t b) { return coarse[a] > coarse[b]; });
+            for (size_t i = 0; i < order.size() && i < kept; ++i) shortlist[order[i]] = 1;
+            exact_frame.score_mask.assign(n_blocks, 0);
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                if (shortlist[b] && frame.score_mask[b]) exact_frame.score_mask[b] = 1;
             }
-            scores=query_scorer_->score(*raw_,query,frame,aggregation);
-#else
-            scores=kvmem::page_softmax_scores(*raw_,query,frame,aggregation);
-#endif
         }
+        scores = shortlist.empty() ? run_scorer(query, frame, nullptr)
+                                   : run_scorer(query, exact_frame, &shortlist);
         if (graph_alpha_ > 0)
             scores=kvmem::propagate_query_scores(scores,frame,prefix ? prefix->graph : graph_,graph_alpha_);
     } catch (...) {
@@ -4991,9 +5048,11 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
     }
     if (prefix) raw_->restore_mean_checkpoint(frontier,previous);
     runtime_->store().set_retrieval_scores(scores);
-    kvmem_diag("KVMEM_QUERY scorer=%s agg=%s lrfu=%d graph_alpha=%.6g rows=%u blocks=%zu\n",
+    kvmem_diag("KVMEM_QUERY scorer=%s agg=%s lrfu=%d graph_alpha=%.6g rows=%u blocks=%zu "
+        "coarse=%d threshold=%llu kept=%u layers=%u\n",
         query_meanq_cosine_ ? "meanq-cosine" : "page-softmax",score_agg_ ? "max" : "mean",
-        int(config.lrfu),graph_alpha_,rows,scores.size());
+        int(config.lrfu),graph_alpha_,rows,scores.size(),
+        int(!shortlist.empty()),(unsigned long long) coarse_threshold_,kept,subset_layers);
 }
 
 void llama_memory_kvmem::accept_retrieval_round() {

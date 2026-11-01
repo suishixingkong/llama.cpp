@@ -109,6 +109,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem-method {recency,retrieval}` | `retrieval` | `recency` 只按新近度选块（不采样、不评分，最省）；`retrieval` 用 Query 注意力给每块打分 |
 | `--kvmem-query-scorer {page-softmax,meanq-cosine}` | `page-softmax` | 检索评分器。`page-softmax` 逐行 softmax 后聚合；`meanq-cosine` 用平均 Query 向量做余弦 |
 | `--kvmem-score-agg {mean,max}` | 评分器默认 | 行级分数聚合成块分数的方式 |
+| `--kvmem-coarse-threshold N` | **32768** | 被打分上下文达到 N token 时改走两阶段：先用少量层给所有块粗排，再对 `max(64, 4×budget_blocks)` 个候选做精确全层打分。`0` = 永远全量精确（唯一没有召回风险的形态）。判据日志 `KVMEM_QUERY ... coarse=1 threshold=... kept=... layers=...`。详见「两阶段打分」 |
 | `--kvmem-lrfu` / `--no-kvmem-lrfu` | 评分器默认 | 是否把历史命中率（LRFU）混进块分数 |
 | `--kvmem-lrfu-lambda X` | 0.5 | 历史衰减，`[0,1]` |
 | `--kvmem-lrfu-top-frac X` | 0.9 | 视为「命中」的历史分位，`(0,1]` |
@@ -160,6 +161,37 @@ KVMem budget auto: n_ctx=8192 ratio=0.33 device_cap_tokens=699008 gen_reserve=10
 - 显式给 `--kvmem-budget N` ⇒ 立刻关闭自适应，打出来的数就是它（低于下限仍会被抬起并告警一次）。
 - 要回到「全常驻、与原生 cache 逐位相同」的老行为：`--kvmem-budget 0 --no-kvmem-budget-auto`。
 - 这条只决定 **GPU 常驻量**，不改选择策略；预算比与失忆率的关系见下文「检索质量」。
+
+### 两阶段打分（`--kvmem-coarse-threshold`，默认 32768）
+
+一轮检索要给**每个**块算一次分，每次都要读一遍 mean-K 镜像（每块 × 每个参与层）。上下文一长，
+这一步就成了整轮里最大的单项，而花掉的绝大部分算力落在**选择根本不会取**的块上。
+
+`--kvmem-coarse-threshold N`（单位 token，作用在**被打分的 frontier** 上）：达到 N 时，这一轮先
+用**少量层**（参与层里等距抽 1–4 个）给所有块赔一个粗分，取前 `max(64, 4 × budget_blocks)` 块作为
+候选（`mandatory` 那批无条件入选），再只对这些候选做**精确全层**打分。低于 N 一律全量精确 ——
+这是唯一没有召回风险的形态，所以默认值放在「全量精确还只是噪声」的边界之上（实测 16k 上下
+两阶段能省掉 38% 的评分时间，谈不上值得为此改语义）。
+
+判据（Qwen3.5-2B，40 k 字符 ≈ 15 986 token、`-c 32768 --kvmem-budget 1024`、`KVMEM_PERF=1`）：
+
+| | `score_ms` | 整轮 `total_ms` | 选块 |
+|---|---|---|---|
+| `--kvmem-coarse-threshold 0`（全量精确） | 21.16 | 33.57 | 33 块 |
+| `--kvmem-coarse-threshold 1024`（两阶段） | **13.19** | **26.19** | 33 块，其中 32 块与上一行逐位相同 |
+
+日志多出三个字段，可直接看出走了哪条路：
+
+```
+KVMEM_QUERY scorer=page-softmax agg=mean lrfu=0 graph_alpha=0.2 rows=31 blocks=501 coarse=1 threshold=1024 kept=128 layers=1
+```
+
+- `coarse=0` ⇒ 这一轮全量精确（默认在 32k 以下都是这个）。
+- `kept` 是候选块数；`kept >= blocks` 时自动退回全量精确。
+- ⚠️ **粗筛是近似**：129 块、预算 512 的小样本上实测 19 个选块里有 4 个不同（约 20%）。
+  块数越少、候选带越窄，分歧越大；因此阈值以下不给这条路径，且 `kept` 至少 64 块。
+- ⚠️ 未被选进候选的块得分为 0，LRFU 的反馈也就看不到它们；默认 LRFU 关，不受影响。
+
 
 ### reserve 图必须包含捕获节点
 

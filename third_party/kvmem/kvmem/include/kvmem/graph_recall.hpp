@@ -41,7 +41,8 @@ float recall_fp16(float value);
 std::vector<double> page_softmax_scores(const RawKvStore&, PageQueryView,
                                       const QueryScoreFrame&, GqaScoreAggregation = GqaScoreAggregation::Mean);
 std::vector<double> mean_query_cosine_scores(const RawKvStore&, PageQueryView,
-                                           uint32_t blocks, GqaScoreAggregation);
+                                           uint32_t blocks, GqaScoreAggregation,
+                                           const std::vector<uint8_t>* block_mask = nullptr);
 
 struct GraphEdge { uint64_t target = 0; double mass = 0; };
 struct GraphRow {

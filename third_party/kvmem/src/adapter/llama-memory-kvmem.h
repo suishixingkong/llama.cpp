@@ -489,6 +489,9 @@ private:
     int score_agg_ = 0;
     bool query_meanq_cosine_ = false;
     double graph_alpha_ = 0.2;
+    // Scored frontier from which the round splits into a cheap ranking pass and an
+    // exact pass over the survivors. 0 keeps every round exact.
+    uint64_t coarse_threshold_ = 0;
     kvmem::RawKvStoreConfig raw_cfg_{};
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;

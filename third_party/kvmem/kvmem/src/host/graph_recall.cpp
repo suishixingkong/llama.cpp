@@ -296,7 +296,8 @@ std::vector<double> page_softmax_scores(const RawKvStore& keys, PageQueryView q,
 }
 
 std::vector<double> mean_query_cosine_scores(const RawKvStore& keys, PageQueryView q,
-                                           uint32_t blocks, GqaScoreAggregation aggregation) {
+                                           uint32_t blocks, GqaScoreAggregation aggregation,
+                                           const std::vector<uint8_t>* block_mask) {
     check((q.data || q.layer_data) && q.layer_rows && q.layers && q.rows && q.query_heads &&
           q.kv_heads && q.head_dim && q.query_heads%q.kv_heads == 0 &&
           q.layers == keys.config().n_layer && uint64_t(q.kv_heads)*q.head_dim == keys.config().n_embd_k,
@@ -312,7 +313,7 @@ std::vector<double> mean_query_cosine_scores(const RawKvStore& keys, PageQueryVi
             sums[size_t(l)*width+d] += base[size_t(t)*width+d];
     }
     return mean_key_retrieval_scores(keys,blocks,{sums.data(),q.layer_rows,q.layers,q.head_dim,
-        q.query_heads,q.kv_heads,aggregation});
+        q.query_heads,q.kv_heads,aggregation,block_mask ? block_mask->data() : nullptr});
 }
 
 size_t GraphSnapshot::bytes() const {

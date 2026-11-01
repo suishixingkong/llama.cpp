@@ -19,6 +19,10 @@ struct MeanKeyQueryView {
     uint32_t query_heads = 0;
     uint32_t kv_heads = 0;
     GqaScoreAggregation aggregation = GqaScoreAggregation::Mean;
+    // Optional shortlist: a block whose slot is zero is left unscored (score 0) instead
+    // of being read. A two-stage round ranks every block with a cheaper key subset and
+    // then spends the exact pass only on the survivors; the caller owns that trade.
+    const uint8_t* block_mask = nullptr;
 };
 
 // Mean mode averages Q over query rows and each GQA group before cosine.

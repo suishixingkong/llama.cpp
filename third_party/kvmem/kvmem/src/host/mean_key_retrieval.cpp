@@ -51,6 +51,7 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
     if (!active_layers) return scores;
     std::vector<float> key(static_cast<size_t>(key_width));
     for (uint32_t block = 0; block < blocks; ++block) {
+        if (query.block_mask && !query.block_mask[block]) continue;
         if (!keys.has_block(block)) continue;
         double total = 0.0;
         for (uint32_t layer = 0; layer < query.layers; ++layer) {
