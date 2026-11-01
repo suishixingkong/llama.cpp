@@ -92,9 +92,15 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
                     LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
+            // KVMem retrieval scores query rows against stored pre-RoPE keys, so both sides
+            // are captured before their rotation (see qwen3.cpp).
+            kvmem_capture_q(Qcur, il);
+            kvmem_capture_v(Vcur, il);
+
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
+            kvmem_capture_k(Kcur, il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);

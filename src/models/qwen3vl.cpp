@@ -99,6 +99,10 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
+            // KVMem retrieval scores query rows against the stored pre-RoPE keys, so both
+            // sides are captured before their rotation (see qwen3.cpp).
+            kvmem_capture_q(Qcur, il);
+
             Qcur = ggml_rope_multi(
                     ctx0, Qcur, inp_pos, nullptr,
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -107,6 +111,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
 
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
+            kvmem_capture_k(Kcur, il);
 
             Kcur = ggml_rope_multi(
                     ctx0, Kcur, inp_pos, nullptr,
@@ -117,6 +122,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
+            kvmem_capture_v(Vcur, il);
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,

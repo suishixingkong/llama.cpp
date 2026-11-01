@@ -232,6 +232,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
+            // KVMem retrieval scores query rows against stored pre-RoPE keys, so both sides
+            // are captured before their rotation (see qwen3.cpp).
+            kvmem_capture_q(Qcur, il);
+
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                  ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Qcur, "Qcur_pos", il);
@@ -265,6 +269,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_normed", il);
             cb(Vcur, "Vcur_normed", il);
+            kvmem_capture_k(Kcur, il);
+            kvmem_capture_v(Vcur, il);
 
             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                  ext_factor, attn_factor, beta_fast, beta_slow);

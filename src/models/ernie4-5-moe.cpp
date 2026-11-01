@@ -37,6 +37,11 @@ llama_model_ernie4_5_moe::graph::graph(const llama_model & model, const llm_grap
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
+            // KVMem retrieval scores query rows against stored pre-RoPE keys, so both sides
+            // are captured before their rotation (see qwen3.cpp). This model has no q/k norm.
+            kvmem_capture_q(Qcur, il);
+            kvmem_capture_k(Kcur, il);
+
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                                  ext_factor, attn_factor, beta_fast, beta_slow);
 
@@ -46,6 +51,7 @@ llama_model_ernie4_5_moe::graph::graph(const llama_model & model, const llm_grap
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
+            kvmem_capture_v(Vcur, il);
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, NULL, model.layers[il].wo_s,

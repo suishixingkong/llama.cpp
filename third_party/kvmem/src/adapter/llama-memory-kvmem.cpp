@@ -3136,11 +3136,24 @@ void llama_memory_kvmem::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 llama_pos llama_memory_kvmem::seq_pos_min(llama_seq_id seq_id) const {
-    return kv_->seq_pos_min(seq_id);
+    // Hybrid half present: mirror llama_memory_hybrid, whose min is the LARGER of the two
+    // children's mins and whose max is the SMALLER of the two maxes. That is what makes a
+    // hybrid state a point-in-time state: the recurrent row has one position and the pair
+    // collapses onto it, so seq_pos_min == seq_pos_max == the recurrent frontier. Reporting
+    // the cells' own window here instead would (a) advertise a resident range the recurrent
+    // half cannot honour and (b) make the server reject every hybrid checkpoint capture with
+    // "[frontier-validity] seq_pos_min != seq_pos_max".
+    if (!recr_) {
+        return kv_->seq_pos_min(seq_id);
+    }
+    return std::max(kv_->seq_pos_min(seq_id), recr_->seq_pos_min(seq_id));
 }
 
 llama_pos llama_memory_kvmem::seq_pos_max(llama_seq_id seq_id) const {
-    return kv_->seq_pos_max(seq_id);
+    if (!recr_) {
+        return kv_->seq_pos_max(seq_id);
+    }
+    return std::min(kv_->seq_pos_max(seq_id), recr_->seq_pos_max(seq_id));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdown() const {
@@ -3158,25 +3171,71 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdow
 // conversation, and the packed bytes for the restored frontier no longer exist. Every
 // decode then dies in restore_partial_tail() and the slot never recovers.
 //
-// So the image is refused on both sides. With the writer refusing, the size probe returns
-// 0 and every caller skips the save (server: "prompt cache save skipped: zero-size
-// state"); with the reader refusing, any image that still arrives -- from another build,
-// a --prompt-cache file, a --slot-save-path dump -- fails closed instead of half
-// restoring, and the caller re-prefills.
+// What a KVMem state image CAN be is a checkpoint: the store is already persistent, so the
+// only thing a mid-prompt snapshot has to carry is the half the store cannot rebuild --
+// the recurrent (GDN/SSM) rows and the frontier they belong to. Restoring means "truncate
+// the store back to P, install the recurrent state as of P"; every attention row below P
+// is still where it was, and the cells are re-materialised from it on demand.
+//
+// Hence the split by flag, which is exactly the split the callers already make:
+//   LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY -> checkpoint capture/restore (server). Supported.
+//   flags == NONE                      -> whole-sequence image (prompt cache, whole-context
+//                                         save, --slot-save-path). Those name a state by
+//                                         tokens and expect to rebuild it in a memory that
+//                                         may hold a different conversation, so they stay
+//                                         refused; the size probe returns 0 and the caller
+//                                         skips the save ("zero-size state").
+namespace {
+struct kvmem_ckpt_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t frontier;   // store rows the recurrent rows below describe
+    uint32_t has_recr;
+};
+constexpr uint32_t KVMEM_CKPT_MAGIC   = 0x4d564b43; // 'KVMx'
+constexpr uint32_t KVMEM_CKPT_VERSION = 1;
+} // namespace
+
 void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    (void) io;
-    (void) seq_id;
-    (void) flags;
-    throw std::runtime_error("KVMem keeps the history in the host store; an engine state image "
-            "holds only the pool cells and cannot rebuild it");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        throw std::runtime_error("KVMem keeps the history in the host store; a whole-sequence state "
+                "image holds only the pool cells and cannot rebuild it");
+    }
+    const bool has_recr = recr_ && recr_->seq_pos_max(seq_id) >= 0;
+    const kvmem_ckpt_header hdr = { KVMEM_CKPT_MAGIC, KVMEM_CKPT_VERSION, store_n_tokens(),
+        (uint32_t) has_recr };
+    io.write(&hdr, sizeof(hdr));
+    if (has_recr) {
+        recr_->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_kvmem::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    (void) io;
-    (void) seq_id;
-    (void) flags;
-    throw std::runtime_error("KVMem cannot adopt an engine state image: its cells describe a "
-            "resident window of another store, not this sequence's history");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        throw std::runtime_error("KVMem cannot adopt a whole-sequence state image: its cells describe "
+                "a resident window of another store, not this sequence's history");
+    }
+    kvmem_ckpt_header hdr = {};
+    io.read(&hdr, sizeof(hdr));
+    if (hdr.magic != KVMEM_CKPT_MAGIC || hdr.version != KVMEM_CKPT_VERSION) {
+        throw std::runtime_error("KVMem checkpoint image is not usable by this build");
+    }
+    if (!runtime_ || store_n_tokens() < hdr.frontier) {
+        // The checkpoint names a frontier this store no longer covers (a different
+        // conversation was attached, or the history was cleared). Fail closed: the server
+        // drops this checkpoint and reprocesses instead of installing a truncated history
+        // under a frontier that claims more.
+        throw std::runtime_error("KVMem checkpoint frontier is beyond this store");
+    }
+    truncate_cached(hdr.frontier);
+    ++attention_epoch_;
+    content_->change_execution();
+    if (hdr.has_recr) {
+        if (!recr_) {
+            throw std::runtime_error("KVMem checkpoint carries recurrent rows this memory has no home for");
+        }
+        recr_->state_read(io, seq_id, flags);
+    }
 }
 
 void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
@@ -5327,6 +5386,13 @@ bool llama_memory_kvmem::set_tail_mean(uint32_t row, const llama_kvmem_tail_mean
 
 void llama_memory_kvmem::apply_retrieval() {
     if (method_ != 1) { harvest_flush(); return; }
+    // Settle the capture before looking at it. Prefill capture is submitted to the
+    // D2H pipe and committed by harvest_flush(); on the batched path the rows of the
+    // ubatch that just ran are not in q_count_ until that happens. Scoring used to
+    // read q_count_ first and skip the round as "no_query_rows" whenever the flush
+    // had not landed yet -- the same model scored or did not score depending on which
+    // capture path the scheduler picked for its tensor layout.
+    harvest_flush();
     // Roll back to the prefill pressure view instead of trimming a plan into
     // the pool. The fork gets this for free: it refuses the Query replay and
     // keeps the view the first prefill pass built. There is no replay pass

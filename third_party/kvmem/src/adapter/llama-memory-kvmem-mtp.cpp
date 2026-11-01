@@ -334,20 +334,55 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem_mtp::memory_brea
     return kv_->memory_breakdown();
 }
 
-// Same refusal as the target: the draft cells are a window over a store the image does
-// not carry. See llama_memory_kvmem::state_write().
+// The draft's history is a window over its own packed store too, so a whole-sequence image
+// is refused for the same reason as the target's (see llama_memory_kvmem::state_write).
+// A checkpoint image is different: it only has to name the frontier the draft's cells and
+// packed rows describe, because everything below it is already here. Restoring truncates
+// back to that frontier -- cells above it are dropped, not reinterpreted -- so the draft
+// resumes from a state the same prompt prefix produced.
+namespace {
+struct kvmem_mtp_ckpt_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t frontier;
+    uint32_t pad;
+};
+constexpr uint32_t KVMEM_MTP_CKPT_MAGIC   = 0x4d564d4b; // 'KVMm'
+constexpr uint32_t KVMEM_MTP_CKPT_VERSION = 1;
+} // namespace
+
 void llama_memory_kvmem_mtp::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    (void) io;
-    (void) seq_id;
-    (void) flags;
-    throw std::runtime_error("KVMem draft cache is not serializable as an engine state image");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        throw std::runtime_error("KVMem draft cache is not serializable as a whole-sequence state image");
+    }
+    const llama_pos top = kv_->seq_pos_max(seq_id);
+    const kvmem_mtp_ckpt_header hdr = { KVMEM_MTP_CKPT_MAGIC, KVMEM_MTP_CKPT_VERSION,
+        (uint32_t) (top >= 0 ? top + 1 : 0), 0 };
+    io.write(&hdr, sizeof(hdr));
 }
 
 void llama_memory_kvmem_mtp::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    (void) io;
-    (void) seq_id;
-    (void) flags;
-    throw std::runtime_error("KVMem draft cache cannot adopt an engine state image");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        throw std::runtime_error("KVMem draft cache cannot adopt a whole-sequence state image");
+    }
+    kvmem_mtp_ckpt_header hdr = {};
+    io.read(&hdr, sizeof(hdr));
+    if (hdr.magic != KVMEM_MTP_CKPT_MAGIC || hdr.version != KVMEM_MTP_CKPT_VERSION) {
+        throw std::runtime_error("KVMem draft checkpoint image is not usable by this build");
+    }
+    const llama_pos top = kv_->seq_pos_max(seq_id);
+    if (top >= 0 && (uint32_t) (top + 1) < hdr.frontier) {
+        // The draft has already lost rows the checkpoint's frontier covers; dropping the
+        // tail here would leave a hole the draft would happily attend across.
+        throw std::runtime_error("KVMem draft checkpoint frontier is beyond this store");
+    }
+    if (hdr.frontier == 0) {
+        clear(true);
+        return;
+    }
+    if (target_) target_->note_attention_change();
+    truncate_cached(hdr.frontier);
+    kv_->seq_rm(seq_id, (llama_pos) hdr.frontier, -1);
 }
 
 void llama_memory_kvmem_mtp::register_capture(struct ggml_tensor * t, int il, char which) {

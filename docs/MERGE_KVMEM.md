@@ -358,7 +358,11 @@ cd tmp/build-kvmem-on && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|mem
 
 16 个 kvmem 单测全过。日志在 `tmp/cmp/matrix/`、`tmp/cmp/bench/`、`tmp/cmp/ppl_*.log`。
 
-## 引擎状态镜像对 KVMem 无效：写入与读取都拒绝
+## 引擎状态镜像：整段镜像拒绝，checkpoint 镜像支持
+
+一条线索下的两个结论。「整段镜像」指按 token 命名、要能在**另一个** memory 里重建的历史（prompt cache、`--slot-save-path`、整段 context 保存）；「checkpoint 镜像」指槽自己活内存的时间点快照（`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`），只在 prompt 的公共前缀下取用。
+
+### 整段镜像：写入与读取都拒绝
 
 **症状**（用户报告，27B + MTP + hybrid，`--kvmem --kvmem-budget 1000 -np 1 -b 512`）：对话 A 正常，切到对话 B 正常，**切回 A 就永久失败**——
 
@@ -384,6 +388,36 @@ E srv decode: Context size has been exceeded.
 | 27B（MTP + hybrid），80484 token，四轮切换 | 四轮全 ok、错误 0 |
 
 **代价**：槽没有镜像就只剩「活内存」，切回旧对话要整段重算。27B / 80k token / `--kvmem-budget 1000` 实测 **34 t/s ≈ 39 分钟**一轮。多会话要复用只能走 `--kvmem-conversations`；`-np 2` 不行——KVMem 在 `n_seq_max > 1` 时**整体不启用**（`KVMem requires n_seq_max=1`，静默退回原生 cache）。
+
+### checkpoint 镜像：hybrid / recurrent 模型支持，顺带修掉「每轮全量 prefill」
+
+**症状**（用户报告，27B + MTP + hybrid，`--kvmem-budget 1000`）：没有崩，但**单会话每轮都整段重算**，像完全没有 KV cache；`--kvmem-conversations 4` 也一样。
+
+**根因**：上一节把三段镜像入口全关了，其中 `create_checkpoint()` 是**回滚**唯一的依靠。聊天界面几乎从不把 assistant 的回复原样送回：它剥掉 reasoning、裁掉尾巴、改标点。任何这种改写都让缓存 prompt 在回复开头处发散，server 于是 rewind 到「最新的、位置不晚于发散点的 checkpoint」——而 checkpoint 被关掉之后一个都没有，只能 `forcing full prompt re-processing`。
+
+**修法**：KVMem 的历史在 host store 里，store 是持久的，所以 checkpoint 真正需要携带的只有**store 造不出来的那一半**：recurrent（GDN/SSM）行，以及它们所属的 frontier。
+
+```c
+struct kvmem_ckpt_header { uint32_t magic, version, frontier, has_recr; };
+// write: header + recr_->state_write(...)     （store_n_tokens() 就是 frontier）
+// read : header; frontier 超出本 store ⇒ throw（fail closed，丢掉这个 checkpoint 重算）
+//        truncate_cached(frontier); recr_->state_read(...)
+```
+
+配套三处：`seq_pos_min/seq_pos_max` 在有 recurrent 半边时按 `llama_memory_hybrid` 的规则折叠（min 取两者较大、max 取两者较小 ⇒ `seq_pos_min == seq_pos_max == recurrent frontier`），否则 server 的 `[frontier-validity]` 会拒绝每一次捕获；`server_slot::checkpoint_image = !kvmem || (hybrid || recurrent)`（attention-only 模型在 KVMem 下依然无法 checkpoint：store 造不出 attention 那一半）；`state_image` 继续为 false，所以 prompt cache / slot-save 仍然静默跳过。
+
+**A/B（27B，12k 字符文档 ≈ 4070 token，每轮把回复改写成前 8 个字符，`--kvmem-budget 2048`）**：
+
+| 配置 | turn 1 | turn 2 | `forcing full prompt re-processing` |
+|---|---|---|---|
+| `--ctx-checkpoints 0`（= 修前） | pp=4098（8.1 s） | pp=4127（6.7 s） | 2 |
+| 默认（checkpoint 镜像可用） | **pp=32（1.9 s）** | **pp=34（1.3 s）** | **0**，`restored context checkpoint` ×2 |
+
+用户的 `--kvmem-budget 1000` 同形复测：`pp=32 / pp=34`，`full_reprocess=0`。2B（Qwen3.5-2B，同样是 hybrid）也是 `pp=30 / pp=30`、`restored ×2`。
+
+⚠️ 只对 hybrid / recurrent 成立。dense 模型在 `--kvmem` 下依旧没有 checkpoint，改写回复仍然整段重算——那部分要等 store 能造出 attention 半边（或 fork 的 replay）才有解。
+
+**checkpoint 捕获的代价（27B，冷启动 4070 token prefill，各 3 次）**：开 checkpoint 472/494/492 t/s（中位 492），关掉 493/486/486（中位 486）——**噪声内，不付钱**。
 
 ## Query 行是追加工作区，不是历史（`--kvmem-query-workspace`）
 
@@ -449,20 +483,36 @@ on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspac
 
 修复前**逐位等于 recency**——这正是「计划冻在第一轮压力视图」的形状。代价是每回合重规划一次：追加回合的平均 prompt eval **1532 → 1619 ms（+5.7%）**。
 
-### 根因二：`kvmem_capture_q` 只接在 qwen3 / qwen35 上
+### 根因二：`kvmem_capture_q` 原来只接在 qwen3 / qwen35 上（现已铺开，但铺开后又露出两个）
 
-评分读的是 Query 自己的 K 行，而这些行由各模型 attention builder 里的 `kvmem_capture_q(Qcur, il)` 送进图。port 里只有 `src/models/qwen3.cpp` 和 `qwen35.cpp` 调了它（各 1 处；K/V 同理）。**其它架构（Qwen3-VL、gemma、ERNIE、OLMoE…）跑 `--kvmem` 时 `q_count_` 恒为 0，`score_retrieval()` 第一行 `if(!rows) return;` 直接返回**，计划退化成 sink+最近块，而日志里一切正常。
+评分读的是 Query 自己的 K 行，而这些行由各模型 attention builder 里的 `kvmem_capture_q(Qcur, il)` 送进图。原先只有 `src/models/qwen3.cpp` 和 `qwen35.cpp` 调了它（各 1 处；K/V 同理）。**其它架构跑 `--kvmem` 时 `q_count_` 恒为 0，`score_retrieval()` 第一行 `if(!rows) return;` 直接返回**，计划退化成 sink+最近块，而日志里一切正常。实测同一个 8B 文档（Qwen3-VL-8B，30000 字符）在「有捕获」和「无捕获」之间就是 46% 与 4% 的差别。
 
-这一条现在会自己说出来（不再静默）：
+现在接入的架构（`kvmem_capture_q/k/v`，一次调用约 6 行，位置在 norm 之后、RoPE 之前——评分比的是 **pre-RoPE** K）：
+
+| 文件 | 架构 | 状态 |
+|---|---|---|
+| `qwen3.cpp` / `qwen35.cpp` | qwen3 / qwen3.5 | 原有 |
+| `qwen3vl.cpp` / `qwen3vlmoe.cpp` | Qwen3-VL | 新增，**实测有 QUERY 行、选块散开** |
+| `olmoe.cpp` | OLMoE | 新增，**实测同上** |
+| `ernie4-5.cpp` / `ernie4-5-moe.cpp` | ERNIE-4.5（含 21B-A3B） | 新增，**实测同上** |
+| `gemma4.cpp` | gemma-4 | 新增（该架构 SWA ⇒ KVMem 直接跳过：`W llama_memory_kvmem_maybe_create: KVMem skips SWA models`，钩子目前是惰性的） |
+
+铺开之后，同一台机器上“勾了但不出行”的模型暴露了两个更隐蔽的问题：
+
+**(a) 模板不声明分隔符 ⇒ 没有 Query span。** `q_begin` 来自 `slot.task->params.message_spans`，那是从 chat template 的 `message_delimiters` 里拆出来的；ERNIE-4.5 的模板没有这项 ⇒ `q_begin = -1` ⇒ 整轮不评分，日志只有一句 `retrieval_skipped ... query=[-1,-1)`。修法：span 为空且这个序列**已有** token 时，用「本轮新增、序列里还没有的那些行」当 Query（`[slot.prompt.n_tokens(), slot.task->n_tokens())`）；冷启动 prompt 不猜，留给 sink/recency。对 follow-up 轮，这就是 fork 里 replay 后缀工作区的那一段。
+
+**(b) 捕获是异步的，评分读得太早。** prefill 捕获走 D2H 管道，`harvest_flush()` 才把行落进 `q_count_`；`apply_retrieval()` 原本先看 `q_count_`、再在回滚分支里 flush。于是**同一个模型会不会评分取决于调度器给它的张量挑了哪条捕获路径**：走同步路径的（Qwen3-VL、OLMoE）当场有行，走 batched D2H 路径的（ERNIE-4.5-21B）永远读到 0，打一句 `no_query_rows` 就退化成 recency，日志全绿。修法：`apply_retrieval()` 进门先 `harvest_flush()` 再判空。
+
+判据（修复前后都适用）：**`KVMEM_QUERY` / `KVMEM_TRACE plan=` / `KVMEM_TRACE selected` 三个计数不能是 0**；`selected` 的块号必须散开（`0 1 14 15 30 40 41 42 43 44 48 49 51 65 69 70 84 85 86 87`），是一段连续尾巴就是 recency。三架构复测（2000 字符文档、`--kvmem-budget 512 --kvmem-gen-reserve 128`）：
 
 ```
-KVMEM_TRACE retrieval_skipped reason=no_query_rows query=[2,12531) rows=12539
-W apply_retrieval: no Query K rows were captured for this model, so the retrieval round has
-  nothing to score and the working set stays on the recency plan (only the architectures that
-  call kvmem_capture_q() can be scored)
+OLMoE      plan=query_workspace history_pages=86 kept_history=18 workspace=2
+           selected 0 1 14 15 30 40 41 42 43 44 48 49 51 65 69 70 84 85 86 87
+Qwen3-VL   plan=query_workspace history_pages=39 kept_history=18 workspace=1
+           selected 0 1 2 3 6 7 13 14 15 16 17 18 19 20 22 23 32 38 39
+ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
+           selected 0 1 2 3 4 7 8 14 15 16 17 18 19 20 21 22 23 39 40 41
 ```
-
-实测同一个 8B 文档（Qwen3-VL-8B，30000 字符）在「有捕获」和「无捕获」之间就是 46% 与 4% 的差别——**换模型前先看日志有没有 `no_query_rows`**。
 
 ### 27B 实测（Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp，6.1k token 文档 = 192 块，`-fa on -ctk/-ctv f16 -dev CUDA0 -b 512 -c 16384`）
 
@@ -507,12 +557,26 @@ W apply_retrieval: no Query K rows were captured for this model, so the retrieva
 
 唯一那次 miss 里问的是 needle 1 的 `ZQ7K`，模型答 `P8VT`——同一轮 needle 5 的码。被驱逐的块不是让模型变空，而是让它用还在驻留的**同类记录**填空。这条对实际使用比命中率更值得警惕：失忆看起来像自信的错误答案，而不是「文档里没有」。
 
+## 本轮改动对性能的影响（架构捕获 + checkpoint 镜像 + flush 竞态）
+
+`llama-bench -m Qwen3.5-0.8B-Q4_K_M -p 4096 -n 128 -b 512 -r 3 -dev CUDA0 --kvmem --kvmem-budget 576`，同一构建目录、同一时段，改动前后各 3 轮：
+
+| | pp4096 (t/s) | tg128 (t/s) |
+|---|---|---|
+| 改动前（`f9cf1326b`） | 12497 / 12388 / 12422 → **中位 12422** | 277.81 / 277.80 / 268.97 → **中位 277.80** |
+| 改动后 | 12539 / 12535 / 12378 → **中位 12535（+0.9%）** | 278.80 / 279.55 / 277.11 → **中位 278.80（+0.4%）** |
+
+两项都在 ±1.5% 噪声地板内 ⇒ **没有可测代价**。原因也直接：捕获钩子只在 `want_q_capture()` 为真时才往图里加节点（bench 不跑检索轮），checkpoint 只在 checkpoint 边界多写 recurrent 行，`harvest_flush()` 进门那次在无待处理拷贝时是空操作。
+
+**退出时那条 `compute buffer size ... does not match expectation` 警告**（用户报的 `179.2345 MiB vs 149.2346 MiB`）= 30 MiB：`llama_context` 析构时比对「调度器实际分配」与「reserve 时估计」。reserve 用的是不含捕获节点的图，而真跑起来的 prefill 图里多出了 pre-rope Q/K 与 D2H 拷贝的输出（`ggml_set_output` + `ggml_build_forward_expand`），调度器因此把 buffer 长到了 179 MiB。**是诊断不是错误**：长出来的就是实际用的那份，不会泄漏，也不影响结果；`~llama_context` 只在退出时打一次。
+
 ## 已知限制
 
-- **检索评分只对 qwen3 / qwen35 架构成立**：`kvmem_capture_q/k/v` 只在 `src/models/qwen3.cpp`、`qwen35.cpp` 里接进了图。其它架构（Qwen3-VL、gemma、ERNIE、OLMoE…）`q_count_` 恒为 0，计划退化成 sink+最近块；日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告，但请求本身照常成功。实测差距 46% vs 4%（见「检索质量」一节）。要接一个架构只需在其 attention builder 里补 `kvmem_capture_q/k/v` 三个调用。
-- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣），`graph-alpha`、`query-max` 在这个尺度无效（同节）。
+- **检索评分覆盖的架构**：`kvmem_capture_q/k/v` 已接在 qwen3、qwen35、qwen3vl、qwen3vlmoe、olmoe、ernie4-5、ernie4-5-moe、gemma4 上（gemma4 因 SWA 不走 KVMem，钩子惰性）。其余架构仍然 `q_count_` 恒为 0、计划退化成 sink+最近块，日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告。要接一个架构只需在其 attention builder 里补三个调用（norm 之后、RoPE 之前）。
+- **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
+- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。除非要卡上限，别调它。
 - **每个增量回合都要重规划一次**（`begin_cached_turn()`，否则计划会冻死）：追加回合的 prompt eval +5.7%（27B、192 块存储）。
-- **状态镜像不可用**：`--kvmem` 下 prompt cache / context checkpoint / `--slot-save-path` 对该槽静默跳过（`state_write/read` 拒绝），切回旧会话要整段重算（27B / 80k token ≈ 39 min）。要多会话复用走 `--kvmem-conversations`，不能用 `-np > 1`（KVMem 会整体不启用）。
+- **整段状态镜像不可用，checkpoint 镜像只对 hybrid / recurrent 成立**：`--kvmem` 下 prompt cache / `--slot-save-path` 对该槽静默跳过（整段镜像被拒）；context checkpoint 在 hybrid / recurrent 模型上可用（携带 recurrent 行 + frontier），dense 模型仍然没有 checkpoint、改写回复要整段重算。切回旧会话（跨会话）仍要重算（27B / 80k token ≈ 39 min）；多会话复用走 `--kvmem-conversations`，不能用 `-np > 1`（KVMem 会整体不启用）。
 - **单序列**：`--parallel > 1` 时 KVMem 与 KV stream 都不成立，只能回到 VBR / 原生 cache；多会话并发需要 fork 的 conversation store，未移植。
 - **架构**：SWA 模型、纯 recurrent 模型、DFlash 草稿侧都不走 KVMem。
 - **检索轮驱动**：`llama-server` 每请求驱动完整检索轮（前缀 prefill → 采样注意力 → 选择 → 回放后缀）；`llama-completion` 只在 prefill 末尾做一次 `apply_retrieval → pin`。**同一棵树换驱动能差十几个百分点，性能数字不可跨驱动横比**。

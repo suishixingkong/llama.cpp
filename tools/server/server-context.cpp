@@ -1210,6 +1210,11 @@ struct server_slot {
     // "Context size has been exceeded" after switching conversations. The slot then
     // keeps its live memory and re-prefills what it no longer holds.
     bool state_image = true;
+    // False when even a checkpoint image would not describe this memory's history. KVMem
+    // keeps the attention side in its host store and only the recurrent half travels in the
+    // image, which is a valid checkpoint for a hybrid/recurrent model and nothing at all for
+    // a plain one. See the slot setup in server_context::initialize().
+    bool checkpoint_image = true;
 #if defined(LLAMA_KVMEM)
     // Task whose retrieval query span was already published to KVMem. The
     // setter flushes pending harvest, so it must run once per request.
@@ -4251,9 +4256,27 @@ private:
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
         // initialize slots
+        //
+        // Two different images, two different answers for KVMem.
+        //
+        // A prompt-cache entry is named by tokens and may be restored into a memory holding
+        // another conversation, so its image has to rebuild the whole history; KVMem's
+        // history is the host store, so `state_image` stays false and the save is skipped.
+        //
+        // A context checkpoint is not that: it is a point-in-time snapshot of the slot's own
+        // live memory, taken and consumed strictly under the prompt's common prefix. For a
+        // hybrid/recurrent model the only part a store cannot rebuild is the recurrent half,
+        // which is exactly what `llama_memory_kvmem::state_write` now carries (plus the
+        // frontier). Without these checkpoints every rewind -- and a chat turn that drops the
+        // generated suffix always rewinds -- falls back to "forcing full prompt re-processing
+        // due to lack of cache data", which is what made a plain single conversation re-prefill
+        // its whole prompt on every turn.
+        const bool kvmem_ckpt = params_base.kvmem.enabled &&
+                (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
-            slots.back().state_image = !params_base.kvmem.enabled;
+            slots.back().state_image      = !params_base.kvmem.enabled;
+            slots.back().checkpoint_image = !params_base.kvmem.enabled || kvmem_ckpt;
         }
 
         // try speculative decoding
@@ -7487,8 +7510,8 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
                            bool is_replay_boundary = false, llama_state_seq_flags tgt_extra_flags = 0) {
-        if (!slot.state_image) {
-            // KVMem: see server_slot::state_image. No image is produced, so none is
+        if (!slot.checkpoint_image) {
+            // KVMem: see server_slot::checkpoint_image. No image is produced, so none is
             // restored, so no frontier can be installed over a store that cannot cover it.
             return;
         }
@@ -11070,6 +11093,24 @@ private:
                             }
                             break;
                         }
+                        // No user span means this chat template did not declare the
+                        // message delimiters the span finder needs, which is true of every
+                        // template written before that mechanism existed (ERNIE-4.5 is one).
+                        // Without a span the adapter scores nothing, prints
+                        // "retrieval_skipped reason=no_query_rows" once, and leaves the
+                        // working set on the recency plan -- so "the model has the capture
+                        // hooks" and "the model retrieves" would be two different things.
+                        //
+                        // Fall back to what is unambiguously new in this request: the rows
+                        // this sequence does not hold yet. On a cold prompt that is the whole
+                        // prompt and there is no history to choose between, so the round is
+                        // left alone (span stays unset); on a follow-up turn it is the
+                        // assistant's last reply plus this turn's user message, which is what
+                        // the fork's replay would append as its suffix workspace.
+                        if (q_begin < 0 && slot.prompt.n_tokens() > 0) {
+                            q_begin = (int32_t) slot.prompt.n_tokens();
+                            q_end   = (int32_t) slot.task->n_tokens();
+                        }
                         // --kvmem-query-max is enforced where the span lands, in
                         // the adapter, so a CLI or perplexity span is capped by
                         // the same policy. Hand over the whole user turn.
@@ -11214,9 +11255,9 @@ private:
                     // for hybrid/recurrent models, lower the checkpoint threshold so short prompts also get checkpointed
                     const int checkpoint_min_tokens = (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
-                    // KVMem: see server_slot::state_image. This is the ONE capture path for
-                    // the live loop, so it is where the images stop being produced.
-                    do_checkpoint = do_checkpoint && slot.state_image;
+                    // KVMem: see server_slot::checkpoint_image. This is the ONE capture path
+                    // for the live loop, so it is where the images stop being produced.
+                    do_checkpoint = do_checkpoint && slot.checkpoint_image;
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
