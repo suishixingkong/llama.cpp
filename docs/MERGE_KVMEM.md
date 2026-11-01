@@ -100,7 +100,9 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem` | 关 | 打开 KVMem 池。要求 `n_seq_max == 1`（即 `--parallel 1`），否则告警并回落到 VBR / 原生 cache |
 | `--kvmem-block-tokens N` | 0 → 32 | 块大小（token）。选择、驱逐、检索都以块为粒度 |
 | `--kvmem-conversations N` | 0 → 所有请求共享一个 store | **仅 server**。保留 N 个 park 在 host 的会话 store，配合请求字段 `kvmem_conversation`（相同的 id 共用一个 store；留空则按 token 前缀匹配，且 store 比请求多出的尾巴必须 ≤ 上一轮生成数 + 64 行才算同一段对话，否则视为分支、另起 store）。切 store 需要空闲上下文，所以 `--parallel > 1` 时告警并保持单 store 行为 |
-| `--kvmem-budget N` | 0 → `n_ctx` | GPU 常驻工作集（token）。**0 = 全常驻、不驱逐**，此时与原生 cache 数值逐位相同。下限是**一次 decode batch**（`-b`）加恒留带：整批 token 在 ubatch 之前就一次性登记，批内不能驱逐，给得比这小会被自动抬到下限并告警一次 |
+| `--kvmem-budget N` | 不给 → 自适应 | GPU 常驻工作集（token）。**给了数字就固定用它**，同时关掉自适应；`0` 配合 `--no-kvmem-budget-auto` 才是「全常驻、不驱逐」，此时与原生 cache 数值逐位相同。下限是**一次 decode batch**（`-b`）加恒留带：整批 token 在 ubatch 之前就一次性登记，批内不能驱逐，给得比这小会被自动抬到下限并告警一次 |
+| `--kvmem-budget-auto` / `--no-kvmem-budget-auto` | **开** | 不给 `--kvmem-budget` 时，工作集 = `min(设备装得下的块, n_ctx × ratio)`。判据日志：`KVMem budget auto: n_ctx=... ratio=... device_cap_tokens=... -> budget=... (N blocks, X% of ctx)` |
+| `--kvmem-budget-ratio X` | 0.33 | 自适应时工作集占 `n_ctx` 的最大份额。1/3 是实测召回 96% 的点；1/6 → 79%、1/8 → 58%，不要往下调 |
 | `--kvmem-gen-reserve N` | **1024**（写 0 取同一默认） | 给 decode 预留的额外 GPU token，与 fork 对齐（port 早期是 256）。⚠️ **GPU 上真正分配的池 = `budget + gen_reserve`**（按块对齐，再受设备 KV 容量约束），所以 `--kvmem-budget 1000` 实际是 `1000 + 1024 = 2024` token ≈ 63 块，而 `budget` 只是其中「可给历史用」的那部分 |
 | `--kvmem-sink-tokens N` | 0 → 一个块 | 永久保留的前缀（attention sink） |
 | `--kvmem-recent-tokens N` | 0 → 压力下保留最新尾部 | 永久保留的后缀 token 数 |
@@ -142,10 +144,39 @@ llama-server -m model.gguf -c 32768 --parallel 1 --kvmem --kvmem-budget 8192
 llama-bench -m model.gguf -p 4096 -n 128 -b 512 --kvmem --kvmem-budget 576
 ```
 
+### 自适应工作集（`--kvmem-budget-auto`，默认开）
+
+不给 `--kvmem-budget` 时，工作集取两边较小值：
+
+- **设备装得下多少**：`cap_blocks`（已扣权重、`gen_reserve` 和调度器图，取剩余显存的 `--kvmem-gpu-ratio`，默认 50%）× 块大小；
+- **值得装多少**：`n_ctx × --kvmem-budget-ratio`（默认 1/3）。
+
+再夹进 `n_ctx`，并抬到下限（恒留带 + 一次 decode batch）。启动时记一行，可直接判读：
+
+```
+KVMem budget auto: n_ctx=8192 ratio=0.33 device_cap_tokens=699008 gen_reserve=1024 -> budget=2720 (85 blocks, 33.2% of ctx)
+```
+
+- 显式给 `--kvmem-budget N` ⇒ 立刻关闭自适应，打出来的数就是它（低于下限仍会被抬起并告警一次）。
+- 要回到「全常驻、与原生 cache 逐位相同」的老行为：`--kvmem-budget 0 --no-kvmem-budget-auto`。
+- 这条只决定 **GPU 常驻量**，不改选择策略；预算比与失忆率的关系见下文「检索质量」。
+
+### reserve 图必须包含捕获节点
+
+`--kvmem` 上下文退出时曾打印：
+
+```
+CUDA0 compute buffer size of 179.2345 MiB, does not match expectation of 149.2346 MiB
+```
+
+不是泄漏。reserve 用的图当时不含捕获节点：适配器把 pre-RoPE 的 Q/K 标成 `ggml_set_output`（harvest 要在整个 ubatch 之后读它们），而 output 张量不能与后续层复用内存，于是**首个真实 ubatch** 时调度器必须扩容 —— 可 `backend_buf_exp_size` 早在 reserve 时就记下了较小的数。
+
+现在 `graph_reserve()` 全程持有 `llama_kvmem_set_reserve_probe()`：捕获钩子无条件建节点，但**不登记**（reserve 张量绝不能进真实捕获）。同一请求下 2B 的 CUDA0 compute buffer 从 55.16 MiB 变成 89.02 MiB，而图节点数仍是 1179 —— 多出来的是 output 标记带来的内存不可复用。运行期不再出现第二次 `sched_reserve`，**峰值不变**：那 34 MiB 以前是在运行期才分配的，现在提前到 reserve 阶段。
+
 ## 环境变量
 
 **参数等价物**：每个 `--kvmem-*` 都有对应的 `LLAMA_ARG_KVMEM_*`（llama.cpp 的通用机制），例如 `LLAMA_ARG_KVMEM=1`、`LLAMA_ARG_KVMEM_BUDGET=2048`、`LLAMA_ARG_KVMEM_METHOD=recency`。完整集合：
-`LLAMA_ARG_KVMEM`、`_BLOCK_TOKENS`、`_BUDGET`、`_GEN_RESERVE`、`_SINK_TOKENS`、`_RECENT_TOKENS`、`_METHOD`、`_QUERY_SCORER`、`_SCORE_AGG`、`_LRFU`、`_LRFU_LAMBDA`、`_LRFU_TOP_FRAC`、`_GRAPH_ALPHA`、`_QUERY_BEGIN`、`_QUERY_END`、`_FORCE_POS`、`_MTP_STATE`、`_GPU_RATIO`、`_GPU_HIGH`、`_GPU_LOW`、`_HOST_MIB`、`_DISK_MIB`、`_DISK_PATH`、`_CPU_GB`、`_HARVEST_V`。
+`LLAMA_ARG_KVMEM`、`_BLOCK_TOKENS`、`_BUDGET`、`_BUDGET_AUTO`、`_BUDGET_RATIO`、`_GEN_RESERVE`、`_SINK_TOKENS`、`_RECENT_TOKENS`、`_METHOD`、`_QUERY_SCORER`、`_SCORE_AGG`、`_LRFU`、`_LRFU_LAMBDA`、`_LRFU_TOP_FRAC`、`_GRAPH_ALPHA`、`_QUERY_BEGIN`、`_QUERY_END`、`_FORCE_POS`、`_MTP_STATE`、`_GPU_RATIO`、`_GPU_HIGH`、`_GPU_LOW`、`_HOST_MIB`、`_DISK_MIB`、`_DISK_PATH`、`_CPU_GB`、`_HARVEST_V`。
 
 **诊断/调试开关**（都只影响日志或诊断，不影响数值）：
 
@@ -661,12 +692,20 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 - **检索评分覆盖的架构**：`kvmem_capture_q/k/v` 已接在 qwen3、qwen35、qwen3vl、qwen3vlmoe、olmoe、ernie4-5、ernie4-5-moe、gemma4 上（gemma4 因 SWA 不走 KVMem，钩子惰性）。其余架构仍然 `q_count_` 恒为 0、计划退化成 sink+最近块，日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告。要接一个架构只需在其 attention builder 里补三个调用（norm 之后、RoPE 之前）。
 - **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
 - **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。除非要卡上限，别调它。
+- **LRFU 默认关，实测没有收益（27B、8 针 × 2 轮、`--kvmem-budget 2048`）**：
+
+  | 配置 | 命中 | 失忆率 | 回滚 |
+  |---|---|---|---|
+  | 默认（page-softmax，LRFU off） | 15/16 | 6.2% | 1 |
+  | `--kvmem-lrfu` | 15/16 | 6.2% | 1 |
+
+  选块列表与基线**逐位相同**，连 miss 的那根针（深度 0.166 的 `ZQ7K`，第二轮被 `Y4KB` 挤掉）都一样。原因：这个 probe 里每根针最多被问两次，LRFU 依赖的历史命中率没有足够样本；而第二轮本身已经稳定，没有它可修的抖动。换成长会话反复追问同一主题才可能体现，在拿到那个证据前保持默认关。
 - **每个增量回合都要重规划一次**（`begin_cached_turn()`，否则计划会冻死）：追加回合的 prompt eval +5.7%（27B、192 块存储）。
 - **整段状态镜像不可用，checkpoint 镜像只对 hybrid / recurrent 成立**：`--kvmem` 下 prompt cache / `--slot-save-path` 对该槽静默跳过（整段镜像被拒）；context checkpoint 在 hybrid / recurrent 模型上可用（携带 recurrent 行 + frontier），dense 模型仍然没有 checkpoint、改写回复要整段重算。**跨会话复用走 `--kvmem-conversations`**（实测切回只 prefill 新增的 25/27 token），不能用 `-np > 1`（KVMem 会整体不启用）。⚠️ 换 store 会把该槽的 checkpoint 环清空（环属于被 detach 的那块 memory），改用一次性 `kvmem_swap_frontier` 认账；store 记账的尾巴界限依赖 `kvmem_last_n_gen`，取错（恒 0）会让任何超过 64 token 的答案把 store 判成「分支」。
 - **单序列**：`--parallel > 1` 时 KVMem 与 KV stream 都不成立，只能回到 VBR / 原生 cache；多会话并发需要 fork 的 conversation store，未移植。
 - **架构**：SWA 模型、纯 recurrent 模型、DFlash 草稿侧都不走 KVMem。
 - **检索轮驱动**：`llama-server` 每请求驱动完整检索轮（前缀 prefill → 采样注意力 → 选择 → 回放后缀）；`llama-completion` 只在 prefill 末尾做一次 `apply_retrieval → pin`。**同一棵树换驱动能差十几个百分点，性能数字不可跨驱动横比**。
-- **`--kvmem-budget` 必须 ≥ 一次 decode batch**（自动抬升，见仲裁表）；想让工作集更小就同时降 `-b`。
+- **`--kvmem-budget` 必须 ≥ 一次 decode batch**（自动抬升，见仲裁表）；想让工作集更小就同时降 `-b`。不给 `--kvmem-budget` 时改由 `--kvmem-budget-auto` 决定（`min(设备容量, n_ctx × 1/3)`），所以「不写 budget」**不再等于全常驻**。
 - **`--kvmem-gpu-low` 目前是死代码**：压力计划每次只裁到 `budget_blocks`，调 high/low 不改变压力事件数。
 - **CPU 后端**：只有 `-dev none`（纯 CPU）能用 host 池；`-ngl 0` 但 CUDA 设备可见时会报 `multi-GPU layer requires every attention KV tensor on its model layer's GPU`。
 - **检索评分只支持 FP16 范围内的操作数**：`recall_fp16` 拒绝 |x| > 65504，个别大模型的 mean-K 超界时整轮检索被跳过（日志 `KVMem retrieval round skipped: recall operand exceeds FP16 range`），退化为压力/新近度选择；不是崩溃，但那一轮用不上注意力评分。
