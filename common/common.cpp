@@ -2063,6 +2063,8 @@ static void common_arm_kvmem(const common_params & params, bool enable) {
     kp.enabled            = true;
     kp.block_tokens       = (uint32_t) std::max(params.kvmem.block_tokens,  0);
     kp.budget             = (uint32_t) std::max(params.kvmem.budget,        0);
+    kp.budget_auto        = params.kvmem.budget_auto;
+    kp.budget_ratio       = params.kvmem.budget_ratio;
     kp.gen_reserve        = (uint32_t) std::max(params.kvmem.gen_reserve,   0);
     kp.sink_tokens        = (uint32_t) std::max(params.kvmem.sink_tokens,   0);
     kp.recent_tokens      = (uint32_t) std::max(params.kvmem.recent_tokens, 0);

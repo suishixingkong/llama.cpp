@@ -29,6 +29,8 @@ struct llama_kvmem_params {
     bool enabled;
     uint32_t block_tokens;  // 0 → 32
     uint32_t budget;        // tokens; 0 → use n_ctx (identity / no sparse)
+    bool     budget_auto;   // derive budget from free VRAM and n_ctx, ignoring `budget`
+    double   budget_ratio;  // with budget_auto: fraction of n_ctx to target
     uint32_t gen_reserve;   // tokens; 0 → 1024 (fork default)
     uint32_t sink_tokens;   // 0 → one block
     uint32_t recent_tokens; // 0 → pressure uses newest tail only

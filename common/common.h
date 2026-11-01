@@ -508,7 +508,15 @@ struct common_moe_cache_params {
 struct common_params_kvmem {
     bool enabled          = false;
     int32_t block_tokens  = 0;    // 0 -> 32
-    int32_t budget        = 0;    // working-set tokens; 0 -> n_ctx (identity, no sparsity)
+    int32_t budget        = 0;    // working-set tokens; explicit > 0 pins it, see budget_auto
+    // Derive the working set instead of pinning it: free VRAM says how many blocks the
+    // device can hold, the context length says how many are worth holding. An explicit
+    // --kvmem-budget turns this off (a typed number means "use this number"); so does
+    // --no-kvmem-budget-auto, which restores the old 0 -> n_ctx identity.
+    bool    budget_auto   = true;
+    // Fraction of n_ctx the working set targets when auto. 1/3 is where recall measured
+    // 96% on the memory probes; below that it falls fast (1/6 -> 79%, 1/8 -> 58%).
+    float   budget_ratio  = 1.0f/3.0f;
     int32_t gen_reserve   = 1024; // extra GPU tokens for decode; 0 -> this same default
     int32_t sink_tokens   = 0;    // always-kept prefix; 0 -> one block
     int32_t recent_tokens = 0;    // always-kept suffix blocks; 0 -> newest tail under pressure

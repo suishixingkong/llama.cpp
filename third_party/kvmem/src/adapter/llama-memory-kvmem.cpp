@@ -895,7 +895,9 @@ static kvmem_pool_plan kvmem_compute_pool(
     const kvmem_kv_types kv_types = kvmem_effective_types(model, params, cparams);
     kvmem_pool_plan p;
     p.block_tokens = kvmem_current_execution().params.block_tokens ? kvmem_current_execution().params.block_tokens : 32u;
-    uint32_t budget = kvmem_current_execution().params.budget;
+    const auto & kparams = kvmem_current_execution().params;
+    const bool auto_budget = kparams.budget_auto;
+    uint32_t budget = kparams.budget;
     if (budget == 0) {
         budget = kvmem_align_tokens(cparams.n_ctx_seq, p.block_tokens);
         if (budget == 0) {
@@ -904,6 +906,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     } else {
         budget = kvmem_align_tokens(budget, p.block_tokens);
     }
+    uint32_t floor_tokens = p.block_tokens;
     {
         // A selection must at least hold the always-kept bands plus one prefill chunk: the
         // adapter marks every incoming block mandatory and refuses a plan it cannot keep, so a
@@ -919,9 +922,9 @@ static kvmem_pool_plan kvmem_compute_pool(
         // once and nothing inside it can be evicted. -b is what a user lowers to shrink it.
         const uint32_t chunk = std::max<uint32_t>(std::max(cparams.n_batch, cparams.n_ubatch),
                 p.block_tokens);
-        const uint32_t floor_tokens = kvmem_align_tokens(
+        floor_tokens = kvmem_align_tokens(
                 sink_tokens_eff + kp.recent_tokens + chunk + p.block_tokens, p.block_tokens);
-        if (kvmem_current_execution().params.budget != 0 && budget < floor_tokens) {
+        if (!auto_budget && kp.budget != 0 && budget < floor_tokens) {
             static bool warned_floor = false;
             if (!warned_floor) {
                 warned_floor = true;
@@ -1057,8 +1060,42 @@ static kvmem_pool_plan kvmem_compute_pool(
         p.cap_blocks = borrowed_kv_size / p.block_tokens;
     }
 
+    if (auto_budget) {
+        // Two limits decide the working set and neither alone is right. cap_blocks says how
+        // many blocks this device can hold once the weights, the decode tail and the scheduler
+        // graph are paid for; budget_ratio says how many are worth holding for the context we
+        // were asked to serve. Take the smaller of the two, keep the pool inside n_ctx, then
+        // honour the floor that keeps one chunk plannable.
+        const uint64_t cap_tokens = p.cap_blocks
+                ? static_cast<uint64_t>(p.cap_blocks) * p.block_tokens : 0;
+        const uint32_t ctx_tokens = kvmem_align_tokens(
+                std::max<uint32_t>(cparams.n_ctx_seq, p.block_tokens), p.block_tokens);
+        const double ratio = kparams.budget_ratio > 0.0 ? kparams.budget_ratio : 1.0 / 3.0;
+        uint32_t want = static_cast<uint32_t>(
+                std::min<uint64_t>(ctx_tokens, static_cast<uint64_t>(ctx_tokens * ratio)));
+        if (cap_tokens > 0) {
+            // The decode tail is not optional: a pool that leaves no room for it plans a
+            // selection that selection_fits() rejects on the first generation step.
+            const uint64_t usable = cap_tokens > gen_reserve ? cap_tokens - gen_reserve : 0;
+            if (usable < want) {
+                want = static_cast<uint32_t>(std::min<uint64_t>(usable, UINT32_MAX));
+            }
+        }
+        if (static_cast<uint64_t>(want) + gen_reserve > ctx_tokens && ctx_tokens > gen_reserve) {
+            want = static_cast<uint32_t>(ctx_tokens - gen_reserve);
+        }
+        if (want < floor_tokens) {
+            want = floor_tokens;
+        }
+        budget = kvmem_align_tokens(want, p.block_tokens);
+        LLAMA_LOG_INFO("%s: KVMem budget auto: n_ctx=%u ratio=%.2f device_cap_tokens=%llu "
+                "gen_reserve=%u -> budget=%u (%u blocks, %.1f%% of ctx)\n",
+                __func__, cparams.n_ctx_seq, ratio, (unsigned long long) cap_tokens, gen_reserve,
+                budget, budget / p.block_tokens, 100.0 * budget / std::max<uint32_t>(ctx_tokens, 1));
+    }
+
     uint32_t pool = budget + gen_reserve;
-    if (pool > cparams.n_ctx_seq && kvmem_current_execution().params.budget == 0) {
+    if (pool > cparams.n_ctx_seq && kparams.budget == 0 && !auto_budget) {
         pool = cparams.n_ctx_seq;
     }
     if (p.cap_blocks > 0) {

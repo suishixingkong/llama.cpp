@@ -3361,14 +3361,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVMEM_CONVERSATIONS"));
     add_opt(common_arg(
         {"--kvmem-budget"}, "N",
-        string_format("KVMem GPU working-set tokens; 0 keeps every block resident (default: %d)", params.kvmem.budget),
+        string_format("KVMem GPU working-set tokens; 0 keeps every block resident. Giving a number "
+                      "pins it and turns adaptive sizing off; omit it to size the working set from "
+                      "free VRAM and n_ctx (default: %d)", params.kvmem.budget),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("KVMem budget must be non-negative");
             }
             params.kvmem.budget = value;
+            // A number on the command line is a decision, not a hint.
+            params.kvmem.budget_auto = false;
         }
     ).set_env("LLAMA_ARG_KVMEM_BUDGET"));
+    add_opt(common_arg(
+        {"--kvmem-budget-auto"},
+        {"--no-kvmem-budget-auto"},
+        string_format("size the working set from free VRAM and n_ctx when no --kvmem-budget is given "
+                      "(default: %s)", params.kvmem.budget_auto ? "on" : "off"),
+        [](common_params & params, bool value) {
+            params.kvmem.budget_auto = value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_BUDGET_AUTO"));
+    add_opt(common_arg(
+        {"--kvmem-budget-ratio"}, "X",
+        string_format("adaptive working set as a fraction of n_ctx, after the VRAM cap (default: %.2f)",
+                      params.kvmem.budget_ratio),
+        [](common_params & params, const std::string & v) {
+            const double value = std::stof(v);
+            if (!(value > 0.0 && value <= 1.0)) {
+                throw std::invalid_argument("KVMem budget ratio must be within (0, 1]");
+            }
+            params.kvmem.budget_ratio = (float) value;
+        }
+    ).set_env("LLAMA_ARG_KVMEM_BUDGET_RATIO"));
     add_opt(common_arg(
         {"--kvmem-gen-reserve"}, "N",
         string_format("extra GPU tokens reserved for decode (default: %d)", params.kvmem.gen_reserve),
