@@ -6430,11 +6430,35 @@ private:
                 llama_tokens rows(held->tokens.begin(), held->tokens.begin() + best_keep);
                 // Drop the rows this request does not continue (usually the last
                 // turn's answer). Both halves of a hybrid memory follow the
-                // position range, so the recurrent cells go with the rows.
+                // position range, so the recurrent cells go with the rows -- but a
+                // hybrid recurrent half is allowed to refuse that rollback outright
+                // (the n_rs_seq snapshot planes do not reach this far, and the default
+                // is 0). Refusing is a decision, not a failed switch: honour it.
+                // Truncating the attention half alone leaves the two halves describing
+                // different histories, and the next decode continues from a position
+                // the recurrent half never reached -- one-token replies, then
+                // seq_pos_min != seq_pos_max, then no checkpoint, then a full re-prefill.
+                bool drop_refused = false;
                 if (best_keep < store_rows) {
                     if (llama_memory_t mem = llama_get_memory(ctx_tgt)) {
-                        llama_memory_seq_rm(mem, 0, best_keep, -1);
+                        drop_refused = !llama_memory_seq_rm(mem, 0, best_keep, -1);
                     }
+                }
+                if (drop_refused) {
+                    // Keep the store bound (these are still the rows this conversation
+                    // continues) but do not claim its frontier: the memory has to be
+                    // rebuilt for the shorter prompt first. prompt_clear() also clears
+                    // both halves and retires the checkpoint ring, which still describes
+                    // the store we just detached -- so the ordinary path prefills once
+                    // instead of answering from a state the model never had.
+                    slot.prompt_clear();
+                    st.table.remember(best, rows, 0);
+                    st.bound = best;
+                    st.table.touch(best, ++st.tick);
+                    SRV_WRN("conversation store %d resumed, but dropping %d of %d rows was "
+                            "refused by the recurrent half; re-prefilling the prompt\n",
+                            best, store_rows - best_keep, store_rows);
+                    return;
                 }
                 // The checkpoint ring describes the memory we just detached, not
                 // the one we attached. Its entries are snapshots of the outgoing

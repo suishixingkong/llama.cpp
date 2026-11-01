@@ -170,12 +170,20 @@ bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_
     const uint32_t n_rs = recr->n_rs_seq;
     const llama_pos rmax = recr->seq_pos_max(seq_id);
     const llama_pos p1x = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
-    if (n_rs > 0 && p0n > 0 && rmax >= 0 && p0n <= rmax && p1x > rmax) {
-        const llama_pos rollback = rmax - (p0n - 1);
-        if (rollback >= 1 && rollback <= (llama_pos) n_rs) {
-            if (!recr->seq_rm(seq_id, p0, p1)) {
-                return false;
-            }
+    // A removal whose upper end reaches the recurrent frontier invalidates the state as
+    // of that frontier, so the recurrent half has to be asked FIRST and allowed to refuse:
+    // inside the n_rs_seq window it rolls back on the snapshot planes, outside it returns
+    // false and nothing is mutated. Gating this call on `n_rs > 0` (the default is 0, so
+    // the gate never opened) truncated the attention half alone, leaving the cell
+    // describing positions the attention half no longer had. The next decode then
+    // continued from a position the recurrent half never reached -- visible as
+    // "find_slot: non-consecutive token position N after M", a reply that ends after one
+    // token, and (because seq_pos_min != seq_pos_max afterwards) no checkpoint to rewind
+    // to, so the following turn re-prefilled the whole prompt.
+    GGML_UNUSED(n_rs);
+    if (rmax >= 0 && p0n > 0 && p0n <= rmax && p1x > rmax) {
+        if (!recr->seq_rm(seq_id, p0, p1)) {
+            return false;
         }
     }
     return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
