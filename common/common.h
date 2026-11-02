@@ -519,11 +519,12 @@ struct common_params_kvmem {
     float   budget_ratio  = 1.0f/3.0f;
     int32_t gen_reserve   = 1024; // extra GPU tokens for decode; 0 -> this same default
     // Two-stage scoring. At or above this many scored tokens a round first ranks every
-    // block with a cheap layer subset and exact-scores only the survivors. 0 always
-    // scores every block exactly, which is the only shape with no recall risk; the split
-    // only pays off once a full exact pass stops being noise, and our probes put that
-    // boundary well above 32k. Below the threshold the extra pass just costs time.
-    int32_t coarse_threshold = 32768;
+    // block with a cheap layer subset and exact-scores only the survivors. 0 (the default)
+    // always scores every block exactly, which is the only shape with no recall risk: the
+    // split measured -46% of the scoring item but that item is under 1% of a prefill, so it
+    // is worth ~0.3% of a turn and not worth a single swapped block. Opt in for very long
+    // contexts only.
+    int32_t coarse_threshold = 0;
     int32_t sink_tokens   = 0;    // always-kept prefix; 0 -> one block
     int32_t recent_tokens = 0;    // always-kept suffix blocks; 0 -> newest tail under pressure
     std::string method    = "retrieval"; // recency | retrieval

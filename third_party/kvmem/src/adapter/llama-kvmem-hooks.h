@@ -50,11 +50,10 @@ struct llama_kvmem_params {
     // accounting where the suffix shares the budget with history.
     int32_t  query_workspace = 1;
     // Scored frontier (tokens) from which a round ranks blocks with a cheap layer
-    // subset first and exact-scores only the survivors. 0 scores every block exactly,
-    // which is the only shape with no recall risk. Below the threshold the split
-    // costs an extra pass and buys nothing, so the default sits above the range where
-    // a full exact pass still measures as noise.
-    uint32_t coarse_threshold = 32768;
+    // subset first and exact-scores only the survivors. 0 (default) scores every block
+    // exactly, which is the only shape with no recall risk; the split measured -46% of
+    // the scoring item, but that item is under 1% of a prefill.
+    uint32_t coarse_threshold = 0;
     int32_t  force_pos;     // include block containing this orig pos; -1 = none
     float    gpu_memory_ratio;     // 0 → 0.50; cap pool vs device VRAM
     float    gpu_high_watermark;   // 0 → 0.95; trigger prefill offload
