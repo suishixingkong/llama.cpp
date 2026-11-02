@@ -5040,8 +5040,20 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
         }
         scores = shortlist.empty() ? run_scorer(query, frame, nullptr)
                                    : run_scorer(query, exact_frame, &shortlist);
-        if (graph_alpha_ > 0)
-            scores=kvmem::propagate_query_scores(scores,frame,prefix ? prefix->graph : graph_,graph_alpha_);
+        // The graph accumulator only knows what `content_->complete()` told it, and a
+        // checkpoint restore moves the content back behind it without moving the graph.
+        // Spreading mass from a snapshot that describes a longer history used to throw --
+        // and the catch below turned that into a whole round without a score, i.e. the
+        // plan fell back to sink+recency right after every resume. Skipping the spread
+        // keeps the round honest and costs only its 0.2 weight; the accumulator re-syncs
+        // on the next completed turn.
+        const kvmem::GraphSnapshot & graph_now = prefix ? prefix->graph : graph_;
+        if (graph_alpha_ > 0 && graph_now.accepted_through == frontier) {
+            scores=kvmem::propagate_query_scores(scores,frame,graph_now,graph_alpha_);
+        } else if (graph_alpha_ > 0 && trace_) {
+            kvmem_diag("KVMEM_QUERY graph spread skipped: graph.accepted=%llu frontier=%llu\n",
+                    (unsigned long long) graph_now.accepted_through, (unsigned long long) frontier);
+        }
     } catch (...) {
         if (prefix) raw_->restore_mean_checkpoint(frontier,previous);
         throw;
