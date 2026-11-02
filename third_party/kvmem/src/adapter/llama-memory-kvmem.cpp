@@ -4046,6 +4046,9 @@ void llama_memory_kvmem::harvest_pending_impl(ggml_backend_sched_t sched) {
 }
 
 void llama_memory_kvmem::reset_query_acc() {
+    // The batch-scoped Query fallback belongs to one round only.
+    query_rebase_lo_ = -1;
+    query_rebase_hi_ = -1;
     // Repair the size, not only the contents. attach_conv() installs the
     // incoming conversation's accumulators and then resizes them, and that
     // resize can throw between the two; reset_policy() calls this to make the
@@ -5142,6 +5145,7 @@ void llama_memory_kvmem::set_turn_spans(const llama_kvmem_turn_spans & spans) {
 
 bool llama_memory_kvmem::query_contains(llama_pos row) const {
     if (query_frozen_) return false;
+    if (query_rebase_lo_ >= 0 && row >= query_rebase_lo_ && row < query_rebase_hi_) return true;
     if (!explicit_spans_) return query_begin_ >= 0 && row >= query_begin_ && (query_end_ <= 0 || row < query_end_);
     for (const auto & r : turn_spans_.query) if (row >= r.begin && row < r.end) return true;
     return false;
@@ -5151,6 +5155,24 @@ bool llama_memory_kvmem::query_overlaps(uint32_t n, const llama_pos * rows) cons
     if (!want_q_capture() || !n) return false;
     if (!rows) return true;
     for (uint32_t i = 0; i < n; ++i) if (query_contains(rows[i])) return true;
+    // No row of this batch falls inside the configured span. When the whole batch sits
+    // past its end, the span is stale rather than empty: a checkpoint restore moved the
+    // resume point back, so the task's span still names rows the round does not evaluate,
+    // and scoring would read zero Query rows and give up on the round. Score the batch
+    // instead -- it holds exactly the tokens this turn is asking about.
+    llama_pos lo = rows[0], hi = rows[0];
+    for (uint32_t i = 1; i < n; ++i) {
+        lo = std::min(lo, rows[i]);
+        hi = std::max(hi, rows[i]);
+    }
+    const llama_pos span_end = explicit_spans_
+            ? (turn_spans_.query.empty() ? -1 : turn_spans_.query.back().end)
+            : (query_end_ > 0 ? query_end_ : -1);
+    if (span_end > 0 && lo >= span_end) {
+        query_rebase_lo_ = lo;
+        query_rebase_hi_ = hi + 1;
+        return true;
+    }
     return false;
 }
 

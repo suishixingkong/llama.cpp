@@ -544,6 +544,12 @@ private:
     bool prefill_capture_ = false;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
+    // Set when the configured Query span lies entirely behind the rows a round is about
+    // to evaluate -- a checkpoint restore hands rows back, so the span the task computed
+    // no longer names anything in the batch and no Q node would be emitted. The fallback
+    // is the batch itself, the same shape as the cold-start rule. Cleared per round.
+    mutable llama_pos query_rebase_lo_ = -1;
+    mutable llama_pos query_rebase_hi_ = -1;
     int32_t query_end_ = -1;
     int32_t query_max_ = 0;
     // Query rows are append workspace, not history: the selection spends its whole
