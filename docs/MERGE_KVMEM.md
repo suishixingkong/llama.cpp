@@ -109,7 +109,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | `--kvmem-method {recency,retrieval}` | `retrieval` | `recency` 只按新近度选块（不采样、不评分，最省）；`retrieval` 用 Query 注意力给每块打分 |
 | `--kvmem-query-scorer {page-softmax,meanq-cosine}` | `page-softmax` | 检索评分器。`page-softmax` 逐行 softmax 后聚合；`meanq-cosine` 用平均 Query 向量做余弦 |
 | `--kvmem-score-agg {mean,max}` | 评分器默认 | 行级分数聚合成块分数的方式 |
-| `--kvmem-coarse-threshold N` | **32768** | 被打分上下文达到 N token 时改走两阶段：先用少量层给所有块粗排，再对 `max(64, 4×budget_blocks)` 个候选做精确全层打分。`0` = 永远全量精确（唯一没有召回风险的形态）。判据日志 `KVMEM_QUERY ... coarse=1 threshold=... kept=... layers=...`。详见「两阶段打分」 |
+| `--kvmem-coarse-threshold N` | **0（关）** | 被打分上下文达到 N token 时改走两阶段：先用少量层给所有块粗排，再对 `max(64, 4×budget_blocks)` 个候选做精确全层打分。`0` = 永远全量精确（唯一没有召回风险的形态，**也是默认**）。实测只值整轮 0.3%，要省这点时间才打开。判据日志 `KVMEM_QUERY ... coarse=1 threshold=... kept=... layers=...`。详见「两阶段打分」 |
 | `--kvmem-lrfu` / `--no-kvmem-lrfu` | 评分器默认 | 是否把历史命中率（LRFU）混进块分数 |
 | `--kvmem-lrfu-lambda X` | 0.5 | 历史衰减，`[0,1]` |
 | `--kvmem-lrfu-top-frac X` | 0.9 | 视为「命中」的历史分位，`(0,1]` |
@@ -162,16 +162,17 @@ KVMem budget auto: n_ctx=8192 ratio=0.33 device_cap_tokens=699008 gen_reserve=10
 - 要回到「全常驻、与原生 cache 逐位相同」的老行为：`--kvmem-budget 0 --no-kvmem-budget-auto`。
 - 这条只决定 **GPU 常驻量**，不改选择策略；预算比与失忆率的关系见下文「检索质量」。
 
-### 两阶段打分（`--kvmem-coarse-threshold`，默认 32768）
+### 两阶段打分（`--kvmem-coarse-threshold`，**默认 0 = 关**）
 
 一轮检索要给**每个**块算一次分，每次都要读一遍 mean-K 镜像（每块 × 每个参与层）。上下文一长，
 这一步就成了整轮里最大的单项，而花掉的绝大部分算力落在**选择根本不会取**的块上。
 
 `--kvmem-coarse-threshold N`（单位 token，作用在**被打分的 frontier** 上）：达到 N 时，这一轮先
 用**少量层**（参与层里等距抽 1–4 个）给所有块赔一个粗分，取前 `max(64, 4 × budget_blocks)` 块作为
-候选（`mandatory` 那批无条件入选），再只对这些候选做**精确全层**打分。低于 N 一律全量精确 ——
-这是唯一没有召回风险的形态，所以默认值放在「全量精确还只是噪声」的边界之上（实测 16k 上下
-两阶段能省掉 38% 的评分时间，谈不上值得为此改语义）。
+候选（`mandatory` 那批无条件入选），再只对这些候选做**精确全层**打分。
+
+**默认是 `0`，即永远全量精确**：只有这个形态没有召回风险。下面两组实测说明为什么把开关合上——
+省下来的绝对时间是 10~18 ms，而它所在的检索轮只有整个 prefill 的 1% 上下。
 
 判据（Qwen3.5-2B，40 k 字符 ≈ 15 986 token、`-c 32768 --kvmem-budget 1024`、`KVMEM_PERF=1`）：
 
@@ -525,6 +526,15 @@ store 已经把 A 的 4125 行 restage 回来了，但扫描从 `rbegin()` 找**
 ⚠️ **这同时是个正确性缺陷**，不只是慢：hybrid/recurrent 的 checkpoint 携带的是**生成它那一刻的 recurrent 行**。把 B 在位置 62 的 GDN 状态装进 A 的位置 62，数值上通得过、日志全绿，输出却是错的。修前一直靠「别的对话恰好没有 checkpoint 落在前缀里」这种运气。
 
 **修法**：换 store 成功时把环清空（`checkpoint_ring_changed()` 走 lifecycle 记账，和 `prompt_clear()` 同一条路）。环属于刚刚被 detach 的那块 memory，换了就不该留着。
+
+**2026-11-02 更新：环改由 store 自己保管（`baddeb834`）。** 清空是正确但不免费的——hybrid 的回滚只能靠快照，环一清，任何「丢掉上一轮答案」的切换（浏览器刷新、两个对话来回切）就只能整段重算（27B / 48k 实测 80–100 s）。现在改成**换走时把环停到那个 store 名下**（`kvmem_conv_state::rings`，每个 store 留最新 2 个，载荷是共享 buffer 所以只是链表拷贝），换回时**只从自己那个 store 停放的环里取**快照恢复，恢复完即作废。判据：
+
+```
+conversation store 0 resumed: dropping 15 of 8036 rows was refused by the recurrent half,
+so the newest usable checkpoint (8017 rows) was restored; 4 rows remain to prefill
+```
+
+2B 实测切回来 `prompt_n` 8036 → **4**、`prompt_ms` 1161 → **37**；19.7k 行那次还原答案与首轮逐字节相同。⚠️ 恢复失败或该 store 没停放环时**仍退回整段重算**，日志会说是哪种。
 
 ### 二、清空环之后：扫描把「空环」读成「没有可复用状态」
 
