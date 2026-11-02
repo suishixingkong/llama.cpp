@@ -3584,7 +3584,18 @@ private:
         uint64_t tick = 0;
         int bound = -1;
         kvmem_store_table table;
+        // Checkpoint ring per parked store. A ring is a set of snapshots of one
+        // conversation's memory: its positions mean nothing once another conversation
+        // has run, so it has to be parked with the store it describes and installed
+        // again when that store comes back. Payloads are shared buffers, so parking
+        // costs a list copy, but the bytes stay alive while the store is parked --
+        // hence the cap below.
+        std::map<int, std::list<common_prompt_checkpoint>> rings;
     } kvmem_conv;
+
+    // Only the newest few snapshots are worth parking: the resume point is always at or
+    // just below the store's frontier, and each image is ~150 MiB on a 27B model.
+    static constexpr size_t kvmem_conv_ring_park_max = 2;
 
     // fork server-context.cpp:15644 (a server_context_impl member there too, among
     // the DFlash cycle flags this port does not carry).  sample_frontier_logits()
@@ -6378,6 +6389,22 @@ private:
         }
         const std::string client = kvmem_store_client_id(raw_client);
 #if defined(LLAMA_KVMEM)
+        // Park the outgoing conversation's snapshots with the store they describe, before
+        // anything replaces them: after a switch the slot's ring holds the incoming
+        // conversation's images, whose positions match but whose tokens do not, and
+        // restoring one would answer as the other conversation.
+        auto park_ring = [&]() {
+            if (st.bound < 0 || slot.prompt.checkpoints.empty()) {
+                return;
+            }
+            auto & park = st.rings[st.bound];
+            park.clear();
+            auto it = slot.prompt.checkpoints.end();
+            for (size_t n = 0; n < kvmem_conv_ring_park_max && it != slot.prompt.checkpoints.begin(); ++n) {
+                --it;
+                park.push_front(*it);
+            }
+        };
         // Only a switch performed by this call may arm the frontier below: an
         // earlier launch's value must not survive a request that reuses the
         // already-bound store.
@@ -6426,6 +6453,11 @@ private:
         if (best >= 0 && best != st.bound) {
             const auto * held = st.table.find(best);
             const int store_rows = (int) held->tokens.size();
+            // Park the outgoing conversation's snapshots with the store they describe,
+            // before the switch replaces them: after it the slot's ring holds the
+            // incoming conversation's images, whose positions match but whose tokens do
+            // not, and restoring one would answer as the other conversation.
+            park_ring();
             if (llama_kvmem_store_switch(held->store_id)) {
                 llama_tokens rows(held->tokens.begin(), held->tokens.begin() + best_keep);
                 // Drop the rows this request does not continue (usually the last
@@ -6445,6 +6477,67 @@ private:
                     }
                 }
                 if (drop_refused) {
+                    // The recurrent half is what refused, and a snapshot is the only thing
+                    // that can move it: that is exactly what a context checkpoint carries.
+                    // Restore the newest snapshot parked WITH THIS STORE at or below the
+                    // prefix this request keeps, so both halves land on one frontier and the
+                    // ordinary path prefills only the remainder (bounded by the checkpoint
+                    // spacing) instead of the whole conversation. No parked snapshot keeps
+                    // the old behaviour: detach, clear both halves, prefill from zero.
+                    //
+                    // The slot's own ring must not be used here: the switch above replaced
+                    // it with the incoming conversation's images, and those describe a
+                    // memory whose positions match but whose tokens do not.
+                    auto parked = st.rings.find(best);
+                    auto chosen = (parked == st.rings.end())
+                            ? std::list<common_prompt_checkpoint>::iterator{}
+                            : parked->second.end();
+                    if (parked != st.rings.end()) {
+                        for (auto it = parked->second.begin(); it != parked->second.end(); ++it) {
+                            if (!it->empty() && it->n_tokens > 0 &&
+                                    it->n_tokens <= (int64_t) rows.size() &&
+                                    it->pos_min >= 0 && it->pos_max >= it->pos_min) {
+                                chosen = it;
+                            }
+                        }
+                    }
+                    llama_pos restored_to = -1;
+                    if (parked != st.rings.end() && chosen != parked->second.end()) {
+                        const size_t checkpoint_size = chosen->data_tgt.size();
+                        const size_t n = llama_state_seq_set_data_ext(
+                                ctx_tgt, chosen->data_tgt.view().data(), checkpoint_size,
+                                slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (n == checkpoint_size &&
+                                (!ctx_dft || chosen->try_load_dft(
+                                        ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
+                            // The restored frontier is the authority, not the recorded row
+                            // count: a hybrid checkpoint carries the store frontier it was
+                            // taken at, and the two can differ by the tokens of one ubatch.
+                            restored_to = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        } else {
+                            SRV_WRN("parked context checkpoint at %" PRId64 " rows could not be "
+                                    "restored (%zu of %zu bytes); falling back to a full prefill\n",
+                                    chosen->n_tokens, n, checkpoint_size);
+                        }
+                    }
+                    if (restored_to >= 0 && (size_t) restored_to < rows.size()) {
+                        const size_t keep = (size_t) restored_to + 1;
+                        // The parked snapshot has been spent and the live ring describes the
+                        // conversation we are leaving, so neither survives this resume.
+                        st.rings.erase(best);
+                        slot.prompt.checkpoints.clear();
+                        slot.prompt.tokens = server_tokens(llama_tokens(rows.begin(), rows.begin() + keep), false);
+                        slot.prompt.sequence_epoch = 0;
+                        slot.kvmem_swap_frontier = -1;
+                        st.table.remember(best, llama_tokens(rows.begin(), rows.begin() + keep), 0);
+                        st.bound = best;
+                        st.table.touch(best, ++st.tick);
+                        SRV_WRN("conversation store %d resumed: dropping %d of %d rows was refused by "
+                                "the recurrent half, so the newest usable checkpoint (%zu rows) was "
+                                "restored; %zu rows remain to prefill\n",
+                                best, store_rows - best_keep, store_rows, keep, best_keep - keep);
+                        return;
+                    }
                     // Keep the store bound (these are still the rows this conversation
                     // continues) but do not claim its frontier: the memory has to be
                     // rebuilt for the shorter prompt first. prompt_clear() also clears
@@ -6456,7 +6549,8 @@ private:
                     st.bound = best;
                     st.table.touch(best, ++st.tick);
                     SRV_WRN("conversation store %d resumed, but dropping %d of %d rows was "
-                            "refused by the recurrent half; re-prefilling the prompt\n",
+                            "refused by the recurrent half and no checkpoint could be restored; "
+                            "re-prefilling the prompt\n",
                             best, store_rows - best_keep, store_rows);
                     return;
                 }
@@ -6494,6 +6588,7 @@ private:
             // A refused switch empties whatever was attached, so nothing is.
             st.bound = -1;
             st.table.erase(best);
+            st.rings.erase(best);
         } else if (best >= 0) {
             st.table.touch(best, ++st.tick);
             return;
@@ -6501,6 +6596,9 @@ private:
 
         // Fresh conversation: a new store, or the pool's least recently used one
         // recycled by destroying it and allocating in its place.
+        // The parked conversation keeps its snapshots even when the next request names a
+        // conversation nobody has seen yet: prompt_clear() below would otherwise drop them.
+        park_ring();
         const int32_t handle = llama_kvmem_store_create();
         if (handle < 0) {
             SRV_WRN("slot %d could not allocate a conversation store; --kvmem-conversations stays idle\n", slot.id);
