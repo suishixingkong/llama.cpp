@@ -11680,11 +11680,26 @@ private:
                                 (common_speculative_get_state(
                                     slot.get_spec(), slot.id, spec_state) &&
                                  !spec_state.empty());
-                            const size_t draft_size = capture_draft
-                                ? llama_state_seq_get_size_ext(
-                                    ctx_dft, slot.id,
-                                    LLAMA_STATE_SEQ_FLAGS_NONE)
-                                : 0;
+                            // A KVMem draft context keeps its history in a packed host
+                            // store, so its whole-sequence image is refused outright and
+                            // the getter reports 0. What it CAN produce is a checkpoint
+                            // image: the frontier its cells describe, which is the shape
+                            // the restore path already asks for (`try_load_dft(...,
+                            // PARTIAL_ONLY)`). Ask for that shape here too, or every
+                            // checkpoint is dropped -- the draft companion gate clears the
+                            // whole staged set, so MTP ends up with no checkpoints at all
+                            // and every conversation switch re-prefills.
+                            llama_state_seq_flags draft_flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+                            size_t draft_size = 0;
+                            if (capture_draft) {
+                                draft_size = llama_state_seq_get_size_ext(
+                                    ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (draft_size == 0) {
+                                    draft_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                                    draft_size = llama_state_seq_get_size_ext(
+                                        ctx_dft, slot.id, draft_flags);
+                                }
+                            }
                             const size_t ring_size = slot.can_speculate()
                                 ? common_speculative_ring_state_size(
                                     slot.get_spec())
@@ -11800,9 +11815,14 @@ private:
                                                 llama_state_seq_get_data_ext(
                                                     ctx_dft, data, size,
                                                     slot.id,
-                                                    LLAMA_STATE_SEQ_FLAGS_NONE);
+                                                    draft_flags);
                                         });
-                                    next.data_dft_full_sequence = true;
+                                    // Only a whole-sequence draft image can carry pending
+                                    // hidden state; a frontier-only one means "the draft's
+                                    // cells stop here", which the restore treats as target
+                                    // without draft and rebuilds from the prompt.
+                                    next.data_dft_full_sequence =
+                                        (draft_flags == LLAMA_STATE_SEQ_FLAGS_NONE);
                                     if (draft_written != draft_size) {
                                         SLT_ERR(slot,
                                             "skipping context checkpoint: draft state short write (expected %zu, got %zu)\n",
@@ -11817,7 +11837,7 @@ private:
                                     }
                                 } else {
                                     if (mtp_checkpoint_required) {
-                                        SLT_ERR(slot,
+                                        SLT_WRN(slot,
                                             "MTP checkpoint companion skipped: "
                                             "target=%zu draft=%zu spec=%zu ring=%zu "
                                             "runway=%" PRIu64 " state-ready=%d\n",
