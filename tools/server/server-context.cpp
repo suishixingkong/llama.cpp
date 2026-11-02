@@ -3533,6 +3533,10 @@ private:
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
+    // A KVMem draft refuses the whole-sequence image every single time it is asked,
+    // and each refusal logs an ERROR from inside the engine. Asking once is enough:
+    // after that the capture path goes straight to the frontier image.
+    bool ctx_dft_frontier_only = false;
 
     common_speculative_init_result_ptr spec_init;
 
@@ -11692,12 +11696,15 @@ private:
                             llama_state_seq_flags draft_flags = LLAMA_STATE_SEQ_FLAGS_NONE;
                             size_t draft_size = 0;
                             if (capture_draft) {
-                                draft_size = llama_state_seq_get_size_ext(
-                                    ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                draft_size = ctx_dft_frontier_only
+                                    ? 0
+                                    : llama_state_seq_get_size_ext(
+                                        ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
                                 if (draft_size == 0) {
                                     draft_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
                                     draft_size = llama_state_seq_get_size_ext(
                                         ctx_dft, slot.id, draft_flags);
+                                    ctx_dft_frontier_only = true;
                                 }
                             }
                             const size_t ring_size = slot.can_speculate()
