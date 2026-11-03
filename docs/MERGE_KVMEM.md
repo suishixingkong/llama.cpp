@@ -787,6 +787,7 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 
 - **检索评分覆盖的架构**：`kvmem_capture_q/k/v` 已接在 qwen3、qwen35、qwen3vl、qwen3vlmoe、olmoe、ernie4-5、ernie4-5-moe、gemma4 上（gemma4 因 SWA 不走 KVMem，钩子惰性）。其余架构仍然 `q_count_` 恒为 0、计划退化成 sink+最近块，日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告。要接一个架构只需在其 attention builder 里补三个调用（norm 之后、RoPE 之前）。
 - **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
+- **多模态（mtmd）已可用（`b275aa789`）**：图片 patch **共用同一个 M-RoPE 时间位置**（一行 `15,15,15,…`），这让"行账本"（append 序）和"位置账本"（cache 寻址）天然不相等，曾经整条图片请求 500（`tail block N keeps M committed rows the packed store lost` → `init_batch` 拒批）。两处修：① `prepare_ubatches` 早备好的行视图（`logical_pos = append 序`）现在**也交给调用方的 ubatch**，否则写 cell 的那一步用 `pos[0]` 覆盖，`gpu_kv_complete()` 永远对不上；② 被拒/中断的批会留下**孤儿 cell**（图片 chunk 先记 20 行被拒、再记 22 行，那 2 个 cell 没人清），`prepare_working_set` 进门按 `seq_rm_logical(0, store_n_tokens(), -1)` 扫掉 `logical_pos ≥ store 行数` 的 cell。判据：`PROBE_PUBLISH ... used == visible == store`、图片请求 200、纯文本 PPL 逐位不变（2B：8.7998 两侧相同）。
 - **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。除非要卡上限，别调它。
 - **LRFU 默认关，实测没有收益（27B、8 针 × 2 轮、`--kvmem-budget 2048`）**：
 
