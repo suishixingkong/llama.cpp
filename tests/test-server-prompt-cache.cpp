@@ -760,6 +760,10 @@ void test_host_save_missing_checkpoint_mirror_fails_locally() {
     cache.publish_authority = &authority;
     cache.retention_obs = &authority.retention;
     cache.destruction_obs = &authority.destruction;
+    // This is the VBR-shaped compound save: image and retention metadata must be
+    // sequenced together, so the gate is what the case is about. A plain run has no
+    // metadata half to miss and leaves the gate off (see retention_gate_required).
+    cache.retention_gate_required = true;
 
     constexpr int32_t slot_id = 2;
     const auto make_checkpoint_entry = []() {
