@@ -3595,6 +3595,12 @@ private:
         // costs a list copy, but the bytes stay alive while the store is parked --
         // hence the cap below.
         std::map<int, std::list<common_prompt_checkpoint>> rings;
+        // The slot ledger each parked store was booked from, kept so a switch back can
+        // install the real ledger instead of rebuilding one from the store's ids. A
+        // rebuild is enough for text (the ids are the whole state) but not for a media
+        // span: the placeholders survive, the chunk objects they stand for do not, and
+        // every reader that walks a media boundary would throw "Chunk not found".
+        std::map<int, server_tokens> ledgers;
     } kvmem_conv;
 
     // Only the newest few snapshots are worth parking: the resume point is always at or
@@ -6380,11 +6386,17 @@ private:
             // them, which leaves the store with a row count that no longer matches the
             // prompt: every index past an image shifts by that chunk's length, so the
             // next turn's prefix match dies exactly at the image and the conversation
-            // re-prefills forever. Booking a media conversation is fine; re-basing such
-            // rows onto a live ledger is the part kvmem_conv_bind() refuses.
+            // re-prefills forever.
             // slot.kvmem_last_n_gen, not slot.stats.n_gen: the slot was released
             // between the turn and this booking, and release() zeroes stats.
             st.table.remember(st.bound, slot.prompt.tokens.raw_tokens(), (int) slot.kvmem_last_n_gen);
+            // Park the ledger itself, not only its ids. A ledger rebuilt from the store's
+            // rows cannot answer find_chunk() at a media span -- the chunk objects died
+            // with the turn that encoded them -- so a media conversation would have to
+            // re-prefill on every switch back. Parking the real ledger (chunk copies
+            // included) is what makes it resumable at all, and it costs one clone per
+            // store, replaced in place on the next turn.
+            st.ledgers.insert_or_assign(st.bound, slot.prompt.tokens.clone());
         }
     }
 
@@ -6480,20 +6492,36 @@ private:
                 // for are gone with the turn that encoded them, so a ledger rebuilt from
                 // these rows cannot answer find_chunk() at a media boundary:
                 // get_common_prefix() and keep_first() would throw "Chunk not found"
-                // instead of returning a prefix length. Fail closed on the same full
-                // prefill a store without rows gave before this conversation could book
-                // at all, and keep the store bound: re-prefilling is correct, guessing
-                // an index is not. Same-conversation consecutive turns never reach this
-                // branch -- they keep the live ledger, media map included.
-                if (std::find(rows.begin(), rows.end(), LLAMA_TOKEN_NULL) != rows.end()) {
-                    slot.prompt_clear();
-                    st.table.remember(best, rows, 0);
-                    st.bound = best;
-                    st.table.touch(best, ++st.tick);
-                    SRV_WRN("conversation store %d holds media rows, which cannot be re-based "
-                            "onto a live ledger; re-prefilling the prompt\n", best);
-                    return;
-                }
+                // instead of returning a prefix length. Such a store therefore installs
+                // the ledger remember() parked with it, trimmed to the same row count;
+                // only when that ledger is missing does the slot fall back to a full
+                // prefill, which is what a store without rows gave before a media
+                // conversation could book at all.
+                const bool media_rows =
+                    std::find(rows.begin(), rows.end(), LLAMA_TOKEN_NULL) != rows.end();
+                auto install_ledger = [&](size_t keep) {
+                    if (!media_rows) {
+                        slot.prompt.tokens = server_tokens(
+                                llama_tokens(rows.begin(), rows.begin() + std::min(keep, rows.size())),
+                                mctx != nullptr);
+                        return true;
+                    }
+                    auto parked = st.ledgers.find(best);
+                    if (parked == st.ledgers.end() || parked->second.size() < keep) {
+                        return false;
+                    }
+                    slot.prompt.tokens = parked->second.clone();
+                    // A media span cannot be cut in half: the rows of half an image are
+                    // not a prefix of anything. Land on the span's start instead of
+                    // asking the ledger for an index it cannot describe.
+                    const llama_tokens & t = slot.prompt.tokens.raw_tokens();
+                    while (keep > 0 && keep < t.size() &&
+                            t[keep - 1] == LLAMA_TOKEN_NULL && t[keep] == LLAMA_TOKEN_NULL) {
+                        --keep;
+                    }
+                    slot.prompt.tokens.keep_first(keep);
+                    return true;
+                };
                 // Drop the rows this request does not continue (usually the last
                 // turn's answer). Both halves of a hybrid memory follow the
                 // position range, so the recurrent cells go with the rows -- but a
@@ -6568,8 +6596,18 @@ private:
                         // for the rest of the process: the next launch that reaches an image
                         // aborts the whole server on GGML_ASSERT(has_mtmd) in
                         // server_tokens::push_back_placeholder().
-                        slot.prompt.tokens = server_tokens(
-                                llama_tokens(rows.begin(), rows.begin() + keep), mctx != nullptr);
+                        if (!install_ledger(keep)) {
+                            // Restored memory with no ledger to describe it: the checkpoint
+                            // has to go with the ledger, or the slot would continue from a
+                            // frontier the token side knows nothing about.
+                            slot.prompt_clear();
+                            st.table.remember(best, rows, 0);
+                            st.bound = best;
+                            st.table.touch(best, ++st.tick);
+                            SRV_WRN("conversation store %d resumed at %zu rows, but its parked "
+                                    "ledger is gone; re-prefilling the prompt\n", best, keep);
+                            return;
+                        }
                         slot.prompt.sequence_epoch = 0;
                         slot.kvmem_swap_frontier = -1;
                         st.table.remember(best, llama_tokens(rows.begin(), rows.begin() + keep), 0);
@@ -6614,9 +6652,18 @@ private:
                     }
                     slot.prompt.checkpoints.clear();
                 }
-                // Same reason as the checkpoint branch above: keep the slot's mtmd capability,
-                // or the rebuild turns the next media launch into a server-wide abort.
-                slot.prompt.tokens = server_tokens(rows, mctx != nullptr);
+                // Text rebuilds from the rows; a media span installs the parked ledger
+                // (see install_ledger), because the rows alone cannot answer a chunk
+                // lookup at the span.
+                if (!install_ledger(rows.size())) {
+                    slot.prompt_clear();
+                    st.table.remember(best, rows, 0);
+                    st.bound = best;
+                    st.table.touch(best, ++st.tick);
+                    SRV_WRN("conversation store %d holds media rows and no parked ledger; "
+                            "re-prefilling the prompt\n", best);
+                    return;
+                }
                 slot.prompt.sequence_epoch = 0;
                 // The restaged rows are a complete state at this frontier, but no
                 // context checkpoint describes them any more (the ring was just
@@ -6630,10 +6677,12 @@ private:
                         best, rows.size(), store_rows);
                 return;
             }
-            // A refused switch empties whatever was attached, so nothing is.
+            // A refused switch empties whatever was attached, so nothing is. The
+            // parked ledger goes with it: it describes rows the store no longer holds.
             st.bound = -1;
             st.table.erase(best);
             st.rings.erase(best);
+            st.ledgers.erase(best);
         } else if (best >= 0) {
             st.table.touch(best, ++st.tick);
             return;
@@ -6678,6 +6727,8 @@ private:
             const auto * held = st.table.find(victim);
             llama_kvmem_store_destroy(held->store_id);
             st.table.erase(victim);
+            st.rings.erase(victim);
+            st.ledgers.erase(victim);
         }
         SRV_INF("slot %d started a fresh conversation store %d\n", slot.id, id);
 #else
@@ -11551,7 +11602,20 @@ private:
                     // existing good checkpoints (do NOT evict for one we won't create). In a coherent
                     // recurrent/hybrid cache equality holds (one recurrent frontier row) so this should
                     // never fire; if it does, it is a real memory-frontier bug worth the loud warning.
-                    if (do_checkpoint && checkpoint_exact_frontier && pos_min != pos_max) {
+                    //
+                    // A media span is the one case where the two halves legitimately report
+                    // different numbers: every patch row of a span carries pos[0], so the
+                    // attention half's max falls back to the span's first position while the
+                    // recurrent row sits on the real frontier. Ask the ledger where that
+                    // frontier is -- pos_next() folds the span's position width in -- and
+                    // accept the capture when the folded min agrees with it. The number to
+                    // compare is NOT pos_max: with a span in the prefix it is always short.
+                    const int64_t ckpt_tokens_now = slot.prompt.n_tokens() - n_tokens_cur;
+                    const llama_pos pos_ledger = slot.prompt.tokens.pos_next(ckpt_tokens_now) - 1;
+                    const bool media_frontier =
+                        slot.prompt.tokens.has_media() && pos_min == pos_ledger;
+                    if (do_checkpoint && checkpoint_exact_frontier && pos_min != pos_max &&
+                            !media_frontier) {
                         SLT_WRN(slot, "[frontier-validity] skipping context checkpoint: recurrent/hybrid seq_pos_min (%d) != seq_pos_max (%d) -- range invalid for a point-in-time state\n",
                                 pos_min, pos_max);
                         do_checkpoint = false;
@@ -11571,7 +11635,13 @@ private:
                         }
                         do_checkpoint = false; // never route a typed window through legacy serialization
                     }
-                    const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
+                    // The exact frontier of a hybrid state is the ledger's next position
+                    // minus one, not the attention half's max: with a media span in the
+                    // prefix the cells report the span's pos[0], and installing the state
+                    // at that number would continue several positions early.
+                    const llama_pos ckpt_pos_min = checkpoint_exact_frontier
+                        ? slot.prompt.tokens.pos_next(ckpt_n_tokens) - 1
+                        : pos_min;
                     llama_memory_vbr_state_data vbr_now = {};
                     if (do_checkpoint) {
                         vbr_now = llama_memory_vbr_state(llama_get_memory(ctx_tgt), slot.id, 0);
