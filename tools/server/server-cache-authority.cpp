@@ -148,15 +148,41 @@ bool execute_shared_payload_claims(
         authority.admission_rollbacks += transaction.rolled_back;
         if (transaction.status !=
                 llama_cache_transaction_status::committed) {
+            // `budget_unavailable` says only that some capacity in the config is
+            // not known; the config itself is the only place that names which
+            // one. Without it the operator sees a refusal that is invariant to
+            // payload size and cannot tell a full host from a device that would
+            // not report its memory.
+            std::string devices;
+            for (const auto & input : config.devices) {
+                devices += string_format(
+                        "%s[phys %s %" PRIu64 "/%" PRIu64 ", compute %s] ",
+                        input.backend_device
+                            ? ggml_backend_dev_name(
+                                  reinterpret_cast<ggml_backend_dev_t>(
+                                      const_cast<void *>(input.backend_device)))
+                            : "null-device",
+                        llama_cache_budget_capacity_state_name(input.phys_state),
+                        input.physical_free, input.physical_total,
+                        llama_cache_budget_capacity_state_name(input.compute_state));
+            }
             SRV_WRN(
                 "CACHE_AUTHORITY shared payload transaction status=%s "
                 "admission=%s failed_leaf=%zu pending_bytes=%" PRIu64
-                " attempts=%u serial_retries=%" PRIu64 "\n",
+                " attempts=%u serial_retries=%" PRIu64
+                " host[pageable %s cap=%" PRIu64 ", total %s cap=%" PRIu64
+                ", global %s] %s\n",
                 llama_cache_transaction_status_name(transaction.status),
                 llama_cache_admission_status_name(
                     transaction.admission_status),
                 transaction.failed_leaf, pending, transaction.attempts,
-                transaction.serial_retries);
+                transaction.serial_retries,
+                llama_cache_budget_capacity_state_name(
+                    config.host.pageable_state), config.host.pageable_cap,
+                llama_cache_budget_capacity_state_name(
+                    config.host.total_state), config.host.total_cap,
+                llama_cache_budget_capacity_state_name(config.global_cap_state),
+                devices.c_str());
             return false;
         }
         size_t bound = 0;

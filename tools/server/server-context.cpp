@@ -1909,6 +1909,18 @@ struct server_slot {
             // with a non-empty prompt publishes an artifact, stamps the
             // bounded cold-start prior and renews the implicit soft lease.
             if (retention_obs) {
+                // A cancelled turn is not a failed reuse. commit_retention_reuse()
+                // normally runs at the final-response boundary, so a client that
+                // hangs up mid-answer (the UI's stop button, or switching
+                // conversations while the model is still talking) used to leave
+                // the branch provisional here, and the retirement below then
+                // destroyed the slot's own retention record. The next idle save
+                // has no source to mirror -- "slot record missing" -- so it
+                // refuses, and that conversation is never cached again: every
+                // later switch re-prefills its whole prompt. The prefix really
+                // was reused and the tokens really are in this slot, so complete
+                // the branch instead of abandoning it.
+                commit_retention_reuse();
                 if ((retention_geometry_failed &&
                      !vbr_prompt_cache_enabled) ||
                     (retention_branch_pending &&
