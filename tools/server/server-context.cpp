@@ -6375,10 +6375,16 @@ private:
         if (!st.armed) {
             return;
         }
-        if (st.bound >= 0 && !slot.prompt.tokens.empty() && !slot.prompt.tokens.has_media()) {
+        if (st.bound >= 0 && !slot.prompt.tokens.empty()) {
+            // The whole ledger, media placeholders included. get_text_tokens() drops
+            // them, which leaves the store with a row count that no longer matches the
+            // prompt: every index past an image shifts by that chunk's length, so the
+            // next turn's prefix match dies exactly at the image and the conversation
+            // re-prefills forever. Booking a media conversation is fine; re-basing such
+            // rows onto a live ledger is the part kvmem_conv_bind() refuses.
             // slot.kvmem_last_n_gen, not slot.stats.n_gen: the slot was released
             // between the turn and this booking, and release() zeroes stats.
-            st.table.remember(st.bound, slot.prompt.tokens.get_text_tokens(), (int) slot.kvmem_last_n_gen);
+            st.table.remember(st.bound, slot.prompt.tokens.raw_tokens(), (int) slot.kvmem_last_n_gen);
         }
     }
 
@@ -6414,7 +6420,11 @@ private:
         // already-bound store.
         slot.kvmem_swap_frontier = -1;
         // The request's own prompt, not slot.prompt: that ledger still holds the
-        // previous turn at this point and is what this function re-bases.
+        // previous turn at this point and is what this function re-bases. Raw tokens,
+        // not get_text_tokens(): the store now books media placeholders, and a
+        // comparison against a de-placeholdered copy stops at the image -- which makes
+        // the measured tail grow by one chunk per turn until the continuation gate
+        // rejects the store it was literally continuing.
         const llama_tokens & prompt = request;
 
         // A store may hold more rows than the request matches: the last turn's
@@ -6464,6 +6474,26 @@ private:
             park_ring();
             if (llama_kvmem_store_switch(held->store_id)) {
                 llama_tokens rows(held->tokens.begin(), held->tokens.begin() + best_keep);
+                // A store that booked a media conversation holds LLAMA_TOKEN_NULL where
+                // the image/audio rows are. Those rows are real -- dropping them would
+                // shift every index past the image -- but the chunk objects they stood
+                // for are gone with the turn that encoded them, so a ledger rebuilt from
+                // these rows cannot answer find_chunk() at a media boundary:
+                // get_common_prefix() and keep_first() would throw "Chunk not found"
+                // instead of returning a prefix length. Fail closed on the same full
+                // prefill a store without rows gave before this conversation could book
+                // at all, and keep the store bound: re-prefilling is correct, guessing
+                // an index is not. Same-conversation consecutive turns never reach this
+                // branch -- they keep the live ledger, media map included.
+                if (std::find(rows.begin(), rows.end(), LLAMA_TOKEN_NULL) != rows.end()) {
+                    slot.prompt_clear();
+                    st.table.remember(best, rows, 0);
+                    st.bound = best;
+                    st.table.touch(best, ++st.tick);
+                    SRV_WRN("conversation store %d holds media rows, which cannot be re-based "
+                            "onto a live ledger; re-prefilling the prompt\n", best);
+                    return;
+                }
                 // Drop the rows this request does not continue (usually the last
                 // turn's answer). Both halves of a hybrid memory follow the
                 // position range, so the recurrent cells go with the rows -- but a
@@ -6670,7 +6700,7 @@ private:
         // the rows of the host store this request continues.
         kvmem_conv_remember(slot);
         prepare_prompt_tokens_for_launch(slot, task);
-        kvmem_conv_bind(slot, task.params.kvmem_conversation, task.tokens.get_text_tokens());
+        kvmem_conv_bind(slot, task.params.kvmem_conversation, task.tokens.raw_tokens());
         if (!admit_task_for_slot(slot, task)) {
             return false;
         }

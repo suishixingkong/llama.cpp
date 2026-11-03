@@ -290,6 +290,12 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // The ledger exactly as it stands, media placeholders included. get_tokens() is
+    // for readers that must not see the NULLs; the host conversation store is the
+    // opposite case -- it books the row list so a later prompt can be aligned against
+    // it, and a row dropped there shifts every index past the media span.
+    const llama_tokens & raw_tokens() const noexcept { return tokens; }
+
     // Exact logical token ids for process-local retention identity. Unlike
     // get_tokens(), this deliberately preserves LLAMA_TOKEN_NULL media cells;
     // callers must pair it with media_content_identity() so placeholders from
