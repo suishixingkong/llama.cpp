@@ -7617,8 +7617,27 @@ bool server_prompt_cache::publish_impl(
     // on the host-save path.
     if (!is_vbr && retention_obs && source_prompt && source_slot >= 0) {
         if (source_prompt->checkpoints.size() !=
-                entry.front().prompt.checkpoints.size() ||
-            !retention_sources_available(*source_prompt, source_slot)) {
+                entry.front().prompt.checkpoints.size()) {
+            // Both lists come from the same prompt, so a mismatch is a staging
+            // invariant, not a policy refusal: the image would ship a ring it
+            // does not own.
+            SRV_WRN("prompt cache save refused: staged ring holds %zu checkpoints, "
+                    "the live slot holds %zu\n",
+                    entry.front().prompt.checkpoints.size(),
+                    source_prompt->checkpoints.size());
+            return false;
+        }
+        std::string missing;
+        if (!retention_sources_available(*source_prompt, source_slot, &missing)) {
+            // A checkpoint whose optional sidecar publication was refused at
+            // capture time reaches this seam with no clone-able record. The
+            // refusal is local and correct (see the admission test), but it
+            // costs the conversation every later switch, so it has to say which
+            // record went missing instead of leaving one anonymous line.
+            SRV_WRN("prompt cache save refused: no retention record for %s "
+                    "(%d tokens, %zu checkpoints)\n",
+                    missing.c_str(), (int) source_prompt->n_tokens(),
+                    source_prompt->checkpoints.size());
             return false;
         }
     }
@@ -7642,11 +7661,13 @@ bool server_prompt_cache::publish_impl(
             server_retention_instance_key::for_slot(source_slot);
         const auto destination_key =
             server_retention_instance_key::for_host_entry(&staged);
-        fixed_retention_prepared = retention_obs->clone(
-            source_key, destination_key) &&
+        const bool slot_cloned = retention_obs->clone(
+            source_key, destination_key);
+        const bool prefix_indexed = slot_cloned &&
             server_prompt_retention_publish_exact_prefix(
                 *retention_obs, destination_key, staged.prompt,
                 staged.adapter_config_key, staged.prompt.n_tokens());
+        fixed_retention_prepared = slot_cloned && prefix_indexed;
         auto source_checkpoint = source_prompt->checkpoints.begin();
         auto host_checkpoint = staged.prompt.checkpoints.begin();
         for (; fixed_retention_prepared &&
@@ -7660,6 +7681,18 @@ bool server_prompt_cache::publish_impl(
                     -1, &*host_checkpoint));
         }
         if (!fixed_retention_prepared) {
+            // Same reason as the gate above: the mirror is bookkeeping the entry
+            // can be restored without, so which half failed has to be named or
+            // the operator only ever sees "refused".
+            SRV_WRN("prompt cache save refused: retention mirror unavailable "
+                    "(slot record %s, prefix index %s, checkpoints %s; "
+                    "%d tokens, %zu checkpoints)\n",
+                    slot_cloned ? "ok" : "missing",
+                    prefix_indexed ? "ok" : "missing",
+                    !slot_cloned || !prefix_indexed ? "not attempted"
+                        : "missing",
+                    (int) staged.prompt.n_tokens(),
+                    staged.prompt.checkpoints.size());
             retire_fixed_preparation();
             return false;
         }

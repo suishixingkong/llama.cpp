@@ -148,7 +148,7 @@ bool execute_shared_payload_claims(
         authority.admission_rollbacks += transaction.rolled_back;
         if (transaction.status !=
                 llama_cache_transaction_status::committed) {
-            SRV_DBG(
+            SRV_WRN(
                 "CACHE_AUTHORITY shared payload transaction status=%s "
                 "admission=%s failed_leaf=%zu pending_bytes=%" PRIu64
                 " attempts=%u serial_retries=%" PRIu64 "\n",
