@@ -2172,17 +2172,6 @@ static void common_resolve_memory_modes(const common_params & params, llama_cont
                 COM_WRN_RESOLVE("KVMem needs n_seq_max=1 (got %u) -- falling back to %s\n",
                         cparams.n_seq_max, vbr ? "VBR" : "the native cache");
             }
-        } else if (!params.mmproj.path.empty()) {
-            // An image lands as many rows that share one M-RoPE temporal position, so the
-            // row ledger (what the pool materialised) and the position ledger (what the
-            // cache can address) stop agreeing: `gpu_kv_complete()` can never match those
-            // rows and the image chunk is refused with "committed rows the packed store
-            // lost". Until the two ledgers are reconciled, a multimodal run keeps the
-            // native cache -- the picture works, it just costs the whole KV.
-            kvmem = false;
-            COM_WRN_RESOLVE("KVMem is disabled for a multimodal run (image rows share one "
-                    "M-RoPE position and the row/position ledger cannot be reconciled yet) -- "
-                    "falling back to %s\n", vbr ? "VBR" : "the native cache");
         } else {
             kvmem = true;
             // A prefill chunk that is bigger than the working set cannot be

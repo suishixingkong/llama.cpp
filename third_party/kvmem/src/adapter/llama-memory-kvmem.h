@@ -101,7 +101,7 @@ public:
     // Slot-pool prepare used by both the dense KVMem memory and the hybrid
     // wrapper (attn half). Fills per-ubatch slot_info and the capture pos queue.
     bool prepare_ubatches(
-            const std::vector<llama_ubatch> & ubatches,
+            std::vector<llama_ubatch> & ubatches,
             uint32_t n_new_tokens,
             llama_kv_cache::slot_info_vec_t & sinfos);
     void reset_policy();

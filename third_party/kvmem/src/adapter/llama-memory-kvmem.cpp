@@ -2863,6 +2863,15 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     if (replay_) {
         return true;
     }
+    // A refused or abandoned batch can leave cells whose logical row the store no longer
+    // holds: the mtmd image chunk booked 20 rows, was refused, then re-booked 22, and the
+    // cells written by the refused attempt stayed behind. The publish check counts them as
+    // "unaccounted attention rows" and drops the whole retrieval round, and nothing else
+    // ever cleans them. Sweep the orphan tail before anything counts cells.
+    if (kv_ && kv_->get_cells(0).get_used() > store_n_tokens()) {
+        kv_->seq_rm_logical(0, (llama_pos) store_n_tokens(), -1);
+        ++attention_epoch_;
+    }
     if (!restore_partial_tail()) {
         return false;
     }
@@ -2957,7 +2966,7 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
 }
 
 bool llama_memory_kvmem::prepare_ubatches(
-        const std::vector<llama_ubatch> & ubatches,
+        std::vector<llama_ubatch> & ubatches,
         uint32_t n_new_tokens,
         llama_kv_cache::slot_info_vec_t & sinfos) {
     const uint32_t old_rows = store_n_tokens();
@@ -3053,6 +3062,12 @@ bool llama_memory_kvmem::prepare_ubatches(
         pos_queue_.push_back(rows[u]);
     }
     prepare_attention_batches(row_view);
+    // Hand the rows to the caller's ubatches too: a 2D batch (image patches sharing one
+    // temporal position) otherwise writes ext.logical_pos = pos[0] for every patch and
+    // gpu_kv_complete() can never match a row again. pos_queue_ owns the storage.
+    for (size_t u = 0; u < ubatches.size() && u < pos_queue_.size(); ++u) {
+        if (!pos_queue_[u].empty()) { ubatches[u].logical_pos = pos_queue_[u].data(); }
+    }
     return true;
 }
 
