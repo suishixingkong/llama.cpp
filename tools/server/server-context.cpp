@@ -6522,6 +6522,39 @@ private:
                     slot.prompt.tokens.keep_first(keep);
                     return true;
                 };
+                // Rows are not positions once a media span is in the prefix: a span's
+                // tokens occupy fewer positions than rows (pos_next() folds
+                // mtmd_input_chunk_get_n_pos in). Every number handed to the memory has
+                // to come from the ledger, and every number handed to rows.begin() has to
+                // come back the other way. For text the two are the same, so this is a
+                // no-op there -- which is exactly why the confusion survived until a
+                // conversation carried an image.
+                auto ledger_pos_next = [&](size_t rows_kept) -> llama_pos {
+                    auto parked = st.ledgers.find(best);
+                    if (parked == st.ledgers.end()) {
+                        return (llama_pos) rows_kept;
+                    }
+                    return parked->second.pos_next((int64_t) rows_kept);
+                };
+                // The largest row count whose next position is still <= pos, i.e. the
+                // inverse of ledger_pos_next() over a monotone ledger.
+                auto rows_for_pos = [&](llama_pos pos) -> size_t {
+                    auto parked = st.ledgers.find(best);
+                    if (parked == st.ledgers.end()) {
+                        return pos > 0 ? (size_t) pos : 0;
+                    }
+                    size_t lo = 0;
+                    size_t hi = parked->second.size();
+                    while (lo < hi) {
+                        const size_t mid = lo + (hi - lo + 1) / 2;
+                        if (parked->second.pos_next((int64_t) mid) <= pos) {
+                            lo = mid;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    return lo;
+                };
                 // Drop the rows this request does not continue (usually the last
                 // turn's answer). Both halves of a hybrid memory follow the
                 // position range, so the recurrent cells go with the rows -- but a
@@ -6535,7 +6568,15 @@ private:
                 bool drop_refused = false;
                 if (best_keep < store_rows) {
                     if (llama_memory_t mem = llama_get_memory(ctx_tgt)) {
-                        drop_refused = !llama_memory_seq_rm(mem, 0, best_keep, -1);
+                        // The ledger's position, not the row count. Passing rows here
+                        // asked to remove everything from position 13301 in a sequence
+                        // whose positions end at 12814: past the recurrent frontier, so
+                        // the recurrent half was never even consulted, the attention half
+                        // had nothing to remove, and seq_rm() answered true. The slot then
+                        // claimed a frontier the memory had not reached, and the next
+                        // turn's one-token rollback -- this time at the correct position --
+                        // was refused, ending in a full re-prefill.
+                        drop_refused = !llama_memory_seq_rm(mem, 0, ledger_pos_next(best_keep), -1);
                     }
                 }
                 if (drop_refused) {
@@ -6582,8 +6623,9 @@ private:
                                     chosen->n_tokens, n, checkpoint_size);
                         }
                     }
-                    if (restored_to >= 0 && (size_t) restored_to < rows.size()) {
-                        const size_t keep = (size_t) restored_to + 1;
+                    // restored_to is a position; the ledger maps it back to a row count.
+                    const size_t keep = restored_to >= 0 ? rows_for_pos(restored_to + 1) : 0;
+                    if (restored_to >= 0 && keep > 0 && keep <= rows.size()) {
                         // The parked snapshot has been spent and the live ring describes the
                         // conversation we are leaving, so neither survives this resume.
                         st.rings.erase(best);
