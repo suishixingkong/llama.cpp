@@ -5363,7 +5363,12 @@ bool server_prompt_cache::retention_sources_available(
         const server_prompt & source_prompt,
         int32_t source_slot,
         std::string * missing) const noexcept {
-    if (!retention_obs || source_slot < 0) {
+    // Without a VBR host publication there is no retention metadata to be
+    // missing, so a missing record must not cost the conversation its cache
+    // entry. This is not a relaxation of the invariant: the invariant is that an
+    // image and its metadata are saved together, and with the gate off there is
+    // no metadata half to sequence.
+    if (!retention_gate_required || !retention_obs || source_slot < 0) {
         return true;
     }
     if (!retention_obs->clone_source_available(

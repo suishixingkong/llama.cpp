@@ -1682,6 +1682,11 @@ struct server_prompt_cache {
     server_cache_destruction_observer * destruction_obs = nullptr;
 
     server_retention_sidecar_store * retention_obs = nullptr;
+
+    // Whether a host-cache image must also carry retention metadata. Only a VBR
+    // host publication produces such metadata, so only that policy may refuse a
+    // save for missing it -- see retention_sources_available().
+    bool retention_gate_required = false;
 // fork 9l-b: lease_obs member (fork server-task.h 1697)
     server_cache_lease_table * lease_obs = nullptr;
 

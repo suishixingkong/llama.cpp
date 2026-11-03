@@ -4683,6 +4683,13 @@ private:
                 prompt_cache->retention_capacity_authority = retention_capacity;
                 prompt_cache->destruction_obs = &cache_authority->destruction;
                 prompt_cache->retention_obs = &cache_authority->retention;
+                // Only a VBR host publication saves retention metadata beside the
+                // image, so only that policy may refuse a save for missing it. With
+                // the gate on for a plain run, a launch that replaces the slot's
+                // prompt retires the live association and nothing re-admits it, so
+                // the save is refused for the rest of the process and every switch
+                // back to that conversation re-prefills the whole prompt.
+                prompt_cache->retention_gate_required = params_base.vbr_prompt_cache;
                 prompt_cache->lease_obs = &cache_authority->leases;
                 prompt_cache->lease_execution_identity =
                     &frontier_execution_identity;
