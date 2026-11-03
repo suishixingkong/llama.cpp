@@ -145,9 +145,15 @@ static void test_empty_handoff() {
     gate.hard_lease = true;
     CHECK(!server_vbr_empty_handoff_allowed(gate));
     gate.hard_lease = false;
-    // durability must beat the incumbent lcp independently of incoming_prefix
+    // Durability is measured against zero, not against the incumbent lcp: a
+    // switch gives up everything past the shared prefix with or without this
+    // handoff, and a stemmed capture lands a few tokens BELOW that prefix, so
+    // requiring the witness to reach past it refused every cross-conversation
+    // switch. Only "nothing recoverable" is a refusal.
     gate.incoming_prefix = 100;
     gate.durable_incumbent_prefix = 4;
+    CHECK(server_vbr_empty_handoff_allowed(gate));
+    gate.durable_incumbent_prefix = 0;
     CHECK(!server_vbr_empty_handoff_allowed(gate));
 }
 

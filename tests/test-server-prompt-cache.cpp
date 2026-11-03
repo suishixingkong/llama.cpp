@@ -1996,9 +1996,15 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
         [](auto & gate) { gate.exact_incumbent_durable = true; });
     rejects_handoff(
         [](auto & gate) { gate.durable_incumbent_prefix = 0; });
-    rejects_handoff([](auto & gate) {
-        gate.durable_incumbent_prefix = gate.incumbent_lcp;
-    });
+    // A witness that reaches only the shared prefix is not a refusal: the switch
+    // discards the tail either way, and a stemmed capture routinely lands a few
+    // tokens below that prefix. Zero is the refusal.
+    {
+        auto reachable_below_lcp = accepted_handoff;
+        reachable_below_lcp.durable_incumbent_prefix =
+            reachable_below_lcp.incumbent_lcp;
+        CHECK(server_vbr_empty_handoff_allowed(reachable_below_lcp));
+    }
     CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
         [](auto & gate) { gate.hard_lease = true; })));
     CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
