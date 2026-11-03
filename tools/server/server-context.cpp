@@ -322,9 +322,18 @@ bool server_vbr_empty_handoff_lookup_allowed(
 
 bool server_vbr_empty_handoff_allowed(
         const server_vbr_empty_handoff_gate & gate) noexcept {
+    // The bar for destroying the idle incumbent is "whatever it holds beyond the
+    // incoming prefix is already being thrown away". A switch trims the live
+    // prompt back to the shared prefix and re-prefills from there, so the tail is
+    // lost with or without this handoff; requiring the durable witness to reach
+    // PAST the shared prefix demanded a recovery point the cold path never
+    // provides either, and a capture that stems a few tokens below it -- which is
+    // the normal shape -- therefore refused every cross-conversation switch on a
+    // one-slot server. Any real recovery point is enough: it is never worse than
+    // the cold prefill this replaces.
     return server_vbr_empty_handoff_lookup_allowed(gate) &&
         gate.incoming_prefix > gate.incumbent_lcp &&
-        gate.durable_incumbent_prefix > gate.incumbent_lcp &&
+        gate.durable_incumbent_prefix > 0 &&
         !gate.exact_incumbent_durable && gate.family_matches;
 }
 
