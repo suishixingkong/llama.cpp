@@ -16099,10 +16099,21 @@ private:
                 const auto consider_checkpoint = [&] (
                         const common_prompt_checkpoint & checkpoint,
                         bool demanded) {
+                    // A checkpoint frontier is the only place a stateful
+                    // prefix may be cut, but a shallow one is not worth cutting
+                    // at all: the artifact it produces covers that frontier and
+                    // nothing else, so it can never serve as the incoming prefix
+                    // for the conversation that produced it -- the request is
+                    // longer than the artifact. That is the ordinary shape when
+                    // a turn prefilled less than --checkpoint-min-step past the
+                    // switch point, which seals no deeper checkpoint. Refuse the
+                    // frontier and let the capture cover the whole prompt.
                     if (checkpoint_frontier || checkpoint.empty() ||
                         !checkpoint.computation_frontier.valid() ||
                         checkpoint.n_tokens <= 0 ||
                         checkpoint.n_tokens >= idle.prompt.n_tokens() ||
+                        uint64_t(checkpoint.n_tokens) * 2 <
+                            uint64_t(std::max<int64_t>(0, idle.prompt.n_tokens())) ||
                         checkpoint.computation_frontier.sequence_epoch !=
                             idle.prompt.sequence_epoch ||
                         (ctx_dft && checkpoint.data_dft.empty())) {
