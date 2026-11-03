@@ -1386,9 +1386,16 @@ struct server_slot {
             // it before sizing, allocating, or writing what can be a multi-GiB
             // host image; publish() repeats the check immediately before its
             // first mutation.
-            if (!prompt_cache.retention_sources_available(prompt, id)) {
-                SLT_WRN(*this, "%s",
-                        "prompt cache save skipped: retention source incomplete\n");
+            std::string missing_source;
+            if (!prompt_cache.retention_sources_available(prompt, id, &missing_source)) {
+                // Name the key. Without it this warning is unactionable: the same
+                // server publishes some conversations and silently drops others, and
+                // "incomplete" does not say whether the slot or one checkpoint lost
+                // its record.
+                SLT_WRN(*this, "prompt cache save skipped: retention source incomplete "
+                        "(%s, %zu tokens, %zu checkpoints)\n",
+                        missing_source.c_str(), prompt.tokens.size(),
+                        prompt.checkpoints.size());
                 return prompt_save_result::failed;
             }
 

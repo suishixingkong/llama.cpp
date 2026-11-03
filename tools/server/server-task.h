@@ -1809,9 +1809,14 @@ struct server_prompt_cache {
 
     // fork 9l-d4b5a (fork server-task.h 1598-1599)
     // fork 9l-d4b6c (fork server-task.h 1595-1597)
+    // `missing` names the first instance key with no clone-able retention record --
+    // "slot" or "checkpoint#3(pos_min=..., n_tokens=..., epoch=...)". A refusal here
+    // costs a conversation its host-cache entry for the rest of the process, so the
+    // caller can say which key went stale instead of only that one did.
     bool retention_sources_available(
             const server_prompt & source_prompt,
-            int32_t source_slot) const noexcept;
+            int32_t source_slot,
+            std::string * missing = nullptr) const noexcept;
     bool vbr_retention_source_available(
             int32_t source_slot) const noexcept;
 

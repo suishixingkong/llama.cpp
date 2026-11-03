@@ -5361,20 +5361,33 @@ bool server_prompt_cache::exactly_redundant(
 // fork 9l-d4b6c: server_prompt_cache::retention_sources_available (fork server-task.cpp 7252-7270)
 bool server_prompt_cache::retention_sources_available(
         const server_prompt & source_prompt,
-        int32_t source_slot) const noexcept {
+        int32_t source_slot,
+        std::string * missing) const noexcept {
     if (!retention_obs || source_slot < 0) {
         return true;
     }
     if (!retention_obs->clone_source_available(
             server_retention_instance_key::for_slot(source_slot))) {
+        if (missing) {
+            *missing = "slot";
+        }
         return false;
     }
+    int index = 0;
     for (const auto & checkpoint : source_prompt.checkpoints) {
         if (!retention_obs->clone_source_available(
                 server_retention_instance_key::for_checkpoint(
                     source_slot, &checkpoint))) {
+            if (missing) {
+                *missing = string_format(
+                        "checkpoint#%d(pos_min=%d, pos_max=%d, n_tokens=%d)",
+                        index, (int) checkpoint.pos_min,
+                        (int) checkpoint.pos_max,
+                        (int) checkpoint.n_tokens);
+            }
             return false;
         }
+        ++index;
     }
     return true;
 }
