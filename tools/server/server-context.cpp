@@ -6530,7 +6530,16 @@ private:
                         // conversation we are leaving, so neither survives this resume.
                         st.rings.erase(best);
                         slot.prompt.checkpoints.clear();
-                        slot.prompt.tokens = server_tokens(llama_tokens(rows.begin(), rows.begin() + keep), false);
+                        // has_mtmd records the SLOT's capability (a projector is loaded), not
+                        // "this ledger carries media" -- see server_tokens::has_media() for the
+                        // narrow question. It is assigned once, when the slots are built
+                        // (make_slots) or when the projector is reloaded, and nothing re-derives
+                        // it. Rebuilding the ledger with `false` here therefore disarms the slot
+                        // for the rest of the process: the next launch that reaches an image
+                        // aborts the whole server on GGML_ASSERT(has_mtmd) in
+                        // server_tokens::push_back_placeholder().
+                        slot.prompt.tokens = server_tokens(
+                                llama_tokens(rows.begin(), rows.begin() + keep), mctx != nullptr);
                         slot.prompt.sequence_epoch = 0;
                         slot.kvmem_swap_frontier = -1;
                         st.table.remember(best, llama_tokens(rows.begin(), rows.begin() + keep), 0);
@@ -6575,7 +6584,9 @@ private:
                     }
                     slot.prompt.checkpoints.clear();
                 }
-                slot.prompt.tokens = server_tokens(rows, false);
+                // Same reason as the checkpoint branch above: keep the slot's mtmd capability,
+                // or the rebuild turns the next media launch into a server-wide abort.
+                slot.prompt.tokens = server_tokens(rows, mctx != nullptr);
                 slot.prompt.sequence_epoch = 0;
                 // The restaged rows are a complete state at this frontier, but no
                 // context checkpoint describes them any more (the ring was just
