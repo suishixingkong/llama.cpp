@@ -51,6 +51,63 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// Deterministic test data.
+//
+// The initializers below used std::random_device, so every run drew different
+// data and a data-dependent failure (NaN/inf at one index, a tolerance that is
+// only just missed) could not be replayed: re-running the same command drew a
+// different case. The seed is now printed on every run and GGML_TEST_SEED=<that
+// value> reproduces the exact same data, including under -j N where the
+// per-tensor order of initialization is not stable.
+//
+// Values are derived from (seed, tensor identity, index) instead of from a
+// per-thread stream, so the split of work across threads cannot change them.
+static uint64_t test_seed() {
+    static const uint64_t seed = [] {
+        const char * env = getenv("GGML_TEST_SEED");
+        uint64_t s = 0;
+        if (env != nullptr && env[0] != '\0') {
+            s = strtoull(env, nullptr, 10);
+        } else {
+            std::random_device rd;
+            s = (uint64_t(rd()) << 32) ^ uint64_t(rd());
+        }
+        fprintf(stderr, "test-backend-ops: seed = %llu (replay with GGML_TEST_SEED=%llu)\n",
+                (unsigned long long) s, (unsigned long long) s);
+        fflush(stderr);
+        return s;
+    }();
+    return seed;
+}
+
+static uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+// A key that identifies one tensor under one seed. Names, shape and type are
+// mixed in so that two tensors never share a stream.
+static uint64_t tensor_seed_key(const ggml_tensor * tensor, uint64_t salt) {
+    uint64_t h = splitmix64(test_seed() ^ salt);
+    for (const char * p = tensor->name; p != nullptr && *p != '\0'; ++p) {
+        h = splitmix64(h ^ uint64_t(uint8_t(*p)));
+    }
+    h = splitmix64(h ^ uint64_t(tensor->type));
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        h = splitmix64(h ^ uint64_t(tensor->ne[i]) ^ (uint64_t(i) << 56));
+    }
+    return h;
+}
+
+// Uniform value in [min, max) for element i of the tensor identified by key.
+static float uniform_at(uint64_t key, size_t i, float min, float max) {
+    const uint64_t bits = splitmix64(key ^ (uint64_t(i) * 0x9E3779B97F4A7C15ull));
+    const double unit = double(bits >> 11) / double(1ull << 53); // [0, 1)
+    return float(double(min) + unit * (double(max) - double(min)));
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -61,12 +118,11 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     {
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
+        const uint64_t key = tensor_seed_key(tensor, 0x5EED5EEDull);
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
-            std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+                data[i] = uniform_at(key, i, min, max);
             }
         };
 
@@ -83,6 +139,20 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             for (auto & t : tasks) {
                 t.get();
             }
+        }
+    }
+
+    if (getenv("GGML_TEST_SEED_TRACE") != nullptr) {
+        static std::atomic<int> trace_left { 8 };
+        if (trace_left.fetch_sub(1) > 0) {
+            uint64_t h = tensor_seed_key(tensor, 0x5EED5EEDull);
+            for (size_t i = 0; i < nels; ++i) {
+                uint32_t bits = 0;
+                memcpy(&bits, &data[i], sizeof(bits));
+                h = splitmix64(h ^ bits);
+            }
+            fprintf(stderr, "seed-trace %s nels=%zu checksum=%016llx\n",
+                    tensor->name, nels, (unsigned long long) h);
         }
     }
 
@@ -156,12 +226,10 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(min, max);
+    const uint64_t key = tensor_seed_key(tensor, 0x5A17CA5Eull);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
-        data_f32[i] = dis(gen);
+        data_f32[i] = uniform_at(key, i, min, max);
     }
 
     // block size
@@ -172,12 +240,13 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const uint64_t block_key = splitmix64(key ^ (uint64_t(b) << 40) ^ 0xB10Cull);
+        const int p3 = int(splitmix64(block_key ^ 0x01) % uint64_t(ne3));
+        const int p2 = int(splitmix64(block_key ^ 0x02) % uint64_t(ne2));
+        const int p1 = int(splitmix64(block_key ^ 0x03) % uint64_t(ne1));
+        const int p0 = int(splitmix64(block_key ^ 0x04) % uint64_t(ne0));
 
-        bool inf = rd() & 1;
+        const bool inf = (splitmix64(block_key ^ 0x05) & 1) != 0;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -230,9 +299,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(min, max);
+    const uint64_t key = tensor_seed_key(tensor, 0x5452494Cull); // "TRIL"
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
@@ -240,7 +307,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
                 for (int64_t i0 = 0; i0 < ne0; i0++) {
                     int64_t idx = (i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3) / sizeof(float);
                     if (i0 <= i1) {
-                        data_f32[idx] = dis(gen);
+                        data_f32[idx] = uniform_at(key, size_t(idx), min, max);
                     } else {
                         data_f32[idx] = 0.0f;
                     }
