@@ -1040,6 +1040,9 @@ struct console_printer : public printer {
 
         if (!result.supported) {
             printf("not supported [%s] ", result.backend_name.c_str());
+            if (!result.error_message.empty() && result.error_message != "not supported") {
+                printf("(%s) ", result.error_message.c_str());
+            }
             printf("\n");
             return;
         }
@@ -1510,12 +1513,26 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
+        // A device that is too small for this case cannot test it. Report the
+        // case by name and skip it instead of failing the run: on a 2 GB card
+        // with -j 4 the same case succeeds or trips cudaMalloc depending on
+        // what the other workers happen to hold, which says nothing about the
+        // kernel under test. Printing through the locked printer also keeps
+        // the case name in the output (a bare printf with no newline used to
+        // merge into whichever line a sibling worker printed next).
+        const auto skip_on_alloc_failure = [&](const char * what) {
+            test_result result(ggml_backend_name(backend1), current_op_name,
+                               vars(), "test", false, false,
+                               std::string(what));
+            print_test_result_locked(output_printer, result);
+            return test_status_t::SKIPPED;
+        };
+
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
-                printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
-                return test_status_t::FAIL;
+                return skip_on_alloc_failure("weight tensors do not fit in device memory");
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
@@ -1524,8 +1541,7 @@ struct test_case {
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
 
         if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
-            return test_status_t::FAIL;
+            return skip_on_alloc_failure("case does not fit in device memory");
         }
 
         // build graph
