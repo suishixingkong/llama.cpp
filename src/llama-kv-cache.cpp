@@ -12614,11 +12614,9 @@ void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // VBR VMM v1: build_graph_shift views the FULL kv_size cells — executing it would touch
-    // unmapped VA. TODO(S6+): bound the shift views to the mapped watermark instead.
-    if (vbr_vmm_active()) {
-        return false;
-    }
+    // VBR VMM: build_graph_shift bounds its k_shift input and K views to the
+    // mapped watermark, so it only touches committed cells and the cache can
+    // shift again. (Cells above the watermark are empty and never viewed.)
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -13363,11 +13361,15 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
+    // The graph may bound this input to the mapped watermark (VBR VMM), so
+    // follow the tensor's own width instead of assuming kv_size per stream.
+    const uint32_t n_cells = (uint32_t) (dst->ne[0] / n_stream);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        for (uint32_t i = 0; i < n_cells; ++i) {
+            data[s*n_cells + i] = i >= cells.size() || cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
 }
@@ -13892,7 +13894,14 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    // A VBR VMM cache maps only the cells below the mapped watermark; cells
+    // above it were never committed, so a shift graph that views every
+    // kv_size cell would read and write unmapped VA. Bound both the k_shift
+    // input and the K views to the watermark -- cells above it are empty by
+    // construction, their shift value is 0 and they hold no KV.
+    const uint32_t n_shift_cells = vbr_vmm_active() ? vbr_watermark_cells(0) : get_size();
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_shift_cells*n_stream);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
@@ -13922,7 +13931,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_rot, n_head_kv, n_shift_cells*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
