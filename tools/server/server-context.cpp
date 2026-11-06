@@ -12734,6 +12734,28 @@ private:
                 }
                 throw std::runtime_error(refusal);
             }
+            // End this batch on the ordinary per-request terminal: tell every
+            // processing slot, release it, and drop the whole context because
+            // we cannot tell how much of the batch was applied.
+            const auto fail_slots = [&](const std::string & reason) {
+                SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", reason.c_str(), off, n_batch, ret);
+
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, reason);
+                        slot.release();
+
+                        // note: it's complicated to keep track of how much of the current batch has been
+                        //       processed before the error occurred, so we simply clear the entire context
+                        slot.mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
+                    }
+                }
+
+                // stop, do not retry with smaller batch size
+                throw std::runtime_error(reason);
+            };
+
             {
                 std::string err;
 
@@ -12757,22 +12779,7 @@ private:
                 if (decode_terminal ==
                         server_speculative_decode_terminal::ordinary_ret_error) {
                     GGML_ASSERT(!err.empty());
-                    SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
-
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            send_error(slot, err);
-                            slot.release();
-
-                            // note: it's complicated to keep track of how much of the current batch has been
-                            //       processed before the error occurred, so we simply clear the entire context
-                            slot.mandatory_recovery_reset(
-                                server_cache_destruction_reason::restore_failure);
-                        }
-                    }
-
-                    // stop, do not retry with smaller batch size
-                    throw std::runtime_error(err);
+                    fail_slots(err);
                 }
             }
 
@@ -12780,6 +12787,21 @@ private:
             GGML_ASSERT(decode_terminal ==
                 server_speculative_decode_terminal::retry);
             if (!try_clear_idle_slots()) {
+                // A batch carrying draft tokens cannot be split: post_decode
+                // refuses a spec index outside the current sub-batch and
+                // aborts every slot in the batch. Idle slots have already been
+                // cleared above, so a shortfall here is the end of this
+                // request, not a reason to shrink the batch.
+                bool spec_batch = false;
+                for (const auto & slot : slots) {
+                    if (slot.is_processing() && !slot.spec_i_batch.empty()) {
+                        spec_batch = true;
+                        break;
+                    }
+                }
+                if (spec_batch) {
+                    fail_slots("Context size has been exceeded.");
+                }
                 n_batch /= 2;
             }
 
