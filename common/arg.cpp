@@ -2581,6 +2581,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--ctx-checkpoint-mib"}, "N",
+        string_format("host memory budget, in MiB, for one slot's context checkpoints (default: %d, 0 - no limit). "
+            "Each checkpoint costs a full target/draft/accelerator image, so this is the bound that keeps the "
+            "host side from growing with the context", params.ctx_checkpoint_mib),
+        [](common_params & params, int value) {
+            params.ctx_checkpoint_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--checkpoint-recurrent-prev"},
         {"--no-checkpoint-recurrent-prev"},
         "use one prompt-only recurrent rollback plane to avoid the final checkpoint replay tail for suffixes >64 tokens "

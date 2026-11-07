@@ -5395,7 +5395,23 @@ private:
             }
         });
         queue_tasks.on_update_slots([this]() {
-            update_slots();
+            // This lambda IS the queue loop's thread entry point
+            // (server-queue.cpp: `while (true) { ... callback_update_slots(); }`), and
+            // that loop has no catch of its own. An exception that leaves it reaches
+            // the thread's terminate handler, which aborts the process: WER shows
+            // ucrtbase!+0x7286e, exception 0xC0000409 with FAST_FAIL_FATAL_APP_EXIT(7)
+            // for every such crash. The one exception the server can actually provoke
+            // on its own is std::bad_alloc: the host checkpoint ring and the prompt
+            // cache together are allowed to consume the whole host commit budget, and
+            // once they do, the next staging allocation throws. Losing the process is
+            // strictly worse than degrading -- a full prefill is recoverable, a dead
+            // server is not -- so the ring is dropped and the in-flight tasks fail
+            // with a retryable error instead.
+            try {
+                update_slots();
+            } catch (const std::bad_alloc & e) {
+                handle_host_alloc_failure(e.what());
+            }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -9651,6 +9667,55 @@ private:
         return false;
     }
 
+    // Terminal for a host allocation failure that escaped update_slots().
+    //
+    // The queue loop calls update_slots() as a thread entry point without a
+    // catch, so anything thrown here used to end the process (see the tick
+    // callback in initialize()). The only exception the server can provoke by
+    // itself is std::bad_alloc: the host checkpoint ring and the prompt cache
+    // are allowed to consume the entire host commit budget, and the next
+    // staging allocation then throws -- this is exactly the sequence the field
+    // log shows ("skipping context checkpoint: staging failed: bad allocation"
+    // followed, one request later, by a silent exit with 0xC0000409).
+    //
+    // Recovery must not allocate and must leave every slot in a state the next
+    // tick can reason about: the ring is dropped through the accounting-aware
+    // door, the interrupted task is failed with a retryable error instead of
+    // being left hanging, and the slot's prompt is cleared so the next request
+    // re-prefills from scratch. A full prefill is recoverable; a dead server
+    // is not.
+    void handle_host_alloc_failure(const char * what) noexcept {
+        SRV_ERR("host allocation failed in the decode loop: %s -- dropping host checkpoint rings, failing in-flight tasks\n",
+                what ? what : "bad allocation");
+        for (auto & slot : slots) {
+            try {
+                const bool processing = slot.is_processing();
+                const int32_t id_task = slot.task ? slot.task->id : -1;
+                if (processing && id_task >= 0) {
+                    send_error(id_task,
+                            "server exhausted its host memory budget while preparing this request; "
+                            "partial state was dropped, retry the request",
+                            ERROR_TYPE_SERVER);
+                }
+                if (processing) {
+                    if (slot.task) {
+                        slot.release();
+                    } else {
+                        // the unwound frame may have moved the task out already
+                        slot.state = SLOT_STATE_IDLE;
+                    }
+                }
+                // Force a clean prefill: after an unwind we cannot know whether the
+                // interrupted batch reached the KV cache, so the token ledger and the
+                // cells may disagree. Dropping the ledger makes the next launch ask for
+                // n_past = 0, which overwrites whatever the partial batch left behind.
+                slot.prompt_clear(server_cache_destruction_reason::restore_failure);
+            } catch (...) {
+                // recovery must never throw out of the tick callback again
+            }
+        }
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -12424,9 +12489,32 @@ private:
                             }
                         }
 
+                        // --ctx-checkpoints bounds the ring by ENTRY COUNT, which stopped
+                        // being a memory bound when the VBR capture kernel made one entry a
+                        // target image plus a full draft sequence, a QSA index and an
+                        // accelerator ring. All of those scale with the context, so a
+                        // 32-entry ring at 170k tokens is ~17 GiB of host RAM (measured);
+                        // with the prompt cache on top the process reaches the host commit
+                        // limit and the next staging allocation throws bad_alloc. Keep the
+                        // count rule and add a byte rule; the newest entry is never evicted
+                        // (size() > 1), so a single oversized checkpoint still survives.
+                        const uint64_t ring_budget_bytes =
+                            params_base.ctx_checkpoint_mib > 0
+                                ? uint64_t(params_base.ctx_checkpoint_mib)*1024ull*1024ull
+                                : 0;
+                        const auto checkpoint_ring_bytes = [&slot]() {
+                            uint64_t total = 0;
+                            for (const auto & ckpt : slot.prompt.checkpoints) {
+                                total += uint64_t(ckpt.size());
+                            }
+                            return total;
+                        };
                         while (checkpoint_publication_allowed &&
-                               slot.prompt.checkpoints.size() >=
-                                   (size_t) params_base.n_ctx_checkpoints) {
+                               (slot.prompt.checkpoints.size() >=
+                                    (size_t) params_base.n_ctx_checkpoints ||
+                                (ring_budget_bytes != 0 &&
+                                 slot.prompt.checkpoints.size() > 1 &&
+                                 checkpoint_ring_bytes() > ring_budget_bytes))) {
                             auto victim = slot.prompt.checkpoints.begin();
                             if (slot.lifecycle_authority) {
                                 common_cache_plan_destruction_reason refusal;

@@ -885,6 +885,15 @@ struct common_params {
     bool    vbr_prompt_cache_explicit = false; // whether --[no-]vbr-prompt-cache was provided
     int32_t vbr_anchor_cache_mib = 0;    // optional extra quality-anchor pool for VBR artifacts
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    // Host byte budget for one slot's checkpoint ring, in MiB (0 = no limit).
+    // --ctx-checkpoints counts ENTRIES, which was a usable proxy only while an
+    // entry was a fixed-state image. The dynamic-VBR capture kernel makes an entry
+    // carry a target image plus a full draft sequence, a QSA index and an
+    // accelerator ring, all of which scale with the context: measured ~0.55 GiB
+    // per entry at 170k tokens, i.e. a 32-entry ring is ~17 GiB of host RAM on top
+    // of the prompt cache. Counting bytes is the only bound that survives context
+    // growth.
+    int32_t ctx_checkpoint_mib  = 3072; // 0 = no byte limit on the ring
     bool checkpoint_recurrent_prev = false; // server: keep one recurrent rollback plane for exact replay checkpoints
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
