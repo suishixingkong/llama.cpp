@@ -400,6 +400,17 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 total = ret.back().total;
             }
         }
+        // The probe context created above is still alive, so this device reading already
+        // excludes the probe's own context/compute allocations -- while `memory_breakdown`
+        // (projected_used) counts the compute buffer a second time. Double counting it made the
+        // fit shrink n_ctx by roughly one compute buffer: on a 27B IQ3_S at -c auto the shrink
+        // stopped at 68864 cells and left 1973 MiB free against a 1024 MiB target, i.e. ~950 MiB
+        // (= probe compute 1360 minus the ~390 the real run reuses) of context was thrown away.
+        // The probe's bytes are released (or recycled by the pool) before the real configuration
+        // is built, so add them back.
+        const size_t probe_own = ret[i].mb.context + ret[i].mb.compute;
+        free = std::min(free + probe_own, total);
+
         ret[i].free  = free;
         ret[i].total = total;
     }
