@@ -75,6 +75,7 @@ struct llama_cparams {
     double vbr_min_bits = 0.0;
     uint64_t vbr_vram_budget_bytes = 0;
     uint64_t vbr_growth_headroom_bytes = 0;
+    uint64_t vbr_map_reserve_bytes    = 0;
     bool vbr_budget_explicit = false;
     bool vbr_min_bits_explicit = false;
     // mixed-config side pins, see llama.h vbr_pin_k

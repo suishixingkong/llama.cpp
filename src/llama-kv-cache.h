@@ -1200,6 +1200,7 @@ private:
     // overstates reality) + resolved growth headroom
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
+    size_t   vbr_map_reserve_      = 0;
     bool     vbr_budget_explicit_  = false;
     bool     vbr_budget_from_scalar_ = false;
     // Deterministic freeze mode — env VBR_FREEZE, TEST/GATING ONLY. Neutralizes the two

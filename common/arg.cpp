@@ -984,6 +984,12 @@ void common_params_postprocess_vbr(common_params & params) {
     params.vbr_vram_budget_bytes = vram_budget_bytes;
     common_setenv_override("VBR_VRAM_BUDGET", vram_budget);
 
+    std::string map_reserve_name;
+    if (!common_vbr_parse_vram_budget(params.vbr_map_reserve, map_reserve_name, params.vbr_map_reserve_bytes)) {
+        throw std::invalid_argument("unsupported VBR map reserve: " + params.vbr_map_reserve);
+    }
+    params.vbr_map_reserve = map_reserve_name;
+
     if (common_vbr_budget_is_dynamic(budget)) {
         ggml_type entry_type = GGML_TYPE_COUNT;
         const char * entry_name = nullptr;
@@ -3767,6 +3773,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vbr_vram_budget_explicit = true;
         }
     ).set_env("LLAMA_ARG_VBR_VRAM_BUDGET"));
+    add_opt(common_arg(
+        {"--vbr-map-reserve"}, "SIZE",
+        "free VRAM a VBR pool growth must leave on the device before it stops mapping (default: auto = 768 MiB). "
+        "This is a driver-transient margin, not a payload: at zero free the flash-attention shared-memory opt-in "
+        "fails and ggml-cuda aborts the process. Larger wastes KV capacity, smaller risks that abort",
+        [](common_params & params, const std::string & value) {
+            params.vbr_map_reserve = value;
+        }
+    ).set_env("LLAMA_ARG_VBR_MAP_RESERVE"));
     add_opt(common_arg(
         {"--vbr-reclaim-floor"}, "BPV",
         "dynamic VBR (server): clear idle slots' KV caches before a degrade wave would land the aggregate below this bits/value (default: 8.125 = protect the near-lossless f16/t8 band; 0 = never reclaim; 16 = reclaim before any degrade)",

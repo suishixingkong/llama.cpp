@@ -439,6 +439,10 @@ extern "C" {
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
                                           // a VBR pool at decode boundaries (0 = 1 GiB default)
+        uint64_t vbr_map_reserve_bytes;   // free VRAM a pool growth must leave on the device, or it
+                                          // stops mapping (0 = 768 MiB default). A driver-transient
+                                          // margin, not a payload: with nothing free the flash-attention
+                                          // shared-memory opt-in fails and ggml-cuda aborts the process
 
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget

@@ -429,6 +429,7 @@ llama_context::llama_context(
     cparams.vbr_min_bits = params.vbr_min_bits;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
+    cparams.vbr_map_reserve_bytes    = params.vbr_map_reserve_bytes;
     cparams.vbr_budget_explicit = params.vbr_budget_explicit;
     cparams.vbr_min_bits_explicit = params.vbr_min_bits_explicit;
     cparams.vbr_pin_k = params.vbr_pin_k;
@@ -453,6 +454,7 @@ llama_context::llama_context(
         cparams.vbr_min_bits             = 0.0;
         cparams.vbr_vram_budget_bytes    = 0;
         cparams.vbr_growth_headroom_bytes = 0;
+        cparams.vbr_map_reserve_bytes     = 0;
         cparams.vbr_budget_explicit      = false;
         cparams.vbr_min_bits_explicit    = false;
         cparams.vbr_pin_k                = false;
@@ -5550,6 +5552,7 @@ llama_context_params llama_context_default_params() {
         /*.vbr_min_bits                =*/ 0.0,
         /*.vbr_vram_budget_bytes       =*/ 0,
         /*.vbr_growth_headroom_bytes   =*/ 0,
+        /*.vbr_map_reserve_bytes      =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_cache_expert_parallel   =*/ 0,

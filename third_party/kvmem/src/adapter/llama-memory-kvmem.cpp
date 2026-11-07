@@ -802,6 +802,7 @@ llama_memory_vbr_params kvmem_owned_cache_vbr_params(
         /*.min_bits_explicit     =*/ false,
         /*.budget_explicit       =*/ false,
         /*.growth_headroom_bytes =*/ 0,
+        /*.map_reserve_bytes    =*/ 0,
         /*.device_share          =*/ 1.0,
         /*.pin_k                 =*/ false,
         /*.pin_v                 =*/ false,

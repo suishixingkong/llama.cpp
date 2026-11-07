@@ -2446,6 +2446,22 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_growth_headroom_ == 0) {
                 vbr_growth_headroom_ = 1024ull * 1024 * 1024;
             }
+            // Mapping admission reserve: free VRAM the device must still have after a growth step.
+            // It is NOT computable from the model. What actually fails at zero free is a driver-side
+            // reconfiguration -- the flash-attention shared-memory opt-in is <= 96 KB
+            // (ggml_cuda_fattn_mma_f16_shared_bytes is capped by the device's smpbo), yet near
+            // exhaustion cudaFuncSetAttribute returns cudaErrorMemoryAllocation and ggml-cuda
+            // aborts. So this prices driver transients (module carve-out reconfigure, graph
+            // instantiation, allocator slack), not a payload, and the value is a measured floor:
+            // 768 MiB kept the same 4x200k load alive that a 2047 MiB (total/8) margin refused
+            // ~100k cells early.
+            vbr_map_reserve_ = (size_t) vbr_params_.map_reserve_bytes;
+            if (const char * env = getenv("VBR_MAP_RESERVE_MIB")) {
+                vbr_map_reserve_ = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
+            }
+            if (vbr_map_reserve_ == 0) {
+                vbr_map_reserve_ = 768ull * 1024 * 1024;
+            }
             const bool budget_fit_armed = vbr_budget_bytes_ > 0;
             vbr_budget_from_scalar_ = budget_fit_armed;
             if (budget_fit_armed) {
@@ -5264,45 +5280,59 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
 // On failure pool.wm_cells stays at its old value; already-mapped delta pages are harmless
 // (maps are idempotent, a later retry re-walks them for free).
 bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
-    // Admission check: pool growth must leave room for the compute that follows
-    // this boundary. Mapping is what makes a cache "full" here, and once the
-    // device is exhausted the failure surfaces far away -- the flash-attention
-    // kernel cannot raise its dynamic shared-memory limit and ggml-cuda aborts
-    // the process (cudaFuncSetAttribute -> out of memory -> GGML_ABORT).
-    // Refusing up front instead fails this batch through prepare_with_slots()
-    // as recoverable, which the caller already retries with a smaller batch.
-    // GGML_VBR_COMPUTE_RESERVE_MIB overrides the reserve; 0 means auto.
-    for (const auto & pool : vbr_pools_) {
-        if (pool.vmm == nullptr || wm <= pool.wm_cells) {
-            continue;
-        }
-        size_t delta = 0;
-        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-            for (int side = 0; side < 2; ++side) {
-                const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
-                if (e.t == nullptr) {
-                    continue;
+    // Admission check: a growth step must leave vbr_map_reserve_ bytes free on the device. Mapping
+    // is what makes a cache "full" here, and once the device is exhausted the failure surfaces far
+    // away -- the flash-attention kernel cannot raise its dynamic shared-memory limit and ggml-cuda
+    // aborts the process (cudaFuncSetAttribute -> out of memory -> GGML_ABORT). Refusing up front
+    // instead fails this batch through prepare_with_slots() as recoverable, which the server
+    // already handles by retrying smaller.
+    //
+    // The margin is a measured floor, not a payload size (see the ctor comment): 768 MiB by
+    // default, --vbr-map-reserve / VBR_MAP_RESERVE_MIB to tune it.
+    size_t  short_need = 0;
+    size_t  short_free = 0;
+    int     short_dev  = -1;
+
+    const auto admission_ok = [&]() -> bool {
+        for (const auto & pool : vbr_pools_) {
+            if (pool.vmm == nullptr || wm <= pool.wm_cells) {
+                continue;
+            }
+            size_t delta = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
+                    if (e.t == nullptr) {
+                        continue;
+                    }
+                    delta += ggml_row_size(e.t->type, e.t->ne[0])*(wm - pool.wm_cells);
                 }
-                delta += ggml_row_size(e.t->type, e.t->ne[0])*(wm - pool.wm_cells);
+            }
+            if (delta == 0) {
+                continue;
+            }
+            size_t free_b = 0, total_b = 0;
+            pool.be->get_device_memory(pool.device, &free_b, &total_b);
+            // Never keep more than a quarter of a small device: the margin prices driver transients
+            // and must not price out a 2 GiB card whose whole pool is smaller than a flat 768 MiB.
+            // The fallback keeps the guard armed even if this cache never ran the ctor's VBR block.
+            const size_t reserve_cap = vbr_map_reserve_ != 0 ? vbr_map_reserve_ : (768ull << 20);
+            const size_t reserve = std::min(reserve_cap, total_b/4);
+            if (free_b < delta + reserve) {
+                short_need = delta + reserve;
+                short_free = free_b;
+                short_dev  = pool.device;
+                return false;
             }
         }
-        if (delta == 0) {
-            continue;
-        }
-        size_t free_b = 0, total_b = 0;
-        pool.be->get_device_memory(pool.device, &free_b, &total_b);
-        static const size_t reserve_override = [] {
-            const char * env = getenv("GGML_VBR_COMPUTE_RESERVE_MIB");
-            return env != nullptr && env[0] != '\0' ? size_t(strtoull(env, nullptr, 10)) << 20 : size_t(0);
-        }();
-        const size_t reserve = reserve_override > 0
-            ? reserve_override
-            : std::max<size_t>(size_t(1024) << 20, total_b/8);
-        if (free_b < delta + reserve) {
-            LLAMA_LOG_WARN("%s: not mapping %zu bytes for watermark %u: %zu MiB free, %zu MiB reserved for compute\n",
-                    __func__, delta, wm, free_b >> 20, reserve >> 20);
-            return false;
-        }
+        return true;
+    };
+
+    if (!admission_ok()) {
+        LLAMA_LOG_WARN("%s: not mapping %zu bytes for watermark %u: %zu MiB free, %zu MiB reserved for compute (device %d)\n",
+                __func__, short_need, wm, short_free >> 20,
+                (vbr_map_reserve_ != 0 ? vbr_map_reserve_ : (768ull << 20)) >> 20, short_dev);
+        return false;
     }
 
     for (auto & pool : vbr_pools_) {

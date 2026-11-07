@@ -759,6 +759,11 @@ struct common_params {
     double vbr_selected_bpv = 0.0;       // measured BPV of the selected policy/rung
     double vbr_selected_kld = 0.0;       // measured KLD of the selected policy/rung
     uint64_t vbr_vram_budget_bytes = 0;  // explicit VBR KV VRAM budget in bytes, 0 == auto
+    // Free VRAM a VBR pool growth must leave on the device, or the mapping step refuses and the
+    // batch fails recoverably. "auto" = the cache's built-in 768 MiB (a measured driver-transient
+    // margin, see llama-kv-cache). Accepts 768M / 1G / bytes.
+    std::string vbr_map_reserve = "auto";
+    uint64_t vbr_map_reserve_bytes = 0;
     bool vbr_budget_explicit = false;   // whether --vbr-budget/--vbr-bits was provided
     bool vbr_entry_explicit = false;    // whether --vbr-entry was provided
     bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided

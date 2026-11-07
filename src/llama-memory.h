@@ -134,6 +134,11 @@ struct llama_memory_vbr_params {
     // free-VRAM headroom kept while growing a VBR pool (0 = 1 GiB default; the fit passes its
     // --fit-target so startup and runtime encode the same worst case)
     uint64_t growth_headroom_bytes = 0;
+    // free VRAM that a pool growth must leave on the device before it stops mapping (0 = the
+    // cache's built-in 768 MiB default). Distinct from growth_headroom_bytes: that one is a
+    // planning margin resolved by the fit pass (it prices auxiliary models), this one is the
+    // driver-transient margin the mapping admission checks at every growth.
+    uint64_t map_reserve_bytes = 0;
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent normalizes their resolved pools so they never double-claim the same free)
     double   device_share = 1.0;
