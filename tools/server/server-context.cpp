@@ -8307,7 +8307,26 @@ private:
                                     cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens());
                                 }
                             }
-                            const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
+                            // cells_committed only counts ACTIVE slots, but the pool also holds
+                            // idle slots' retained prompts and the draft cache, so the estimate can
+                            // report room that the memory does not have -- the request then prefills
+                            // tens of thousands of tokens before the cells run out. Query the memory.
+                            auto * mem = llama_get_memory(ctx_tgt);
+                            const int64_t cells_total = (int64_t) llama_memory_kv_cells_total(mem);
+                            const auto cells_free = [&]() -> int64_t {
+                                if (cells_total <= 0) {
+                                    return (int64_t) slot->n_ctx - cells_committed;
+                                }
+                                // Occupancy is whichever is larger: what the pool holds now (idle
+                                // retained prompts, the draft cache) or what the active slots have
+                                // promised themselves. Taking only the first lets a burst of requests
+                                // all pass admission while the pool is still empty, and they then
+                                // starve each other mid-prefill.
+                                const int64_t used = std::max((int64_t) llama_memory_kv_cells_used(mem),
+                                                              cells_committed);
+                                return cells_total - std::min(used, cells_total);
+                            };
+                            int64_t cells_available = cells_free();
                             if (cells_available < (int64_t) task.n_tokens()) {
                                 // never-fits: reject instead of deferring forever (silent hang)
                                 if (task.n_tokens() > slot->n_ctx) {
@@ -8320,12 +8339,23 @@ private:
                                     slot->abandon_retention_prepared_launch();
                                     break; // drop the task
                                 }
-                                SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
-                                        id_task, task.n_tokens(), cells_available, cells_committed);
-                                slot->cache_plan.reset();
-                                slot->abandon_retention_prepared_launch();
-                                queue_tasks.defer(std::move(task));
-                                break;
+                                // Idle slots may be holding this room. Release them and re-check;
+                                // if the request still cannot fit, fail it now instead of queueing it
+                                // behind KV that will not be given up (the client would hang).
+                                (void) try_clear_idle_slots();
+                                cells_available = cells_free();
+                                if (cells_available < (int64_t) task.n_tokens()) {
+                                    SRV_WRN("rejecting task %d: needs %d tokens, %" PRId64 " of %" PRId64 " cells free\n",
+                                            id_task, task.n_tokens(), cells_available, cells_total);
+                                    send_error(task.id,
+                                               string_format(
+                                                   "context is full: request needs %d tokens but only %" PRId64 " of %" PRId64 " KV cells are free",
+                                                   task.n_tokens(), cells_available, cells_total),
+                                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), cells_total);
+                                    slot->cache_plan.reset();
+                                    slot->abandon_retention_prepared_launch();
+                                    break; // drop the task instead of deferring it
+                                }
                             }
                         }
 

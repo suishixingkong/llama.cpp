@@ -6225,6 +6225,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+uint32_t llama_memory_kv_cells_used(llama_memory_t mem) {
+    return mem != nullptr ? mem->kv_cells_used() : 0;
+}
+
+uint32_t llama_memory_kv_cells_total(llama_memory_t mem) {
+    return mem != nullptr ? mem->kv_cells_total() : 0;
+}
+
 double llama_memory_kv_bpv(llama_memory_t mem) {
     if (!mem) {
         return -1.0;

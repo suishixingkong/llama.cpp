@@ -849,6 +849,12 @@ extern "C" {
     // This is a non-mutating capability query.
     LLAMA_API bool llama_memory_can_seq_rm_partial(llama_memory_t mem);
 
+    // Occupied and total KV cells. Non-mutating; 0 when the memory holds no
+    // attention KV. Callers use it to refuse a prompt that cannot fit instead
+    // of processing it until the cells run out.
+    LLAMA_API uint32_t llama_memory_kv_cells_used (llama_memory_t mem);
+    LLAMA_API uint32_t llama_memory_kv_cells_total(llama_memory_t mem);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]

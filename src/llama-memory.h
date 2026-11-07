@@ -288,6 +288,13 @@ struct llama_memory_i {
     // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
     virtual double kv_bpv() const { return -1.0; }
 
+    // Occupied / total KV cells. Used by callers that must decide whether a
+    // prompt can still fit BEFORE spending its prefill (a full cache otherwise
+    // only fails at whichever token the cells run out, which is most of the
+    // prompt). Both return 0 when the memory holds no attention KV.
+    virtual uint32_t kv_cells_used()  const { return 0; }
+    virtual uint32_t kv_cells_total() const { return 0; }
+
     virtual llama_memory_vbr_representation_identity
     vbr_representation_identity() const {
         return {};

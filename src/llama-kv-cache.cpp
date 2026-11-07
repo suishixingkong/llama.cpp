@@ -10255,6 +10255,18 @@ double llama_kv_cache::kv_bpv() const {
     return vals > 0.0 ? bits / vals : -1.0;
 }
 
+uint32_t llama_kv_cache::kv_cells_used() const {
+    uint32_t n = 0;
+    for (const auto & cells : v_cells) {
+        n += cells.get_used();
+    }
+    return n;
+}
+
+uint32_t llama_kv_cache::kv_cells_total() const {
+    return (uint32_t) get_size()*n_stream;
+}
+
 llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
         llama_seq_id seq_id, uint32_t n_tokens_extra) const {
     llama_memory_vbr_state_data_v2 result = {};

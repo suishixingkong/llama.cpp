@@ -66,6 +66,8 @@ public:
     }
 
     double kv_bpv() const override { return mem_attn->kv_bpv(); }
+    uint32_t kv_cells_used()  const override { return mem_attn->kv_cells_used(); }
+    uint32_t kv_cells_total() const override { return mem_attn->kv_cells_total(); }
 
     llama_memory_vbr_representation_identity
     vbr_representation_identity() const override {
