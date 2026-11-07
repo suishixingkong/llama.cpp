@@ -8339,22 +8339,41 @@ private:
                                     slot->abandon_retention_prepared_launch();
                                     break; // drop the task
                                 }
-                                // Idle slots may be holding this room. Release them and re-check;
-                                // if the request still cannot fit, fail it now instead of queueing it
-                                // behind KV that will not be given up (the client would hang).
+                                // Idle slots may be holding this room. Release them and re-check.
                                 (void) try_clear_idle_slots();
                                 cells_available = cells_free();
                                 if (cells_available < (int64_t) task.n_tokens()) {
-                                    SRV_WRN("rejecting task %d: needs %d tokens, %" PRId64 " of %" PRId64 " cells free\n",
-                                            id_task, task.n_tokens(), cells_available, cells_total);
+                                    // Wait for space, but only until a deadline. Queued without one, a
+                                    // request could sit behind KV that is never given up for minutes.
+                                    // LLAMA_SERVER_KV_WAIT_MS sets the budget (0 = fail immediately).
+                                    static const int64_t kv_wait_ms = [] {
+                                        const char * env = getenv("LLAMA_SERVER_KV_WAIT_MS");
+                                        return env != nullptr && env[0] != '\0'
+                                            ? (int64_t) strtoll(env, nullptr, 10)
+                                            : (int64_t) 30000;
+                                    }();
+                                    const int64_t now_ms = ggml_time_ms();
+                                    if (task.t_kv_wait_deadline_ms == 0) {
+                                        task.t_kv_wait_deadline_ms = now_ms + kv_wait_ms;
+                                    }
+                                    if (now_ms < task.t_kv_wait_deadline_ms) {
+                                        SRV_DBG("defer task %d: needs %d tokens, %" PRId64 " of %" PRId64 " cells free, waiting up to %" PRId64 " ms\n",
+                                                id_task, task.n_tokens(), cells_available, cells_total, kv_wait_ms);
+                                        slot->cache_plan.reset();
+                                        slot->abandon_retention_prepared_launch();
+                                        queue_tasks.defer(std::move(task));
+                                        break;
+                                    }
+                                    SRV_WRN("rejecting task %d: needs %d tokens, %" PRId64 " of %" PRId64 " cells free after waiting %" PRId64 " ms\n",
+                                            id_task, task.n_tokens(), cells_available, cells_total, kv_wait_ms);
                                     send_error(task.id,
                                                string_format(
-                                                   "context is full: request needs %d tokens but only %" PRId64 " of %" PRId64 " KV cells are free",
-                                                   task.n_tokens(), cells_available, cells_total),
+                                                   "context is full: request needs %d tokens but only %" PRId64 " of %" PRId64 " KV cells are free (waited %" PRId64 " ms)",
+                                                   task.n_tokens(), cells_available, cells_total, kv_wait_ms),
                                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), cells_total);
                                     slot->cache_plan.reset();
                                     slot->abandon_retention_prepared_launch();
-                                    break; // drop the task instead of deferring it
+                                    break; // drop the task
                                 }
                             }
                         }
@@ -9645,6 +9664,16 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // Requests waiting for KV space carry a deadline; fail the ones that passed it,
+        // so they do not depend on some slot happening to free before the client gives up.
+        queue_tasks.expire_deferred(ggml_time_ms(), [this](server_task && task) {
+            SRV_WRN("task %d waited for KV space past its deadline, failing it\n", task.id);
+            send_error(task.id,
+                       string_format("context is full: request needs %d tokens and no KV space became free before its deadline",
+                                     task.n_tokens()),
+                       ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), (int32_t) llama_n_ctx(ctx_tgt));
+        });
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop

@@ -165,6 +165,11 @@ public:
     // Add a new task, but defer until one slot is available
     void defer(server_task && task);
 
+    // Hand every deferred task whose KV wait deadline has passed to on_expired and
+    // drop it from the deferred queue. Called from the decode loop so a waiter
+    // fails at its deadline instead of waiting for a slot that never frees.
+    void expire_deferred(int64_t now_ms, const std::function<void(server_task &&)> & on_expired);
+
     // Get the next id for creating a new task
     int get_new_id();
 

@@ -297,6 +297,25 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     return 0;
 }
 
+void server_queue::expire_deferred(int64_t now_ms, const std::function<void(server_task &&)> & on_expired) {
+    std::vector<server_task> expired;
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ) {
+            if (it->t_kv_wait_deadline_ms != 0 && now_ms >= it->t_kv_wait_deadline_ms) {
+                expired.push_back(std::move(*it));
+                it = queue_tasks_deferred.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (auto & task : expired) {
+        on_expired(std::move(task));
+    }
+}
+
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     // fork 9l-d4b8d: a deferred task is still a task the capture cannot see.

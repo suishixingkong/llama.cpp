@@ -212,6 +212,11 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // absolute deadline for waiting on KV space (0 = not waiting). Set the first
+    // time the scheduler defers this task for capacity, so a request that cannot
+    // fit does not sit in the deferred queue indefinitely.
+    int64_t t_kv_wait_deadline_ms = 0;
+
     // fork 9l-d2c: optional declared-family policy input (fork server-task.h
     // 186-190). The wire layer supplies only this opaque token; scheduler
     // launch resolves the strong binding locally, so an HTTP worker cannot
