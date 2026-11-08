@@ -2587,6 +2587,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "host side from growing with the context", params.ctx_checkpoint_mib),
         [](common_params & params, int value) {
             params.ctx_checkpoint_mib = value;
+            params.ctx_checkpoint_mib_explicit = true;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINT_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

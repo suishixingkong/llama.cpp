@@ -5322,6 +5322,26 @@ private:
             SRV_INF("%s", "cache-debug enabled: observed cache decisions per request (JSON log + /slots.cache_plan)\n");
         }
 
+        // --ctx-checkpoint-mib is a PER-SLOT budget, but the server defaults to
+        // -np 4 (`n_parallel = auto`), so its default value silently multiplied by
+        // four. Field report 2026-11-08: -c 700000 (auto -np 4, 262144 per slot)
+        // with an 8 GiB prompt cache reached 30.6 GiB of host private bytes on a
+        // 32 GiB box, "skipping context checkpoint: staging failed: bad allocation"
+        // started, and then the server stopped serving: idle slots could no longer
+        // be published to the host cache, so their KV was never released, so KV
+        // admission deferred every new request until the client gave up. Split the
+        // default across slots unless the user asked for a specific number.
+        if (params_base.ctx_checkpoint_mib > 0 &&
+            !params_base.ctx_checkpoint_mib_explicit) {
+            const int32_t n_slots_cfg = std::max(1, params_base.n_parallel);
+            const int32_t per_slot = std::max(512, 3072 / n_slots_cfg);
+            if (per_slot != params_base.ctx_checkpoint_mib) {
+                SRV_INF("context checkpoint budget: %d MiB per slot x %d slots = %d MiB total\n",
+                        per_slot, n_slots_cfg, per_slot * n_slots_cfg);
+            }
+            params_base.ctx_checkpoint_mib = per_slot;
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);

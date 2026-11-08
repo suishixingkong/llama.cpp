@@ -894,6 +894,12 @@ struct common_params {
     // of the prompt cache. Counting bytes is the only bound that survives context
     // growth.
     int32_t ctx_checkpoint_mib  = 3072; // 0 = no byte limit on the ring
+    // Whether --ctx-checkpoint-mib was given. The default above is a TOTAL that the
+    // server splits across slots, because it is otherwise a per-slot number and the
+    // server defaults to -np 4: four uncontrolled rings plus the 8 GiB prompt cache
+    // over-subscribe a 32 GiB host (measured 30.6 GiB private, then every host
+    // allocation failed and KV admission stalled on unpublished idle slots).
+    bool    ctx_checkpoint_mib_explicit = false;
     bool checkpoint_recurrent_prev = false; // server: keep one recurrent rollback plane for exact replay checkpoints
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
