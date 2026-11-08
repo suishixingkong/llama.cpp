@@ -1413,6 +1413,10 @@ void llama_memory_kvmem::reset_turn_policy() {
     turn_spans_ = {};
     retrieval_pinned_ = false;
     keep_selected_ = false;
+    // A refused round is a property of one request's span, so it must not outlive the
+    // turn: begin_retrieval_round() sets it again for the next request, and a driver
+    // that never opens a round has to keep capturing.
+    round_span_infeasible_ = false;
     // Not prefill_capture_: a cleared turn is not a driver that scores. The
     // server re-arms it per request (begin_retrieval_round), and everything
     // else must not D2H rows no scorer will read.

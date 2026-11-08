@@ -138,8 +138,50 @@ public:
     // server opens a retrieval round before the request's first ubatch, and
     // without one there is no scoring call to spend the captured bytes on.
     void begin_retrieval_round() {
+        round_span_infeasible_ = query_span_over_budget();
+        if (round_span_infeasible_) {
+            return;
+        }
         prefill_capture_ = true;
         runtime_->store().begin_retrieval_round();
+    }
+    // Every block overlapping the Query span is mandatory, and query_fixed_blocks()
+    // refuses a mandatory set that cannot fit the budget -- apply_retrieval() then rolls
+    // the round back and keeps the pressure view. On a cold prompt the span is the whole
+    // prompt, so this is the ordinary outcome for any request larger than the pool:
+    // 2026-11-09, 30k-token prompt against a 682-block budget, "mandatory_exceeds_pool:
+    // 939 of 680" on every attempt. Harvesting the Query and K rows of that whole prefill
+    // first buys nothing, so the refusal is decided before the first ubatch.
+    bool query_span_over_budget() {
+        if (query_begin_ < 0 || query_end_ <= query_begin_ || explicit_spans_) {
+            // Not a plain contiguous span (or the caller owns the spans): leave the
+            // verdict to apply_retrieval(), which sees the real mandatory set.
+            return false;
+        }
+        const uint32_t block = block_tokens_ ? block_tokens_ : 1;
+        const uint32_t budget = runtime_->store().budget_blocks();
+        const auto & cfg = runtime_->store().config();
+        const uint32_t reserve = cfg.sink_blocks + cfg.recent_blocks + 1;
+        if (!budget || budget <= reserve) {
+            // No plan can fit at all, including the sink and recency bands; that is
+            // not this span's fault and it is already reported by the round.
+            return false;
+        }
+        const uint32_t cap = budget - reserve;
+        const uint32_t first = uint32_t(query_begin_) / block;
+        const uint32_t last = uint32_t(query_end_ - 1) / block;
+        const uint32_t span_blocks = last - first + 1;
+        if (span_blocks <= cap) {
+            return false;
+        }
+        if (round_span_infeasible_end_ != query_end_) {
+            round_span_infeasible_end_ = query_end_;
+            LLAMA_LOG_INFO("%s: prefill capture skipped: the Query span alone needs %u of %u blocks "
+                    "(query=[%d,%d)), so no complete retrieval plan can fit; keeping the prefill "
+                    "pressure view. --kvmem-query-max scores only the span's tail and stays scoreable.\n",
+                    __func__, span_blocks, cap, query_begin_, query_end_);
+        }
+        return true;
     }
     void accept_retrieval_round();
     void restore_history(const kvmem::LrfuState& state) { runtime_->store().restore_retrieval(state); }
@@ -186,7 +228,7 @@ public:
     }
     // Capture the first-pass Query; replay keeps that seed frozen.
     bool want_q_capture() const {
-        return method_ == 1 && !no_capture() && !retrieval_pinned_ && !query_frozen_ && !speculative_evaluation_ &&
+        return !round_span_infeasible_ && method_ == 1 && !no_capture() && !retrieval_pinned_ && !query_frozen_ && !speculative_evaluation_ &&
             (explicit_spans_ ? !turn_spans_.query.empty() : query_begin_ >= 0);
     }
     bool want_decode_mean() const {
@@ -542,6 +584,12 @@ private:
     // llama-perplexity) still pays the eviction policy it asked for, but not
     // the D2H and the host packing of rows nothing will score.
     bool prefill_capture_ = false;
+    // This request's Query span cannot fit the budget even on its own, so no complete
+    // plan exists and the round will be rolled back; set once per request by
+    // begin_retrieval_round(), and the capture hooks consult it so the Query and K rows
+    // of the whole prefill are not harvested for scores that get thrown away.
+    bool round_span_infeasible_ = false;
+    int32_t round_span_infeasible_end_ = -1;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
     // Set when the configured Query span lies entirely behind the rows a round is about
