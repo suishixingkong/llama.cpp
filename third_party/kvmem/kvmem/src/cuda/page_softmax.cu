@@ -206,13 +206,33 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
         frame.starts.size()!=frame.counts.size() || frame.starts.size()!=frame.score_mask.size())
         throw std::invalid_argument("page softmax CUDA geometry mismatch");
     std::vector<size_t> enabled;
-    for(size_t i=0;i<frame.starts.size();++i) if(frame.score_mask[i]) enabled.push_back(i);
+    size_t masked=0;
+    const auto block_tokens=keys.config().block_tokens;
+    for(size_t i=0;i<frame.starts.size();++i) {
+        if(!frame.score_mask[i]) continue;
+        ++masked;
+        const auto begin=frame.starts[i];
+        if(!block_tokens || begin%block_tokens || begin>=frame.accepted_through ||
+            !frame.counts[i] || frame.counts[i]>frame.accepted_through-begin ||
+            begin/block_tokens>UINT32_MAX)
+            throw std::invalid_argument("page softmax CUDA stale index extent");
+        // A page the index never accepted has no evidence to score, and the host
+        // scorers treat exactly that as "not a candidate" (mean_key_retrieval.cpp
+        // continues on a missing block). Failing the round instead costs the whole
+        // retrieval pass for one hole: the 2026-11-09 field log threw on all 318
+        // rounds of a 160k conversation and silently fell back to recency. Such a
+        // page keeps its 0 and stays out of the softmax denominator.
+        if(!keys.has_block(uint32_t(begin/block_tokens))) continue;
+        enabled.push_back(i);
+    }
     std::vector<double> result(frame.starts.size(),0);
     uint32_t active=0;
     for(uint32_t l=0;l<q.layers;++l) {
         if(q.layer_rows[l]>q.rows) throw std::invalid_argument("page softmax CUDA row coverage mismatch");
         active+=q.layer_rows[l]!=0;
     }
+    if(enabled.empty() && masked)
+        throw std::invalid_argument("page softmax CUDA found no page with an accepted block");
     if(enabled.empty() || !active) return result;
     if(enabled.size()>INT_MAX || q.query_heads>INT_MAX || q.head_dim>INT_MAX)
         throw std::length_error("page softmax CUDA geometry exceeds launch addressing");
@@ -234,12 +254,8 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
     for(uint32_t layer=0;layer<q.layers;++layer) {
         if(!q.layer_rows[layer]) continue;
         for(size_t j=0;j<blocks;++j) {
-            const auto i=enabled[j],begin=frame.starts[i];
-            if(begin%keys.config().block_tokens || begin>=frame.accepted_through ||
-                !frame.counts[i] || frame.counts[i]>frame.accepted_through-begin ||
-                begin/keys.config().block_tokens>UINT32_MAX || !keys.has_block(uint32_t(begin/keys.config().block_tokens)))
-                throw std::invalid_argument("page softmax CUDA stale index extent");
-            keys.mean_k(uint32_t(begin/keys.config().block_tokens),layer,key.data());
+            const auto i=enabled[j];
+            keys.mean_k(uint32_t(frame.starts[i]/block_tokens),layer,key.data());
             for(size_t d=0;d<kw;++d) host_means[j*kw+d]=__float2half_rn(recall_fp16(key[d]));
         }
         checked(cudaMemcpyAsync(w.means.data,host_means.data(),blocks*kw*sizeof(half),cudaMemcpyHostToDevice,w.stream));

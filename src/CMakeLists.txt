@@ -181,6 +181,21 @@ if (LLAMA_KVMEM)
         # host, which measured 4195 ms for 3156 rows against 25 ms for the whole round
         # otherwise: the round then dominates the request's prefill.
         kvmem_enable_cuda_recall()
+        # The device implementation is the one the server actually scores with, and
+        # the 2026-11-09 field failure (a page without an accepted block throwing on
+        # every round) existed only there, so keep its qualification test in the
+        # suite whenever CUDA is on. It needs a device and says so instead of
+        # silently passing, which is why it is not part of the host test list.
+        if (TARGET kvmem-recall-cuda AND LLAMA_BUILD_TESTS)
+            add_executable(test-graph-recall-cuda ${LLAMA_KVMEM_ROOT}/kvmem/tests/graph_recall_cuda_test.cpp)
+            target_include_directories(test-graph-recall-cuda PRIVATE ${LLAMA_KVMEM_ROOT}/kvmem/include)
+            target_compile_features(test-graph-recall-cuda PRIVATE cxx_std_17)
+            if (WIN32)
+                target_compile_definitions(test-graph-recall-cuda PRIVATE _CRT_SECURE_NO_WARNINGS)
+            endif()
+            target_link_libraries(test-graph-recall-cuda PRIVATE kvmem)
+            add_test(NAME test-graph-recall-cuda COMMAND test-graph-recall-cuda)
+        endif()
     endif()
     target_link_libraries(llama PRIVATE kvmem)
     if (GGML_CUDA)

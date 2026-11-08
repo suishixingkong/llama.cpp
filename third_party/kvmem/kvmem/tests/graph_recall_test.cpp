@@ -104,6 +104,42 @@ void scorer_variants() {
         "signed Query order lost");
     rejects([&] {store.pick_scored_blocks({0,1,2},{-.8,-.2,-.5},{},2);});
 }
+// 2026-11-09 field log: one page without an accepted block threw out of the
+// scorer and took every one of 318 retrieval rounds with it, so a 160k
+// conversation silently fell back to recency. A page the index never accepted
+// is "not a candidate": score 0 and outside the softmax denominator, which is
+// what the exact path (mean_key_retrieval.cpp) already does by skipping it.
+void index_holes_are_not_fatal() {
+    kvmem::RawKvStore keys({1, 2, 0, 4});
+    const float a[]{2,0}, c[]{0,2};
+    keys.write_layer_mean_sum(0,1,0,a);          // page 0
+    keys.write_layer_mean_sum(8,1,0,c);          // page 2; page 1 is the hole
+    require(!keys.has_block(1) && keys.has_block(0) && keys.has_block(2), "fixture did not hole page 1");
+    const float q[]{2,0}; const uint32_t rows[]{1};
+    const auto frame = kvmem::query_score_frame(12,4,3,0,0,{});
+    kvmem::PageQueryView view{q,rows,1,1,1,1,2};
+    const auto scores = kvmem::page_softmax_scores(keys,view,frame);
+    require(scores.size()==3 && scores[1]==0, "missing page was given a score");
+    // Two pages compete, so the winner keeps exp(4/sqrt2)/(exp(4/sqrt2)+1);
+    // counting the hole as a zero-logit page would move it from 0.944 to 0.894.
+    const double logit = 4/std::sqrt(2.);
+    const double winner = std::exp(logit)/(std::exp(logit)+1);
+    close(scores[0],winner,1e-3);
+    close(scores[2],1-winner,1e-3);
+    require(std::abs(std::accumulate(scores.begin(),scores.end(),0.)-1)<1e-9,
+            "missing page was left in the softmax denominator");
+    const auto exact = kvmem::mean_query_cosine_scores(keys,view,3,kvmem::GqaScoreAggregation::Mean);
+    require(exact[1]==0 && std::abs(exact[0]-1)<1e-6 && std::abs(exact[2])<1e-6,
+            "index hole changed the exact path");
+    // A misaligned or overrun page is still a broken frame, not a hole.
+    auto broken = frame; broken.starts[0] = 2;
+    rejects([&] { kvmem::page_softmax_scores(keys,view,broken); });
+    // And a hollow index must stay visible instead of quietly scoring nothing,
+    // which would read as "no preference" and select by recency.
+    kvmem::RawKvStore hollow({1, 2, 0, 4});
+    rejects([&] { kvmem::page_softmax_scores(hollow,view,frame); });
+}
+
 void graph_lifecycle() {
     constexpr size_t limit=1u<<20;
     kvmem::GraphSnapshot graph; graph.block_tokens=64;
@@ -282,7 +318,7 @@ void message_locality() {
 } // namespace
 int main() {
     try {
-        frames_and_scores(); gqa_and_large_domain(); scorer_variants(); graph_lifecycle(); orthogonal_query_scoring(); feedback_and_pressure(); accepted_sampling(); fixed_picker(); statistics_budget(); message_locality();
+        frames_and_scores(); index_holes_are_not_fatal(); gqa_and_large_domain(); scorer_variants(); graph_lifecycle(); orthogonal_query_scoring(); feedback_and_pressure(); accepted_sampling(); fixed_picker(); statistics_budget(); message_locality();
         std::cout << "graph recall numerical and accepted-state checks passed\n";
         return 0;
     } catch (const std::exception& e) {

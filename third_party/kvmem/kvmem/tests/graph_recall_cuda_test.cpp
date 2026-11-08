@@ -57,6 +57,31 @@ int main() {
             std::cout<<"agg="<<int(aggregation)<<" pages="<<shape.blocks<<" rows="<<shape.rows<<" D="<<shape.dim
                 <<" worst_abs="<<worst<<" workspace="<<scorer.device_bytes()<<'\n';
         }
+        {
+            // The 2026-11-09 field failure: a page whose block was never accepted
+            // must not fail the round on the GPU either (see graph_recall_test.cpp).
+            constexpr uint32_t layers=1,blocks=5,rows=3,dim=4,qheads=2,kvheads=1;
+            const auto kw=kvheads*dim,qw=qheads*dim;
+            kvmem::RawKvStore keys({layers,kw,0,4});
+            std::vector<float> key(kw);
+            for(uint32_t b=0;b<blocks;++b) {
+                if(b==2) continue;                       // the hole
+                for(uint32_t d=0;d<kw;++d) key[d]=float(int((b*5+d*3)%13)-6)/8;
+                keys.write_layer_mean_sum(b*4,4,0,key.data());
+            }
+            std::vector<float> query(size_t(layers)*rows*qw);
+            for(size_t d=0;d<query.size();++d) query[d]=float(int((d*11)%17)-8)/8;
+            const uint32_t counts[]{rows};
+            auto frame=kvmem::query_score_frame(uint64_t(blocks)*4,4,blocks,0,0,{});
+            kvmem::PageQueryView view{query.data(),counts,layers,rows,qheads,kvheads,dim};
+            const auto expected=kvmem::page_softmax_scores(keys,view,frame,kvmem::GqaScoreAggregation::Mean);
+            const auto actual=scorer.score(keys,view,frame,kvmem::GqaScoreAggregation::Mean);
+            if(actual[2]!=0) throw std::runtime_error("CUDA scorer gave an index hole a score");
+            for(size_t b=0;b<actual.size();++b)
+                if(std::abs(actual[b]-expected[b])>2e-6+expected[b]*3e-5)
+                    throw std::runtime_error("CUDA scorer disagrees with the host on an index hole");
+            std::cout<<"index hole tolerated (page 2 scored 0, "<<blocks-1<<" pages compared)\n";
+        }
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

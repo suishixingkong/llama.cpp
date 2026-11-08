@@ -233,13 +233,26 @@ std::vector<double> page_softmax_scores(const RawKvStore& keys, PageQueryView q,
           frame.counts.size() == n && frame.score_mask.size() == n &&
           frame.transport_mask.size() == n, "page softmax geometry mismatch");
     std::vector<size_t> enabled;
+    size_t masked = 0;
     for (size_t b = 0; b < n; ++b) {
         check(frame.counts[b] && frame.starts[b] % keys.config().block_tokens == 0 &&
               frame.starts[b] <= frame.accepted_through &&
               frame.counts[b] <= frame.accepted_through-frame.starts[b], "invalid accepted Query extent");
-        if (frame.score_mask[b]) enabled.push_back(b);
+        if (!frame.score_mask[b]) continue;
+        ++masked;
+        // A page the index never accepted has no evidence to score. Treat it as
+        // "not a candidate" the way mean_key_retrieval.cpp does (it continues on a
+        // missing block) instead of failing the round: one hole in a long history
+        // otherwise costs the whole retrieval pass. The page keeps its 0 and stays
+        // out of the softmax denominator.
+        if (!keys.has_block(uint32_t(frame.starts[b]/keys.config().block_tokens))) continue;
+        enabled.push_back(b);
     }
     std::vector<double> result(n, 0);
+    // Dropping a hole is a downgrade, dropping everything is a broken index: that
+    // one has to stay visible instead of quietly selecting by recency.
+    if (enabled.empty() && masked)
+        throw std::invalid_argument("page softmax found no page with an accepted block");
     if (enabled.empty()) return result;
     uint32_t active_layers = 0;
     for (uint32_t l = 0; l < q.layers; ++l) {
@@ -256,7 +269,6 @@ std::vector<double> page_softmax_scores(const RawKvStore& keys, PageQueryView q,
         if (!q.layer_rows[l]) continue;
         for (size_t j = 0; j < enabled.size(); ++j) {
             const auto block = uint32_t(frame.starts[enabled[j]]/keys.config().block_tokens);
-            check(keys.has_block(block), "page softmax index lacks an accepted block");
             keys.mean_k(block, l, key.data());
             for (size_t d = 0; d < kw; ++d) means[j*kw+d] = recall_fp16(key[d]);
         }
