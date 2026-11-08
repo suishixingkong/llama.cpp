@@ -2680,6 +2680,13 @@ struct server_slot {
     llama_cache_acct_artifact_id vbr_idle_stem_host_artifact;
     // fork server-context.cpp:1561
     bool vbr_idle_stem_source_valid = false;
+    // How many consecutive KV-admission starvations this slot has refused to
+    // yield during. An idle slot is only purgeable when its frontier is already
+    // durable in the host cache (vbr_idle_source_durable); when publishing is
+    // impossible -- the host is out of memory, which is exactly what made the
+    // publication fail in the first place -- the slot keeps its cells forever
+    // and admission starves every later request. See try_clear_idle_slots().
+    int32_t vbr_idle_purge_refusals = 0;
     // fork server-context.cpp:1562
     bool vbr_idle_stem_retry = false;
     // fork server-context.cpp:1567
@@ -5397,6 +5404,14 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_idle([this]() {
+            // A task deferred for KV space is only re-examined by update_slots(), and
+            // update_slots() runs only when a task wakes the queue. With nothing else
+            // in flight -- the normal state right after the deferred request -- the
+            // deadline never fires: measured 2026-11-08, a task deferred with
+            // "waiting up to 5000 ms" was still queued minutes later, and the field
+            // server only ever answered it with the client's own 30 s cancel. The
+            // idle tick is the one thing that keeps running, so expire here too.
+            fail_expired_kv_waits();
             if (params_base.vbr_prompt_cache && vbr_idle_exact_capture) {
                 (void) finish_idle_exact_vbr_capture(true);
                 if (vbr_idle_exact_capture) {
@@ -5740,8 +5755,14 @@ private:
                     continue;
                 }
                 if (!vbr_idle_source_durable(slot)) {
-                    SLT_DBG(slot, "%s",
-                            "idle purge skipped: no durable VBR frontier\n");
+                    // Nothing durable to restore from. Keep the cells for now, but
+                    // count the refusal: this function is only reached when admission
+                    // is already starving, and during a starvation episode nothing can
+                    // make the frontier durable either (publishing needs host memory,
+                    // and the idle capture cannot run while a task is queued).
+                    ++slot.vbr_idle_purge_refusals;
+                    SLT_DBG(slot, "idle purge skipped: no durable VBR frontier (refused %d times)\n",
+                            (int) slot.vbr_idle_purge_refusals);
                     continue;
                 }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -5755,10 +5776,57 @@ private:
                     continue;
                 }
 
+                slot.vbr_idle_purge_refusals = 0;
                 res = true;
 
                 // clear slots one by one
                 break;
+            }
+        }
+
+        // Last resort: an idle slot whose frontier cannot be published is holding
+        // cells that admission needs, and nothing in the system can ever release
+        // them -- publishing needs host memory, which is exactly what ran out.
+        // Measured consequence (2026-11-08): three unpublishable conversations held
+        // 538k cells, every request was deferred for the whole KV wait and the client
+        // cancelled first, so the server looked "alive but dead" for 90 minutes.
+        // Dropping one such prompt costs a re-prefill; keeping it costs the server.
+        // LLAMA_SERVER_KV_PURGE_AFTER sets the refusal count that triggers this
+        // (0 disables it); a hard lease is still never broken.
+        if (!res) {
+            static const int32_t purge_after = [] {
+                const char * env = getenv("LLAMA_SERVER_KV_PURGE_AFTER");
+                return env != nullptr && env[0] != '\0'
+                    ? (int32_t) strtol(env, nullptr, 10)
+                    : (int32_t) 3;
+            }();
+            server_slot * victim = nullptr;
+            if (purge_after > 0) {
+                for (auto & slot : slots) {
+                    if (slot.is_processing() || slot.prompt.n_tokens() <= 0) {
+                        continue;
+                    }
+                    if (slot.hard_lease_blocks_live_prefix()) {
+                        continue;
+                    }
+                    if (slot.vbr_idle_purge_refusals < purge_after) {
+                        continue;
+                    }
+                    // oldest first: its tokens are the least likely to be asked for
+                    if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                        victim = &slot;
+                    }
+                }
+            }
+            if (victim != nullptr) {
+                SRV_WRN("idle purge forced on slot %d (%d tokens) after %d refused publications: "
+                        "no durable VBR frontier exists and KV admission is starving, "
+                        "dropping the live prompt -- the next request on this slot re-prefills\n",
+                        victim->id, victim->prompt.n_tokens(),
+                        (int) victim->vbr_idle_purge_refusals);
+                victim->prompt_clear(server_cache_destruction_reason::idle_reclaim);
+                victim->vbr_idle_purge_refusals = 0;
+                res = true;
             }
         }
 
@@ -6857,6 +6925,10 @@ private:
             server_slot & slot,
             server_task && task,
             bool reclaim_before_launch = false) {
+        // A new task starts a new starvation episode: the purge-refusal counter that
+        // try_clear_idle_slots() accumulates only speaks for the prompt this slot is
+        // about to replace.
+        slot.vbr_idle_purge_refusals = 0;
         // Defensive backstop for any future caller which does not pass through
         // process_single_task's group-wide preselection admission.
         // The outgoing store is booked before its ledger is replaced, then the
@@ -8382,11 +8454,19 @@ private:
                                     // Wait for space, but only until a deadline. Queued without one, a
                                     // request could sit behind KV that is never given up for minutes.
                                     // LLAMA_SERVER_KV_WAIT_MS sets the budget (0 = fail immediately).
+                                    //
+                                    // The default has to stay WELL below a client's request timeout,
+                                    // because a client that gives up first turns this rejection into a
+                                    // silent hang: the 2026-11-08 field run deferred for the full 30000 ms
+                                    // while the agent cancelled at 30 s, so every reply ended in
+                                    // "stop: cancel task" instead of the "context is full" error below.
+                                    // 5 s also happens to be longer than any single decode step that could
+                                    // actually be holding the cells.
                                     static const int64_t kv_wait_ms = [] {
                                         const char * env = getenv("LLAMA_SERVER_KV_WAIT_MS");
                                         return env != nullptr && env[0] != '\0'
                                             ? (int64_t) strtoll(env, nullptr, 10)
-                                            : (int64_t) 30000;
+                                            : (int64_t) 5000;
                                     }();
                                     const int64_t now_ms = ggml_time_ms();
                                     if (task.t_kv_wait_deadline_ms == 0) {
@@ -9736,6 +9816,22 @@ private:
         }
     }
 
+    // Fail the requests whose KV-space wait has run out. Called from update_slots()
+    // AND from the idle tick: a deferred task is only re-examined by update_slots(),
+    // and update_slots() needs a wake, so an otherwise-idle server would honour the
+    // deadline only when some unrelated request happened to arrive. The idle tick
+    // runs at least once a second (server-queue.cpp max_wait_time), which bounds the
+    // overshoot to that.
+    void fail_expired_kv_waits() {
+        queue_tasks.expire_deferred(ggml_time_ms(), [this](server_task && task) {
+            SRV_WRN("task %d waited for KV space past its deadline, failing it\n", task.id);
+            send_error(task.id,
+                       string_format("context is full: request needs %d tokens and no KV space became free before its deadline",
+                                     task.n_tokens()),
+                       ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), (int32_t) llama_n_ctx(ctx_tgt));
+        });
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -9752,13 +9848,7 @@ private:
 
         // Requests waiting for KV space carry a deadline; fail the ones that passed it,
         // so they do not depend on some slot happening to free before the client gives up.
-        queue_tasks.expire_deferred(ggml_time_ms(), [this](server_task && task) {
-            SRV_WRN("task %d waited for KV space past its deadline, failing it\n", task.id);
-            send_error(task.id,
-                       string_format("context is full: request needs %d tokens and no KV space became free before its deadline",
-                                     task.n_tokens()),
-                       ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), (int32_t) llama_n_ctx(ctx_tgt));
-        });
+        fail_expired_kv_waits();
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
