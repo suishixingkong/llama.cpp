@@ -5732,19 +5732,21 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
-        bool res = false;
-
+    // `avoid_slot_id` is the slot the incoming task is about to reuse. Purging THAT
+    // slot throws away the very prefix the request came for -- field log 2026-11-08:
+    // selection picked slot 3 at f_sim 0.999 and the purge walk still offered slot 3
+    // as a victim, because the walk knew nothing about the selection. Other idle
+    // slots go first; the avoided slot is only used when nothing else can yield.
+    bool try_clear_idle_slots(int32_t avoid_slot_id = -1) {
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
-        for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                continue;
+        const auto purge_one = [&](server_slot & slot) -> bool {
+            if (slot.is_processing() || slot.prompt.n_tokens() <= 0) {
+                return false;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
+            {
                 // fork 9l-d4b8z: an idle purge now goes through the durability
                 // classifier and the publication-aware clear door, so a slot whose
                 // cache cannot be republished is KEPT instead of being destroyed
@@ -5752,7 +5754,7 @@ private:
                 // Approved guard, not destruction-authority certification.
                 if (slot.hard_lease_blocks_live_prefix()) {
                     SLT_INF(slot, "%s", "idle purge skipped: hard lease seals the live prefix\n");
-                    continue;
+                    return false;
                 }
                 if (!vbr_idle_source_durable(slot)) {
                     // Nothing durable to restore from. Keep the cells for now, but
@@ -5763,7 +5765,7 @@ private:
                     ++slot.vbr_idle_purge_refusals;
                     SLT_DBG(slot, "idle purge skipped: no durable VBR frontier (refused %d times)\n",
                             (int) slot.vbr_idle_purge_refusals);
-                    continue;
+                    return false;
                 }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
@@ -5773,14 +5775,34 @@ private:
                 if (!removed) {
                     SLT_DBG(slot, "%s",
                             "idle purge skipped: full-slot lease refused displacement\n");
-                    continue;
+                    return false;
                 }
 
                 slot.vbr_idle_purge_refusals = 0;
-                res = true;
+                return true;
+            }
+        };
 
-                // clear slots one by one
-                break;
+        const auto purge_any_other = [&]() -> bool {
+            for (auto & slot : slots) {
+                if (slot.id == avoid_slot_id) {
+                    continue;
+                }
+                if (purge_one(slot)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        bool res = purge_any_other();
+        // last resort inside the ordinary walk: the avoided slot itself
+        if (!res && avoid_slot_id >= 0) {
+            for (auto & slot : slots) {
+                if (slot.id == avoid_slot_id && purge_one(slot)) {
+                    res = true;
+                    break;
+                }
             }
         }
 
@@ -5801,7 +5823,8 @@ private:
                     : (int32_t) 3;
             }();
             server_slot * victim = nullptr;
-            if (purge_after > 0) {
+            const auto pick_victim = [&](bool allow_avoid) {
+                victim = nullptr;
                 for (auto & slot : slots) {
                     if (slot.is_processing() || slot.prompt.n_tokens() <= 0) {
                         continue;
@@ -5812,10 +5835,23 @@ private:
                     if (slot.vbr_idle_purge_refusals < purge_after) {
                         continue;
                     }
+                    // Never hand over the slot the incoming task is about to reuse
+                    // while any other slot qualifies: its prefix is what the request
+                    // came for.
+                    if (!allow_avoid && avoid_slot_id >= 0 && slot.id == avoid_slot_id) {
+                        continue;
+                    }
                     // oldest first: its tokens are the least likely to be asked for
                     if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
                         victim = &slot;
                     }
+                }
+            };
+            if (purge_after > 0) {
+                pick_victim(false);
+                if (victim == nullptr) {
+                    // starving is worse than dropping the prefix we wanted
+                    pick_victim(true);
                 }
             }
             if (victim != nullptr) {
@@ -8447,8 +8483,9 @@ private:
                                     slot->abandon_retention_prepared_launch();
                                     break; // drop the task
                                 }
-                                // Idle slots may be holding this room. Release them and re-check.
-                                (void) try_clear_idle_slots();
+                                // Idle slots may be holding this room. Release them and re-check,
+                                // preferring one that is not the slot this task will run on.
+                                (void) try_clear_idle_slots(slot->id);
                                 cells_available = cells_free();
                                 if (cells_available < (int64_t) task.n_tokens()) {
                                     // Wait for space, but only until a deadline. Queued without one, a
