@@ -133,7 +133,10 @@ public:
     void harvest_flush();
     void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
-    void apply_retrieval();
+    // True when a plan was scored, selected and applied. False means the round was
+    // skipped (no Query rows, span over budget, selection does not fit) and the resident
+    // view is still the prefill pressure view -- the caller must not pin or commit that.
+    bool apply_retrieval();
     // Only a driver that will actually score can want the prefill K rows: the
     // server opens a retrieval round before the request's first ubatch, and
     // without one there is no scoring call to spend the captured bytes on.

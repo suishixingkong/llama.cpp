@@ -207,7 +207,10 @@ LLAMA_API void llama_kvmem_decode_mean_discard(void);
 LLAMA_API void llama_kvmem_decode_mean_flush(void);
 
 // Score + reselect + stage-in raw-K/V for retrieval. No-op if method is recency.
-LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);
+// True only when a plan was applied; false means the round was skipped and the
+// resident view is still the prefill pressure view, so the caller must not pin or
+// commit it (pinning a skipped round blocks every later Query capture).
+LLAMA_API bool llama_kvmem_apply_retrieval(struct llama_context * ctx);
 LLAMA_API void llama_kvmem_begin_retrieval_round(void);
 LLAMA_API void llama_kvmem_accept_retrieval_round(void);
 // True when sink + [query_begin, prompt_end) fits the GPU selection budget

@@ -5103,6 +5103,10 @@ void llama_memory_kvmem::accept_retrieval_round() {
     bool query_ready = false;
     for (uint32_t il = 0; il < n_layer_; ++il) {
         if (kvmem_cache_has_layer(kv_, il)) {
+            // expected counts positions, q_count_ counts rows. They agree unless the
+            // span itself carries a media chunk (a chunk advances fewer positions than
+            // rows); that round is then applied but not committed, so its LRFU history
+            // waits for the next turn. Cheap and safe, unlike inverting the ledger here.
             if (q_count_[il] != expected) return;
             query_ready = true;
         }
@@ -5537,8 +5541,8 @@ bool llama_memory_kvmem::set_tail_mean(uint32_t row, const llama_kvmem_tail_mean
     return true;
 }
 
-void llama_memory_kvmem::apply_retrieval() {
-    if (method_ != 1) { harvest_flush(); return; }
+bool llama_memory_kvmem::apply_retrieval() {
+    if (method_ != 1) { harvest_flush(); return false; }
     // Settle the capture before looking at it. Prefill capture is submitted to the
     // D2H pipe and committed by harvest_flush(); on the batched path the rows of the
     // ubatch that just ran are not in q_count_ until that happens. Scoring used to
@@ -5584,17 +5588,18 @@ void llama_memory_kvmem::apply_retrieval() {
                     "(only the architectures that call kvmem_capture_q() can be scored)\n", __func__);
         }
         if (trace_) {
-            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=no_query_rows query=[%d,%d) rows=%u\n",
-                    query_begin_, query_end_, rows);
+            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=no_query_rows query=[%d,%d) rows=%u "
+                    "pinned=%d frozen=%d\n", query_begin_, query_end_, rows,
+                    (int) retrieval_pinned_, (int) query_frozen_);
         }
         harvest_flush();
-        return;
+        return false;
     }
     if (retrieval_mandatory_over_budget(need, cap)) {
         // The span alone outgrows the pool, so no honest plan exists. Scoring
         // it would only let query_fixed_blocks() throw on a required block.
         skip("mandatory_exceeds_pool", need, cap);
-        return;
+        return false;
     }
     const llama_kvmem_selection selection = preview_retrieval();
     if (!selection_fits(selection, rows, 0)) {
@@ -5602,9 +5607,10 @@ void llama_memory_kvmem::apply_retrieval() {
         // tail does not fit the slot pool. Either way the plan is not a
         // continuation-safe view, and neither is a version clipped to fit.
         skip("selection_does_not_fit", selection.blocks.size(), cap);
-        return;
+        return false;
     }
     apply_selection(selection);
+    return true;
 }
 
 void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection) {
@@ -5973,10 +5979,9 @@ void llama_kvmem_dump_kv_writeback(struct llama_context * /*ctx*/, int32_t block
     }
 }
 
-void llama_kvmem_apply_retrieval(struct llama_context * /*ctx*/) {
-    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
-        mem->apply_retrieval();
-    }
+bool llama_kvmem_apply_retrieval(struct llama_context * /*ctx*/) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    return mem ? mem->apply_retrieval() : false;
 }
 
 bool llama_memory_kvmem::query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const {

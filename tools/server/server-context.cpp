@@ -22,7 +22,7 @@ extern "C" void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_
 extern "C" void llama_kvmem_begin_retrieval_round(void);
 extern "C" void llama_kvmem_begin_cached_turn(void);
 extern "C" void llama_kvmem_accept_retrieval_round(void);
-extern "C" void llama_kvmem_apply_retrieval(struct llama_context * ctx);
+extern "C" bool llama_kvmem_apply_retrieval(struct llama_context * ctx);
 extern "C" void llama_kvmem_pin_working_set(void);
 extern "C" void llama_kvmem_end_prefill_capture(void);
 extern "C" bool llama_kvmem_want_prefill_capture(void);
@@ -13333,9 +13333,15 @@ private:
                     // state no query was harvested, so a round could only throw "graph rows
                     // are not complete" on every request.
                     try {
-                        llama_kvmem_apply_retrieval(ctx_tgt);
-                        llama_kvmem_pin_working_set();
-                        llama_kvmem_accept_retrieval_round();
+                        // A skipped round is not a plan: pinning it would freeze the
+                        // pressure view AND set retrieval_pinned_, which answers
+                        // want_q_capture() with false forever after -- one round without
+                        // Query rows (an image in the conversation, a span past the
+                        // budget) would silently disable scoring for that conversation.
+                        if (llama_kvmem_apply_retrieval(ctx_tgt)) {
+                            llama_kvmem_pin_working_set();
+                            llama_kvmem_accept_retrieval_round();
+                        }
                     } catch (const std::exception & e) {
                         // A refusal keeps the resident view. The request still
                         // has to produce tokens, so degrade instead of failing.
