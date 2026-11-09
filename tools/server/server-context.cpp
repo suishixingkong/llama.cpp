@@ -6848,7 +6848,14 @@ private:
                         st.table.remember(best, llama_tokens(rows.begin(), rows.begin() + keep), 0);
                         st.bound = best;
                         st.table.touch(best, ++st.tick);
-                        SRV_WRN("conversation store %d resumed: dropping %d of %d rows was refused by "
+                        // INFO, not WARN: this is the healthy continuation path, not a
+                        // damaged store. The trim falls back to the newest checkpoint
+                        // whenever the client does not send the previous answer back --
+                        // the tail then exceeds what the recurrent half can roll back --
+                        // and the result equals a fresh prefill of that prefix. At WARN a
+                        // normal multi-conversation cycle (one line per switch) reads as a
+                        // stream of problems.
+                        SRV_INF("conversation store %d resumed: dropping %d of %d rows was refused by "
                                 "the recurrent half, so the newest usable checkpoint (%zu rows) was "
                                 "restored; %zu rows remain to prefill\n",
                                 best, store_rows - best_keep, store_rows, keep, best_keep - keep);
