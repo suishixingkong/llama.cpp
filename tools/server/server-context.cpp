@@ -6564,7 +6564,17 @@ private:
             // re-prefills forever.
             // slot.kvmem_last_n_gen, not slot.stats.n_gen: the slot was released
             // between the turn and this booking, and release() zeroes stats.
-            st.table.remember(st.bound, slot.prompt.tokens.raw_tokens(), (int) slot.kvmem_last_n_gen);
+            // The token column alone cannot describe a media conversation: every
+            // media cell is LLAMA_TOKEN_NULL, so replacing an image with another of
+            // the same shape leaves the two rows identical and the next request
+            // resumes on the old image's rows. Book the per-row content identity
+            // beside the tokens; it is what turns that into a miss.
+            std::vector<uint64_t> media;
+            if (!slot.prompt.tokens.media_row_ids(media)) {
+                media.clear(); // an undescribable ledger falls back to tokens
+            }
+            st.table.remember(st.bound, slot.prompt.tokens.raw_tokens(), std::move(media),
+                    (int) slot.kvmem_last_n_gen);
             // Park the ledger itself, not only its ids. A ledger rebuilt from the store's
             // rows cannot answer find_chunk() at a media span -- the chunk objects died
             // with the turn that encoded them -- so a media conversation would have to
@@ -6579,7 +6589,7 @@ private:
     // slot.prompt: a switch replaces that ledger with the store's rows, which
     // is exactly what makes the ordinary prefix match resume at the store's
     // frontier instead of re-prefilling from zero.
-    void kvmem_conv_bind(server_slot & slot, const std::string & raw_client, llama_tokens request) {
+    void kvmem_conv_bind(server_slot & slot, const std::string & raw_client, const server_tokens & request_ledger) {
         auto & st = kvmem_conv;
         if (!st.armed) {
             return;
@@ -6612,7 +6622,15 @@ private:
         // comparison against a de-placeholdered copy stops at the image -- which makes
         // the measured tail grow by one chunk per turn until the continuation gate
         // rejects the store it was literally continuing.
-        const llama_tokens & prompt = request;
+        const llama_tokens & prompt = request_ledger.raw_tokens();
+        // The request's own media column, aligned with `prompt`. Empty when this
+        // ledger cannot describe its rows, which degrades the match to tokens --
+        // the pre-existing behaviour, and the honest answer when the rows cannot
+        // be identified.
+        std::vector<uint64_t> prompt_media;
+        if (!request_ledger.media_row_ids(prompt_media)) {
+            prompt_media.clear();
+        }
 
         // A store may hold more rows than the request matches: the last turn's
         // answer sits at its tail, and a client that re-sends the same history
@@ -6630,7 +6648,7 @@ private:
             if (held.tokens.empty()) {
                 continue;
             }
-            const int lcp = kvmem_store_table::prefix_rows(held.tokens, prompt);
+            const int lcp = kvmem_store_table::shared_rows(held, prompt, prompt_media);
             // One line per candidate at debug level: "why did the switch back
             // re-prefill" is otherwise unanswerable, because a store that loses
             // the match looks exactly like a conversation the server forgot.
@@ -6972,7 +6990,7 @@ private:
         // the rows of the host store this request continues.
         kvmem_conv_remember(slot);
         prepare_prompt_tokens_for_launch(slot, task);
-        kvmem_conv_bind(slot, task.params.kvmem_conversation, task.tokens.raw_tokens());
+        kvmem_conv_bind(slot, task.params.kvmem_conversation, task.tokens);
         if (!admit_task_for_slot(slot, task)) {
             return false;
         }

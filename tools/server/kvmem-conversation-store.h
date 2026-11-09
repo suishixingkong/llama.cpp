@@ -36,6 +36,12 @@
 #include <string>
 #include <vector>
 
+// A media row whose chunk carries no content identity. Comparing rows cannot
+// verify such a chunk (its bytes were never hashed), so the match has to end
+// there rather than assume the stored image is the requested one -- the same
+// answer get_common_prefix() gives an empty id.
+inline constexpr uint64_t kvmem_media_unverified = ~uint64_t(0);
+
 struct kvmem_store_limits {
     int      max_stores = 1; // live host stores in this selection snapshot
     uint64_t max_bytes  = 0; // accounted host bytes across stores; 0 = count cap only
@@ -287,6 +293,12 @@ public:
         // an allocated but unrun store matches nothing, and saying so is more
         // honest than assuming its caller's prompt.
         std::vector<int32_t> tokens;
+        // One entry per row, aligned with `tokens`: 0 for text, otherwise the
+        // content identity of the media chunk that owns the row. Every media cell
+        // is LLAMA_TOKEN_NULL, so two prompts can carry identical token ids and
+        // different images; without this column the prefix match runs straight
+        // through the replacement image and hands back the old one's rows.
+        std::vector<uint64_t> media;
     };
 
     int add(int32_t store_id, std::string client_id = {}) {
@@ -311,11 +323,52 @@ public:
         return (int) at;
     }
 
+    // Rows the two sequences share, media included. `media` is the request's own
+    // column and may be empty when its ledger cannot describe the rows, in which
+    // case the answer is the token prefix alone. A row whose identity differs ends
+    // the match there: everything before it describes the same prefix, everything
+    // after it describes a different image. An unverified row ends it too -- the
+    // stored chunk was never hashed, so "same tokens" is not evidence.
+    static int shared_rows(const entry & held, const std::vector<int32_t> & prompt,
+                           const std::vector<uint64_t> & media) {
+        const int lcp = prefix_rows(held.tokens, prompt);
+        if (media.empty() || held.media.size() != held.tokens.size() ||
+                media.size() != prompt.size()) {
+            return lcp;
+        }
+        const int limit = lcp < (int) media.size() ? lcp : (int) media.size();
+        for (int i = 0; i < limit; ++i) {
+            if (held.media[i] != media[i] || held.media[i] == kvmem_media_unverified) {
+                return i;
+            }
+        }
+        return lcp;
+    }
+
     // Record what the store now holds, after its turn finished. The generated
     // row count is stored beside the sequence because the continuation rule
-    // needs it on the next request, when the turn is no longer in memory.
+    // needs it on the next request, when the turn is no longer in memory. The
+    // media column travels with the tokens: it is what makes a replacement image
+    // a miss instead of a match.
+    void remember(int id, std::vector<int32_t> tokens, std::vector<uint64_t> media, int last_n_gen) {
+        if (entry * held = mutable_find(id)) {
+            held->tokens     = std::move(tokens);
+            held->media      = std::move(media);
+            held->last_n_gen = last_n_gen;
+        }
+    }
+
+    // Recording a prefix of what the store already holds (the plan trims a store
+    // to the rows it keeps). The rows are a prefix by construction, so the media
+    // column is cut the same way instead of being asked for again.
     void remember(int id, std::vector<int32_t> tokens, int last_n_gen) {
         if (entry * held = mutable_find(id)) {
+            const size_t rows = tokens.size();
+            if (held->media.size() >= rows && rows <= held->tokens.size()) {
+                held->media.resize(rows);
+            } else {
+                held->media.clear();
+            }
             held->tokens     = std::move(tokens);
             held->last_n_gen = last_n_gen;
         }
@@ -331,7 +384,10 @@ public:
         }
         out             = kvmem_store_match{};
         out.id          = held->id;
-        out.lcp         = prefix_rows(held->tokens, prompt);
+        // No media column from this caller, so the answer is the token prefix.
+        // Anything that can hand over a media conversation has to use
+        // shared_rows() with the request's own column instead.
+        out.lcp         = shared_rows(*held, prompt, {});
         out.rows        = (int) held->tokens.size();
         out.live_row    = out.rows; // a parked store is whole; eviction within it
                                     // is the adapter's business, not the table's

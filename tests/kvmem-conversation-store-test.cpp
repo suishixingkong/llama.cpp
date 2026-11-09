@@ -643,6 +643,63 @@ static void test_table_matching() {
     CHECK(kvmem_store_table::prefix_rows({1, 2, 3}, {1, 2}) == 2);
 }
 
+static void test_media_rows() {
+    // 10 text rows, one image worth 4 rows, 2 trailing text rows. Every media cell
+    // is LLAMA_TOKEN_NULL, so the two images below have identical token vectors.
+    std::vector<int32_t> tokens;
+    for (int32_t i = 0; i < 10; ++i) tokens.push_back(100 + i);
+    // LLAMA_TOKEN_NULL: this test is freestanding, and the table only compares ids.
+    for (int32_t i = 0; i < 4; ++i) tokens.push_back(-1);
+    tokens.push_back(200);
+    tokens.push_back(201);
+
+    constexpr uint64_t img_a = 0x1111;
+    constexpr uint64_t img_b = 0x2222;
+    std::vector<uint64_t> media(tokens.size(), 0);
+    for (size_t i = 10; i < 14; ++i) media[i] = img_a;
+
+    kvmem_store_table table;
+    const int store = table.add(9);
+    table.remember(store, tokens, media, 0);
+
+    kvmem_store_table::entry held;
+    held.tokens = tokens;
+    held.media  = media;
+
+    g_row = "media rows: same tokens, same image";
+    CHECK(kvmem_store_table::shared_rows(held, tokens, media) == (int) tokens.size());
+
+    g_row = "media rows: the image was replaced";
+    std::vector<uint64_t> replaced = media;
+    for (size_t i = 10; i < 14; ++i) replaced[i] = img_b;
+    // The rows before the image still describe the same prefix; everything from
+    // the image on describes a different one. Returning the token prefix here is
+    // exactly the defect this column exists to prevent.
+    CHECK(kvmem_store_table::prefix_rows(tokens, tokens) == (int) tokens.size());
+    CHECK(kvmem_store_table::shared_rows(held, tokens, replaced) == 10);
+
+    g_row = "media rows: unverified chunk ends the match";
+    std::vector<uint64_t> unverified = media;
+    for (size_t i = 10; i < 14; ++i) unverified[i] = kvmem_media_unverified;
+    // Either side unverified ends the match: a chunk that was never hashed cannot
+    // be claimed to be the same image, whichever turn produced it.
+    CHECK(kvmem_store_table::shared_rows(held, tokens, unverified) == 10);
+    kvmem_store_table::entry stored_unverified = held;
+    stored_unverified.media = unverified;
+    CHECK(kvmem_store_table::shared_rows(stored_unverified, tokens, unverified) == 10);
+
+    g_row = "media rows: no column from the caller degrades to tokens";
+    CHECK(kvmem_store_table::shared_rows(held, tokens, {}) == (int) tokens.size());
+
+    g_row = "media rows: trim keeps the column aligned";
+    table.remember(store, std::vector<int32_t>(tokens.begin(), tokens.begin() + 12), 0);
+    const kvmem_store_table::entry * trimmed = table.find(store);
+    CHECK(trimmed != nullptr);
+    CHECK(trimmed->media.size() == 12);
+    CHECK(trimmed->media[10] == img_a && trimmed->media[11] == img_a);
+    CHECK(kvmem_store_table::shared_rows(*trimmed, tokens, replaced) == 10);
+}
+
 int main() {
     test_decision_table();
     test_capture_hint_does_not_authorize_restore();
@@ -651,5 +708,6 @@ int main() {
     test_continuation_clamps_last_n_gen();
     test_table_lru_and_bytes();
     test_table_matching();
+    test_media_rows();
     std::puts("conversation store selection, LRU and byte accounting PASS");
 }

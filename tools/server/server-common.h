@@ -10,6 +10,10 @@
 
 #include "json.h"
 
+// For kvmem_media_unverified, the "no content identity" row marker shared with
+// the conversation store's prefix match.
+#include "kvmem-conversation-store.h"
+
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -256,6 +260,17 @@ public:
 
     // the next position after n_tokens. if n_tokens < 0, return the next position after all tokens.
     llama_pos pos_next(int64_t n_tokens = -1) const;
+
+    // One entry per row: 0 for a text row, otherwise the identity of the media
+    // chunk that owns it. Every media cell is LLAMA_TOKEN_NULL, so two prompts
+    // carrying different images of the same shape have identical token vectors --
+    // a prefix comparison over tokens alone runs straight through the new image
+    // and hands back the old one's rows. The identity is the chunk's content id
+    // (sha256 of the image bytes), folded to 64 bits; a chunk without one is
+    // recorded as kvmem_media_unverified, which no comparison accepts.
+    // False when this ledger cannot describe the rows (an overrunning chunk), in
+    // which case the caller has to fall back to comparing tokens.
+    bool media_row_ids(std::vector<uint64_t> & out) const;
 
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;

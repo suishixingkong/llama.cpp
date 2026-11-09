@@ -619,6 +619,38 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
     return pos;
 }
 
+bool server_tokens::media_row_ids(std::vector<uint64_t> & out) const {
+    out.assign(tokens.size(), 0);
+    for (const auto & entry : map_idx_to_media) {
+        const size_t start = entry.first;
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(entry.second.get());
+        if (start >= out.size() || start + n_tok > out.size()) {
+            return false;
+        }
+        const char * id = mtmd_input_chunk_get_id(entry.second.get());
+        uint64_t row_id = kvmem_media_unverified;
+        if (id != nullptr && id[0] != '\0') {
+            // FNV-1a over the chunk's content id, which the mtmd helper fills with
+            // the sha256 of the image bytes. A 64-bit fold is enough to tell two
+            // images apart; this is a match filter, not a security boundary, and
+            // the id it folds already carries the poisoning protection.
+            row_id = 1469598103934665603ull;
+            for (const char * p = id; *p != '\0'; ++p) {
+                row_id ^= (unsigned char) *p;
+                row_id *= 1099511628211ull;
+            }
+            // 0 means "text row" and ~0 means "unverified", so neither may be a hash.
+            if (row_id == 0 || row_id == kvmem_media_unverified) {
+                row_id = 1;
+            }
+        }
+        for (size_t i = 0; i < n_tok; ++i) {
+            out[start + i] = row_id;
+        }
+    }
+    return true;
+}
+
 size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
     if (!has_mtmd) {
         return std::min((size_t)max_pos, tokens.size());
