@@ -5387,6 +5387,10 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
             selection.blocks.push_back(id);
         std::sort(selection.blocks.begin(),selection.blocks.end());
         selection.blocks.erase(std::unique(selection.blocks.begin(),selection.blocks.end()),selection.blocks.end());
+        const auto kept = std::count_if(selection.blocks.begin(), selection.blocks.end(),
+                [&](uint32_t id) { return id < pages; });
+        selection.history_blocks   = (uint32_t) kept;
+        selection.workspace_blocks = (uint32_t) (selection.blocks.size() - kept);
     } else {
         bool planned = false;
         if (workspace_begin > 0 && workspace_begin < (int32_t) selection.rows) {
@@ -5426,9 +5430,11 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
                 std::sort(selection.blocks.begin(), selection.blocks.end());
                 selection.blocks.erase(std::unique(selection.blocks.begin(), selection.blocks.end()), selection.blocks.end());
                 planned = true;
+                const auto kept = std::count_if(selection.blocks.begin(), selection.blocks.end(),
+                        [&](uint32_t id) { return id < pages; });
+                selection.history_blocks   = (uint32_t) kept;
+                selection.workspace_blocks = (uint32_t) (selection.blocks.size() - kept);
                 if (trace_) {
-                    const auto kept = std::count_if(selection.blocks.begin(), selection.blocks.end(),
-                            [&](uint32_t id) { return id < pages; });
                     kvmem_diag("KVMEM_TRACE plan=query_workspace history_pages=%u kept_history=%zu "
                             "workspace=%zu budget_blocks=%u\n", pages, size_t(kept),
                             selection.blocks.size() - size_t(kept), policy.budget_blocks());
@@ -5438,6 +5444,8 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
         if (!planned) {
             selection.blocks = method_==1 ? store().pick_graph_blocks(retrieval_mandatory()) :
                 runtime_->preview_reselect(retrieval_mandatory());
+            selection.history_blocks   = (uint32_t) selection.blocks.size();
+            selection.workspace_blocks = 0;
             if (trace_ && method_ == 1) {
                 kvmem_diag("KVMEM_TRACE plan=flat selected=%zu budget_blocks=%u\n",
                         selection.blocks.size(), store().budget_blocks());
@@ -5601,18 +5609,23 @@ bool llama_memory_kvmem::apply_retrieval() {
     // here, so the equivalent is to leave the pressure plan resident -- whole
     // bands dropped by recency read in order, a torn span does not.
     const uint32_t rows = store_n_tokens();
-    auto skip = [&](const char * reason, uint32_t need = 0, uint32_t cap = 0) {
+    // `limit` is the thing the reason actually compares against, not always the budget:
+    // mandatory_exceeds_pool() charges the budget-derived cap, while a selection is
+    // judged against the physical slot pool. Printing the budget for both made a plan
+    // that was 4 blocks over its pool read as 38 blocks over its budget.
+    auto skip = [&](const char * reason, uint32_t need = 0, uint32_t limit = 0,
+                    const char * extra = "") {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            LLAMA_LOG_WARN("%s: retrieval round rolled back (%s: %u of %u blocks), "
-                    "keeping the prefill pressure view\n", __func__, reason, need, cap);
+            LLAMA_LOG_WARN("%s: retrieval round rolled back (%s: %u of %u blocks%s), "
+                    "keeping the prefill pressure view\n", __func__, reason, need, limit, extra);
         }
         if (trace_) {
             kvmem_diag("KVMEM_TRACE retrieval_skipped reason=%s query=[%d,%d) "
-                    "rows=%u budget_blocks=%u block_tokens=%u need=%u cap=%u\n", reason,
+                    "rows=%u budget_blocks=%u block_tokens=%u need=%u limit=%u%s\n", reason,
                     query_begin_, query_end_, rows, store().budget_blocks(), block_tokens_,
-                    need, cap);
+                    need, limit, extra);
         }
         harvest_flush();
     };
@@ -5667,7 +5680,10 @@ bool llama_memory_kvmem::apply_retrieval() {
         // The selector trimmed a required block, or the plan plus the append
         // tail does not fit the slot pool. Either way the plan is not a
         // continuation-safe view, and neither is a version clipped to fit.
-        skip("selection_does_not_fit", selection.blocks.size(), cap);
+        char split[64] = {};
+        snprintf(split, sizeof(split), "; history %u + workspace %u",
+                selection.history_blocks, selection.workspace_blocks);
+        skip("selection_does_not_fit", selection.blocks.size(), n_slots_, split);
         return false;
     }
     apply_selection(selection);

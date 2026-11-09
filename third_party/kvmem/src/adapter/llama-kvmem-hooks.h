@@ -318,6 +318,13 @@ struct llama_kvmem_selection {
     uint64_t epoch = 0;
     uint32_t rows = 0;
     std::vector<uint32_t> blocks;
+    // How `blocks` splits: the history the selector chose, and the append workspace
+    // that is never a choice (the Query span onwards). Only the sum has to fit the
+    // slot pool, but the two halves are charged differently -- the selector fills the
+    // budget with history and the workspace lands on top of it -- so a plan that does
+    // not fit cannot be explained, or tuned, without them.
+    uint32_t history_blocks   = 0;
+    uint32_t workspace_blocks = 0;
 };
 LLAMA_API void llama_kvmem_set_turn_spans(const llama_kvmem_turn_spans & spans);
 LLAMA_API llama_kvmem_attention_view llama_kvmem_get_attention_view();
