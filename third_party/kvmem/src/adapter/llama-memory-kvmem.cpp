@@ -2510,6 +2510,25 @@ llama_pos llama_memory_kvmem::model_pos(uint32_t logical) const {
     return last.pos[0] + 1 + (llama_pos) (logical - row_positions_.size());
 }
 
+uint32_t llama_memory_kvmem::row_at_pos(llama_pos p) const {
+    const uint32_t rows = store_n_tokens();
+    if (p <= 0) return 0;
+    // Fall back to identity unless the ledger covers the store and starts at zero.
+    // That is the text case exactly, and it is also what a store with a missing
+    // ledger entry has to assume: guessing a row from a position is worse than
+    // keeping the old behavior for the rows we cannot describe.
+    if (rows == 0 || row_positions_.size() != rows || row_positions_.front().pos[0] != 0) {
+        if (p >= (llama_pos) rows) return rows;
+        return (uint32_t) p;
+    }
+    // Positions never step back (a media chunk pushes one time coordinate across
+    // all of its rows, it does not rewind), so the rows before position p are a
+    // prefix of the store and a binary search over the ledger finds its length.
+    const auto it = std::lower_bound(row_positions_.begin(), row_positions_.end(), p,
+            [](const RowPosition & r, llama_pos v) { return r.pos[0] < v; });
+    return (uint32_t) (it - row_positions_.begin());
+}
+
 bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
     ++attention_epoch_;
     if (mtp_ && llama_get_memory(ctx) == mtp_) return mtp_->remove_logical(begin, end);
@@ -3146,7 +3165,16 @@ void llama_memory_kvmem::clear(bool data) {
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     ++attention_epoch_;
     const uint32_t total = runtime_ != nullptr ? runtime_->store().total_tokens() : 0;
-    const bool tail = p1 < 0 || p1 >= static_cast<llama_pos>(total);
+    // p0/p1 arrive in position space (server: slot.prompt.tokens.pos_next()), while
+    // "reaches the live end" and the store's truncation point are row space. With a
+    // media span in the prefix the two differ by hundreds of rows, and answering the
+    // question with the wrong one is not a near miss: the tail test fails, an
+    // ordinary trim looks like an interior removal, and either way the packed store
+    // is cut at a position where it should have been cut at a row.
+    const llama_pos pos_end = row_positions_.empty() || row_positions_.size() != total
+            ? (llama_pos) total
+            : row_positions_.back().pos[0] + 1;
+    const bool tail = p1 < 0 || p1 >= pos_end;
     const bool ok = kv_->seq_rm(seq_id, p0, p1);
     if (!ok) {
         return false;
@@ -3165,11 +3193,12 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     }
     // This memory object is the only place that sees both halves of the history: the
     // cells just removed above and the packed store, which addresses blocks by absolute
-    // position. A removal that reaches the live end is a truncation and the store follows
+    // row. A removal that reaches the live end is a truncation and the store follows
     // it exactly -- the cache above and the store below keep describing the same rows.
     if (!replay_ && seq_id <= 0 && tail && p0 >= 0) {
-        if ((uint32_t) p0 < total) {
-            truncate_cached((uint32_t) p0);
+        const uint32_t row = row_at_pos(p0);
+        if (row < total) {
+            truncate_cached(row);
         }
         return true;
     }
@@ -5589,33 +5618,21 @@ bool llama_memory_kvmem::apply_retrieval() {
     };
     uint32_t need = 0;
     uint32_t cap = 0;
-    // KVMem numbers blocks by the rows it was handed and carries that row index as the
-    // block's orig_pos; the KV cache numbers cells by sequence position. The two agree
-    // only while every row advances the position by one, and a media chunk breaks that:
-    // its rows repeat a single position (M-RoPE), so the store ends up with fewer rows
-    // than the sequence has positions. A plan built from row indices is then applied to
-    // cells by the wrong keys. Measured 2026-11-09, 10.9k prompt with one image: the store
-    // held 10091 rows while the frontier was 10930, applying the row-space plan truncated
-    // the cache to seq_pos=[0,10090], and the next 1-token decode then failed with
-    // "failed to find a memory slot for batch of size 1". Refuse the round until rows and
-    // positions are mapped explicitly; recency keeps working, and the round is cheap to
-    // lose because it never had a plan in the right space.
-    if (rows_diverge_from_pos_) {
-        static bool warned_rows = false;
-        if (!warned_rows) {
-            warned_rows = true;
-            LLAMA_LOG_WARN("%s: a media span repeated a position across its rows, so the "
-                    "store's %u rows no longer index the KV cells by position; a row-indexed "
-                    "plan would land on the wrong cells, keeping the recency view\n",
-                    __func__, rows);
-        }
-        if (trace_) {
-            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=rows_not_positions query=[%d,%d) "
-                    "rows=%u seq_pos=[%d,%d]\n", query_begin_, query_end_, rows,
-                    (int) seq_pos_min(0), (int) seq_pos_max(0));
-        }
-        harvest_flush();
-        return false;
+    // A media span makes rows and positions diverge (see row_at_pos()): the store
+    // numbers blocks by the rows it was handed and carries that row index as the
+    // block's orig_pos, while the KV cache numbers cells by position, and an image
+    // pushes one time coordinate across 880 cells. Every step of this round is in row
+    // space and stays there: the span arrives as prompt token indices, which is one
+    // entry per KV cell; query_fixed_blocks() and the selection count blocks;
+    // apply_plan_to_kv() removes cells by logical row; occupy_in() stamps logical_pos
+    // with the row. The two spaces only meet in the trim that seq_rm() translates, so
+    // the round scores as it stands. The trace line exists because the first field
+    // report of the divergence looked like a scoring failure, and the number that
+    // disproves it belongs in the record.
+    if (rows_diverge_from_pos_ && trace_) {
+        kvmem_diag("KVMEM_TRACE media_rows query=[%d,%d) rows=%u last_row_pos=%d: rows and "
+                "positions diverge, scoring in row space\n", query_begin_, query_end_, rows,
+                rows == 0 ? -1 : (int) model_pos(rows - 1));
     }
     // Scoring reads the Query's own K rows, and only the architectures whose
     // attention builder calls kvmem_capture_q() produce them (today qwen3 and

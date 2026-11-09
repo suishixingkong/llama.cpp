@@ -265,6 +265,15 @@ public:
     bool restore_partial_tail();
     void occupy_in(llama_kv_cache * cache, uint32_t block_id);
     llama_pos model_pos(uint32_t logical_pos) const;
+    // Rows are KVMem's address space (one row per KV cell); positions are the KV
+    // cache's. Both are the same number for text, which is why so much of this
+    // adapter treats them as interchangeable: block ids, plan membership, the
+    // packed store's truncation point. A media chunk breaks that. Its rows share a
+    // time coordinate, so it emits far more cells than it advances the cursor --
+    // measured 2026-11-09, an 880-cell image at position 10024 after which the next
+    // text row is at 10064. Anything that receives a position from a caller and
+    // hands it to a row-indexed structure has to come back through here.
+    uint32_t row_at_pos(llama_pos p) const;
     bool remove_logical(llama_context * ctx, llama_pos begin, llama_pos end);
     uint32_t store_n_tokens() const {
         return runtime_ ? runtime_->store().total_tokens() : 0;
@@ -600,11 +609,11 @@ private:
     // of the whole prefill are not harvested for scores that get thrown away.
     bool round_span_infeasible_ = false;
     int32_t round_span_infeasible_end_ = -1;
-    // Set when a row of this conversation repeated its position (a media chunk repeats one
-    // position across all of its rows). The store numbers blocks by rows it was handed and
-    // the KV cache numbers cells by position, so from then on a row-indexed plan cannot be
-    // applied. Observed in prepare_ubatches, carried with the conversation, cleared with
-    // the store.
+    // Set when a row of this conversation repeated its position, which is what a media
+    // chunk does (it pushes one time coordinate across all of its rows). From then on
+    // rows and positions are different numbers, so every conversion has to go through
+    // row_at_pos() or model_pos() instead of assuming they are the same. Observed in
+    // prepare_ubatches, carried with the conversation, cleared with the store.
     bool rows_diverge_from_pos_ = false;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
