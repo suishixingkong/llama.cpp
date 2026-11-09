@@ -177,16 +177,21 @@ public:
         if (span_blocks <= cap) {
             return false;
         }
-        // The INFO line below fires once per distinct span end, which is right for a log a
+        // The WARN line below fires once per distinct span end, which is right for a log a
         // user reads: the same conversation refuses the same span every turn. It is wrong
         // for diagnosis -- a later refusal then looks like the round never opened at all
         // (2026-11-09: a resumed conversation re-sends the same span end, so its refusal
         // was silent). Keep one line per request at debug level.
         LLAMA_LOG_DEBUG("%s: round not armed, span over budget: query=[%d,%d) needs %u of %u blocks\n",
                 __func__, query_begin_, query_end_, span_blocks, cap);
+        // WARN, not INFO. common_log_get_verbosity() maps the llama/ggml INFO level to the
+        // server's TRACE (4), so LLAMA_LOG_INFO never reaches the default verbosity of 3:
+        // the one line that says "retrieval did not run for this request" was invisible to
+        // every user who hit it, and its absence looked like a stale binary. Same level as
+        // the sibling "retrieval round rolled back", which this refusal stands in front of.
         if (round_span_infeasible_end_ != query_end_) {
             round_span_infeasible_end_ = query_end_;
-            LLAMA_LOG_INFO("%s: prefill capture skipped: the Query span alone needs %u of %u blocks "
+            LLAMA_LOG_WARN("%s: prefill capture skipped: the Query span alone needs %u of %u blocks "
                     "(query=[%d,%d)), so no complete retrieval plan can fit; keeping the prefill "
                     "pressure view. --kvmem-query-max scores only the span's tail and stays scoreable.\n",
                     __func__, span_blocks, cap, query_begin_, query_end_);
