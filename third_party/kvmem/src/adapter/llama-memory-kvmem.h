@@ -177,6 +177,13 @@ public:
         if (span_blocks <= cap) {
             return false;
         }
+        // The INFO line below fires once per distinct span end, which is right for a log a
+        // user reads: the same conversation refuses the same span every turn. It is wrong
+        // for diagnosis -- a later refusal then looks like the round never opened at all
+        // (2026-11-09: a resumed conversation re-sends the same span end, so its refusal
+        // was silent). Keep one line per request at debug level.
+        LLAMA_LOG_DEBUG("%s: round not armed, span over budget: query=[%d,%d) needs %u of %u blocks\n",
+                __func__, query_begin_, query_end_, span_blocks, cap);
         if (round_span_infeasible_end_ != query_end_) {
             round_span_infeasible_end_ = query_end_;
             LLAMA_LOG_INFO("%s: prefill capture skipped: the Query span alone needs %u of %u blocks "
