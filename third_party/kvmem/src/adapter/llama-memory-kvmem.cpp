@@ -158,6 +158,10 @@ struct llama_memory_kvmem::ConvStore {
     // makes a restaged store resume at the row it was drained at instead of at
     // position 0. Empty for a pure transformer, where the rows are the state.
     std::vector<uint8_t>                 recurrent;
+    // True once a row of this conversation repeated its position (a media chunk). The
+    // store then numbers rows and the KV cache numbers cells differently, so a
+    // row-indexed plan cannot be applied. Per-conversation, like row_positions.
+    bool                                 rows_diverge_from_pos = false;
     // Block ids that were GPU-resident at detach, ascending.
     std::vector<uint32_t>                resident;
 };
@@ -1427,6 +1431,7 @@ void llama_memory_kvmem::reset_policy() {
     graph_={}; graph_.block_tokens=block_tokens_;
     if(graph_budget) graph_.set_budget(std::move(graph_budget));
     feedback_={}; attention_scope_={}; attention_output_begin_=UINT64_MAX;
+    rows_diverge_from_pos_ = false;
     attention_batches_.clear(); attention_pending_batch_=UINT32_MAX;
     if (content_) content_->reset();
     evaluation_queue_.clear();
@@ -1946,10 +1951,12 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
     conv->graph=std::move(graph_); conv->feedback=std::move(feedback_);
     conv->scope=attention_scope_; conv->output_begin=attention_output_begin_;
     conv->think_open=attention_think_open_; conv->think_close=attention_think_close_;
+    conv->rows_diverge_from_pos = rows_diverge_from_pos_;
     row_positions_.clear();
     cells_materialized_ = 0;
     q_rows_.clear();
     q_count_.clear();
+    rows_diverge_from_pos_ = false;
     reset_turn_policy();
     return conv;
 }
@@ -1975,6 +1982,7 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     evaluation_cursor_ = 0;
     row_positions_ = std::move(conv->row_positions);
     cells_materialized_ = conv->cells_materialized;
+    rows_diverge_from_pos_ = conv->rows_diverge_from_pos;
     q_rows_ = std::move(conv->q_rows);
     q_count_ = std::move(conv->q_count);
     graph_=std::move(conv->graph); feedback_=std::move(conv->feedback);
@@ -3039,6 +3047,14 @@ bool llama_memory_kvmem::prepare_ubatches(
             row.spatial = ub.is_pos_2d();
             for (uint32_t j = 0; j < 4; ++j) row.pos[j] = ub.pos[(j < ub.n_pos ? j*ub.n_tokens : 0) + i];
             row.token = ub.token ? ub.token[i] : LLAMA_TOKEN_NULL;
+            // One row per token is KVMem's address space; the KV cache's is the sequence
+            // position. They coincide only while each row advances the position, and a
+            // media chunk breaks that by repeating one position across its rows. Observe
+            // it here rather than infer it: seq_pos_max() cannot tell, because the hybrid
+            // half answers with the smaller of the two, which is the row count.
+            if (i > 0 && ub.pos[i] <= ub.pos[i - 1]) {
+                rows_diverge_from_pos_ = true;
+            }
         }
     }
     // The slot mapper and the capture batches address blocks the same way the store does,
@@ -5573,6 +5589,34 @@ bool llama_memory_kvmem::apply_retrieval() {
     };
     uint32_t need = 0;
     uint32_t cap = 0;
+    // KVMem numbers blocks by the rows it was handed and carries that row index as the
+    // block's orig_pos; the KV cache numbers cells by sequence position. The two agree
+    // only while every row advances the position by one, and a media chunk breaks that:
+    // its rows repeat a single position (M-RoPE), so the store ends up with fewer rows
+    // than the sequence has positions. A plan built from row indices is then applied to
+    // cells by the wrong keys. Measured 2026-11-09, 10.9k prompt with one image: the store
+    // held 10091 rows while the frontier was 10930, applying the row-space plan truncated
+    // the cache to seq_pos=[0,10090], and the next 1-token decode then failed with
+    // "failed to find a memory slot for batch of size 1". Refuse the round until rows and
+    // positions are mapped explicitly; recency keeps working, and the round is cheap to
+    // lose because it never had a plan in the right space.
+    if (rows_diverge_from_pos_) {
+        static bool warned_rows = false;
+        if (!warned_rows) {
+            warned_rows = true;
+            LLAMA_LOG_WARN("%s: a media span repeated a position across its rows, so the "
+                    "store's %u rows no longer index the KV cells by position; a row-indexed "
+                    "plan would land on the wrong cells, keeping the recency view\n",
+                    __func__, rows);
+        }
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE retrieval_skipped reason=rows_not_positions query=[%d,%d) "
+                    "rows=%u seq_pos=[%d,%d]\n", query_begin_, query_end_, rows,
+                    (int) seq_pos_min(0), (int) seq_pos_max(0));
+        }
+        harvest_flush();
+        return false;
+    }
     // Scoring reads the Query's own K rows, and only the architectures whose
     // attention builder calls kvmem_capture_q() produce them (today qwen3 and
     // qwen35). With no rows score_retrieval() returns immediately, the plan

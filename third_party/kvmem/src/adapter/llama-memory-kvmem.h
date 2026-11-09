@@ -593,6 +593,12 @@ private:
     // of the whole prefill are not harvested for scores that get thrown away.
     bool round_span_infeasible_ = false;
     int32_t round_span_infeasible_end_ = -1;
+    // Set when a row of this conversation repeated its position (a media chunk repeats one
+    // position across all of its rows). The store numbers blocks by rows it was handed and
+    // the KV cache numbers cells by position, so from then on a row-indexed plan cannot be
+    // applied. Observed in prepare_ubatches, carried with the conversation, cleared with
+    // the store.
+    bool rows_diverge_from_pos_ = false;
     int32_t method_ = 0;
     int32_t query_begin_ = -1;
     // Set when the configured Query span lies entirely behind the rows a round is about
