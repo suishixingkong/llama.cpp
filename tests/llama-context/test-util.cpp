@@ -350,6 +350,17 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
 
     if (opts.n_ctx) {
         cparams.n_ctx = opts.n_ctx;
+    } else if (cparams.n_ctx == 0) {
+        // A case decodes a few hundred tokens; inheriting the model's trained context
+        // makes the KV pools -- and VBR's per-device watermarks -- scale with it, so the
+        // suite's verdict depends on how much memory the machine happens to have free.
+        // Measured 2026-11-14 on a 16 GiB + 2 GiB pair: the rollback case's third live
+        // context grew one more cell into a device that VBR's admission margin
+        // (min(768 MiB, total/4) = 512 MiB there) had already priced out, and the batch
+        // failed recoverably, which the case reports as FAIL. The same suite with
+        // --ctx-size 4096 passes, so the default belongs here rather than in a flag the
+        // caller has to remember.
+        cparams.n_ctx = 4096;
     }
     if (opts.n_seq_max) {
         cparams.n_seq_max = opts.n_seq_max;
