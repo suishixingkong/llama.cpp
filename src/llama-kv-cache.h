@@ -480,7 +480,11 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     // commit=false is used only by plan_slots() to suppress non-metadata side effects
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
+    // False when the ubatch could not be applied and the batch must not run: today that is
+    // only a VBR mapping admission that failed at commit time, which used to abort the
+    // process from vbr_vmm_ensure_mapped(). The caller (llama_kv_cache_context::apply())
+    // turns it into a failed decode.
+    bool apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit = true);
 
     //
     // input API
@@ -874,7 +878,9 @@ private:
     };
     vbr_shared_scratch_registration vbr_shared_scratch_register(
             const vbr_shared_scratch_binding & binding);
-    void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
+    // Grow physical backing to the current cell watermark. False when the device cannot
+    // hold it; the batch fails instead of taking the process with it.
+    bool vbr_vmm_ensure_mapped();
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
     // Decode-time degrade controller (VMM mode only). The price order and its cursor stay

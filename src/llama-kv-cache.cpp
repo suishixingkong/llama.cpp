@@ -4149,7 +4149,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
         }
 
         states.push_back(std::move(state));
-        apply_ubatch(sinfo_new, ubatch, false);
+        (void) apply_ubatch(sinfo_new, ubatch, false); // commit=false never maps
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -4473,10 +4473,11 @@ bool llama_kv_cache::can_reuse_cell(uint32_t stream, uint32_t cell) const {
     return reusable;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
+bool llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool commit) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        return;
+        // A shared cell range has nothing of its own to apply; the owner does it.
+        return true;
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -4701,7 +4702,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
     // grow the physical backing first (no-op unless the watermark advanced past a page)
     if (commit && vbr_vmm_active()) {
-        vbr_vmm_ensure_mapped();
+        if (!vbr_vmm_ensure_mapped()) {
+            // The graph that follows reads and writes cells up to this watermark, so the
+            // batch cannot run. Failing it here is what the caller turns into a decode
+            // error; this used to abort the process instead.
+            return false;
+        }
     }
 
     // Dynamic-VBR anchor self-test (environment-gated, runs once). It fires from the second apply_ubatch call so
@@ -4732,6 +4738,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     if (auto pending = mutation_op.detach_deferred()) {
         vbr_pending_decode_ops_.push_back(std::move(*pending));
     }
+
+    return true;
 }
 
 // Defined with the mutation-op implementation below.
@@ -5279,6 +5287,26 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
 // aborting — the caller decides whether its position in the batch lifecycle is recoverable.
 // On failure pool.wm_cells stays at its old value; already-mapped delta pages are harmless
 // (maps are idempotent, a later retry re-walks them for free).
+// Device-derived ceiling for the mapping-admission margin. The margin is not a payload:
+// what actually fails at zero free is a driver-side reconfiguration (the flash-attention
+// shared-memory opt-in is at most 96 KB, and the module carve-out / graph instantiation /
+// allocator slack that goes with it), so it does not scale with device size the way a
+// fraction of total would. Pricing it as total/4 made a 2 GiB card refuse work it could
+// do and then abort in the vbr_vmm_ensure_mapped() backstop.
+//
+// Measured 2026-11-14 on a 2 GiB GTX950 (Qwen3.5-0.8B, -c 8192, three live contexts):
+// reserve 1, 4, 8, 32 and 128 MiB all refuse gracefully at zero free, while the old
+// total/4 = 512 MiB aborted the process twice out of two runs. 16 GiB and above keep the
+// 768 MiB measured for 4x200k on a V100 (see the ctor comment), so only smaller devices
+// get the floor.
+static size_t vbr_map_reserve_auto(size_t total_bytes) {
+    constexpr size_t mib = size_t(1) << 20;
+    if (total_bytes >= 16 * 1024 * mib) {
+        return 768 * mib;
+    }
+    return std::max<size_t>(32 * mib, total_bytes / 32);
+}
+
 bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     // Admission check: a growth step must leave vbr_map_reserve_ bytes free on the device. Mapping
     // is what makes a cache "full" here, and once the device is exhausted the failure surfaces far
@@ -5291,6 +5319,7 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     // default, --vbr-map-reserve / VBR_MAP_RESERVE_MIB to tune it.
     size_t  short_need = 0;
     size_t  short_free = 0;
+    size_t  short_keep = 0; // the margin that was actually applied, see vbr_map_reserve_auto()
     int     short_dev  = -1;
 
     const auto admission_ok = [&]() -> bool {
@@ -5317,10 +5346,11 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
             // and must not price out a 2 GiB card whose whole pool is smaller than a flat 768 MiB.
             // The fallback keeps the guard armed even if this cache never ran the ctor's VBR block.
             const size_t reserve_cap = vbr_map_reserve_ != 0 ? vbr_map_reserve_ : (768ull << 20);
-            const size_t reserve = std::min(reserve_cap, total_b/4);
+            const size_t reserve = std::min(reserve_cap, vbr_map_reserve_auto(total_b));
             if (free_b < delta + reserve) {
                 short_need = delta + reserve;
                 short_free = free_b;
+                short_keep = reserve;
                 short_dev  = pool.device;
                 return false;
             }
@@ -5329,9 +5359,8 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     };
 
     if (!admission_ok()) {
-        LLAMA_LOG_WARN("%s: not mapping %zu bytes for watermark %u: %zu MiB free, %zu MiB reserved for compute (device %d)\n",
-                __func__, short_need, wm, short_free >> 20,
-                (vbr_map_reserve_ != 0 ? vbr_map_reserve_ : (768ull << 20)) >> 20, short_dev);
+        LLAMA_LOG_WARN("%s: not mapping %zu bytes for watermark %u: %zu MiB free, %zu MiB kept free for the driver (device %d)\n",
+                __func__, short_need, wm, short_free >> 20, short_keep >> 20, short_dev);
         return false;
     }
 
@@ -5372,17 +5401,25 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     return true;
 }
 
-void llama_kv_cache::vbr_vmm_ensure_mapped() {
+bool llama_kv_cache::vbr_vmm_ensure_mapped() {
     // the coming graph's writes land on positioned cells below the watermark; reads pad up to it.
     // The degrade trigger deliberately does not live here: apply_ubatch runs mid-batch
     // where positioned cells outrun the graph writes (see prepare()). prepare() already mapped to
     // its predicted watermark recoverably, so this fires only when placement outran the
-    // prediction (freed low cells + a head above used_max_p1) — with graphs already built,
-    // aborting is all that is left. Kept as the backstop, expected unreachable.
+    // prediction (freed low cells + a head above used_max_p1).
+    //
+    // It used to GGML_ABORT here on the reasoning that graphs were already built. Reaching it
+    // is not fatal by construction though: the caller can abandon the batch, and on a
+    // saturated device it was reached right after prepare_with_slots() had refused the same
+    // watermark "recoverably". Measured 2026-11-14 on a 2 GiB GTX950 with the old total/4
+    // margin: 2 runs out of 2 aborted here. Fail the batch instead.
     const uint32_t wm = vbr_watermark_cells(0);
     if (!vbr_vmm_try_map(wm)) {
-        GGML_ABORT("VBR VMM: out of physical memory mapping to watermark %u cells mid-batch", wm);
+        LLAMA_LOG_ERROR("%s: VBR VMM cannot back watermark %u cells mid-batch (%llu MiB budget); "
+                "failing this batch\n", __func__, wm, (unsigned long long) (vbr_budget_bytes_ >> 20));
+        return false;
     }
+    return true;
 }
 
 // mapped-physical bytes needed to back `wm_cells` of ONE pool's extents at the CURRENT per-tensor
@@ -14186,7 +14223,7 @@ const slot_info_vec_t *   sinfos_in) {
             // sequence into a freshly initialized context is exactly that case: the
             // watermark is above the mapped floor and nothing else will map it before the
             // scatter.
-            vbr_vmm_ensure_mapped();
+            res = res && vbr_vmm_ensure_mapped();
         }
 
         try {
@@ -14505,7 +14542,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         // Native import publishes one controller-global generation only after state_read_data
         // completes. Do not misclassify its preparatory cell placement as an ordinary append.
-        apply_ubatch(sinfo, ubatch, false);
+        (void) apply_ubatch(sinfo, ubatch, false); // commit=false never maps
 
         // The ubatch uses this cache's n_pos_per_embd. A non-M-RoPE cache that mirrors an
         // M-RoPE cache (Qwen4 QSA indexer) would otherwise drop the saved x/y coordinates.
@@ -15108,7 +15145,9 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
-    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    if (!kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur])) {
+        return false;
+    }
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update

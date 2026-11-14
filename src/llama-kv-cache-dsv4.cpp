@@ -1911,7 +1911,7 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
         res = res & ctx_swa_mem->apply();
     }
     if (!ubatches_write.empty()) {
-        kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
+        res = res && kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
     }
 
