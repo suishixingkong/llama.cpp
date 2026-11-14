@@ -6978,7 +6978,7 @@ private:
         // to make: the slot keeps the ordinary prefix match on its own prompt.
         (void) slot;
         (void) raw_client;
-        (void) request;
+        (void) request_ledger;
 #endif
     }
 

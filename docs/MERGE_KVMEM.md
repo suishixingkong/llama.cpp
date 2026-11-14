@@ -282,13 +282,13 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 真的会驱逐时才有代价。`llama-bench -p 4096 -n 128 -b 512`（0.8B，工作集 576 token）：pp **8941.6 t/s** 对无 kvmem 的 13260.8（**−32.6%**），tg 262.1 对 252.0（decoding 反而略快，池子小、注意力带宽低）。质量 PPL 11.9618 对基线 11.9679（−0.05%）。
 这 −32% 里约 32 个百分点是「把待换出块的裸 K 逐层镜像到 host」（5 ms/ubatch，192 次小块拷贝），**可 slab 化，未做**。
-⚠️ 上面这一段的数字已被后续优化改写：capture 门控 + 打分器 staging 之后，同一口径的真驱逐代价是 **−14.3%**（`13662.5 → 11706.5 t/s`），详见本文末「四方复测」。
+⚠️ 上面这一段的数字已被后续优化改写：capture 门控 + 打分器 staging 之后，同一口径的真驱逐代价降到 **−14.3%**（`13662.5 → 11706.5 t/s`，`34063912e` 那轮）；2026-11-15 复测为 **−16.7%**（`15256.3 → 12701.8 t/s`）。两轮的绝对值不可跨会话比，只看比值，详见本文末「四方复测」。
 
 功能面（同一批构建）：长会话三连问 16k 上下文 / MTP 草稿回滚 / 图像输入都通过（细节见下面「已修复」与 `AUDIT_KVMEM_PERF_QUALITY.md`）。
 
 **只有会评分的驱动才捕获 prefill K**（`e04bdb5d6`）：检索轮所需的 mean-K 与 query 行来自图中的捕获管道，它把每个 ubatch 的全部 K 行 D2H 到 host 再做打包。`llama-completion` / `llama-bench` / `llama-perplexity` 从不跑检索轮，却仍按检索方法付费搬运没人会读的行。捕获改由 `begin_retrieval_round()` 开启（server 每请求开一次），清轮/重置/重放入口不再重新开启；`harvest_gpu_v` 的 KV 镜像不受影响（换出块靠它回填）。0.8B `-p 4096 -b 512 --kvmem-budget 2048`：pp 9094 → 9710 t/s（+6.8%），server 侧 `KVMEM_QUERY scorer=page-softmax rows=1071 blocks=34` 照旧。
 
-单测：KVMem 的 16 个测试已注册进 ctest（`test-kvmem-store`、`test-kvmem-runtime`、`test-spill-io`、`test-native-residency` 等，`ctest -N` 由 113 涨到 129），16/16 通过。
+单测：KVMem 的测试已注册进 ctest（`test-kvmem-store`、`test-kvmem-runtime`、`test-spill-io`、`test-native-residency` 等），2026-11-15 复测时该组 **17/17 通过**。
 
 测量方法、口径陷阱、噪声地板和每条结论的原始数据见 [`AUDIT_KVMEM_PERF_QUALITY.md`](AUDIT_KVMEM_PERF_QUALITY.md)。
 
@@ -346,64 +346,97 @@ W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping
 
 复现与验证（Qwen3.5-2B、f16、`-c 262144 --kvmem-budget 1000 -b 512`、13.2k prompt 连续 5 轮各生成 5k）：修复前 3/6 次在第三轮 decode 报 gap；修复后 5 轮全过，且 `KVMEM_TRACE=1` 能看到 `tail_restage` 正好在这些轮次触发（一次运行 3 次）。PPL 1.2126（开/关逐位同）、真驱逐 budget 576 为 1.2135。
 
-## 四方复测：旧版 / port 开 / port 关 / fork 开 / fork 关（`34063912e`）
+## 四方复测：旧版 / port 关 / port 开 / fork 开 / fork 关（2026-11-15 复测）
 
-这一轮问的是三件事：移植后**有没有退化**、真驱逐**还差多少**、回滚语义**与 fork 是否等效**。四棵树、五个单元，同一台机器（Windows + MSVC + CUDA 12.8、`sm_70`、V100 16 GB、`Qwen3.5-0.8B-Q4_K_M`），跑同一批参数。
+这一轮问的还是三件事：移植后**有没有退化**、真驱逐**还差多少**、回滚语义**与 fork 是否等效**。
+同一台机器（Windows + MSVC + CUDA 12.8、`sm_70`、V100 16 GB、`Qwen3.5-0.8B-Q4_K_M`），
+参数与 `34063912e` 那轮逐字相同，因此两轮按**比值**对照。
+
+⚠️ **绝对值不要跨会话比**：本轮 `port-nokv` 的 pp4096 是 15256，上一轮是 13662，差 12% 来自机器状态
+（时钟/驱动），不是代码。
+
+⚠️ **每个单元都跑多轮**：bench 4 轮轮换、server 4 轮轮换、PPL 3 轮。
+两处口径修正见下——不做这两件事，同一格的单次结果会差 18%，足以造出或抹掉结论。
 
 ### 五个单元
 
 | 单元 | 二进制 | 含义 |
 |---|---|---|
-| `old` | `tmp/build-master-cuda`（2026-10-30 02:44） | **未移植 kvmem 的旧版**：`--help` 里没有任何 `kvmem` 字样 |
-| `port-off` | `tmp/build-kvmem-off`（`-DLLAMA_KVMEM=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70`） | port 树，kvmem 代码**不参与编译** |
-| `port-nokv` | `tmp/build-kvmem-on`，不加 `--kvmem` | port 树，kvmem 编入但不启用 |
+| `old` | `tmp/build-master-cuda`（冻结快照，2026-10-30 02:44） | **未移植 kvmem 的旧版**：`--help` 里没有任何 `kvmem` 字样 |
+| `port-off` | `tmp/build-kvmem-off`（`-DLLAMA_KVMEM=OFF`，2026-11-15 02:47 重建） | port 树，kvmem **不参与编译**：`llama.dll` 里 `kvmem_store_create` 出现 **0** 次（kvmem-on 构建是 2 次） |
+| `port-nokv` | `tmp/wt-kvmem/build`（`e2acc0f9d`），不加 `--kvmem` | port 树，kvmem 编入但不启用 |
 | `port-kv` | 同上 + `--kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024` | port 树，真驱逐 |
-| `fork-nokv` / `fork-kv` | `kvmem-llama.cpp/build-v100/bin/llama-kvmem-server.exe` / `llama-bench.exe` | fork 本体，参数同上 |
+| `fork-nokv` / `fork-kv` | `kvmem-llama.cpp/build-v100/bin`（`llama-kvmem-server.exe` / `llama-bench.exe`，2026-10-31） | fork 本体，参数同上 |
 
 ⚠️ `old` 是一个**冻结的二进制**（构建目录的源现在是 master，master 已含 kvmem）：它的价值就在于是移植前那一刻的快照，重建它就不再是旧版。
+
+⚠️ **`port-off` 本轮是修好之后才测到的**：`-DLLAMA_KVMEM=OFF` 的构建自多会话存储那次提交起就是坏的——
+`kvmem_conv_bind()` 的 `#else` 分支写了 `(void) request;`，而参数名是 `request_ledger`，于是 `C2065`。
+也就是说，"编入 kvmem 不花钱"这条结论在此之前一直靠 10-31 的二进制支撑。本轮修掉（`(void) request_ledger;`）并重建，
+`old` / `port-off` / `port-nokv` 三者现在是同一天的源码与同一批构建。
+
+⚠️ 两处口径修正（不修就会得到假差距）：
+1. **bench 先热身一轮丢弃**，再轮换顺序跑 4 轮。
+2. **server 每个单元先发一个 1-token 请求丢弃**：新起的服务第一个请求要付 CUDA graph 捕获与模块加载，
+   这段落在 `prompt_eval` 里，同一格单次可以在 8725–10184 t/s 之间摆（±18%）；加了预热后同一格是 10909–11049（±1.3%）。
+   server 也改成轮换顺序——固定顺序会让"刚退出的服务"这一刻的 GPU 状态变成系统偏差：不轮换时 `port-off` 看起来比
+   `port-nokv` 慢 8.7%，轮换后是 −0.1%。
+
+⚠️ `old` 与 fork 是 `CMAKE_CUDA_ARCHITECTURES=70`，`wt-kvmem/build` 是 `52;70`；运行期都走 sm_70 的 kernel，
+fatbin 里多一份 sm_52 不改变稳态吞吐，但这确实是口径差异，记在这里。
 
 ⚠️ fork 的 `llama-bench` 与 `llama-perplexity` **不注册 `--kvmem`**（`--help` 里 0 个 kvmem 字样），所以 fork 的 kvmem 开/关只能在 server 上比。⚠️ port 的 `llama-bench` 没有 `--kvmem-gen-reserve`，基准表的池子 = budget（16 块），server 表显式给 1024（池 3072 = 24 槽）。
 
 ### prefill / decode（`llama-bench -p 4096 -n 128 -b 512 -fa 1 -ctk/-ctv f16 -dev CUDA0 -r 3`）
 
-先热身一轮丢弃（GPU 空闲后的第一次跑的是时钟爬坡，不是代码：同二进制首轮 10728 / 次轮 13530），再**轮换顺序**跑 4 轮（固定顺序会造假差距），取中位数：
+先热身一轮丢弃，再**轮换顺序**跑 4 轮，取中位数：
 
 | 单元 | pp4096 t/s | 对 `port-nokv` | tg128 t/s | 对 `port-nokv` |
 |---|---|---|---|---|
-| `old`（无 kvmem） | 13637.3 | −0.2% | 273.6 | −0.4% |
-| `port-off` | 13659.7 | −0.02% | 270.4 | −1.6% |
-| `port-nokv` | **13662.5** | — | **274.7** | — |
-| `port-kv`（真驱逐） | 11706.5 | **−14.3%** | 277.6 | +1.0% |
-| `fork-nokv` | 10273.6 | −24.8% | 241.1 | −12.2% |
+| `old`（无 kvmem） | 15277.9 | +0.1% | 298.2 | +1.2% |
+| `port-off` | 15243.1 | **−0.1%** | 295.2 | +0.2% |
+| `port-nokv` | **15256.3** | — | **294.6** | — |
+| `port-kv`（真驱逐） | 12701.8 | **−16.7%** | 306.1 | +3.9% |
+| `fork-nokv` | 11339.6 | −25.7% | 269.1 | −8.7% |
 
 4 轮原始值（pp）：
-`old` 13628.2 / 13646.4 / 13616.5 / 13648.1；`port-off` 13673.5 / 13584.4 / 13651.6 / 13667.8；`port-nokv` 13650.0 / 13657.0 / 13668.1 / 13668.1；`port-kv` 11841.2 / 11608.2 / 11674.4 / 11738.5；`fork-nokv` 10369.0 / 10171.0 / 10391.0 / 10178.2。
+`old` 15322.3 / 15163.3 / 15273.6 / 15282.2；`port-off` 15229.5 / 14974.8 / 15287.9 / 15256.7；
+`port-nokv` 15290.5 / 15242.0 / 15223.2 / 15270.6；`port-kv` 12825.8 / 12642.3 / 12543.7 / 12761.2；
+`fork-nokv` 11310.5 / 11373.6 / 10958.6 / 11368.6。
 
 读法：
-- **编入 kvmem 不花钱**：`port-off` / `port-nokv` / `old` 三者互差 ≤0.2%，都在噪声地板（同二进制自比 ±1.5%）内。
-- **真驱逐的代价从 −32.6% 收到 −14.3%**（`94f780e9e` 去掉两处整设备等待、`e04bdb5d6` 只让会评分的驱动捕获 prefill K，`35e773a8c` 的打分器 staging + batch512）。剩下的 −14.3% 全在压力路径：块换出/回填 + 记账。
-- **fork 基线本身慢**：同一台机器、同一个 `llama-bench`，fork 的 pp 低 24.8%、tg 低 12.2%。所以「fork 比 port 快/慢」必须拿 **fork 对 fork、port 对 port** 的比值说话，跨树横比会把 fork 的基线差算到 kvmem 头上。
+- **编入 kvmem 不花钱**：`port-off` / `port-nokv` / `old` 的 pp 互差 ≤0.1%，tg 互差 ≤1.2%，全在噪声地板（同二进制自比 ±1.5%）内。
+  上一轮记下的 `old` tg −3.2% 在这次 5 单元轮换里消失了，判定为爬坡/顺序噪声，不是真实差异。
+- 真驱逐的 prefill 代价本轮 **−16.7%**（上轮 −14.3%），decode 反而 **+3.9%**（池子小、注意力带宽低）。
+  4 轮内部很紧（12544–12826，±1%）。
+- **fork 基线本身慢**：同一台机器、同一个 `llama-bench`，fork 的 pp 低 25.7%、tg 低 8.7%。所以「fork 比 port 快/慢」必须拿 **fork 对 fork、port 对 port** 的比值说话。
 
-### 检索轮与答案（server，4649-token 文档、3 次/单元）
+### 检索轮与答案（server，4649-token 文档、4 轮轮换、每单元取中位）
 
-请求是同一份 14 000 字中文文档（tokenize 后 4649 token），三个探针分别埋在 **12%**（`H-2298`，落在被驱逐的头部）、**60%**（`M-4471`）、**末尾**（`T-9932`），问题要求三个温度上限全部按格式给出。`-c 16384 -b 512 -np 1 --no-webui`，`temperature 0`，`max_tokens 200`。
+请求是同一份 14 000 字中文文档（tokenize 后 4649 token），三个探针分别埋在 **12%**（`H-2298`，落在被驱逐的头部）、**60%**（`M-4471`）、**末尾**（`T-9932`），问题要求三个温度上限全部按格式给出。`-c 16384 -b 512 -np 1 --no-webui`，`temperature 0`，`max_tokens 200`。每单元 4 轮，答案逐轮相同，时间取中位。
 
-| 单元 | pp t/s（中位） | tg t/s（中位） | 检索轮 | H / M / T |
-|---|---|---|---|---|
-| `old` | 9724.6 | 214.4 | 无 | **3/3** |
-| `port-off` | 9680.3 | 209.8 | 无 | **3/3** |
-| `port-nokv` | 9030.3 | 199.9 | 无 | **3/3** |
-| `port-kv`（回滚） | 5655.8 | 202.4 | `mandatory_exceeds_pool`，**回滚** | 2/3，头部答成 87 |
-| `port-kv --kvmem-query-max 512` ¹ | 6027.6 | 205.3 | 应用，`rows=512` | 2/3，头部答成 87 |
-| `port-kv --kvmem-query-max 1024` ¹ | 5681.3 | 201.6 | 应用，`rows=1024 score_ms=83.8` | 2/3，头部答成 87 |
-| `fork-off` | 6154.1 | 143.2 | 无 | **3/3** |
-| `fork-kv` | 4062.9 | 146.3 | 应用，`rows=512 score_ms=66.5` | **3/3** |
+| 单元 | pp t/s（中位） | tg t/s（中位） | 对 `port-nokv` | 检索轮 | H / M / T |
+|---|---|---|---|---|---|
+| `port-off` | 10992.1 | 233.2 | +0.2% | 无 | **3/3** |
+| `port-nokv` | **10970.5** | 230.8 | — | 无 | **3/3** |
+| `port-kv` | 8683.0 | 229.1 | **−20.9%** | **捕获前拒绝** | 2/3，头部答成 87 |
+| `port-kv --kvmem-query-max 512` | 7106.1 | 216.2 | −35.2% | 应用 | 2/3，头部答成 87 |
+| `fork-nokv` | 7373.1 | 169.2 | −32.8% | 无 | **3/3** |
+| `fork-kv` | 4566.5 | 161.8 | −58.4% | 应用 | **3/3** |
 
-¹ 这两档只跑了 1 次（用来分离「上限」与「回滚语义」两个变量），时间数字按单次读，不经中位数。
+本轮最大的变化是 **`port-kv` 不再「评分后回滚」，而是在捕获前就拒绝**：
 
-三次的答案逐字相同（`H-2298=87, M-4471=64, T-9932=64` 或正确的 `51/87/64`），说明这不是采样抖动而是工作集差异：池 3072 token 只装得下 4649 的尾部，12% 处的块被压力路径按新近度扔掉了。**回滚语义本身是对的**——port 与 fork 在「装不下」时都不硬裁；差别在下一节。
+```
+W query_span_over_budget: prefill capture skipped: the Query span alone needs 37 of 14 blocks
+  (query=[2,4642)), so no complete retrieval plan can fit; keeping the prefill pressure view.
+```
 
-### 质量：PPL（200 kB 中文、`-c 8192 -b 512 -fa on`、f16）
+整段 Query 是 37 块，预算 2048 token 只给出 16 块（cap 14），所以这一轮从头到尾不会有可用的计划
+（`34063912e` 的分段：装不下就不先付捕获的钱）。上轮同样的负载是"先采完整段再回滚"。
+本轮口径修正后这一格的中位是 **8683 t/s（−20.9%）**；上一轮记的 −37%（5656 t/s）里混着冷启动成本，
+不宜再直接对比。
+
+### 质量：PPL（200 kB 中文、`-c 8192 -b 512 -fa on`、f16、每单元 3 轮）
 
 | 单元 | PPL | 对 `old` |
 |---|---|---|
@@ -414,35 +447,38 @@ W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping
 | `port-kv --kvmem-method recency` | 12.3027 | 同上，逐位同 |
 | `fork-nokv` | 12.0627 | −0.002% |
 
-`recency` 与 `retrieval` 在 PPL 上逐位相同，是因为 **PPL 从不跑检索轮**（每个 chunk 先 `memory_clear`，末尾的检索影响不到本 chunk 的 logits），这是口径限制而非实现等价——要验检索方法只能看上面那张 server 表。
+每单元 3 轮，三轮逐位相同（PPL 是确定性的）。`recency` 与 `retrieval` 仍逐位相同，是因为 **PPL 从不跑检索轮**
+（每个 chunk 先 `memory_clear`，末尾的检索影响不到本 chunk 的 logits），这是口径限制而非实现等价——要验检索方法只能看上面那张 server 表。
 
 ### 结论
 
-1. 移植没有引入退化：`port-nokv` / `port-off` / `old` 的 pp、tg、PPL 三者互相在噪声内（PPL 甚至逐位相同）。
-2. 真驱逐的代价是 **−14.3% prefill / +1.0% decode**（bench）与 **−37% 首字速度**（server，4649 token：9724 → 5656），后者是大头，因为 server 的每请求检索轮 + 压力搬运都压在 prefill 上。
-3. 回滚语义生效且可观测：`need=22 cap=14` → 保留压力视图，不评分、不提交。
-4. **query 行在 fork 里是工作区，在 port 里算历史** —— 已修（`--kvmem-query-workspace`，默认 on）。修前同参数下 fork 选中 18 块、port 选中 16 块：
-
-```
-port : selected 0 19 20 21 22 23 24 25 26 27 29 32 33 34 35 36        (16)
-fork : selected 0 7 18 19 20 21 22 23 24 25 26 27 28 29 30 32 33 34 35 36  (18)
-```
-
-port 少掉的两块里，**第 7 块正是埋着头部探针的那一块**。成因是 fork 的检索轮走 Query replay：它的 `fixed` 集由 `retrieval_prefix_mandatory(frontier)` 生成，`frontier` 是**提问之前**的历史末端，所以 Query 自己那几块属于 append 工作区（追加到 16 块之外），16 个语义槽全部留给历史；port 没有 replay 遍，`fixed` 用 `query_fixed_blocks(retrieval_mandatory())` 且 `frontier = total_tokens()`，Query 的尾部块要占同一份 16 个槽，历史因此少两块，第 7 块落榜。**补这一处不需要移植 replay**，只需要把记账改对——见下一节。
+1. **移植没有引入退化**：`port-off` 对 `port-nokv` 是 pp −0.1% / tg +0.2% / PPL 逐位相同；
+   `old` 对 `port-nokv` 是 +0.1% / +1.2%。三者全在噪声地板内。
+2. **真驱逐的代价**：bench **−16.7% prefill / +3.9% decode**；server 4649 token **−20.9% 首字速度**。
+   bench 与 server 的差别来自检索轮：bench 只有压力搬运，server 还多一次打分的驱动捕获。
+3. **语义**：port 现在把"装不下"提前到捕获前（`needs 37 of 14 blocks`），fork 在同样 2048 预算下应用了一个
+   `rows=512` 的计划——两者都不硬裁，只是决定点不同。要跨这两棵树比"计划质量"，必须给 port 加
+   `--kvmem-query-max` 让它也能出计划。
+4. **质量差距仍在**：port 两档都是 2/3（头部答成 87），fork 两档都是 3/3。本轮 port 的 2/3 直接原因是
+   **整轮不跑**（`port-kv`），或**工作集只有 16 块够不到 12% 处的头部**（`qm512`）——本轮数据**不支持**
+   把 2/3 归因于上轮讨论过的 query 行记账。
+5. **顺带修掉一个编译回归**：`-DLLAMA_KVMEM=OFF` 自从多会话存储那次提交起编不过（`C2065`），
+   本轮修好才让 `port-off` 这一行重新有当天的数据。
 
 ### 复现
 
 ```bash
-# 基准（轮换、热身、中位数）
-bash tmp/cmp/bench_matrix.sh
-# server 检索轮 + 三段探针答案
-python tmp/cmp/matrix.py m-port-kv 8302 14000 200 tmp/build-kvmem-on/bin/llama-server.exe \
-    --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024
+# 基准（热身 + 5 单元轮换 4 轮 + 中位数）
+bash tmp/cmp/retest.sh bench
+# server（每格先预热再测，6 格轮换 4 轮）
+bash tmp/cmp/retest.sh server
+# PPL（每单元 3 轮）
+bash tmp/cmp/retest.sh ppl
 # 单测
-cd tmp/build-kvmem-on && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|memory-contract|native-kv-payload|host-kv-storage|spill-io|tiered-kv-storage|native-residency|kv-content|prefix-checkpoint|mean-key-retrieval|graph-recall|query-policy|raw-kv-store|conversation-store)"
+cd tmp/wt-kvmem/build && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|memory-contract|native-kv-payload|host-kv-storage|spill-io|tiered-kv-storage|native-residency|kv-content|prefix-checkpoint|mean-key-retrieval|graph-recall|query-policy|raw-kv-store|conversation-store)"
 ```
 
-16 个 kvmem 单测全过。日志在 `tmp/cmp/matrix/`、`tmp/cmp/bench/`、`tmp/cmp/ppl_*.log`。
+17 个 kvmem 单测全过。本轮日志在 `tmp/cmp/retest/`（`bench_<unit>_r<N>.log`、`server7.jsonl` + 每格 `.log`、`ppl_<unit>_<N>.log`）。
 
 ## 引擎状态镜像：整段镜像拒绝，checkpoint 镜像支持
 
