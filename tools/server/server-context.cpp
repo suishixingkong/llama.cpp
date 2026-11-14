@@ -12179,8 +12179,17 @@ private:
                             // and every conversation switch re-prefills.
                             llama_state_seq_flags draft_flags = LLAMA_STATE_SEQ_FLAGS_NONE;
                             size_t draft_size = 0;
+                            // Under --kvmem the complete image cannot exist: the draft's
+                            // history is a packed host store and only its frontier is
+                            // serializable, which the adapter refuses by throwing. The
+                            // generic size getter logs that refusal as an ERROR before
+                            // reporting the 0 this branch is written to expect, so the
+                            // first capture of the process left an alarming line behind.
+                            // Ask for the shape the restore path uses when the answer is
+                            // known, and keep the probe for every other memory.
+                            const bool draft_whole_image = !params_base.kvmem.enabled;
                             if (capture_draft) {
-                                draft_size = ctx_dft_frontier_only
+                                draft_size = ctx_dft_frontier_only || !draft_whole_image
                                     ? 0
                                     : llama_state_seq_get_size_ext(
                                         ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
