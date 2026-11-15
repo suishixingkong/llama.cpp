@@ -217,6 +217,27 @@ LLAMA_API void llama_kvmem_accept_retrieval_round(void);
 // (qw3 kvmem_replay_capacity). False → skip query seq_rm/replay.
 LLAMA_API bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end);
 LLAMA_API void llama_kvmem_set_replay(bool replay);
+// The span the adapter scores from, after the --kvmem-query-max cap. False for a
+// declared-span driver (turn_spans_) and for a request with no Query window.
+LLAMA_API bool llama_kvmem_get_query_span(int32_t * begin, int32_t * end);
+// Query replay, in three steps the server can drive without holding adapter state.
+// The first pass evaluates the Query rows against the history the selector is about
+// to cut, so its last-token logits describe a view that no longer exists once
+// apply_retrieval() lands. Replaying the span with the frozen Q against the chosen
+// view is what makes the sampled token a product of the retained history.
+//
+// Snapshot the Mean-K/graph state at the Query's first row, before the selector runs
+// (frontier must still be `row`). Returns false when the state is not exactly there,
+// which is why the server has to stop its prefill exactly on the boundary.
+LLAMA_API bool llama_kvmem_save_replay_checkpoint(uint32_t row);
+// True while a snapshot for `row` is held and still validates.
+LLAMA_API bool llama_kvmem_replay_checkpoint_ready(uint32_t row);
+// Restore the snapshot and arm the replay: Q stays frozen, packed rows from `row` are
+// invalidated, and the decode that follows rewrites the span as a new execution.
+LLAMA_API bool llama_kvmem_replay_begin(uint32_t row);
+// Disarm. Every exit path of the replay decode must call this, or the next append is
+// treated as a replay and never registers tokens.
+LLAMA_API void llama_kvmem_replay_end(void);
 LLAMA_API void llama_kvmem_trace_cells(struct llama_context * ctx, const char * tag);
 // True when the GPU slot-pool spans the whole sequence context: no block can ever be
 // evicted, so retrieval scoring and query replay cannot change the placement. Drivers

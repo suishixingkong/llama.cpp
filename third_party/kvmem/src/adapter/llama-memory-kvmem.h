@@ -228,6 +228,13 @@ public:
     void trace_working_set(const char * tag) const;
     void set_replay(bool replay);
     bool replay() const { return replay_; }
+    // The server target is deliberately not allowed to see this header, so it cannot
+    // carry a llama_kvmem_tail_mean_state across the prefill/apply boundary. The
+    // adapter holds that one snapshot itself, keyed by the Query's first row.
+    bool save_replay_checkpoint(uint32_t row);
+    bool replay_checkpoint_ready(uint32_t row) const;
+    bool replay_begin(uint32_t row);
+    void replay_end() { set_replay(false); }
     // A pool that covers the whole context never evicts: every scoring and staging
     // decision below would keep every block anyway.
     bool no_eviction() const { return no_eviction_; }
@@ -305,6 +312,16 @@ public:
         explicit_spans_ = false;
         query_begin_ = capped_query_begin(begin, end, query_max_);
         query_end_ = end;
+    }
+    // What the adapter actually scores from, after the --kvmem-query-max cap. A caller
+    // that wants to snapshot the Mean-K state on the boundary has to use this row and
+    // no other; declaring its own begin would put the snapshot one step off whenever
+    // the cap applied. Declared spans (turn_spans_) are the driver's own business.
+    bool get_query_span(int32_t * begin, int32_t * end) const {
+        if (explicit_spans_ || query_begin_ < 0 || query_end_ <= query_begin_) return false;
+        *begin = query_begin_;
+        *end = query_end_;
+        return true;
     }
     void set_force_pos(int32_t pos) { force_pos_ = pos; }
     void set_mtp_follower(llama_memory_kvmem_mtp * mtp) { mtp_ = mtp; }
@@ -598,6 +615,12 @@ private:
     ggml_type type_v_ = GGML_TYPE_F16;
     bool v_trans_ = false;
     bool replay_ = false;
+    // Mean-K/graph state at the Query's first row, taken while the front of the
+    // prompt is still intact. Held here rather than by the driver because the server
+    // target has no adapter header, and the state owns a prefix + graph snapshot.
+    llama_kvmem_tail_mean_state replay_cp_;
+    bool replay_cp_valid_ = false;
+    uint32_t replay_cp_row_ = 0;
     // Failed store repair marker. Such a bundle cannot be carried into another
     // conversation; reset_policy restores both the logical and packed stores.
     bool host_mirror_stale_ = false;

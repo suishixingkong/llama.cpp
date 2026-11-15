@@ -26,6 +26,15 @@ extern "C" bool llama_kvmem_apply_retrieval(struct llama_context * ctx);
 extern "C" void llama_kvmem_pin_working_set(void);
 extern "C" void llama_kvmem_end_prefill_capture(void);
 extern "C" bool llama_kvmem_want_prefill_capture(void);
+// Query replay. The adapter holds the Mean-K snapshot (this target has no adapter
+// header), the server only drives the order: stop on the boundary, snapshot, select,
+// re-decode the span with the frozen Q, disarm.
+extern "C" bool llama_kvmem_save_replay_checkpoint(uint32_t row);
+extern "C" bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end);
+extern "C" bool llama_kvmem_replay_begin(uint32_t row);
+extern "C" void llama_kvmem_replay_end(void);
+extern "C" bool llama_kvmem_get_query_span(int32_t * begin, int32_t * end);
+extern "C" bool llama_kvmem_remove_logical(struct llama_context * ctx, llama_pos begin, llama_pos end);
 // Host stores for --kvmem-conversations. Same boundary discipline: declared
 // here rather than by pulling the adapter header into this target.
 extern "C" int32_t  llama_kvmem_store_create(void);
@@ -35,6 +44,17 @@ extern "C" bool     llama_kvmem_store_destroy(int32_t store_id);
 extern "C" uint32_t llama_kvmem_store_rows(int32_t store_id);
 extern "C" uint64_t llama_kvmem_store_bytes(int32_t store_id);
 extern "C" uint32_t llama_kvmem_store_n_tokens(void);
+
+// The replay pass is on by default; KVMEM_REPLAY=0 keeps the first-pass view. It
+// exists so one binary can answer "what did the replay buy" in an A/B, which the
+// fork's driver can only answer by rebuilding it.
+static bool kvmem_replay_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("KVMEM_REPLAY");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return enabled;
+}
 #endif
 #include "fit.h"
 #include "llama.h"
@@ -1238,6 +1258,22 @@ struct server_slot {
     // Task whose retrieval query span was already published to KVMem. The
     // setter flushes pending harvest, so it must run once per request.
     int32_t kvmem_span_task = -1;
+    // Query span of this request, kept in row space. The replay pass has to stop
+    // prefill exactly on kvmem_q_begin, snapshot the Mean-K state there, and decode
+    // [kvmem_q_begin, kvmem_q_end) again once the selector has cut the history.
+    int32_t kvmem_q_begin = -1;
+    int32_t kvmem_q_end   = -1;
+    // -1 not attempted yet, 0 refused (no snapshot), 1 held. A tri-state, because the
+    // prefill loop has to stop ON the boundary exactly once: with a plain bool a
+    // refused snapshot would stop the loop there forever.
+    int8_t  kvmem_replay_cp   = -1;
+    bool    kvmem_replay_done = false;  // replay decided (run or refused) for this request
+    // KVMem's PARTIAL_ONLY state image at the Query's first row: the recurrent rows and
+    // the frontier they belong to. Restoring it truncates the store back to that row,
+    // which is what makes the replay a rewrite of the same history instead of a second
+    // pass over a model that has already moved past it. Empty when the memory has no
+    // recurrent half, or when the image could not be taken.
+    std::vector<uint8_t> kvmem_replay_state;
 #endif
     int id;
 
@@ -11788,13 +11824,80 @@ private:
                         // the same policy. Hand over the whole user turn.
                         llama_kvmem_set_request_span(q_begin, q_end, -1);
                         llama_kvmem_begin_retrieval_round();
+                        // The server keeps the span it just published. The adapter
+                        // caps the Query window internally, so ask it rather than
+                        // guessing: a snapshot taken at the server's own q_begin would
+                        // never match the row the adapter scores from.
+                        {
+                            int32_t qb = -1, qe = -1;
+                            if (llama_kvmem_get_query_span(&qb, &qe) && qb >= 0 && qe > qb) {
+                                slot.kvmem_q_begin = qb;
+                                slot.kvmem_q_end   = qe;
+                            } else {
+                                slot.kvmem_q_begin = -1;
+                                slot.kvmem_q_end   = -1;
+                            }
+                            // A turn that resumes from cache already holds the Query
+                            // rows, so the boundary has been crossed before this
+                            // callback exists. Nothing to snapshot; do not stop prefill
+                            // waiting for a row that will never come around.
+                            slot.kvmem_replay_cp =
+                                (kvmem_replay_enabled() && slot.kvmem_q_begin >= slot.prompt.n_tokens()) ? -1 : 0;
+                            slot.kvmem_replay_done = false;
+                        }
                     }
 #endif
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+#if defined(LLAMA_KVMEM)
+                    // Take the Mean-K/graph snapshot exactly on the Query's first row.
+                    // get_tail_mean() only answers for the row the graph last accepted,
+                    // so this has to happen between two ubatches: the previous one ended
+                    // on the boundary (see the stop condition below) and none of the
+                    // Query rows has been evaluated yet.
+                    if (slot.kvmem_replay_cp < 0 && slot.kvmem_q_begin >= 0 &&
+                            slot.prompt.n_tokens() == slot.kvmem_q_begin) {
+                        slot.kvmem_replay_cp = llama_kvmem_save_replay_checkpoint(
+                                (uint32_t) slot.kvmem_q_begin) ? 1 : 0;
+                        if (slot.kvmem_replay_cp == 0) {
+                            SLT_DBG(slot, "KVMem replay: no Mean-K snapshot on row %d, "
+                                    "decode keeps the first-pass view\n", slot.kvmem_q_begin);
+                        } else {
+                            // The attention half is only half the model: a hybrid memory
+                            // also carries recurrent rows for this frontier, and the
+                            // rewrite below would otherwise run against state that has
+                            // already moved past it (the recurrent module then refuses
+                            // the batch as non-consecutive). KVMem's PARTIAL_ONLY image
+                            // is exactly "recurrent rows as of row P, truncate the store
+                            // back to P on restore", so keep it next to the Mean-K one.
+                            const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                            const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, flags);
+                            slot.kvmem_replay_state.clear();
+                            if (size > 0) {
+                                slot.kvmem_replay_state.resize(size);
+                                if (llama_state_seq_get_data_ext(ctx_tgt, slot.kvmem_replay_state.data(),
+                                        size, slot.id, flags) != size) {
+                                    slot.kvmem_replay_state.clear();
+                                }
+                            }
+                        }
+                    }
+#endif
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+#if defined(LLAMA_KVMEM)
+                        // Stop the ubatch exactly on the Query boundary, before any of
+                        // its rows is evaluated: one row past it and the snapshot above
+                        // is refused for the rest of the request. Once the snapshot is
+                        // held (or refused) the batch may run past the boundary again.
+                        if (slot.kvmem_replay_cp < 0 && slot.kvmem_q_begin > 0 &&
+                                slot.prompt.n_tokens() == slot.kvmem_q_begin &&
+                                !slot.prompt.tokens.has_media()) {
+                            break;
+                        }
+#endif
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -13373,6 +13476,41 @@ private:
                         // Query rows (an image in the conversation, a span past the
                         // budget) would silently disable scoring for that conversation.
                         if (llama_kvmem_apply_retrieval(ctx_tgt)) {
+                            // The round just cut the history the first pass scored
+                            // against, so the Query rows on the GPU and the logits the
+                            // sampler would read describe a view that no longer exists.
+                            // Replay the span against the chosen view before pinning it.
+                            if (kvmem_replay_enabled() && !slot.kvmem_replay_done &&
+                                    slot.kvmem_replay_cp == 1 &&
+                                    slot.kvmem_q_begin >= 0 && slot.kvmem_q_begin < slot.kvmem_q_end) {
+                                slot.kvmem_replay_done = true;
+                                const int32_t qb = slot.kvmem_q_begin;
+                                // The rewrite has to cover everything the first pass put
+                                // after the snapshot, not just the user span: the chat
+                                // template's trailing rows live past the span's end, and
+                                // remove_logical() cuts them all. The fork replays
+                                // [query, prompt_end) for the same reason.
+                                const int32_t qe = (int32_t) slot.prompt.n_tokens();
+                                if (qb >= qe) {
+                                    SLT_DBG(slot, "KVMem replay: empty span [%d,%d)\n", qb, qe);
+                                } else if (slot.prompt.tokens.has_media()) {
+                                    // A media span is decoded through the vision path,
+                                    // which this rebuild does not reproduce; the first
+                                    // pass stays the answer there.
+                                    SLT_DBG(slot, "KVMem replay skipped: media inside [%d,%d)\n", qb, qe);
+                                } else if (!llama_kvmem_query_replay_fits(
+                                        (uint32_t) qb, (uint32_t) qe)) {
+                                    SLT_DBG(slot, "KVMem replay skipped: rows [%d,%d) do not fit\n", qb, qe);
+                                } else if (kvmem_replay_span(slot, qb, qe, off)) {
+                                    // The target is one execution newer than every
+                                    // speculative carrier; the draft side has to hear
+                                    // about it before it offers another token.
+                                    common_speculative_sequence_transition(
+                                        slot.get_spec(), slot.id,
+                                        common_speculative_sequence_event::
+                                            target_restored_without_draft);
+                                }
+                            }
                             llama_kvmem_pin_working_set();
                             llama_kvmem_accept_retrieval_round();
                         }
@@ -13944,6 +14082,88 @@ private:
                     : server_slot_frontier_prepare_status::decode_rolled_back;
         }
     }
+
+#if defined(LLAMA_KVMEM)
+    // Re-decode [begin, end) of the prompt with the adapter in replay mode: the
+    // tokens and positions are the ones the first pass used, so this is a rebuild,
+    // not a new request. Only the retained view underneath differs -- the adapter
+    // freezes Q, rewrites the rows from `begin` on and invalidates the packed copies
+    // it derived from the full history.
+    //
+    // On success the context's logits buffer holds the replay rows alone, so the slot
+    // is re-pointed at the last of them; sampling afterwards must read the replayed
+    // view or the whole pass was paid for nothing.
+    bool kvmem_replay_span(server_slot & slot, int32_t begin, int32_t end, int off) {
+        // Restore the frontier the snapshot named: the store is truncated back to
+        // `begin` and the recurrent rows are installed as of that row. Cutting the
+        // attention rows alone is not enough on a hybrid model -- the recurrent half
+        // would keep running on state from the end of the first pass, which is where
+        // the "non-consecutive position" refusals come from -- so the image is tried
+        // first and the plain removal is only the fallback for a memory with no
+        // recurrent rows to restore.
+        bool restored = false;
+        if (!slot.kvmem_replay_state.empty()) {
+            try {
+                const size_t want = slot.kvmem_replay_state.size();
+                restored = llama_state_seq_set_data_ext(ctx_tgt, slot.kvmem_replay_state.data(),
+                        want, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == want;
+            } catch (const std::exception & e) {
+                SLT_WRN(slot, "KVMem replay: recurrent checkpoint rejected at row %d: %s\n",
+                        begin, e.what());
+            }
+        }
+        if (!restored && !llama_kvmem_remove_logical(ctx_tgt, begin, -1)) {
+            SLT_WRN(slot, "KVMem replay: cannot remove rows [%d,-) before the rewrite\n", begin);
+            return false;
+        }
+        if (!llama_kvmem_replay_begin((uint32_t) begin)) {
+            SLT_DBG(slot, "KVMem replay refused to open at row %d\n", begin);
+            return false;
+        }
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        struct batch_guard {
+            llama_batch value;
+            explicit batch_guard(int32_t n) : value(llama_batch_init(n, 0, 1)) {}
+            ~batch_guard() { llama_batch_free(value); }
+        } rb(n_batch);
+        // The rows being rewritten already exist in the store, so the batch has to name
+        // them: without logical_pos the adapter assigns the next free rows (old_rows,
+        // old_rows+1, ...) and refuses the batch as "outside the store". llama_batch_free
+        // does not own this pointer, so a vector can be lent to it for the decode.
+        std::vector<llama_pos> logical(std::max<int32_t>(n_batch, 1));
+        rb.value.logical_pos = logical.data();
+        bool ok = true;
+        int32_t last_logits = -1;
+        for (int32_t row = begin; row < end && ok; ) {
+            rb.value.n_tokens = 0;
+            while (row < end && rb.value.n_tokens < n_batch) {
+                const bool last = row + 1 == end;
+                const int32_t idx = rb.value.n_tokens;
+                common_batch_add(rb.value, slot.prompt.tokens[row],
+                        slot.prompt.tokens.pos_next(row), { slot.id }, last);
+                logical[idx] = row;
+                if (last) {
+                    last_logits = idx;
+                }
+                ++row;
+            }
+            if (const int rc = llama_decode(ctx_tgt, rb.value); rc != 0) {
+                SLT_WRN(slot, "KVMem replay decode failed rc=%d at row %d\n", rc, row);
+                ok = false;
+            }
+        }
+        // Every exit path disarms: an armed replay makes prepare_working_set() skip
+        // its append registration, so the next generation step would not be counted.
+        llama_kvmem_replay_end();
+        if (!ok || last_logits < 0) {
+            SLT_WRN(slot, "KVMem query replay failed on rows [%d,%d)\n", begin, end);
+            return false;
+        }
+        llama_synchronize(ctx_tgt);
+        slot.i_batch = off + last_logits;
+        return true;
+    }
+#endif
 
     bool build_capture_identity_fields(
             server_slot & slot,

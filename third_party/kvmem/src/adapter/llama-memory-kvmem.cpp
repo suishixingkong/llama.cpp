@@ -1595,6 +1595,53 @@ bool llama_memory_kvmem::restore_checkpoint_tail() {
     return view.valid;
 }
 
+bool llama_memory_kvmem::save_replay_checkpoint(uint32_t row) {
+    replay_cp_valid_ = false;
+    replay_cp_row_ = row;
+    llama_kvmem_tail_mean_state state;
+    // get_tail_mean() only answers for the row the graph last accepted, so the
+    // caller has to stop prefill exactly on the Query's first row. An ubatch that
+    // ran past it leaves the frontier one step ahead and the snapshot is refused --
+    // which is the correct answer, not a case to paper over.
+    if (!get_tail_mean(row, state)) {
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE replay_checkpoint row=%u unavailable frontier=%lld accepted=%lld\n",
+                    row, (long long) content_->stamp().frontier, (long long) graph_.accepted_through);
+        }
+        return false;
+    }
+    replay_cp_ = std::move(state);
+    replay_cp_valid_ = true;
+    if (trace_) {
+        kvmem_diag("KVMEM_TRACE replay_checkpoint row=%u saved values=%zu\n", row, replay_cp_.values.size());
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::replay_checkpoint_ready(uint32_t row) const {
+    if (!replay_cp_valid_ || replay_cp_row_ != row) {
+        return false;
+    }
+    return tail_mean_valid(row, replay_cp_);
+}
+
+bool llama_memory_kvmem::replay_begin(uint32_t row) {
+    if (replay_) {
+        return false;
+    }
+    if (!replay_checkpoint_ready(row)) {
+        if (trace_) kvmem_diag("KVMEM_TRACE replay_begin row=%u refused no_checkpoint\n", row);
+        return false;
+    }
+    if (!set_tail_mean(row, replay_cp_)) {
+        if (trace_) kvmem_diag("KVMEM_TRACE replay_begin row=%u refused tail_mean_rejected\n", row);
+        return false;
+    }
+    set_replay(true);
+    if (trace_) kvmem_diag("KVMEM_TRACE replay_begin row=%u q=[%d,%d)\n", row, query_begin_, query_end_);
+    return replay_;
+}
+
 void llama_memory_kvmem::set_replay(bool replay) {
     if (replay && !replay_) {
         harvest_flush();
@@ -6131,6 +6178,40 @@ bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end) {
 void llama_kvmem_set_replay(bool replay) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->set_replay(replay);
+    }
+}
+
+bool llama_kvmem_save_replay_checkpoint(uint32_t row) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->save_replay_checkpoint(row);
+    }
+    return false;
+}
+
+bool llama_kvmem_get_query_span(int32_t * begin, int32_t * end) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->get_query_span(begin, end);
+    }
+    return false;
+}
+
+bool llama_kvmem_replay_checkpoint_ready(uint32_t row) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->replay_checkpoint_ready(row);
+    }
+    return false;
+}
+
+bool llama_kvmem_replay_begin(uint32_t row) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        return mem->replay_begin(row);
+    }
+    return false;
+}
+
+void llama_kvmem_replay_end(void) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->replay_end();
     }
 }
 
