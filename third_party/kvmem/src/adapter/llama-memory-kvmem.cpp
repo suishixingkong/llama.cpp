@@ -5015,7 +5015,7 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     }
 }
 
-void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* prefix) {
+void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* prefix, int32_t history_end) {
     graph_.set_messages(request_graph_messages_);
     const auto rows=*std::max_element(q_count_.begin(),q_count_.end());
     if(!rows) return;
@@ -5027,8 +5027,21 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
     }
     const auto& policy=store();
     const auto& config=policy.config();
-    const auto frontier = prefix ? prefix->row : policy.total_tokens();
-    auto fixed = prefix ? retrieval_prefix_mandatory(frontier) : policy.query_fixed_blocks(retrieval_mandatory());
+    // This tree has no replay pass, so with no prefix the frame used to end at
+    // total_tokens() -- inside the Query. The Query's own pages were then scored as
+    // history pages, and page-softmax normalises over the frame, so four extra pages
+    // took probability mass from every real page and reordered them: on a 4649-token
+    // document at a 16-page budget the three highest-scoring pages were the Query's own
+    // last pages (positions 4608 / 4224 / 4352). history_end is the first row of the
+    // Query, so the frame now covers exactly the pages the selector may choose from.
+    const auto frontier = prefix ? prefix->row
+        : (history_end > 0 ? (uint32_t) history_end : policy.total_tokens());
+    // Both branches must speak about the same page range as the frame. The prefix-less
+    // branch used to pass the raw mandatory set, which carries pages from the Query's own
+    // tail: harmless while the frame covered them, but outside it now -- query_score_frame()
+    // then rejects the frame with "fixed Query block is outside the accepted index" and the
+    // round falls back to the pressure view.
+    auto fixed = retrieval_prefix_mandatory(frontier);
     auto frame=kvmem::query_score_frame(frontier,block_tokens_,policy.budget_blocks(),
         config.sink_blocks,config.recent_blocks,fixed);
     kvmem::PageQueryView query{nullptr,q_count_.data(),n_layer_,rows,n_head_,n_head_kv_,n_embd_head_,layers.data()};
@@ -5354,8 +5367,6 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
     const int64_t t1 = ggml_time_us();
     if (prefix && !tail_mean_valid(prefix->row,*prefix))
         throw std::runtime_error("stale Query score prefix");
-    if (method_ == 1) score_retrieval(prefix);
-    const int64_t t2 = ggml_time_us();
     llama_kvmem_selection selection;
     selection.epoch = attention_epoch_;
     selection.rows = store_n_tokens();
@@ -5374,6 +5385,14 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval(const llama_kvmem_ta
             workspace_begin = query_begin_;
         }
     }
+    // The frame counts pages as floor(frontier / block) while the plan counts ceil, so a
+    // frontier that lands inside a page leaves the frame one page short of the page
+    // `recent` pins. Round up to the block that holds the Query's first row.
+    const int32_t score_history = workspace_begin > 0
+        ? ((workspace_begin + (int32_t) block_tokens_ - 1) / (int32_t) block_tokens_) * (int32_t) block_tokens_
+        : workspace_begin;
+    if (method_ == 1) score_retrieval(prefix, score_history);
+    const int64_t t2 = ggml_time_us();
     if (prefix && method_==1) {
         const auto& policy=store();
         const auto pages=(prefix->row+block_tokens_-1)/block_tokens_;

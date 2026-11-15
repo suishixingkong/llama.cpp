@@ -443,7 +443,7 @@ private:
                                 void * host, uint64_t bytes);
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
                                   const void * host, uint64_t bytes);
-    void score_retrieval(const llama_kvmem_tail_mean_state* prefix = nullptr);
+    void score_retrieval(const llama_kvmem_tail_mean_state* prefix = nullptr, int32_t history_end = -1);
     std::vector<uint32_t> retrieval_prefix_mandatory(uint32_t frontier) const;
     bool read_gpu_block(uint32_t block_id, uint32_t il, bool is_k, std::vector<float> & out) const;
     static void kv_stats(const char * tag, const float * a, const float * b, size_t n);
