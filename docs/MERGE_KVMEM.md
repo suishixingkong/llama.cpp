@@ -626,6 +626,39 @@ port 相差 **0.03**。这条轨迹不是"多给预算"能走出来的——20 �
 cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=4678 q=[4678,4703)`，答案仍正确；
 若 Query 行本身已被缓存复用（`query_begin < n_tokens`），没有可抓的快照，直接跳过。
 
+#### MTP：draft 必须跟着重放（`--spec-type draft-mtp` + `-md mtp-*.gguf`）
+
+draft 池随 target 一起被 `truncate_cached` 截到 `query_begin`，所以 replay 的每一块都要在
+`llama_process(target)` 之后调 `common_speculative_process()`，否则 draft 的 KV 停在一个洞上，生成阶段
+一直在缺 500 行的上下文里提议。trace 判据：draft 侧出现同样的重建行
+（`mtp_occupy n=512 first_pos=4130`、`mtp_occupy n=7 first_pos=4642`）。
+
+2B Q8 + `mtp-Qwen3.5-2B-Q8_0`，24 格（两遍各自复现，逐格相同）：
+
+| 配置 | 命中 | pp | tg | draft 接受率 |
+|---|---|---|---|---|
+| replay 关 | 52/72 = 72.2% | 5013 | 203 | 0.875 |
+| replay 开 | **57/72 = 79.2%** | 4601 | **168** | **0.545** |
+
+方向正确（配对 5:1，p=0.22），但 **tg −17%** 是这条路径的真实代价：接受率掉了三分之一。原因是 replay
+第一块的 `pending_h`（target 在 `query_begin-1` 的 hidden）本该是回退点的 carry，而它是 process-local 的
+activation，**不随 `PARTIAL_ONLY` 镜像保存**（adapter 的 `state_write` 注释也点明了这一点）。fork 的
+checkpoint 里带 `draft_carry` 就是为了补这一步。在 draft carry 有保存/恢复入口之前，
+`KVMEM_REPLAY=0` 是"要 MTP 全速"的退路（质量回到 72.2%）。
+
+#### 媒体跨度：拒绝，而不是半重写
+
+Query span 跨图时不 replay，退回首遍视图。这条路径的判据在 trace 里连着两行：
+
+```
+KVMEM_TRACE media_rows query=[4388,4900) rows=4907 last_row_pos=4666: rows and positions diverge, scoring in row space
+D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4907)
+```
+
+（第二行是 `SLT_DBG`，要 `-lv 5`；第一行是 adapter 说明行号≠位置、打分在行空间做。）2B + `mmproj` 实测：
+`n_prompt=4905`（图占 258 token），三条记录全中；`KVMEM_REPLAY=0` 对照答案相同，即拒绝是设计内的边界，
+不是丢功能。vision 的 chunk 解码走 mtmd，replay 的 rebuild 不复现它，硬做只会把图的行写坏。
+
 ### 质量：PPL（200 kB 中文、`-c 8192 -b 512 -fa on`、f16、每单元 3 轮）
 
 | 单元 | PPL | 对 `old` |

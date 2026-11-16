@@ -14121,34 +14121,38 @@ private:
             return false;
         }
         const int32_t n_batch = llama_n_batch(ctx_tgt);
-        struct batch_guard {
-            llama_batch value;
-            explicit batch_guard(int32_t n) : value(llama_batch_init(n, 0, 1)) {}
-            ~batch_guard() { llama_batch_free(value); }
-        } rb(n_batch);
-        // The rows being rewritten already exist in the store, so the batch has to name
-        // them: without logical_pos the adapter assigns the next free rows (old_rows,
-        // old_rows+1, ...) and refuses the batch as "outside the store". llama_batch_free
-        // does not own this pointer, so a vector can be lent to it for the decode.
-        std::vector<llama_pos> logical(std::max<int32_t>(n_batch, 1));
-        rb.value.logical_pos = logical.data();
+        common_batch batch(ctx_tgt);
         bool ok = true;
         int32_t last_logits = -1;
+        // A rebuild is a prompt pass, and the speculative side has to see the same
+        // tokens: the draft pool was truncated together with the target
+        // (truncate_cached walks the follower mirror), so a rewrite that skipped the
+        // draft would leave generation proposing out of a hole -- still correct, because
+        // the target verifies every draft, but slower for the rest of the request.
+        llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_PROMPT);
         for (int32_t row = begin; row < end && ok; ) {
-            rb.value.n_tokens = 0;
-            while (row < end && rb.value.n_tokens < n_batch) {
+            batch.clear();
+            while (row < end && batch.size() < n_batch) {
                 const bool last = row + 1 == end;
-                const int32_t idx = rb.value.n_tokens;
-                common_batch_add(rb.value, slot.prompt.tokens[row],
-                        slot.prompt.tokens.pos_next(row), { slot.id }, last);
-                logical[idx] = row;
+                const int32_t idx = batch.add(slot.prompt.tokens[row],
+                        slot.prompt.tokens.pos_next(row), slot.id, last);
+                // The rows already exist in the store: name them, or the adapter appends
+                // new ones past the end and refuses the batch as "outside the store".
+                batch.tokens[idx].logical_pos = row;
                 if (last) {
                     last_logits = idx;
                 }
                 ++row;
             }
-            if (const int rc = llama_decode(ctx_tgt, rb.value); rc != 0) {
+            const int rc = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (rc != 0) {
                 SLT_WRN(slot, "KVMem replay decode failed rc=%d at row %d\n", rc, row);
+                ok = false;
+                break;
+            }
+            if (slot.get_spec() != nullptr &&
+                    !common_speculative_process(slot.get_spec(), batch)) {
+                SLT_WRN(slot, "KVMem replay: draft could not follow the rewrite at row %d\n", row);
                 ok = false;
             }
         }
