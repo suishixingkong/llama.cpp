@@ -51,11 +51,6 @@ extern "C" uint32_t llama_kvmem_store_n_tokens(void);
 // The replay pass is on by default; KVMEM_REPLAY=0 keeps the first-pass view. It
 // exists so one binary can answer "what did the replay buy" in an A/B, which the
 // fork's driver can only answer by rebuilding it.
-// PROBE (uncommitted): where does the replay's time go?
-static bool kvmem_replay_time() {
-    static const bool on = getenv("KVMEM_REPLAY_TIME") != nullptr;
-    return on;
-}
 static bool kvmem_replay_enabled() {
     static const bool enabled = []() {
         const char * v = getenv("KVMEM_REPLAY");
@@ -14123,7 +14118,6 @@ private:
         // the "non-consecutive position" refusals come from -- so the image is tried
         // first and the plain removal is only the fallback for a memory with no
         // recurrent rows to restore.
-        const int64_t t_all = ggml_time_us();
         bool restored = false;
         if (!slot.kvmem_replay_state.empty()) {
             try {
@@ -14139,7 +14133,6 @@ private:
             SLT_WRN(slot, "KVMem replay: cannot remove rows [%d,-) before the rewrite\n", begin);
             return false;
         }
-        const int64_t t_restore = ggml_time_us();
         if (!llama_kvmem_replay_begin((uint32_t) begin)) {
             SLT_DBG(slot, "KVMem replay refused to open at row %d\n", begin);
             return false;
@@ -14186,7 +14179,6 @@ private:
         }
         // Every exit path disarms: an armed replay makes prepare_working_set() skip
         // its append registration, so the next generation step would not be counted.
-        const int64_t t_loop = ggml_time_us();
         llama_kvmem_replay_end();
         if (!ok || last_logits < 0) {
             // The rewrite stopped halfway, so the target and the carriers no longer
@@ -14199,13 +14191,6 @@ private:
             return false;
         }
         llama_synchronize(ctx_tgt);
-        if (kvmem_replay_time()) {
-            const int64_t t_end = ggml_time_us();
-            SLT_WRN(slot, "KVMEM_REPLAY_TIME rows=%d restore=%.1fms loop=%.1fms sync=%.1fms total=%.1fms %.1f t/s\n",
-                    end - begin, (t_restore - t_all)/1e3, (t_loop - t_restore)/1e3,
-                    (t_end - t_loop)/1e3, (t_end - t_all)/1e3,
-                    (end - begin) / std::max(1e-6, (t_end - t_all)/1e6));
-        }
         slot.i_batch = off + last_logits;
         return true;
     }

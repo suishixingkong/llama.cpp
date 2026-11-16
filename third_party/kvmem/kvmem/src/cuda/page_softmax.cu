@@ -34,15 +34,18 @@ struct Buffer {
     ~Buffer() { if (data && !borrowed) cudaFree(data); }
 };
 constexpr size_t logits_limit=64u<<20;
-std::array<size_t,5> planned_sizes(uint32_t blocks,uint32_t heads,uint32_t kvheads,uint32_t dim) {
+std::array<size_t,6> planned_sizes(uint32_t blocks,uint32_t heads,uint32_t kvheads,uint32_t dim) {
     if(!blocks || !heads || !kvheads || !dim || heads%kvheads ||
        uint64_t(blocks)*heads*sizeof(float)>logits_limit)
         throw std::invalid_argument("invalid planned page softmax geometry");
     // 512 rows a batch keeps the stream cadence low without pressing the logits
     // budget: at 9.5k rows the old 64-row batch meant 148 sync points per layer.
     const auto batch=std::min<size_t>(512,logits_limit/(size_t(blocks)*heads*sizeof(float)));
-    return {batch*heads*dim*sizeof(half),size_t(blocks)*kvheads*dim*sizeof(half),
-        batch*blocks*heads*sizeof(float),batch*heads*2*sizeof(float),size_t(blocks)*sizeof(float)};
+    // The Query is staged as float: the device does the FP16 conversion (see
+    // page_logits), and a 2x upload is cheaper than converting it on the host.
+    return {batch*heads*dim*sizeof(float),size_t(blocks)*kvheads*dim*sizeof(half),
+        batch*blocks*heads*sizeof(float),batch*heads*2*sizeof(float),size_t(blocks)*sizeof(float),
+        sizeof(int)};
 }
 size_t aligned(size_t bytes) {
     if(bytes>SIZE_MAX-255) throw std::length_error("page softmax workspace overflow");
@@ -52,20 +55,44 @@ __device__ float warp_sum(float value) {
     for (int offset=16;offset;offset/=2) value += __shfl_down_sync(0xffffffff,value,offset);
     return value;
 }
-__global__ void page_logits(const half* queries, const half* means, float* logits,
-                            int blocks, int qheads, int kvheads, int dim) {
-    const int page=int(blockIdx.x)*4+int(threadIdx.x)/32;
+// One warp per (row, head) distribution, looping the pages. The previous shape gave
+// every warp a single page, so a 4k-token Query at a 19-page budget launched
+// rows*heads*ceil(pages/4) = 20k blocks per layer that each did four FMAs and a
+// shuffle reduction -- launch-bound, and it re-read the row's Query vector once per
+// page group. Here the Query is read once per distribution and each page costs the
+// same dot it did before, so the logits are bit-identical.
+//
+// The Query arrives as float and is converted here. Converting it on the host cost
+// 70 ms of a 77 ms scoring pass on a 4058-token prompt: MSVC compiles
+// __float2half_rn to a software routine when the translation unit has no F16C, and
+// the pass ran over rows*heads*dim = 14.7M elements twice (a range scan, then the
+// conversion). The device converts the same values with the same rounding, one
+// register at a time, and `bad` keeps the range rejection that the host pass used
+// to perform -- recall_fp16() rounds to nearest even too, and its only other job was
+// to throw on operands a bare conversion cannot represent.
+__global__ void page_logits(const float* queries, const half* means, float* logits,
+                            int* bad, int distributions, int blocks, int qheads,
+                            int kvheads, int dim) {
+    const int distribution=int(blockIdx.x)*4+int(threadIdx.x)/32;
     const int lane=int(threadIdx.x)%32;
-    const int distribution=int(blockIdx.y);
+    if (distribution >= distributions) return;
     const int head=distribution%qheads;
     const int kvhead=head/(qheads/kvheads);
-    if (page >= blocks) return;
     const auto* q=queries+size_t(distribution)*dim;
-    const auto* k=means+(size_t(page)*kvheads+kvhead)*dim;
-    float dot=0;
-    for (int d=lane;d<dim;d+=32) dot=fmaf(__half2float(q[d]),__half2float(k[d]),dot);
-    dot=warp_sum(dot);
-    if (lane==0) logits[size_t(distribution)*blocks+page]=dot*rsqrtf(float(dim));
+    for (int d=lane;d<dim;d+=32) {
+        if (!(fabsf(q[d]) <= 65504.0f)) {
+            // NaN and anything past the FP16 maximum. Any lane may report it; a
+            // plain store is enough because the host only tests "not zero".
+            *bad = 1;
+        }
+    }
+    for (int page=0;page<blocks;++page) {
+        const auto* k=means+(size_t(page)*kvheads+kvhead)*dim;
+        float dot=0;
+        for (int d=lane;d<dim;d+=32) dot=fmaf(__half2float(__float2half_rn(q[d])),__half2float(k[d]),dot);
+        dot=warp_sum(dot);
+        if (lane==0) logits[size_t(distribution)*blocks+page]=dot*rsqrtf(float(dim));
+    }
 }
 __global__ void normalize_pages(const float* logits, float* norms, int blocks) {
     __shared__ float reduction[128];
@@ -129,31 +156,12 @@ __global__ void accumulate_gqa_max(const float* logits, const float* norms, floa
     output[page] += sum*weight;
 }
 
-// recall_fp16() rounds each lane by hand so it can reject operands that a bare
-// conversion would turn into an infinity or a NaN; its rounding *is*
-// round-to-nearest-even, which is what __float2half_rn already does. On a 9.5k
-// row prefill the two run 467M times and the hand-written version dominates the
-// scoring pass, so keep the rejection as one branchless magnitude scan and let
-// the conversion be the intrinsic. Operands that need the exact path -- NaN,
-// and anything at or above the FP16 maximum -- still take it.
-void stage_query_half(const float * src, half * dst, size_t n) {
-    bool exact = false;
-    for (size_t i = 0; i < n; ++i) {
-        const float a = std::fabs(src[i]);
-        exact |= !(a <= 65504.0f);
-    }
-    if (!exact) {
-        for (size_t i = 0; i < n; ++i) dst[i] = __float2half_rn(src[i]);
-        return;
-    }
-    for (size_t i = 0; i < n; ++i) dst[i] = __float2half_rn(recall_fp16(src[i]));
-}
 } // namespace
 
 struct PageSoftmaxCuda::Impl {
     int device;
     cudaStream_t stream=nullptr;
-    Buffer queries,means,logits,norms,output;
+    Buffer queries,means,logits,norms,output,bad;
     uint32_t max_batch=512;
     explicit Impl(int device):device(device) {
         DeviceBinding binding(device); checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
@@ -162,7 +170,7 @@ struct PageSoftmaxCuda::Impl {
         DeviceBinding binding(device);
         cudaStreamSynchronize(stream);
         // Release in the owning context, before member destruction restores it.
-        for(auto* buffer:{&queries,&means,&logits,&norms,&output}) {
+        for(auto* buffer:{&queries,&means,&logits,&norms,&output,&bad}) {
             if(buffer->data && !buffer->borrowed) cudaFree(buffer->data);
             buffer->data=nullptr; buffer->capacity=0;
         }
@@ -184,7 +192,7 @@ PageSoftmaxCuda::PageSoftmaxCuda(int device,void* workspace,size_t bytes,uint32_
     if(!workspace || reinterpret_cast<uintptr_t>(workspace)%256 || bytes<workspace_bytes(blocks,heads,kvheads,dim))
         throw std::invalid_argument("page softmax borrowed workspace is missing, unaligned or too small");
     auto* begin=static_cast<uint8_t*>(workspace);size_t at=0;size_t index=0;
-    for(auto* buffer:{&impl_->queries,&impl_->means,&impl_->logits,&impl_->norms,&impl_->output}) {
+    for(auto* buffer:{&impl_->queries,&impl_->means,&impl_->logits,&impl_->norms,&impl_->output,&impl_->bad}) {
         buffer->data=begin+at;buffer->capacity=sizes[index++];buffer->borrowed=true;
         at+=aligned(buffer->capacity);
     }
@@ -193,7 +201,8 @@ PageSoftmaxCuda::PageSoftmaxCuda(int device,void* workspace,size_t bytes,uint32_
 PageSoftmaxCuda::~PageSoftmaxCuda()=default;
 size_t PageSoftmaxCuda::device_bytes() const {
     const auto& w=*impl_;
-    return w.queries.capacity+w.means.capacity+w.logits.capacity+w.norms.capacity+w.output.capacity;
+    return w.queries.capacity+w.means.capacity+w.logits.capacity+w.norms.capacity+w.output.capacity+
+        w.bad.capacity;
 }
 
 std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView q,
@@ -243,14 +252,17 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
     const auto batch=uint32_t(std::min<size_t>(impl_->max_batch,max_logits/row_bytes));
     auto& w=*impl_; DeviceBinding binding(w.device);
     checked(cudaStreamSynchronize(w.stream));
-    w.queries.reserve(size_t(batch)*qw*sizeof(half));
+    w.queries.reserve(size_t(batch)*qw*sizeof(float));
     w.means.reserve(blocks*kw*sizeof(half));
     w.logits.reserve(size_t(batch)*row_bytes);
     w.norms.reserve(size_t(batch)*q.query_heads*2*sizeof(float));
     w.output.reserve(blocks*sizeof(float));
+    w.bad.reserve(sizeof(int));
     checked(cudaMemsetAsync(w.output.data,0,blocks*sizeof(float),w.stream));
-    std::vector<half> host_means(blocks*kw),host_query(size_t(batch)*qw);
+    std::vector<half> host_means(blocks*kw);
     std::vector<float> key(kw),scores(blocks);
+    // One flag for the whole pass: any Query operand that a half cannot hold.
+    checked(cudaMemsetAsync(w.bad.data,0,sizeof(int),w.stream));
     for(uint32_t layer=0;layer<q.layers;++layer) {
         if(!q.layer_rows[layer]) continue;
         for(size_t j=0;j<blocks;++j) {
@@ -264,12 +276,12 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
             const auto* base=q.layer_data ? q.layer_data[layer] : q.data+size_t(layer)*q.rows*qw;
             if(!base) throw std::invalid_argument("page softmax CUDA missing active layer storage");
             const auto* input=base+size_t(first)*qw;
-            stage_query_half(input,host_query.data(),size_t(rows)*qw);
-            checked(cudaMemcpyAsync(w.queries.data,host_query.data(),size_t(rows)*qw*sizeof(half),cudaMemcpyHostToDevice,w.stream));
             const int distributions=int(rows*q.query_heads);
-            page_logits<<<dim3(unsigned((blocks+3)/4),unsigned(distributions)),128,0,w.stream>>>(
-                static_cast<half*>(w.queries.data),static_cast<half*>(w.means.data),
-                static_cast<float*>(w.logits.data),int(blocks),int(q.query_heads),int(q.kv_heads),int(q.head_dim));
+            checked(cudaMemcpyAsync(w.queries.data,input,size_t(rows)*qw*sizeof(float),cudaMemcpyHostToDevice,w.stream));
+            page_logits<<<unsigned((distributions+3)/4),128,0,w.stream>>>(
+                static_cast<const float*>(w.queries.data),static_cast<const half*>(w.means.data),
+                static_cast<float*>(w.logits.data),static_cast<int*>(w.bad.data),
+                distributions,int(blocks),int(q.query_heads),int(q.kv_heads),int(q.head_dim));
             normalize_pages<<<distributions,128,0,w.stream>>>(static_cast<float*>(w.logits.data),static_cast<float*>(w.norms.data),int(blocks));
             if (aggregation == GqaScoreAggregation::Mean) {
                 accumulate_pages<<<unsigned((blocks+127)/128),128,0,w.stream>>>(static_cast<float*>(w.logits.data),
@@ -288,6 +300,10 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
     }
     checked(cudaMemcpyAsync(scores.data(),w.output.data,blocks*sizeof(float),cudaMemcpyDeviceToHost,w.stream));
     checked(cudaStreamSynchronize(w.stream));
+    int bad=0;
+    checked(cudaMemcpy(&bad,w.bad.data,sizeof(int),cudaMemcpyDeviceToHost));
+    if(bad) throw std::runtime_error(
+        "page softmax CUDA query operand is nonfinite or exceeds the FP16 range");
     for(size_t j=0;j<blocks;++j) result[enabled[j]]=scores[j];
     return result;
 }

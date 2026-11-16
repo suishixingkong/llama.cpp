@@ -635,15 +635,22 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
 |---|---|---|
 | 不带 `--kvmem` | 8229 | 基线 |
 | `--kvmem --kvmem-budget 16384`（池 = 上下文） | 7795–7931 | 捕获整体关闭（`no_eviction()`），只剩 adapter 的追加记账 |
-| `--kvmem-budget 8192 --kvmem-method recency` | 6570 | 池成窗口 ⇒ 捕获打开（39 次 harvest），但从不打分 |
-| `--kvmem-budget 8192` | 4965 → **5421**（本节优化后） | 加上打分（71 ms） |
-| `--kvmem-budget 2048` | 4958 | 加上打分 60 ms + 重放 93 ms |
+| `--kvmem-budget 8192 --kvmem-method recency` | 6878–6923 | 池成窗口 ⇒ 捕获打开（只有 K，Q 已按 method 门控），但从不打分 |
+| `--kvmem-budget 8192` | 5891–6242 | 加上打分（71 → **7.75 ms**，见下） |
+| `--kvmem-budget 2048` | 5053–5274 | 加上打分（60 → **7.7 ms**）+ 重放 93 ms |
+
+（第三行同时是本轮改动的对照：它一行都不该受打分优化影响，却也在两次会话之间漂了 ~5%，
+ 就是这套单格测量的噪声地板；所以下面的结论只用**段内**数字算，不用单格 pp 差。）
 
 单段实测（`KVMEM_RETR_SUM` / `KVMEM_REPLAY_TIME` 两个现成的计时面）：
 
-- **打分是最大的一笔**：检索轮 total 63–71 ms，其中 `score_ms` 占 57–71 ms。它随 Query 行线性增长
-  （512 行 57 ms、256 行 29 ms、128 行 12.5 ms），因为 CUDA 打分的 grid 是
-  `排 × head × ⌈页/4⌉` ≈ 2 万 block/层、28 层 ⇒ **启动开销主导，不是算力**。
+- **打分的钱不在网格，在宿主转换**（本轮已修）。检索轮 total 63–71 ms，其中 `score_ms` 占 57–71 ms，
+  且随 Query 行线性（512 行 57 ms、256 行 29 ms、128 行 12.5 ms）。拆开看（临时探针，
+  `KVMEM_SCORE_PROBE`）：
+  `stage_ms=70.3 / kernel_ms=0.65 / h2d_ms=2.0 / sync_ms=2.4 / means_ms=1.6`。
+  `stage_query_half()` 在宿主上把 Q 转成 fp16：4k prompt 上 14.7M 个元素、**两遍**扫描（范围检查 + 转换），
+  而 MSVC 在这个 TU 没有 F16C 时把 `__float2half_rn` 编成软件例程 ⇒ 2.4 ns/元素。
+  原先猜的「grid 两万 block、启动开销主导」是错的：kernel 只占 0.65 ms。
 - **重放**：519 行 = 86–106 ms（`restore` 5–9 ms、`loop` 81–97 ms，即 ~4900–6000 t/s）。这一段是按行付的，
   跟「重算」这件事本身等价，除非少算行。
 - **捕获**：4k prompt 上 78.6 MB D2H、39–50 次事件。但字节只合 8 ms，而开/关之间差 ~16% of prefill
@@ -663,13 +670,24 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
 
 ⇒ 这条优化的适用面是「预算够大、检索轮空转」的那种会话（真实长会话里占多数）；池紧缩时它自动退成原行为。
 
-还没做、但已经量化清楚的三个方向：
+**本轮第二处优化：打分不再在宿主上转 fp16。** Q 以 float 上卡（H2D 翻倍，每层 +1 MB），
+核心里用 `__float2half_rn` 转一次——同样的取整，只是换成 GPU 做；范围拒绝搬到设备上的一个 flag，
+主机最后读 4 字节、照旧抛 `query operand is nonfinite or exceeds the FP16 range`。同时把
+`page_logits` 从「一个 warp 一页、grid = 行×head×⌈页/4⌉」改成「一个 warp 一个 distribution、
+循环所有页」：每个页的点积与 warp 归约顺序不变，所以 logits 逐位相同，但 block 数少 20×、
+每行的 Q 只读一次而不是每页组一次。
 
-1. **打分的网格粒度**（57 ms）。每个 block 只算 4 页 × 32 lane，2 万个 block 的调度开销远大于算术。
-   把每 block 的页数提到 16、或让一个 block 处理多个 (row, head)，按 block 数比例预计 2–4×。
-2. **捕获机制**（~16% of prefill）。字节只有 8 ms，要在 harvest 里看 event sync 与 pack 的占比。
-3. **`--kvmem-method recency` 仍在捕获**（39 次 harvest，一次都不会被打分）。`prefill_capture_`
-   应当以 `method_ == 1` 为门——这是一处纯浪费，但会动到捕获的开关语义，要单独验证。
+- 打分：**77 → 7.3 ms**（`stage` 0、`h2d` 3.75、`kernel` 0.38、`sync` 2.35）。
+- 换算成 prefill：8192 那格检索轮 71 → 7.75 ms（同格 `KVMEM_RETR_SUM`），即 **+9%**；
+  2048 那格 60 → 7.7 ms，即 **+6.4%**。
+- 等价性：24 格逐格答案相同（57/72、`24/24`），ctest 17/17。
+
+还没做、但已经量化清楚的两个方向：
+
+1. **捕获机制**（~16% of prefill，~100 ms）。字节只有 78.6 MB（≈8 ms）⇒ 贵在每 ubatch 的 event sync / pack，
+   得用 nsys 或更细的计数器才拆得开。
+2. **`--kvmem-method recency` 的对照**：这里没有浪费可省——`want_q_capture()` 已经按 `method_ == 1`
+   门控，recency 少掉的只是 Q；K 仍然要捕获，因为驱逐/回迁要靠 `raw_` 的宿主 K。
 
 #### MTP：draft 必须跟着重放，而且重放完不能再发「目标已还原」
 
@@ -750,6 +768,8 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
 6. **MTP 下 replay 不吃速度**：draft 侧跟着重放、并且重放成功后不发 `target_restored_without_draft`
    （发了会让下一步走 `target_only`，把 draft 的 prompt KV 整段清空）。修好后 2B+MTP 的 24 格：
    命中 52 → 57/72，tg 210 → 207/211（无退化），pp −12%（重放的 512 行）。
+7. **开 kvmem 的 prefill 代价可以逐段拆、也可以逐段砍**：捕获 ~16%、打分 71 → 7.75 ms、
+   重放 86–106 ms（页集不变时跳过）、压力搬运 4%。两轮优化合计把 8192 那格从 4965 抬到 ~5900 t/s。
 
 ### 复现
 
