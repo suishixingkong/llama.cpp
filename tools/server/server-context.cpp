@@ -13502,13 +13502,16 @@ private:
                                         (uint32_t) qb, (uint32_t) qe)) {
                                     SLT_DBG(slot, "KVMem replay skipped: rows [%d,%d) do not fit\n", qb, qe);
                                 } else if (kvmem_replay_span(slot, qb, qe, off)) {
-                                    // The target is one execution newer than every
-                                    // speculative carrier; the draft side has to hear
-                                    // about it before it offers another token.
-                                    common_speculative_sequence_transition(
-                                        slot.get_spec(), slot.id,
-                                        common_speculative_sequence_event::
-                                            target_restored_without_draft);
+                                    // The rewrite is complete and every speculative
+                                    // carrier was driven through it, so the frontier it
+                                    // holds is the live one. Do NOT announce a target
+                                    // restore here: that event invalidates the MTP carry
+                                    // bit, the next generation batch then resolves to
+                                    // `target_only`, and `target_only` clears the draft
+                                    // sequence outright -- throwing away the prompt KV
+                                    // the draft had just been rebuilt against. Measured
+                                    // on Qwen3.5-2B MTP: acceptance 0.875 -> 0.545 and
+                                    // tg -19% for exactly that reason.
                                 }
                             }
                             llama_kvmem_pin_working_set();
@@ -14124,11 +14127,8 @@ private:
         common_batch batch(ctx_tgt);
         bool ok = true;
         int32_t last_logits = -1;
-        // A rebuild is a prompt pass, and the speculative side has to see the same
-        // tokens: the draft pool was truncated together with the target
-        // (truncate_cached walks the follower mirror), so a rewrite that skipped the
-        // draft would leave generation proposing out of a hole -- still correct, because
-        // the target verifies every draft, but slower for the rest of the request.
+        // A rebuild is a prompt pass: the target has to treat these rows as prompt
+        // tokens again, or the next generation step inherits a graph built for one.
         llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_PROMPT);
         for (int32_t row = begin; row < end && ok; ) {
             batch.clear();
@@ -14150,16 +14150,29 @@ private:
                 ok = false;
                 break;
             }
+            // The carriers have to be driven through the same rows: process() rewinds
+            // the draft pool to the first position of the batch it is handed (M-RoPE
+            // refuses to write over a stored position), so a rewrite that skipped them
+            // would leave the draft frontier short of the target's. The cost of that is
+            // not subtle: the next generation batch resolves to `target_only`, which
+            // clears the draft sequence and with it the whole prompt KV.
             if (slot.get_spec() != nullptr &&
                     !common_speculative_process(slot.get_spec(), batch)) {
                 SLT_WRN(slot, "KVMem replay: draft could not follow the rewrite at row %d\n", row);
                 ok = false;
+                break;
             }
         }
         // Every exit path disarms: an armed replay makes prepare_working_set() skip
         // its append registration, so the next generation step would not be counted.
         llama_kvmem_replay_end();
         if (!ok || last_logits < 0) {
+            // The rewrite stopped halfway, so the target and the carriers no longer
+            // agree on where they are. Say it out loud: the alternative is a next batch
+            // that trusts an aligned frontier and reads the hole as context.
+            common_speculative_sequence_transition(
+                slot.get_spec(), slot.id,
+                common_speculative_sequence_event::target_restored_without_draft);
             SLT_WRN(slot, "KVMem query replay failed on rows [%d,%d)\n", begin, end);
             return false;
         }

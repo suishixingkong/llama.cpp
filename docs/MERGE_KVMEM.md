@@ -626,25 +626,38 @@ port 相差 **0.03**。这条轨迹不是"多给预算"能走出来的——20 �
 cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=4678 q=[4678,4703)`，答案仍正确；
 若 Query 行本身已被缓存复用（`query_begin < n_tokens`），没有可抓的快照，直接跳过。
 
-#### MTP：draft 必须跟着重放（`--spec-type draft-mtp` + `-md mtp-*.gguf`）
+#### MTP：draft 必须跟着重放，而且重放完不能再发「目标已还原」
 
-draft 池随 target 一起被 `truncate_cached` 截到 `query_begin`，所以 replay 的每一块都要在
-`llama_process(target)` 之后调 `common_speculative_process()`，否则 draft 的 KV 停在一个洞上，生成阶段
-一直在缺 500 行的上下文里提议。trace 判据：draft 侧出现同样的重建行
-（`mtp_occupy n=512 first_pos=4130`、`mtp_occupy n=7 first_pos=4642`）。
+draft 池里**有** prompt KV：prefill 的每个 ubatch 都会同步给它。所以 replay 重写 `[qb, prompt_end)` 时
+它必须跟着重写，两块都要做对，少一块就会把整段 prompt KV 弄丢：
 
-2B Q8 + `mtp-Qwen3.5-2B-Q8_0`，24 格（两遍各自复现，逐格相同）：
+1. **每块 `llama_process(target)` 之后调 `common_speculative_process()`**。它内部会先把 draft 回退到
+   本块首位置（M-RoPE 不允许覆盖已存位置），再喂同样的行。
+2. **重放成功后不要再发 `target_restored_without_draft`**。那条事件会清掉 MTP carry 位，下一批 preflight
+   就判成 `target_only`，而 `target_only` 是 `seq_rm(dft, -1, -1)` —— 把 draft 的 prompt KV 整段清空。
+
+第 2 条是真正难找的那个：只做第 1 条时，命中率和答案都已经对了（`target_only` 发生在生成首步，
+不影响 target 的 logits），只有吞吐塌下去。判据在 draft 侧的位置前沿上：
+
+```
+mode=cold_or_retained first_pos=4060 dft_pos_max=4059 ready=0   <- 生成首步：carry 失效
+mode=cold_or_retained first_pos=4064 dft_pos_max=-1   ready=1   <- target_only 已把 draft 清空
+```
+
+`ready=0` 就是第 2 条干的。修掉之后同一格是
+`first_pos=4060 dft_pos_max=4059 ready=1`，draft 接着往 4063、4067… 走。
+
+2B Q8 + `mtp-Qwen3.5-2B-Q8_0`，24 格（`on` 两遍逐格相同；`off` 一遍同批次测）：
 
 | 配置 | 命中 | pp | tg | draft 接受率 |
 |---|---|---|---|---|
-| replay 关 | 52/72 = 72.2% | 5013 | 203 | 0.875 |
-| replay 开 | **57/72 = 79.2%** | 4601 | **168** | **0.545** |
+| replay 关 | 52/72 = 72.2% | 5156 | 210 | 0.846 |
+| replay 开，只跟随（仍发还原事件） | 57/72 = 79.2% | 4601 | **168** | **0.545** |
+| replay 开，跟随 + 不发还原事件 | **57/72 = 79.2%** | 4524 / 4807 | **207 / 211** | **0.855** |
 
-方向正确（配对 5:1，p=0.22），但 **tg −17%** 是这条路径的真实代价：接受率掉了三分之一。原因是 replay
-第一块的 `pending_h`（target 在 `query_begin-1` 的 hidden）本该是回退点的 carry，而它是 process-local 的
-activation，**不随 `PARTIAL_ONLY` 镜像保存**（adapter 的 `state_write` 注释也点明了这一点）。fork 的
-checkpoint 里带 `draft_carry` 就是为了补这一步。在 draft carry 有保存/恢复入口之前，
-`KVMEM_REPLAY=0` 是"要 MTP 全速"的退路（质量回到 72.2%）。
+⇒ 质量收益（配对 5:1，p=0.22）与 tg 都不受影响：**tg 与关掉 replay 时相同**，pp 少 12% 是因为重放的
+512 行本来就在第一次 prefill 里算过一遍。之前记的「tg −17%、接受率 0.545、缺 draft carry」全部撤回——
+那不是 carry 的问题，是这条事件。0.8B（无 spec）路径不受影响：8 格命中与答案逐格相同。
 
 #### 媒体跨度：拒绝，而不是半重写
 
@@ -689,6 +702,9 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
    代价是 4647-token prompt 上 pp 再 −10.3%（重算 512 token）。
 5. **顺带修掉一个编译回归**：`-DLLAMA_KVMEM=OFF` 自从多会话存储那次提交起编不过（`C2065`），
    本轮修好才让 `port-off` 这一行重新有当天的数据。
+6. **MTP 下 replay 不吃速度**：draft 侧跟着重放、并且重放成功后不发 `target_restored_without_draft`
+   （发了会让下一步走 `target_only`，把 draft 的 prompt KV 整段清空）。修好后 2B+MTP 的 24 格：
+   命中 52 → 57/72，tg 210 → 207/211（无退化），pp −12%（重放的 512 行）。
 
 ### 复现
 
@@ -709,6 +725,15 @@ KVMEM_REPLAY=0 bash tmp/cmp/qrun.sh portnoreplay 2048 "$PWD/tmp/wt-kvmem/build/b
 bash tmp/cmp/qrun.sh fork 2048 "$PWD/kvmem-llama.cpp/build-v100/bin/llama-kvmem-server.exe" \
      --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024
 python tmp/cmp/setdiff.py                                # 选中集 vs 探针页的列联表
+# MTP 路径（2B + nextn 头）：MODEL_PATH 覆盖 qmatrix/lpmatrix 的模型
+MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf bash tmp/cmp/qrun.sh mtp24 2048 \
+     "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" --kvmem --kvmem-budget 2048 \
+     --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512 \
+     --spec-type draft-mtp -md C:/Users/yj/models/mtp-Qwen3.5-2B-Q8_0.gguf
+# 媒体跨度：单轮带图请求（LOGV 控制 -lv，replay 的拒绝行是 SLT_DBG）
+MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf LOGV=5 python tmp/cmp/media.py media 9311 \
+     "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" --kvmem --kvmem-budget 2048 \
+     --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512
 # 单测
 cd tmp/wt-kvmem/build && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|memory-contract|native-kv-payload|host-kv-storage|spill-io|tiered-kv-storage|native-residency|kv-content|prefix-checkpoint|mean-key-retrieval|graph-recall|query-policy|raw-kv-store|conversation-store)"
 ```
