@@ -48,6 +48,12 @@
 // llama_context
 //
 
+// thrown for the expected (non-fatal) "ctx_other not yet set" case during memory fitting;
+// caught in llama_init_from_model and logged as a warning rather than an error (upstream PR #24590)
+class llama_exception : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 
 // Verify that every Hadamard-folded weight consumed by the graph receives its
 // activation-side transform, and that every latent lookup table gets the inverse.
@@ -289,8 +295,7 @@ llama_context::llama_context(
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
-            // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+            throw llama_exception("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
         cparams.ctx_other = params.ctx_other;
@@ -299,7 +304,7 @@ llama_context::llama_context(
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw llama_exception(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
         }
@@ -5791,6 +5796,10 @@ llama_context * llama_init_from_model(
         // phase=satisfied; the claim lives until the first real decode (claim-complete)
         llama_vram_demand_satisfied();
         return ctx;
+    } catch (const llama_exception & err) {
+        // expected during memory fitting (Gemma4Assistant/EAGLE3/DFlash ctx_other not yet set) -- warn, don't error
+        LLAMA_LOG_WARN("%s: failed to initialize the context: %s\n", __func__, err.what());
+        llama_vram_demand_abandon();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
         llama_vram_demand_abandon();
