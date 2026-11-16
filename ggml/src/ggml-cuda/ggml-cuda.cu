@@ -3320,13 +3320,8 @@ static int ggml_cuda_try_fwht_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         return 0;
     }
 
-    // The fused kernel reads x (and signs) in the same launch that writes its output. The separate transform
-    // and quantize launches never needed those apart, and ggml-alloc does hand mm the block of x when x is a
-    // reshape view (no in-place reuse through a view parent, so the viewed tensor is released at the MUL and
-    // mm takes it two nodes later - the output-projection input on every Bonsai layer). Blocks storing q8_1
-    // rows early would then overwrite f32 input other blocks have not loaded yet: sporadic garbage that on a
-    // hybrid model lands in the recurrent state and poisons the rest of the sequence. In that case the rows
-    // go to a pool block held until the next graph evaluation instead of mm's buffer.
+    // Used by the plain-F32 fallback below: folding the sign multiply into the transform writes mm in
+    // the same launch that reads x, so if the two alias the write would corrupt an input still in use.
     auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data;
         const char * a1 = a0 + ggml_nbytes(a);
@@ -3334,7 +3329,6 @@ static int ggml_cuda_try_fwht_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         const char * b1 = b0 + ggml_nbytes(b);
         return a0 < b1 && b0 < a1;
     };
-    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
 
     // every use of the transform output (directly or through a reshape view of the whole tensor) must be
     // src1 of a mat-mul whose route re-encodes it: a PTQ1_0 mat-vec (q8_1 form), a mul_mat_q tile GEMM
@@ -3512,14 +3506,20 @@ static int ggml_cuda_try_fwht_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         // unless that much room is left in it.
         const bool   mmq_rows = consumers_kind == 3;
         const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1 + (size_t) mmq_tail;
-        void * out = mm->data;
-        if (out_aliases_in) {
-            auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
-            out = blk->get();
-            ctx.fwht_q8().held.push_back(std::move(blk));
-        } else if ((int64_t) q8_bytes > (int64_t) ggml_nbytes(mm)) {
-            return 0; // the quantized rows must fit in the F32 output allocation
-        }
+
+        // The q8_1 rows are written at graph-build time, well before the transform's real consumers
+        // run. mm->data is a ggml-alloc graph buffer whose lifetime is only this MUL_MAT node, so
+        // ggml-alloc is free to hand the very same block to a later node's activation. On Gemma4 all
+        // the V inverse rotations share one such block: writing q8_1 into mm->data here stomps the
+        // F32 attention output that a later rotation still has to read, which comes back as NaN and
+        // poisons the logits (endless <unusedNN> tokens). Testing x/mm overlap at build time does not
+        // catch this -- the victim is a cross-node reuse, not an alias of this node's own input.
+        // There is no reliable way to know from here whether ggml-alloc recycled the block, so the
+        // rows always go to a dedicated pool block held until fwht_q8().reset() at the next graph
+        // evaluation. The consumers read pre_q8->data, never mm->data, so this is transparent to them.
+        auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+        void * out = blk->get();
+        ctx.fwht_q8().held.push_back(std::move(blk));
 
         fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
                                     out, layout, K, ne0_padded, ncols, ctx.stream());
