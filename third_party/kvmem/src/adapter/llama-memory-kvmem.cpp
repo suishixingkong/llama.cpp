@@ -1417,6 +1417,7 @@ void llama_memory_kvmem::reset_turn_policy() {
     turn_spans_ = {};
     retrieval_pinned_ = false;
     keep_selected_ = false;
+    first_pass_stale_ = false;
     // A refused round is a property of one request's span, so it must not outlive the
     // turn: begin_retrieval_round() sets it again for the next request, and a driver
     // that never opens a round has to keep capturing.
@@ -3000,10 +3001,16 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
             for(auto id:fixed) if(!std::binary_search(candidates.begin(),candidates.end(),id))
                 throw std::runtime_error("KVMem pressure would recall a cold mandatory page");
             const auto selected=store.pick_scored_blocks(candidates,feedback_.pressure_scores(starts),fixed,budget_blocks);
+            const uint64_t residency_before = residency_fingerprint();
             if(native_contract_supported()) run_native_transaction(selected,NativePurpose::Pressure);
             else {
                 const auto plan=runtime_->prepare_native_selection(selected);
                 trace_plan("attention_pressure",plan); apply_plan_to_kv(plan);
+            }
+            // A pressure pass that relocates rows invalidates the rows already decoded
+            // against the old layout: the Query replay cannot be skipped after it.
+            if (residency_fingerprint() != residency_before) {
+                first_pass_stale_ = true;
             }
             kvmem_diag("KVMEM_PRESSURE phase=%s logical=%u candidates=%zu selected=%zu graph=0\n",
                 retrieval_pinned_?"decode":"prefill",t0,candidates.size(),selected.size());
@@ -5760,7 +5767,11 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
     if (selection.epoch != attention_epoch_ || selection.rows != store_n_tokens())
         throw std::runtime_error("stale KVMem selection");
     if (native_contract_supported()) {
+        const uint64_t residency_before = residency_fingerprint();
         run_native_transaction(selection.blocks, NativePurpose::Retrieval);
+        if (residency_fingerprint() != residency_before) {
+            first_pass_stale_ = true;
+        }
     } else {
         apply_native_selection(selection);
     }
@@ -5781,6 +5792,7 @@ void llama_memory_kvmem::apply_native_selection(const llama_kvmem_selection & se
             retr_.n_skip = plan.gpu_reused_blocks;
         }
     }
+    const uint64_t residency_before = residency_fingerprint();
     trace_plan("retrieval", plan);
     if (trace_) {
         kvmem_diag("KVMEM_TRACE selected");
@@ -5790,6 +5802,9 @@ void llama_memory_kvmem::apply_native_selection(const llama_kvmem_selection & se
         fprintf(stderr, "\n");
     }
     apply_plan_to_kv(plan);
+    if (residency_fingerprint() != residency_before) {
+        first_pass_stale_ = true;
+    }
     auto & store = runtime_->store();
     retrieval_pinned_ = true;
     if (mtp_) {
@@ -6125,6 +6140,33 @@ void llama_kvmem_dump_kv_writeback(struct llama_context * /*ctx*/, int32_t block
 bool llama_kvmem_apply_retrieval(struct llama_context * /*ctx*/) {
     llama_memory_kvmem * mem = kvmem_capture_active();
     return mem ? mem->apply_retrieval() : false;
+}
+
+bool llama_kvmem_first_pass_stale() {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    // No adapter means no captured first pass to distrust: the caller's replay is
+    // gated on its own snapshot, which does not exist in that case either.
+    return mem ? mem->first_pass_stale() : true;
+}
+
+uint64_t llama_memory_kvmem::residency_fingerprint() const {
+    if (!runtime_) {
+        return 0;
+    }
+    const auto & blocks = runtime_->store().blocks();
+    // FNV-1a over (id, slot). A block that leaves and another that takes its slot
+    // cannot produce the same stream, so "same hash" means "same rows in the same
+    // places", which is exactly what makes a first pass reusable.
+    uint64_t h = 1469598103934665603ull;
+    for (size_t id = 0; id < blocks.size(); ++id) {
+        const int32_t slot = blocks[id].gpu_slot;
+        if (slot < 0) {
+            continue;
+        }
+        h ^= (uint64_t(id) << 32) | uint32_t(slot);
+        h *= 1099511628211ull;
+    }
+    return h;
 }
 
 bool llama_memory_kvmem::query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const {

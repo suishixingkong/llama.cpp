@@ -626,6 +626,51 @@ port 相差 **0.03**。这条轨迹不是"多给预算"能走出来的——20 �
 cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=4678 q=[4678,4703)`，答案仍正确；
 若 Query 行本身已被缓存复用（`query_begin < n_tokens`），没有可抓的快照，直接跳过。
 
+#### prefill 的三笔账：捕获、打分、重放
+
+「开了 kvmem 就变慢」不是一个数，是四段加起来。同一格反复测（Qwen3.5-2B-Q8、`-c 16384`、
+4058-token prompt、单请求、不带 MTP），把每段单独关掉：
+
+| 配置 | pp t/s | 这一段买的是什么 |
+|---|---|---|
+| 不带 `--kvmem` | 8229 | 基线 |
+| `--kvmem --kvmem-budget 16384`（池 = 上下文） | 7795–7931 | 捕获整体关闭（`no_eviction()`），只剩 adapter 的追加记账 |
+| `--kvmem-budget 8192 --kvmem-method recency` | 6570 | 池成窗口 ⇒ 捕获打开（39 次 harvest），但从不打分 |
+| `--kvmem-budget 8192` | 4965 → **5421**（本节优化后） | 加上打分（71 ms） |
+| `--kvmem-budget 2048` | 4958 | 加上打分 60 ms + 重放 93 ms |
+
+单段实测（`KVMEM_RETR_SUM` / `KVMEM_REPLAY_TIME` 两个现成的计时面）：
+
+- **打分是最大的一笔**：检索轮 total 63–71 ms，其中 `score_ms` 占 57–71 ms。它随 Query 行线性增长
+  （512 行 57 ms、256 行 29 ms、128 行 12.5 ms），因为 CUDA 打分的 grid 是
+  `排 × head × ⌈页/4⌉` ≈ 2 万 block/层、28 层 ⇒ **启动开销主导，不是算力**。
+- **重放**：519 行 = 86–106 ms（`restore` 5–9 ms、`loop` 81–97 ms，即 ~4900–6000 t/s）。这一段是按行付的，
+  跟「重算」这件事本身等价，除非少算行。
+- **捕获**：4k prompt 上 78.6 MB D2H、39–50 次事件。但字节只合 8 ms，而开/关之间差 ~16% of prefill
+  （7795 → 6570）⇒ 贵在每 ubatch 的机制（event sync / pack），不在搬运。
+- **压力搬运**（池装不下时 stage_out）：只有 4%（budget 4096 → 2048 是 5154 → 4958），不是主因。
+
+**本节已做的一处优化：页集没变就不重放。** 检索轮经常什么都没搬（池够大时 `n_move=0 n_stage_in=0`），
+可是首遍的 Query 行仍然被整段重算一遍——重算的是同一批行、对着同一个视图，纯属把同样的 KV 再写一次。
+判定用**驻留指纹**（每个块的 `(block_id, gpu_slot)` 的 FNV-1a）：压力搬运前后、检索轮应用前后各取一次，
+哈希没变就说明首遍描述的就是刚选定的视图，`llama_kvmem_first_pass_stale()` 返回 false，server 跳过重放。
+
+- 池够大（budget 8192，24 格，带 MTP）：pp 4628 → **5012（+8.3%）**；命中 72/72 → 71/72，
+  逐格看是 0 好 1 差（第 3000 格 M 值 87→64）。那一格是已知的刀刃格（4 行文本就能翻盘），
+  差别只来自首遍与重放的 ubatch 切分不同带来的浮点尾数差。
+- 池紧缩（budget 2048，24 格）：**完全不变**——`n_move=19`，指纹变了，照旧重放；
+  57/72 与 24/24 逐格答案与优化前一致。
+
+⇒ 这条优化的适用面是「预算够大、检索轮空转」的那种会话（真实长会话里占多数）；池紧缩时它自动退成原行为。
+
+还没做、但已经量化清楚的三个方向：
+
+1. **打分的网格粒度**（57 ms）。每个 block 只算 4 页 × 32 lane，2 万个 block 的调度开销远大于算术。
+   把每 block 的页数提到 16、或让一个 block 处理多个 (row, head)，按 block 数比例预计 2–4×。
+2. **捕获机制**（~16% of prefill）。字节只有 8 ms，要在 harvest 里看 event sync 与 pack 的占比。
+3. **`--kvmem-method recency` 仍在捕获**（39 次 harvest，一次都不会被打分）。`prefill_capture_`
+   应当以 `method_ == 1` 为门——这是一处纯浪费，但会动到捕获的开关语义，要单独验证。
+
 #### MTP：draft 必须跟着重放，而且重放完不能再发「目标已还原」
 
 draft 池里**有** prompt KV：prefill 的每个 ubatch 都会同步给它。所以 replay 重写 `[qb, prompt_end)` 时
@@ -730,6 +775,13 @@ MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf bash tmp/cmp/qrun.sh mtp24 20
      "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" --kvmem --kvmem-budget 2048 \
      --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512 \
      --spec-type draft-mtp -md C:/Users/yj/models/mtp-Qwen3.5-2B-Q8_0.gguf
+# prefill 的账：三档预算 + 两个计时面（捕获/打分/重放分别落在哪一段）
+KVMEM_PERF=1 KVMEM_REPLAY_TIME=1 python tmp/cmp/qmatrix.py perf <port> 2048 2000 \
+     "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" --kvmem --kvmem-budget 2048 \
+     --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512
+#   KVMEM_RETR_SUM  → total/flush/score/plan/stage_out/…
+#   KVMEM_REPLAY_TIME → restore/loop/total（每次重放一行）
+#   budget 16384 时捕获整体关闭，budget 8192 时池成窗口、捕获打开；两档之差就是捕获机制的钱
 # 媒体跨度：单轮带图请求（LOGV 控制 -lv，replay 的拒绝行是 SLT_DBG）
 MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf LOGV=5 python tmp/cmp/media.py media 9311 \
      "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" --kvmem --kvmem-budget 2048 \

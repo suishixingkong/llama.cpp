@@ -211,6 +211,10 @@ LLAMA_API void llama_kvmem_decode_mean_flush(void);
 // resident view is still the prefill pressure view, so the caller must not pin or
 // commit it (pinning a skipped round blocks every later Query capture).
 LLAMA_API bool llama_kvmem_apply_retrieval(struct llama_context * ctx);
+// True when the applied round (or a pressure pass during the same prefill) relocated
+// rows in the pool. False means the residency is exactly what the first pass decoded
+// against, so re-running those rows would reproduce them: the caller may skip it.
+LLAMA_API bool llama_kvmem_first_pass_stale(void);
 LLAMA_API void llama_kvmem_begin_retrieval_round(void);
 LLAMA_API void llama_kvmem_accept_retrieval_round(void);
 // True when sink + [query_begin, prompt_end) fits the GPU selection budget

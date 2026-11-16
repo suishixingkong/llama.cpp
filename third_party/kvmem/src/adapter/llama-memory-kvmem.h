@@ -141,6 +141,8 @@ public:
     // server opens a retrieval round before the request's first ubatch, and
     // without one there is no scoring call to spend the captured bytes on.
     void begin_retrieval_round() {
+        // A new request has its own first pass.
+        first_pass_stale_ = false;
         round_span_infeasible_ = query_span_over_budget();
         if (round_span_infeasible_) {
             return;
@@ -220,6 +222,10 @@ public:
     // The follower also invalidates a pending proof when old draft KV changes.
     void note_attention_change() { ++attention_epoch_; }
     bool query_replay_fits(uint32_t query_begin, uint32_t prompt_end) const;
+    // See first_pass_stale_: the server skips the Query replay when this is false.
+    bool first_pass_stale() const { return first_pass_stale_; }
+    // Identity of the current residency: (block id, GPU slot) for every resident block.
+    uint64_t residency_fingerprint() const;
     // True when the Query span is larger than the pool can hold beside the sink
     // and recency bands. Such a round has no complete plan, and the answer is to
     // keep what prefill's pressure path built rather than to tear the prompt.
@@ -636,6 +642,13 @@ private:
     // begin_retrieval_round(), and the capture hooks consult it so the Query and K rows
     // of the whole prefill are not harvested for scores that get thrown away.
     bool round_span_infeasible_ = false;
+    // Whether anything inside the pool moved since the prefill that produced the
+    // current Query rows: a pressure eviction, or the retrieval round's own layout.
+    // A round that leaves the residency exactly as the first pass found it does not
+    // need those rows decoded again -- the first pass already scored against the very
+    // view the round chose. Set from a residency fingerprint, so it does not depend on
+    // KVMEM_PERF counters.
+    bool first_pass_stale_ = false;
     int32_t round_span_infeasible_end_ = -1;
     // Set when a row of this conversation repeated its position, which is what a media
     // chunk does (it pushes one time coordinate across all of its rows). From then on
