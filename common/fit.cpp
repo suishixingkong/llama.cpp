@@ -5,6 +5,7 @@
 #include "json.h"
 #include "log.h"
 
+#include "gguf.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "../src/llama-ext.h"
 
@@ -600,9 +601,51 @@ static void common_params_fit_impl(
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
+                // A drafter that needs ctx_other (Gemma4Assistant/EAGLE3/DFlash) cannot be
+                // probed while fitting, because the target context does not exist yet. Its
+                // weights are still real device memory: booking zero here makes fit hand the
+                // whole device to the target's KV cache, and the real drafter load then OOMs.
+                // Estimate the footprint from the GGUF tensor sizes (metadata only, no alloc)
+                // and reserve it on the drafter's device. A shared-model drafter (no independent
+                // weights) is already counted in the main model and must not be charged twice.
+                if (!extra->shares_model) {
+                    gguf_init_params gip = { /* no_alloc = */ true, /* ctx = */ nullptr };
+                    gguf_context * gctx = gguf_init_from_file(extra->path_model, gip);
+                    if (gctx != nullptr) {
+                        size_t draft_bytes = 0;
+                        const int64_t nt = gguf_get_n_tensors(gctx);
+                        for (int64_t j = 0; j < nt; ++j) {
+                            draft_bytes += gguf_get_tensor_size(gctx, j);
+                        }
+                        gguf_free(gctx);
+                        if (draft_bytes > 0 && !dmds_extra.empty()) {
+                            dmds_extra[0].mb.model = draft_bytes;
+                            LOG_WRN("%s: reserving %.2f MiB of draft weights from GGUF (context probe unavailable)\n",
+                                    __func__, draft_bytes / (1024.0*1024.0));
+                        }
+                    }
+                    // The drafter also needs its own graph compute buffer, which the failed
+                    // probe omits. A Gemma4Assistant MTP context uses the same ubatch shape as
+                    // the target, so mirror the target's measured compute as a conservative
+                    // reserve (it is charged to the drafter, not double-counted on the target).
+                    if (!dmds.empty() && !dmds_extra.empty()) {
+                        dmds_extra[0].mb.compute = dmds[0].mb.compute;
+                        LOG_WRN("%s: reserving %.2f MiB of draft compute (mirrored from target probe)\n",
+                                __func__, dmds[0].mb.compute / (1024.0*1024.0));
+                    }
+                }
                 // the alternative consumer is loaded regardless of the drafter, keep its reservation
                 add_phase_alt_bytes();
                 n_ctx_extra = cparams->n_ctx;
+                // this branch returns before the shared accumulation loop at the end of the
+                // lambda, so apply the (estimated) drafter footprint to this measurement here.
+                // dmds_extra itself is retained: later calls at the same n_ctx skip the probe
+                // and pick the estimate up through the regular accumulation loop instead.
+                for (size_t id = 0; id < dmds.size(); id++) {
+                    dmds[id].mb.model   += dmds_extra[id].mb.model;
+                    dmds[id].mb.context += dmds_extra[id].mb.context;
+                    dmds[id].mb.compute += dmds_extra[id].mb.compute;
+                }
                 return;
             }
 
