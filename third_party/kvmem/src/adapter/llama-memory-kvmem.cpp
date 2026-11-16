@@ -3868,6 +3868,16 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     perf_.last_d2h_submit_us = 0;
     const int64_t t_submit0 = ggml_time_us();
     if (s.cap < bytes) {
+        // Ask for room, not for the exact size, and never add a constant on top of the
+        // request. The capture set is not uniform across a prefill: a 512-token ubatch
+        // that lies before the Query span carries only K (6.3 MB on a 2B model), while
+        // the one that lands inside it carries K and the whole span's Query (31.2 MB).
+        // "bytes + 16 MiB" therefore grew the buffer from 16.8 MB to 17.1 MB on the
+        // second ubatch and then to 47.9 MB on the last one -- two full reallocations,
+        // each a cudaFree (device-wide sync) plus cudaMalloc plus cudaMallocHost, 12 ms
+        // and 52 ms measured inside one prefill. Doubling with a floor reaches the
+        // high-water mark on the first ubatch and stays there.
+        const size_t want = std::max<size_t>(bytes * 2, size_t(32) << 20);
         if (s.gpu) {
             cudaFree(s.gpu);
             s.gpu = nullptr;
@@ -3876,12 +3886,12 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
             cudaFreeHost(s.pin);
             s.pin = nullptr;
         }
-        if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&s.gpu), bytes), "gpu staging") ||
-            !kvmem_cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&s.pin), bytes), "pinned host")) {
+        if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&s.gpu), want), "gpu staging") ||
+            !kvmem_cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&s.pin), want), "pinned host")) {
             s.cap = 0;
             return false;
         }
-        s.cap = bytes;
+        s.cap = want;
         kvmem_diag("KVMEM_CAPTURE_MEMORY mode=raw slot0_bytes=%zu slot1_bytes=%zu last_bytes=%zu pinned_bytes=%zu\n",
                 d2h_->slots[0].cap, d2h_->slots[1].cap, bytes, d2h_->slots[0].cap + d2h_->slots[1].cap);
     }
@@ -4013,9 +4023,13 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     } else {
         s.inflight = true;
     }
-    if (!old_sync && d2h_->compute_done) {
-        ggml_backend_event_synchronize(d2h_->compute_done);
-    }
+    // No host wait for this ubatch's compute. The only thing the next ubatch has to be
+    // ordered behind is the read out of this ubatch's graph buffer, and that ordering
+    // is already on the device: the D2D copies wait for compute_done on the harvest
+    // stream, and ggml_backend_event_wait(be, snap_be) above puts the compute stream
+    // behind them. Waiting here instead charged the host the whole remaining compute of
+    // the ubatch, which emptied the two-ubatch pipeline (163 ms of a 719 ms prefill on
+    // a 4058-token prompt); removing it is worth +7.0% pp, paired over alternating runs.
     perf_.last_d2h_submit_us = ggml_time_us() - t_submit0;
     perf_.d2h_submit_us += perf_.last_d2h_submit_us;
     if (trace_) {
@@ -4188,10 +4202,38 @@ void llama_memory_kvmem::bytes_to_f32_token_major(const uint8_t * data, ggml_typ
                                                   int64_t d, int64_t h, int64_t n,
                                                   size_t nb0, size_t nb1, size_t nb2,
                                                   std::vector<float> & out) {
-    out.assign(static_cast<size_t>(n * h * d), 0.0f);
+    const size_t total = static_cast<size_t>(n) * static_cast<size_t>(h) * static_cast<size_t>(d);
     if (!data) {
+        out.assign(total, 0.0f);
         return;
     }
+    // A KV cache tensor is already token-major and contiguous, so the transpose below
+    // is the identity and the conversion is a straight row pass: a memcpy for f32 and
+    // one SIMD convert per row for the half formats, instead of a scalar triple loop
+    // with a per-element type test. Worth ~10% of the pack (108.7 -> 97.5 ms over a
+    // 4058-token prefill), which says the rest of the pack is the mean-K accumulation
+    // in raw_, not the data movement -- so this is here for the removed scratch churn
+    // (a 6 MB vector per layer) as much as for the time.
+    {
+        const size_t esz = type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+        const bool packable = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+                type == GGML_TYPE_BF16;
+        if (packable && nb0 == esz && nb1 == static_cast<size_t>(d) * esz &&
+                nb2 == static_cast<size_t>(h) * static_cast<size_t>(d) * esz) {
+            out.resize(total);
+            if (type == GGML_TYPE_F32) {
+                std::memcpy(out.data(), data, total * sizeof(float));
+            } else if (type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(data),
+                                      out.data(), static_cast<int64_t>(total));
+            } else {
+                ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(data),
+                                      out.data(), static_cast<int64_t>(total));
+            }
+            return;
+        }
+    }
+    out.assign(total, 0.0f);
     for (int64_t tok = 0; tok < n; ++tok) {
         for (int64_t head = 0; head < h; ++head) {
             for (int64_t dim = 0; dim < d; ++dim) {
@@ -4272,7 +4314,21 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
     if (which == 'k') {
         std::vector<float> flat;
-        if (type == GGML_TYPE_F16) {
+        // The keys of a KV cache tensor are contiguous and token-major, so the
+        // uint16 staging copy in bytes_to_f16_token_major() would be a memcpy whose
+        // result is converted immediately: skip it and convert the pinned bytes in
+        // place. Same values, one pass instead of two plus a 6 MB scratch vector per
+        // layer.
+        const size_t k_total = static_cast<size_t>(ntok) * static_cast<size_t>(h) *
+                static_cast<size_t>(d);
+        if (type == GGML_TYPE_F16 &&
+                nb0 == sizeof(uint16_t) &&
+                nb1 == static_cast<size_t>(d) * sizeof(uint16_t) &&
+                nb2 == static_cast<size_t>(h) * static_cast<size_t>(d) * sizeof(uint16_t)) {
+            flat.resize(k_total);
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(host),
+                                  flat.data(), static_cast<int64_t>(k_total));
+        } else if (type == GGML_TYPE_F16) {
             std::vector<uint16_t> flat16;
             bytes_to_f16_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat16);
             flat.resize(flat16.size());

@@ -653,8 +653,8 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
   原先猜的「grid 两万 block、启动开销主导」是错的：kernel 只占 0.65 ms。
 - **重放**：519 行 = 86–106 ms（`restore` 5–9 ms、`loop` 81–97 ms，即 ~4900–6000 t/s）。这一段是按行付的，
   跟「重算」这件事本身等价，除非少算行。
-- **捕获**：4k prompt 上 78.6 MB D2H、39–50 次事件。但字节只合 8 ms，而开/关之间差 ~16% of prefill
-  （7795 → 6570）⇒ 贵在每 ubatch 的机制（event sync / pack），不在搬运。
+- **捕获**：4k prompt 上 78.6 MB D2H、39–50 次事件。字节只合 8 ms，而开/关之间差 ~16% of prefill
+  （7795 → 6570）⇒ 贵在每 ubatch 的机制（event sync / pack），不在搬运。这一段的逐项拆账见下一小节。
 - **压力搬运**（池装不下时 stage_out）：只有 4%（budget 4096 → 2048 是 5154 → 4958），不是主因。
 
 **本节已做的一处优化：页集没变就不重放。** 检索轮经常什么都没搬（池够大时 `n_move=0 n_stage_in=0`），
@@ -682,10 +682,46 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
   2048 那格 60 → 7.7 ms，即 **+6.4%**。
 - 等价性：24 格逐格答案相同（57/72、`24/24`），ctest 17/17。
 
+**本轮第三处优化：捕获不再让主机等 GPU，也不再紧贴申请缓冲。**
+
+捕获的账要按**线程**分，不然会归错因。同一个 4058-token 请求（`KVMEM_HARVEST_SUM`，每请求一行）：
+
+| 段 | 耗时 | 在哪个线程 | 性质 |
+|---|---|---|---|
+| `submit_ms` | 1.8（修前 **163**） | 主线程 | 提交副本 + 等 compute |
+| `full_ms`（整块 V 收集） | 30–32 | 主线程 | 固有搬运 |
+| `d2h_wait_ms` | 135 | harvest worker | 等 D2H，本质是在等 GPU 算完 |
+| `pack_ms` | 109（修后 98） | harvest worker | 宿主转换 + `write_layer_mean_k` |
+| `sync_ms` / `d2d_ms` | 0.4 / 0.8 | 主线程 | 事件与 D2D 提交 |
+
+两处真开销，都在主线程上：
+
+1. **每个 ubatch 末尾等一次 `compute_done`**（163 ms）。它让主机在 ubatch 之间完全对齐 GPU，
+   双缓冲流水线退化成串行。而这一步其实不需要：下一批 ubatch 只欠"别在本批的 graph 缓冲被读走之前
+   覆盖它"，而这个顺序**已经在设备上**——D2D 在 harvest stream 上等 `compute_done`，
+   `ggml_backend_event_wait(be, snap_be)` 又把 compute stream 排在 D2D 之后。删掉主机等待：
+   **+7.0% ~ +8.6% pp**（两次独立的同二进制、环境开关 A/B，4 轮 / 3 轮交替配对）。
+2. **D2H 暂存缓冲紧贴字节数申请**（`cudaMalloc` + `cudaMallocHost`）。捕获集在一次 prefill 里**不均匀**：
+   落在 Query span 之前的 512-token ubatch 只带 K（2B 上 6.3 MB），落进去的那个带 K + 整段 Query
+   （31.2 MB）。旧规则 `bytes + max(bytes/2, 16 MiB)` 于是先给 16.8 MB、第二个 ubatch 要 17.1 MB 就整块重分配、
+   最后一个 ubatch 要 47.9 MB 再重分配一次 —— 每次都是 `cudaFree`（设备级同步）+ `cudaMalloc` +
+   `cudaMallocHost`，实测 **12 ms 和 52 ms** 都落在 prefill 里。改成 `max(2 * bytes, 32 MiB)`：
+   第一次就拿够，**+5.3% pp**（同样的配对方法）。
+
+顺带把打包里的两处标量循环换成紧凑快路径（KV cache 张量本来就是 token-major 连续的，转置是恒等）：
+`pack` 108.7 → **97.5 ms**。收益只有一成，说明打包的大头是 `raw_` 的 mean-K 逐 token 累加，不是数据搬运。
+
+留在台面上的两处（都不在主机等待上，属固有搬运）：整块 V 收集 30 ms/请求（每 ubatch 4 个新满块的
+`harvest_gpu_v`，还要过一次 pinned 中转），以及 worker 上的 98 ms 打包（要动 `raw_` 的 mean-K 存放位置
+才能省掉，属于另一次改动）。
+
+**量这套东西只能用同二进制内的配对差。** 捕获开/关的绝对差在两次会话之间从 -30% 漂到 -14%
+（同一份二进制、同样的格），所以下面这类跨小时的数字不能横向比；页面上的百分比都是配对中位数。
+
 还没做、但已经量化清楚的两个方向：
 
-1. **捕获机制**（~16% of prefill，~100 ms）。字节只有 78.6 MB（≈8 ms）⇒ 贵在每 ubatch 的 event sync / pack，
-   得用 nsys 或更细的计数器才拆得开。
+1. **整块 V 收集**（~30 ms/请求，主线程）：只有"刚满"的块才需要，可现在每块每层一次 enqueue，
+   还要 GPU→pinned→GPU 中转。若 `raw_` 能给出设备侧目标指针，这批就能变成纯 D2D gather。
 2. **`--kvmem-method recency` 的对照**：这里没有浪费可省——`want_q_capture()` 已经按 `method_ == 1`
    门控，recency 少掉的只是 Q；K 仍然要捕获，因为驱逐/回迁要靠 `raw_` 的宿主 K。
 
@@ -768,8 +804,9 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
 6. **MTP 下 replay 不吃速度**：draft 侧跟着重放、并且重放成功后不发 `target_restored_without_draft`
    （发了会让下一步走 `target_only`，把 draft 的 prompt KV 整段清空）。修好后 2B+MTP 的 24 格：
    命中 52 → 57/72，tg 210 → 207/211（无退化），pp −12%（重放的 512 行）。
-7. **开 kvmem 的 prefill 代价可以逐段拆、也可以逐段砍**：捕获 ~16%、打分 71 → 7.75 ms、
-   重放 86–106 ms（页集不变时跳过）、压力搬运 4%。两轮优化合计把 8192 那格从 4965 抬到 ~5900 t/s。
+7. **开 kvmem 的 prefill 代价可以逐段拆、也可以逐段砍**：打分 77 → 7.3 ms、捕获的 163 ms 主机等待清零、
+   捕获缓冲不再在 prefill 里重分配、重放按驻留指纹跳过、压力搬运只占 4%。两处捕获改动各自由同一
+   二进制内的配对实验给出 **+8.6%** 与 **+5.3%**（相乘约 +14%），捕获与"全关"的差距因此收到 -14%。
 
 ### 复现
 
