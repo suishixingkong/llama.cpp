@@ -9144,6 +9144,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             // V += v*expf(s - M), accumulated in F32 for every V type
             if (v->type == GGML_TYPE_F16) {
                 ggml_vec_mad_f16_f32(DV, VKQ32, (const ggml_fp16_t *) v_data, vs);
+            } else if (v->type == GGML_TYPE_BF16) {
+                // widen+accumulate in one pass instead of dequantising into V32 first
+                ggml_vec_mad_bf16_f32(DV, VKQ32, (const ggml_bf16_t *) v_data, vs);
             } else if (v_to_float) {
                 v_to_float(v_data, V32, DV);
                 ggml_vec_mad_f32(DV, VKQ32, V32, vs);

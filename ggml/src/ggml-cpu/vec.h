@@ -471,6 +471,39 @@ inline static void ggml_vec_mad_f16_f32(const int n, float * GGML_RESTRICT y, co
     }
 }
 
+// bf16 -> f32 is a pure 16-bit left shift, so widen and accumulate in one pass
+// instead of materialising a temporary f32 copy of the row.
+inline static void ggml_vec_mad_bf16_f32(const int n, float * GGML_RESTRICT y, const ggml_bf16_t * GGML_RESTRICT x, const float v) {
+    int i = 0;
+#if defined(__AVX512F__)
+    const __m512 vx = _mm512_set1_ps(v);
+    for (; i + 16 <= n; i += 16) {
+        const __m256i xh = _mm256_loadu_si256((const __m256i *)(x + i));
+        const __m512 ax = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(xh), 16));
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(ax, vx, _mm512_loadu_ps(y + i)));
+    }
+#elif defined(__AVX2__)
+    const __m256 vx = _mm256_set1_ps(v);
+    for (; i + 8 <= n; i += 8) {
+        const __m128i xh = _mm_loadu_si128((const __m128i *)(x + i));
+        const __m256 ax = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(xh), 16));
+        _mm256_storeu_ps(y + i, GGML_F32x8_FMA(_mm256_loadu_ps(y + i), ax, vx));
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+    const float32x4_t vx = vdupq_n_f32(v);
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t xh = vld1q_u16((const uint16_t *)(x + i));
+        const float32x4_t a0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16 (xh), 16));
+        const float32x4_t a1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(xh), 16));
+        vst1q_f32(y + i + 0, vfmaq_f32(vld1q_f32(y + i + 0), a0, vx));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), a1, vx));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] += GGML_BF16_TO_FP32(x[i])*v;
+    }
+}
+
 inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
 #if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
     const int sve_register_length = svcntb() * 8;
