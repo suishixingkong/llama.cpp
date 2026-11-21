@@ -121,6 +121,14 @@ static nlohmann::ordered_json server_ordered_from_json(const json & value) {
 
 #endif
 
+// A Gemma4-style MTP draft has no KV of its own: it reads the target's cache through
+// ctx_other. Restoring the target state therefore restores the draft rows as well,
+// so a context checkpoint must not demand a separate draft image for that draft.
+static bool server_mtp_draft_shares_target_kv(const llama_context * ctx_dft, const llama_context * ctx_tgt) {
+    return ctx_dft != nullptr && ctx_tgt != nullptr &&
+           llama_get_ctx_other(const_cast<llama_context *>(ctx_dft)) == ctx_tgt;
+}
+
 // fork 9l-d4b8i: the fixed-capacity capture writer (fork server-context.cpp 87-122).
 // The VBR capture kernel hands this to a QSA capture_stream so an index image
 // lands in exactly the buffer its size probe reserved; `complete()` is what
@@ -11187,9 +11195,16 @@ private:
                                             // optional accelerator image. This ordering lets legacy
                                             // DFlash clear an old ring while preserving the newly
                                             // authenticated checkpoint ring installed below.
+                                            // With a shared-KV draft the target restore
+                                            // already reinstated the draft rows. Treat that
+                                            // as a draft restore so the event clears the
+                                            // branch-local MTP carry without claiming the
+                                            // target lost its draft.
                                             const bool draft_image_restored =
-                                                !it->data_dft.empty() &&
-                                                it->data_dft_full_sequence;
+                                                (server_mtp_draft_shares_target_kv(ctx_dft, ctx_tgt) &&
+                                                 it->data_dft.empty() && it->accel.spec.empty()) ||
+                                                (!it->data_dft.empty() &&
+                                                 it->data_dft_full_sequence);
                                             common_speculative_sequence_transition(
                                                 slot.get_spec(), slot.id,
                                                 draft_image_restored
@@ -12330,15 +12345,23 @@ private:
                             // required, the draft half is measured on its own budget
                             // and no longer inherits qsa_vbr_fits. Otherwise the two
                             // stay coupled exactly as before.
-                            const bool mtp_fits = qsa_required
-                                ? draft_size != 0 && qsa_vbr_fits
-                                : draft_size != 0;
+                            // A shared-KV draft (Gemma4Assistant) has no image of its
+                            // own: its rows are the target's rows. Do not demand a
+                            // non-empty draft state or an armed carry for such a
+                            // checkpoint -- neither can exist here.
+                            const bool draft_shares_target = mtp_checkpoint_required &&
+                                server_mtp_draft_shares_target_kv(ctx_dft, ctx_tgt);
+                            const bool mtp_fits = draft_shares_target
+                                ? true
+                                : (qsa_required
+                                    ? draft_size != 0 && qsa_vbr_fits
+                                    : draft_size != 0);
                             const bool draft_vbr_fits =
                                 mtp_fits &&
                                 uint64_t(checkpoint_size) <= mtp_limit &&
                                 (!capture_dflash || llama_memory_seq_pos_max(
                                     llama_get_memory(ctx_dft), slot.id) == pos_max) &&
-                                mtp_state_ready &&
+                                (draft_shares_target || mtp_state_ready) &&
                                 uint64_t(ring_size) <=
                                     mtp_limit-
                                         uint64_t(checkpoint_size)-qsa_size &&
@@ -12413,28 +12436,37 @@ private:
                             // published as one atomic companion set.
                             if (!staged.empty() && capture_draft) {
                                 if (draft_vbr_fits) {
-                                    size_t draft_written = 0;
-                                    next.data_dft.overwrite(
-                                        draft_size,
-                                        [&](uint8_t * data, size_t size) {
-                                            draft_written =
-                                                llama_state_seq_get_data_ext(
-                                                    ctx_dft, data, size,
-                                                    slot.id,
-                                                    draft_flags);
-                                        });
-                                    // Only a whole-sequence draft image can carry pending
-                                    // hidden state; a frontier-only one means "the draft's
-                                    // cells stop here", which the restore treats as target
-                                    // without draft and rebuilds from the prompt.
-                                    next.data_dft_full_sequence =
-                                        (draft_flags == LLAMA_STATE_SEQ_FLAGS_NONE);
-                                    if (draft_written != draft_size) {
-                                        SLT_ERR(slot,
-                                            "skipping context checkpoint: draft state short write (expected %zu, got %zu)\n",
-                                            draft_size, draft_written);
-                                        staged.clear();
-                                    } else if (mtp_checkpoint_required) {
+                                    // A shared-KV draft must not receive a standalone
+                                    // image: writing one into ctx_dft would write into
+                                    // the target's cells and overwrite the frontier just
+                                    // captured. Its rows come back with the target state.
+                                    if (!draft_shares_target) {
+                                        size_t draft_written = 0;
+                                        next.data_dft.overwrite(
+                                            draft_size,
+                                            [&](uint8_t * data, size_t size) {
+                                                draft_written =
+                                                    llama_state_seq_get_data_ext(
+                                                        ctx_dft, data, size,
+                                                        slot.id,
+                                                        draft_flags);
+                                            });
+                                        // Only a whole-sequence draft image can carry pending
+                                        // hidden state; a frontier-only one means "the draft's
+                                        // cells stop here", which the restore treats as target
+                                        // without draft and rebuilds from the prompt.
+                                        next.data_dft_full_sequence =
+                                            (draft_flags == LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        if (draft_written != draft_size) {
+                                            SLT_ERR(slot,
+                                                "skipping context checkpoint: draft state short write (expected %zu, got %zu)\n",
+                                                draft_size, draft_written);
+                                            staged.clear();
+                                        }
+                                    }
+                                    if (staged.empty()) {
+                                        // short write above: nothing further to publish
+                                    } else if (mtp_checkpoint_required && !spec_state.empty()) {
                                         next.accel.spec.overwrite(
                                             spec_state.size(),
                                             [&](uint8_t * data, size_t size) {
