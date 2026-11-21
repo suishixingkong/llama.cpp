@@ -90,7 +90,7 @@ third_party/kvmem/kvmem/         libkvmem（host store / runtime / recall / 单�
 | SWA / 纯 recurrent 架构 | 池化 + 滑动窗口 / 递归状态没有一致的块语义；`maybe_create()` 直接返回 `nullptr` 并告警，回落到原生 cache |
 
 ⚠️ 这里原本还有一行「query replay：本分支在 prefill 末尾一次性 `apply_retrieval → pin`，数值上无损失」。
-**那句是错的**：24 起点矩阵上它值 13–18 个百分点（62.5% → 80.6%），已在本轮补齐，见
+**那句是错的**：24 起点矩阵上它值 13–18 个百分点（`KVMEM_REPLAY=0` 59.7% → 开 80.6%，11-22 复测；11-15 是 62.5% → 80.6%），已在本轮补齐，见
 「Query replay：检索轮之后要按最终页集重算 Query」。不补的话，采样读到的 logits 属于一个已经被
 检索轮裁掉的历史视图。
 
@@ -286,7 +286,7 @@ turbo 是 **编码类型**，不是动态分级策略：`-ctk turbo4` 不 arm VB
 
 真的会驱逐时才有代价。`llama-bench -p 4096 -n 128 -b 512`（0.8B，工作集 576 token）：pp **8941.6 t/s** 对无 kvmem 的 13260.8（**−32.6%**），tg 262.1 对 252.0（decoding 反而略快，池子小、注意力带宽低）。质量 PPL 11.9618 对基线 11.9679（−0.05%）。
 这 −32% 里约 32 个百分点是「把待换出块的裸 K 逐层镜像到 host」（5 ms/ubatch，192 次小块拷贝），**可 slab 化，未做**。
-⚠️ 上面这一段的数字已被后续优化改写：capture 门控 + 打分器 staging 之后，同一口径的真驱逐代价降到 **−14.3%**（`13662.5 → 11706.5 t/s`，`34063912e` 那轮）；2026-11-15 复测为 **−16.7%**（`15256.3 → 12701.8 t/s`）。两轮的绝对值不可跨会话比，只看比值，详见本文末「四方复测」。
+⚠️ 上面这一段的数字已被后续优化改写：capture 门控 + 打分器 staging 之后，同一口径的真驱逐代价降到 **−14.3%**（`13662.5 → 11706.5 t/s`，`34063912e` 那轮）；2026-11-15 复测为 **−16.7%**（`15256.3 → 12701.8 t/s`），2026-11-22 复测为 **−18.1%**（`15005.1 → 12293.8 t/s`，replay 关）。各轮的绝对值不可跨会话比，只看比值，详见本文末「四方复测」。
 
 功能面（同一批构建）：长会话三连问 16k 上下文 / MTP 草稿回滚 / 图像输入都通过（细节见下面「已修复」与 `AUDIT_KVMEM_PERF_QUALITY.md`）。
 
@@ -350,34 +350,37 @@ W retrieval round rolled back (mandatory_exceeds_pool: 22 of 14 blocks), keeping
 
 复现与验证（Qwen3.5-2B、f16、`-c 262144 --kvmem-budget 1000 -b 512`、13.2k prompt 连续 5 轮各生成 5k）：修复前 3/6 次在第三轮 decode 报 gap；修复后 5 轮全过，且 `KVMEM_TRACE=1` 能看到 `tail_restage` 正好在这些轮次触发（一次运行 3 次）。PPL 1.2126（开/关逐位同）、真驱逐 budget 576 为 1.2135。
 
-## 四方复测：旧版 / port 关 / port 开 / fork 开 / fork 关（2026-11-15 复测）
+## 四方复测：旧版 / port 关 / port 开（replay 开与关）/ fork（2026-11-22 复测）
 
-这一轮问的还是三件事：移植后**有没有退化**、真驱逐**还差多少**、回滚语义**与 fork 是否等效**。
+这一轮问的还是三件事：移植后**有没有退化**、真驱逐**还差多少**、质量**与 fork 是否等效**。
 同一台机器（Windows + MSVC + CUDA 12.8、`sm_70`、V100 16 GB、`Qwen3.5-0.8B-Q4_K_M`），
-参数与 `34063912e` 那轮逐字相同，因此两轮按**比值**对照。
+参数与 `34063912e` 那轮逐字相同，因此两轮按**比值**对照。与上一轮（11-15）的区别只有一处：
+`port-kv` 拆成 **replay 关 / replay 开** 两个臂（同一份二进制，`KVMEM_REPLAY=0/1`），
+用来把「补上 Query replay 之后还剩多少差距」和「replay 本身要付多少钱」分开。
 
-⚠️ **绝对值不要跨会话比**：本轮 `port-nokv` 的 pp4096 是 15256，上一轮是 13662，差 12% 来自机器状态
+⚠️ **绝对值不要跨会话比**：本轮 `port-nokv` 的 pp4096 是 15005，上一轮是 15256，差 1.7%，来自机器状态
 （时钟/驱动），不是代码。
 
 ⚠️ **每个单元都跑多轮**：bench 4 轮轮换、server 4 轮轮换、PPL 3 轮。
 两处口径修正见下——不做这两件事，同一格的单次结果会差 18%，足以造出或抹掉结论。
 
-### 五个单元
+### 六个单元（`fork-kv` 另在 server 表里加两行）
 
 | 单元 | 二进制 | 含义 |
 |---|---|---|
 | `old` | `tmp/build-master-cuda`（冻结快照，2026-10-30 02:44） | **未移植 kvmem 的旧版**：`--help` 里没有任何 `kvmem` 字样 |
-| `port-off` | `tmp/build-kvmem-off`（`-DLLAMA_KVMEM=OFF`，2026-11-15 02:47 重建） | port 树，kvmem **不参与编译**：`llama.dll` 里 `kvmem_store_create` 出现 **0** 次（kvmem-on 构建是 2 次） |
-| `port-nokv` | `tmp/wt-kvmem/build`（`e2acc0f9d`），不加 `--kvmem` | port 树，kvmem 编入但不启用 |
-| `port-kv` | 同上 + `--kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024` | port 树，真驱逐 |
+| `port-off` | `tmp/build-kvmem-off`（`-DLLAMA_KVMEM=OFF`，2026-11-22 01:39 重建） | port 树，kvmem **不参与编译**：`llama.dll` 里 `kvmem_store_create` 出现 **0** 次（kvmem-on 构建是 2 次） |
+| `port-nokv` | `tmp/wt-kvmem/build`（`b7bb90f16`），不加 `--kvmem` | port 树，kvmem 编入但不启用 |
+| `port-kv-r0` / `port-kv-r1` | 同上 + `--kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024`，`KVMEM_REPLAY=0/1` | port 树，真驱逐；两个臂是**同一份二进制**，只切环境变量 |
 | `fork-nokv` / `fork-kv` | `kvmem-llama.cpp/build-v100/bin`（`llama-kvmem-server.exe` / `llama-bench.exe`，2026-10-31） | fork 本体，参数同上 |
 
 ⚠️ `old` 是一个**冻结的二进制**（构建目录的源现在是 master，master 已含 kvmem）：它的价值就在于是移植前那一刻的快照，重建它就不再是旧版。
 
-⚠️ **`port-off` 本轮是修好之后才测到的**：`-DLLAMA_KVMEM=OFF` 的构建自多会话存储那次提交起就是坏的——
-`kvmem_conv_bind()` 的 `#else` 分支写了 `(void) request;`，而参数名是 `request_ledger`，于是 `C2065`。
-也就是说，"编入 kvmem 不花钱"这条结论在此之前一直靠 10-31 的二进制支撑。本轮修掉（`(void) request_ledger;`）并重建，
-`old` / `port-off` / `port-nokv` 三者现在是同一天的源码与同一批构建。
+⚠️ **`port-off` 本轮是重建过的**：`-DLLAMA_KVMEM=OFF` 的构建曾自多会话存储那次提交起编不过
+（`kvmem_conv_bind()` 的 `#else` 分支写 `(void) request;` 而参数名是 `request_ledger`，`C2065`），
+11-15 修掉后才有当天的数据；此后源码又前进 14 个提交（FA 的 F32 累加、bf16 直读、FWHT 隔离、capture 去串行化），
+所以 11-22 又增量重建了一次。`old` / `port-off` / `port-nokv` 三者现在是同一天的源码与同一批构建。
+判据：`strings llama.dll | grep -c kvmem_store_create` = 0 / 0 / 2。
 
 ⚠️ 两处口径修正（不修就会得到假差距）：
 1. **bench 先热身一轮丢弃**，再轮换顺序跑 4 轮。
@@ -397,23 +400,26 @@ fatbin 里多一份 sm_52 不改变稳态吞吐，但这确实是口径差异，
 
 | 单元 | pp4096 t/s | 对 `port-nokv` | tg128 t/s | 对 `port-nokv` |
 |---|---|---|---|---|
-| `old`（无 kvmem） | 15277.9 | +0.1% | 298.2 | +1.2% |
-| `port-off` | 15243.1 | **−0.1%** | 295.2 | +0.2% |
-| `port-nokv` | **15256.3** | — | **294.6** | — |
-| `port-kv`（真驱逐） | 12701.8 | **−16.7%** | 306.1 | +3.9% |
-| `fork-nokv` | 11339.6 | −25.7% | 269.1 | −8.7% |
+| `old`（无 kvmem） | 14968.6 | −0.2% | 278.8 | +3.1% |
+| `port-off` | 15035.4 | +0.2% | 275.4 | +1.8% |
+| `port-nokv` | **15005.1** | — | **270.5** | — |
+| `port-kv-r0`（真驱逐，replay 关） | 12293.8 | **−18.1%** | 278.1 | +2.8% |
+| `port-kv-r1`（真驱逐，replay 开） | 12398.0 | **−17.4%** | 275.0 | +1.6% |
 
 4 轮原始值（pp）：
-`old` 15322.3 / 15163.3 / 15273.6 / 15282.2；`port-off` 15229.5 / 14974.8 / 15287.9 / 15256.7；
-`port-nokv` 15290.5 / 15242.0 / 15223.2 / 15270.6；`port-kv` 12825.8 / 12642.3 / 12543.7 / 12761.2；
-`fork-nokv` 11310.5 / 11373.6 / 10958.6 / 11368.6。
+`old` 15055.5 / 14601.1 / 14881.8 / 15105.2；`port-off` 15074.7 / 14732.6 / 15138.8 / 14996.1；
+`port-nokv` 14897.3 / 15017.2 / 15245.0 / 14993.0；`port-kv-r0` 12206.9 / 12380.8 / 12538.8 / 11892.8；
+`port-kv-r1` 12695.3 / 12645.1 / 12150.9 / 12019.6。
 
 读法：
-- **编入 kvmem 不花钱**：`port-off` / `port-nokv` / `old` 的 pp 互差 ≤0.1%，tg 互差 ≤1.2%，全在噪声地板（同二进制自比 ±1.5%）内。
-  上一轮记下的 `old` tg −3.2% 在这次 5 单元轮换里消失了，判定为爬坡/顺序噪声，不是真实差异。
-- 真驱逐的 prefill 代价本轮 **−16.7%**（上轮 −14.3%），decode 反而 **+3.9%**（池子小、注意力带宽低）。
-  4 轮内部很紧（12544–12826，±1%）。
-- **fork 基线本身慢**：同一台机器、同一个 `llama-bench`，fork 的 pp 低 25.7%、tg 低 8.7%。所以「fork 比 port 快/慢」必须拿 **fork 对 fork、port 对 port** 的比值说话。
+- **编入 kvmem 不花钱**：`port-off` / `port-nokv` / `old` 的 pp 互差 ≤0.2%，tg 互差 ≤3.1%，都在噪声地板
+  （同二进制自比 ±1.5%，这一晚 tg 的单轮摆幅到过 262–280）内。三个数的排序在三个会话里都不稳定，判定为噪声。
+- 真驱逐的 prefill 代价本轮 **−18.1% / −17.4%**（上轮 −16.7%），decode 反而 +1.6% ~ +2.8%（池子小、注意力带宽低）。
+  4 轮内部很紧（11893–12539，±2.7%）。
+- **replay 在这张表上没有位置**：`llama-bench` 不跑检索轮，`KVMEM_REPLAY` 两个臂的差（−18.1% 对 −17.4%，0.7 个点）
+  在噪声内。replay 的钱只在 server 表上能看见（重算 512 行）。
+- **fork 基线本身慢**：同一台机器、同一个 `llama-bench`，fork 的 pp 低 25.7%（11-15 那轮）、tg 低 8.7%。
+  所以「fork 比 port 快/慢」必须拿 **fork 对 fork、port 对 port** 的比值说话。
 
 ### 检索轮与答案（server，4649-token 文档、4 轮轮换、每单元取中位）
 
@@ -421,14 +427,15 @@ fatbin 里多一份 sm_52 不改变稳态吞吐，但这确实是口径差异，
 
 | 单元 | pp t/s（中位） | tg t/s（中位） | 对 `port-nokv` | 检索轮 | H / M / T |
 |---|---|---|---|---|---|
-| `port-off` | 10992.1 | 233.2 | +0.2% | 无 | **3/3** |
-| `port-nokv` | **10970.5** | 230.8 | — | 无 | **3/3** |
-| `port-kv` | 8683.0 | 229.1 | **−20.9%** | **捕获前拒绝** | 2/3，头部答成 87 |
-| `port-kv --kvmem-query-max 512` | 7106.1 | 216.2 | −35.2% | 应用 | 2/3，头部答成 87 |
-| `fork-nokv` | 7373.1 | 169.2 | −32.8% | 无 | **3/3** |
-| `fork-kv` | 4566.5 | 161.8 | −58.4% | 应用 | **3/3** |
+| `port-off` | 10266.7 | 212.7 | −0.7% | 无 | **3/3** |
+| `port-nokv` | **10343.7** | 211.1 | — | 无 | **3/3** |
+| `port-kv`（默认参数） | 8291.3 | 219.0 | **−19.8%** | **捕获前拒绝** | 2/3，头部答成 87 |
+| `port-kv --kvmem-query-max 512`，replay 关 | 7378.1 | 206.1 | −28.7% | 应用 | 2/3，头部答成 87 |
+| `port-kv --kvmem-query-max 512`，replay 开 | 6152.2 | 203.4 | **−40.5%** | 应用 | **3/3** |
+| `fork-nokv` | 6896.8 | 129.4 | −33.3% | 无 | **3/3** |
+| `fork-kv` | 4288.9 | 134.0 | −58.5% | 应用 | **3/3** |
 
-本轮最大的变化是 **`port-kv` 不再「评分后回滚」，而是在捕获前就拒绝**：
+`port-kv` 默认参数仍是**在捕获前就拒绝**，不在评分后回滚：
 
 ```
 W query_span_over_budget: prefill capture skipped: the Query span alone needs 37 of 14 blocks
@@ -436,9 +443,12 @@ W query_span_over_budget: prefill capture skipped: the Query span alone needs 37
 ```
 
 整段 Query 是 37 块，预算 2048 token 只给出 16 块（cap 14），所以这一轮从头到尾不会有可用的计划
-（`34063912e` 的分段：装不下就不先付捕获的钱）。上轮同样的负载是"先采完整段再回滚"。
-本轮口径修正后这一格的中位是 **8683 t/s（−20.9%）**；上一轮记的 −37%（5656 t/s）里混着冷启动成本，
-不宜再直接对比。
+（`34063912e` 的分段：装不下就不先付捕获的钱）。这一格 4 轮答案完全相同（头部都答成 87）。
+
+**replay 的钱在这张表上第一次被单独量出来**：同一个二进制、同样的 512 行 Query，
+replay 关 7378 t/s、replay 开 6152 t/s，**−16.6%**（wall 0.79 → 0.94 s）。
+这与「把 512 行重算一遍」的预期一致，也和下一节 `-10.3%` 的量级相符（那一格的 prompt 更长）。
+买到的是一格：replay 关时头部（深度 12%、已被驱逐）4 轮全错，replay 开时 4 轮全对。
 
 ### 质量：24 起点检索矩阵（取代单文档的 2/3 vs 3/3）
 
@@ -452,33 +462,31 @@ token 的文档时，答案卡在 token 对齐的刀口上，这个探针的分�
 
 | 单元（budget 2048 = 16 页历史，除注明外） | 命中 | 头部针 | 对 fork 的 p |
 |---|---|---|---|
-| `port-kv` 默认参数（不做检索，压力视图） | 36/72 = 50% | **1/24** | **0.0004** |
-| `port-kv --kvmem-query-max 512` | 43/72 = **60%** | 10/24 | **0.018** |
-| `port-kv --kvmem-budget 2304`（18 页） | 49/72 = 68% | 13/24 | 0.19 |
-| `port-kv --kvmem-budget 2560`（20 页） | 54/72 = **75%** | 16/24 | 0.69 |
-| `port-kv --kvmem-query-max 512` + Query replay（只退 attention 半边） | 54/72 = 75% | 12/24 | 0.69 |
-| **`port-kv --kvmem-query-max 512` + Query replay（attention+recurrent）** | **58/72 = 80.6%** | **14/24** | **1.00（不可分）** |
-| **`fork-kv`** | 57/72 = **79%** | 19/24 | — |
-| 两侧 @ `--kvmem-budget 3072`（24 页） | 都是 18/18 | 6/6 | — |
-| 两侧 @ `--kvmem-budget 4096`（32 页） | 都是 18/18 | 6/6 | — |
+| `port-kv` 默认参数（不做检索，压力视图） | 40/72 = 55.6% | **3/24** | **0.0042** |
+| `port-kv --kvmem-query-max 512`，replay 关 | 43/72 = **59.7%** | 10/24 | **0.018** |
+| **`port-kv --kvmem-query-max 512`，replay 开** | **58/72 = 80.6%** | **20/24** | **1.00（不可分）** |
+| `port-kv --kvmem-query-max 512`，replay 开，`--kvmem-budget 2560`（20 页） | 62/72 = **86.1%** | 21/24 | 0.38 |
+| **`fork-kv`** | 57/72 = **79.2%** | 19/24 | — |
 
-（3072 / 4096 两行只跑了 6 个起点，即 18 个命中。两个 replay 行是同一份代码用 `KVMEM_REPLAY=0/1`
-切出来的，配对比较见下文「Query replay」一节。）
+（预算 3072 / 4096 两档本轮未重测：那两档池子已经覆盖整篇文档，不涉及选页，11-15 测出来两侧都是 18/18。
+表里三个 `port-kv` 臂是同一份二进制，只切 `KVMEM_REPLAY` 与预算；`fork-kv` 用它的默认块宽 128。）
 
 读法：
 
-- **差距是真的，但不是塌方**：16 页时 port 60% / fork 79%（p=0.018）；port 每多 2 页涨 7–8 个点
-  （60 → 68 → 75），到 20 页与 fork 的 16 页统计上不可分（p=0.69）。
-- ⇒ 只看预算曲线，答案是"多给 25% 预算"（16 页 → 20 页，2048 → 2560 token）。**实际答案是补一个阶段**：
-  Query replay 移植后（下一节），port 在**同样的 16 页**上 58/72 = 80.6%，与 fork 的 57/72 统计上
-  完全不可分（p=1.00）；配对到格是 14 好 / 2 差（符号检验 p=0.0042）。也就是说 25% 预算买来的那部分，
-  有相当一部分是在替缺失的 replay 兜底，而不是真的需要更多历史。
-- 差距集中在**最深的头部针**（10–16/24 对 19/24）；尾部针双方都接近满分（recency 覆盖），
-  中部针差异最小。`port-kv` 默认参数（连计划都不出）只有 50%，头部针 1/24——不开
-  `--kvmem-query-max` 时 port 基本等于没做检索，这一点比 2/3 与 3/3 重要得多。
+- **replay 就是那 15 格**：replay 关 43/72（59.7%）→ 开 58/72（80.6%），配对到格 **16 好 / 2 差**，
+  符号检验 p=0.0103；同期 fork 是 57/72。补上 replay 后两棵树在**同样的 16 页**上统计上不可分（p=1.00）。
+  头部针一起从 10/24 涨到 20/24（fork 19/24），中部针 11 → 14/24（fork 14/24）。
+- **不补 replay 时差距是真的**：43 对 57，p=0.018，头部针 10 对 19。也就是说 11-15 那轮记的
+  "16 页时 port 60% / fork 79%" 在 11-22 这轮仍然是 60 / 79——**这个差距不是上一轮的偶然**，而是缺 replay 的稳定形状。
+- **多给预算也能涨，但不是同一件事**：16 页 + replay 已经 80.6%，20 页 + replay 86.1%（p=0.38）。
+  预算曲线还在（55.6 → 59.7 → 80.6 → 86.1），但"加到 20 页就追平 fork"这条路现在不需要走了。
+- **默认参数等于没做检索**：55.6%，头部针 3/24。不开 `--kvmem-query-max` 时 port 连计划都不出
+  （`prefill capture skipped: needs 37 of 14 blocks`），这一点比具体命中率更值得记住。
 
 把差距拆开看。同一格两棵树**留下的 20 页是否相同**，是一个不需要任何假设的分组变量
-（从每格日志的 `KVMEM_TRACE selected` 直接读）。为此把 offset 扩到 36 格（0…35000，步长 1000）：
+（从每格日志的 `KVMEM_TRACE selected` 直接读）。为此把 offset 扩到 36 格（0…35000，步长 1000）
+（2026-11-15 测；11-22 复测没有重跑这组，因为它解释的是"选页不同"的**因**，而 replay 补上后
+两棵树在 16 页上已经统计不可分）：
 
 | 36 格（budget 2048） | 格数 | head | mid | tail |
 |---|---|---|---|---|
@@ -586,14 +594,20 @@ logits。port 早先把这套机制（`set_replay`/`query_replay_fits`/`get/set_
 
 | 变体 | 命中 | 配对到格 | 符号检验 |
 |---|---|---|---|
-| 无 replay（首遍视图） | 45/72 = 62.5% | — | — |
-| 只退 attention（`remove_logical`，不恢复 recurrent） | 54/72 = 75.0% | 12 好 / 4 差 | p=0.077 |
-| **attention+recurrent（`state_seq_set_data_ext`）** | **58/72 = 80.6%** | **14 好 / 2 差** | **p=0.0042** |
+| 无 replay（首遍视图） | 43/72 = 59.7% | — | — |
+| 只退 attention（`remove_logical`，不恢复 recurrent；11-15 测） | 54/72 = 75.0% | 12 好 / 4 差 | p=0.077 |
+| **attention+recurrent（`state_seq_set_data_ext`）** | **58/72 = 80.6%** | **16 好 / 2 差** | **p=0.0103** |
 
 ⇒ 追平 fork（57/72，p=1.00）。两次独立运行 24 格逐格相同（58/58），这一阶段不引入不确定性。
+11-22 复测把"无 replay"从 45/72 重新测成 43/72（同一偏置方向、同一量级），配对从 14:2 变成 16:2；
+中间那行"只退 attention"需要改代码才能切，本轮没有重测，数值沿用 11-15。
 
 命中率是二值的，而本文上一版正是被一个二值结论误导过（"20 页追平"被 margin 推翻），所以同一份代码
-再用连续指标测一遍：prompt 只问 H-2298、要求首 token 是数字，取 `logit(5…) − logit(8…)`：
+再用连续指标测一遍：prompt 只问 H-2298、要求首 token 是数字，取 `logit(5…) − logit(8…)`。
+
+⚠️ **这两张表是 11-15 的数据**：读分布要走 `KVLOGIT` 探针，那个探针没有提交，11-22 的二进制里没有它
+（`strings llama.dll | grep -c KVLOGIT` = 0）。同一件事在 11-22 由上面那张 24 格命中表覆盖，
+结论方向一致（replay 关 59.7% → 开 80.6%，fork 79.2%）。
 
 | 24 格配对 | margin 均值 | 中位 | >0 的格数 |
 |---|---|---|---|
@@ -607,7 +621,7 @@ logits。port 早先把这套机制（`set_replay`/`query_replay_fits`/`get/set_
 | replay vs fork | 13 / 11 | +0.03 | p=0.84（不可分） |
 | 无 replay vs fork | 4 / 20 | −4.01 | p=0.0015（上一版结论，逐格复现） |
 
-两个指标同向：命中率 62.5% → 80.6%，margin +0.32 → +3.34；而 fork 的 +3.30 与补上 replay 后的
+两个指标同向：命中率 59.7% → 80.6%（11-15 那次是 62.5% → 80.6%），margin +0.32 → +3.34；而 fork 的 +3.30 与补上 replay 后的
 port 相差 **0.03**。这条轨迹不是"多给预算"能走出来的——20 页那一行 margin 只有 +0.88。
 
 ⚠️ 四个必须踩对的点（每一个都单独造过故障）：
@@ -790,50 +804,54 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
 | `port-kv --kvmem-method recency` | 12.3027 | 同上，逐位同 |
 | `fork-nokv` | 12.0627 | −0.002% |
 
-每单元 3 轮，三轮逐位相同（PPL 是确定性的）。`recency` 与 `retrieval` 仍逐位相同，是因为 **PPL 从不跑检索轮**
+每单元 3 轮，三轮逐位相同（PPL 是确定性的），11-22 复测与 11-15 逐位相同（同一批数值）。
+`recency` 与 `retrieval` 仍逐位相同，是因为 **PPL 从不跑检索轮**
 （每个 chunk 先 `memory_clear`，末尾的检索影响不到本 chunk 的 logits），这是口径限制而非实现等价——要验检索方法只能看上面那张 server 表。
+同理 `KVMEM_REPLAY` 在 PPL 上不可见（没有检索轮就没有重放），本轮 `port-kv` 那一行是 `KVMEM_REPLAY=1` 跑出来的。
 
 ### 结论
 
-1. **移植没有引入退化**：`port-off` 对 `port-nokv` 是 pp −0.1% / tg +0.2% / PPL 逐位相同；
-   `old` 对 `port-nokv` 是 +0.1% / +1.2%。三者全在噪声地板内。
-2. **真驱逐的代价**：bench **−16.7% prefill / +3.9% decode**；server 4649 token **−20.9% 首字速度**。
-   bench 与 server 的差别来自检索轮：bench 只有压力搬运，server 还多一次打分的驱动捕获。
+1. **移植没有引入退化**：`port-off` 对 `port-nokv` 是 pp +0.2% / tg +1.8% / PPL 逐位相同；
+   `old` 对 `port-nokv` 是 −0.2% / +3.1%。三者全在噪声地板内（这一晚 tg 单轮摆幅到过 262–280）。
+2. **真驱逐的代价**：bench **−18.1%（replay 关）/ −17.4%（replay 开）prefill**、decode +1.6 ~ +2.8%；
+   server 4649 token **−19.8% 首字速度（默认参数）/ −40.5%（qm512 + replay）**。
+   bench 与 server 的差别来自检索轮：bench 只有压力搬运，server 还多一次打分的驱动捕获与 512 行的重放。
 3. **语义**：port 现在把"装不下"提前到捕获前（`needs 37 of 14 blocks`），fork 在同样 2048 预算下应用了一个
    `rows=512` 的计划——两者都不硬裁，只是决定点不同。要跨这两棵树比"计划质量"，必须给 port 加
    `--kvmem-query-max` 让它也能出计划。
-4. **质量：缺的是一个阶段，不是预算**。24 起点矩阵上 port 60% / fork 79%（p=0.018）；"port 到 20 页
-   （2560 token）追平 fork 的 16 页"曾经被读成"效率差 25%"。补上 Query replay 之后，**同样的 16 页**
-   就是 58/72 = 80.6% 对 fork 57/72（p=1.00），配对 14:2（p=0.0042）：25% 预算买来的那部分，多半是在
-   替缺失的 replay 兜底。选页修正（43→45）与回填（字节核对精确）都只解释小部分。
-   代价是 4647-token prompt 上 pp 再 −10.3%（重算 512 token）。
-5. **顺带修掉一个编译回归**：`-DLLAMA_KVMEM=OFF` 自从多会话存储那次提交起编不过（`C2065`），
-   本轮修好才让 `port-off` 这一行重新有当天的数据。
+4. **质量：缺的是一个阶段，不是预算**。24 起点矩阵上 port 59.7% / fork 79.2%（p=0.018）；补上 Query replay 之后，
+   **同样的 16 页**就是 58/72 = 80.6% 对 fork 57/72（p=1.00），配对 16:2（p=0.0103）。
+   代价是 4649-token prompt 上 pp 再 −16.6%（重算 512 token，7378 → 6152 t/s）。
+   11-15 那轮"20 页（2560 token）追平 fork 的 16 页"的读法不再需要：16 页就够了。
+5. **`port-off` 这一行现在有当天的数据**：`-DLLAMA_KVMEM=OFF` 曾因 `C2065` 编不过（已修），
+   11-22 又随源码前进重建了一次，`kvmem_store_create` 计数 0。
 6. **MTP 下 replay 不吃速度**：draft 侧跟着重放、并且重放成功后不发 `target_restored_without_draft`
    （发了会让下一步走 `target_only`，把 draft 的 prompt KV 整段清空）。修好后 2B+MTP 的 24 格：
    命中 52 → 57/72，tg 210 → 207/211（无退化），pp −12%（重放的 512 行）。
 7. **开 kvmem 的 prefill 代价可以逐段拆、也可以逐段砍**：打分 77 → 7.3 ms、捕获的 163 ms 主机等待清零、
    捕获缓冲不再在 prefill 里重分配、重放按驻留指纹跳过、压力搬运只占 4%。两处捕获改动各自由同一
    二进制内的配对实验给出 **+8.6%** 与 **+5.3%**（相乘约 +14%），捕获与"全关"的差距因此收到 -14%。
+8. **失忆率（27B，8 针 × 3 轮）**：`--kvmem` 真驱逐 + qm512 + replay 开是 22/24（8.3%），fork 24/24（0%），
+   no-kv 基线 24/24；replay 关掉则掉到 18/24（25%）。详见「检索质量：失忆率实测」一节。
 
 ### 复现
 
 ```bash
-# 基准（热身 + 5 单元轮换 4 轮 + 中位数）
-bash tmp/cmp/retest.sh bench
-# server（每格先预热再测，6 格轮换 4 轮）
-bash tmp/cmp/retest.sh server
+# 基准（热身后 5 单元轮换 4 轮 + 中位数，含 replay 两臂）
+bash tmp/cmp/retest2.sh bench
+# server（每格先预热再测，7 格轮换 4 轮）
+bash tmp/cmp/retest2.sh server
 # PPL（每单元 3 轮）
-bash tmp/cmp/retest.sh ppl
-# 质量：24 起点检索矩阵（分辨率足够的那个）
-python tmp/cmp/needle_pos.py <port>                      # 探针 token 位置（需先起一个服务）
-# replay 的 A/B：同一份 binary，只切环境变量
-KVMEM_REPLAY=1 bash tmp/cmp/qrun.sh portfix 2048 "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" \
-     --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512
-KVMEM_REPLAY=0 bash tmp/cmp/qrun.sh portnoreplay 2048 "$PWD/tmp/wt-kvmem/build/bin/llama-server.exe" \
-     --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024 --kvmem-query-max 512
-bash tmp/cmp/qrun.sh fork 2048 "$PWD/kvmem-llama.cpp/build-v100/bin/llama-kvmem-server.exe" \
-     --kvmem --kvmem-budget 2048 --kvmem-block-tokens 128 --kvmem-gen-reserve 1024
+bash tmp/cmp/retest2.sh ppl
+# 质量：24 起点检索矩阵（分辨率足够的那个），五臂一条命令跑完
+bash tmp/cmp/qmatrix5.sh
+#   单臂：KVMEM_REPLAY=0|1 PORT_BASE=<port> bash tmp/cmp/qrun2.sh <label> 2048 <exe> [args...]
+# 失忆率（27B，8 针 x 3 轮）
+bash tmp/cmp/amnesia.sh r1        # port-kv + qm512 + replay 开
+bash tmp/cmp/amnesia.sh r0        # 同上，KVMEM_REPLAY=0
+bash tmp/cmp/amnesia.sh fork      # fork（默认块宽 128）
+bash tmp/cmp/amnesia.sh nokv      # 不用 --kvmem
+#   块宽对照要另传 --kvmem-block-tokens 128 / 32，见下表
 python tmp/cmp/setdiff.py                                # 选中集 vs 探针页的列联表
 # MTP 路径（2B + nextn 头）：MODEL_PATH 覆盖 qmatrix/lpmatrix 的模型
 MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf bash tmp/cmp/qrun.sh mtp24 2048 \
@@ -855,7 +873,8 @@ MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf LOGV=5 python tmp/cmp/media.p
 cd tmp/wt-kvmem/build && ctest -R "test-(kvmem|backend-rebind|pinned-kv-tier|memory-contract|native-kv-payload|host-kv-storage|spill-io|tiered-kv-storage|native-residency|kv-content|prefix-checkpoint|mean-key-retrieval|graph-recall|query-policy|raw-kv-store|conversation-store)"
 ```
 
-17 个 kvmem 单测全过。本轮日志在 `tmp/cmp/retest/`（`bench_<unit>_r<N>.log`、`server7.jsonl` + 每格 `.log`、`ppl_<unit>_<N>.log`）。
+17 个 kvmem 单测全过。本轮日志在 `tmp/cmp/retest2/`（`bench_<unit>_r<N>.log`、`server7.jsonl` + 每格 `.log`、
+`ppl_<unit>_<N>.log`、`q_<arm>_<budget>.jsonl`），失忆率在 `tmp/cmp/quality/a-*.json` + `.log`。
 
 ## 引擎状态镜像：整段镜像拒绝，checkpoint 镜像支持
 
@@ -1099,15 +1118,18 @@ on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspac
 
 修法：server 发布本请求的 span 之前，若 `slot.prompt.n_tokens() > 0`（这个请求在继续一个已有行的序列）就 `llama_kvmem_begin_cached_turn()`——flush 解码期 mean-K、丢掉冻结的 Query、清 `keep_selected_`、解除 pinned。**必须在 `set_request_span()` 之前**，顺序反了就把刚发布的 Query 冲掉。
 
-同二进制 A/B（27B，6.1k token 文档，`--kvmem-budget 2048`，8 针 × 3 轮）：
+同二进制 A/B（27B，5611 token 文档，`--kvmem-budget 2048`，8 针 × 3 轮）：
 
 | ARM | 命中 | 失忆率 |
 |---|---|---|
-| 关掉 `begin_cached_turn()`（= 修复前） | 13/24 | **45.8%** |
-| 打开（现在） | 23/24 | **4.2%** |
-| 对照：`--kvmem-method recency`（只留 sink+最近块） | 13/24 | 45.8% |
+| 关掉 `begin_cached_turn()`（= 修复前，11-06 测） | 13/24 | **45.8%** |
+| 打开（现在，`--kvmem-query-max 512`） | 22/24 | **8.3%** |
+| 对照：`--kvmem-method recency`（只留 sink+最近块，11-06 测） | 13/24 | 45.8% |
 
 修复前**逐位等于 recency**——这正是「计划冻在第一轮压力视图」的形状。代价是每回合重规划一次：追加回合的平均 prompt eval **1532 → 1619 ms（+5.7%）**。
+「关掉」这一臂需要改代码才能切，11-22 没重测；「打开」的数字是当天的（22/24，比 11-06 的 23/24 少一格，
+少的是最深那条 KD-7，答成了邻近记录 `B2XF`）。⚠️ 另一条更隐蔽的 recency 退化见下面 27B 表：
+即使 `begin_cached_turn()` 在跑，只要冷启动的 Query 装不下预算，`kept=0 layers=0` 也会把整段退化成 recency。
 
 ### 根因二：`kvmem_capture_q` 原来只接在 qwen3 / qwen35 上（现已铺开，但铺开后又露出两个）
 
@@ -1140,27 +1162,45 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
            selected 0 1 2 3 4 7 8 14 15 16 17 18 19 20 21 22 23 39 40 41
 ```
 
-### 27B 实测（Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp，6.1k token 文档 = 192 块，`-fa on -ctk/-ctv f16 -dev CUDA0 -b 512 -c 16384`）
+### 27B 实测（Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp，5611 token 文档 = 175 块 @32 / 45 块 @128，`-fa on -ctk/-ctv f16 -dev CUDA0 -b 512 -c 16384`）
 
-| 配置 | 预算 | 保留比例 | 命中 | 失忆率 |
-|---|---|---|---|---|
-| 不用 `--kvmem`（全上下文注意力） | — | 100% | 24/24 | 0% |
-| `--kvmem`，预算装得下（不驱逐） | 8192 | 100% | 24/24 | 0% |
-| `--kvmem` 真驱逐 | 4096 | 67% | 23/24 | 4.2% |
-| `--kvmem` 真驱逐 | 2048 | 33% | 23/24 | 4.2% |
-| 同上 + `--kvmem-query-workspace off` | 2048 | 33% | 23/24 | 4.2% |
-| 同上 + `--kvmem-method recency` | 2048 | 33% | 13/24 | **45.8%** |
-| `--kvmem` 真驱逐 | 1024 | 17% | 19/24 | 20.8% |
-| `--kvmem` 真驱逐 | 512 | 8% | 8/24 | **66.7%** |
+预算 2048 + `--kvmem-gen-reserve 1024` ⇒ 池 3072 token，保留比例 55%（两侧同）。
 
-两件事值得单独说：
+| 配置 | 块宽 | 命中 | 失忆率 |
+|---|---|---|---|
+| 不用 `--kvmem`（全上下文注意力） | — | 24/24 | 0% |
+| `--kvmem` 预算装得下（pool 9216 > 5611，不驱逐，默认参数） | 32 | 24/24 | 0% |
+| `--kvmem` **默认参数，真驱逐**（抓不到，压力视图 = recency） | 32 | 9/24 | **62.5%** |
+| `--kvmem --kvmem-query-max 512`，replay 关 | 32 | 18/24 | 25.0% |
+| **`--kvmem --kvmem-query-max 512`，replay 开** | 32 | **22/24** | **8.3%** |
+| 同上（replay 开），块宽对齐 fork | 128 | 14/24 | 41.7% |
+| `fork-kv`（块宽 128 = 它的默认） | 128 | 13/24 | 45.8% |
+| **`fork-kv --kvmem-block-tokens 32`** | 32 | **24/24** | **0%** |
 
-- **kvmem 本身不伤质量**：不驱逐时 100%，与不用 kvmem 逐位相同（24/24）。伤质量的只有驱逐。
-- **新记账（Query 工作区）在这条轴上测不出差别**：on/off 都是 23/24，且 miss 是同一条记录。它不是为端到端命中率准备的，它是补「同预算少 2 块历史」的记账缺口，在 64 块的预算上占 3%，针探针分辨不出来。
+四件事值得单独说：
+
+- **默认参数在「真驱逐 + 冷启动 Query 装不下」时是不可用状态**，这是本轮新发现。冷启动那轮 Query 就是整篇文档，
+  `needs 175 of 62 blocks` ⇒ `prefill capture skipped`；此后每轮虽然都在跑检索轮（`KVMEM_QUERY` 48 行、`plan=query_workspace`），
+  但 `selected` 是 `0 113 114 … 143` 这样一段**连续尾巴**——就是 sink+recency，8 根针里只有深于 0.54 的还在，
+  逐深度命中 0/0/0/0/0/3/3/3。加 `--kvmem-query-max 512` 之后同一份日志变成
+  `selected 0 1 2 3 5 6 7 … 40 47 48 58 73 75`（散开），命中 9 → 22/24。
+  ⇒ **在这种负载上 `--kvmem-query-max` 不是可选项，是前提**；0.8B 那张 24 格表的默认行（55.6%）是同一个形状。
+  ⚠️ 判据是 `selected` 的**形状**，不是 `kept` / `layers` 两个字段：预算装得下的那次（8192）日志里同样是
+  `kept=0 layers=0`，而它 24/24——那两个字段只说明"没有页被驱逐/没用到页统计"，不说明评分是否在跑。
+  ⚠️ 11-06 那轮在同样 2048 预算下记的是 23/24（默认参数），与本轮 9/24 不可能同时成立：这中间有提交改变了
+  「捕获被拒之后 mean-K 还能不能用」。这条单列为待查，判据是 `selected` 是散开还是连尾。
+- **replay 在这条轴上也值钱**：18 → 22/24，四个格子全在 0.42–0.79 的中段，没有一格变差。
+  27B 是 hybrid（`hybrid_attn`、`n_rs_seq`、`KVMEM_GDN_ALLOCATION mode=snapshots`），
+  replay 退的是 attention + recurrent 两半，只退一半在 0.8B 上已经证明只有 75%。
+- **块宽是比"哪棵树"更大的自变量**：同一棵树同一预算，32 块宽 22/24、128 块宽 14/24；
+  fork 反过来也一样（32 → 24/24，128 → 13/24）。同样 3072 token 的池子，32 块宽能装 96 页、
+  128 块宽只有 24 页，page-softmax 在页这一维做 softmax，页粗了就先被"摊平"。
+- **同块宽下两棵树几乎等价**：32 块宽 port 22/24 对 fork 24/24（差 2 格，都是最深那条 KD-7）；
+  128 块宽 port 14/24 对 fork 13/24（差 1 格）。所以"port 失忆率比 fork 高"这个说法只在块宽不匹配时才成立。
 
 ### 保留比例才是自变量（把预算换算成「留了文档的百分之几」）
 
-12k token 文档（14656 token = 458 块）补了另一段：
+12k token 文档（14656 token = 458 块）补了另一段（2026-11-06 测，本轮未重测——它测的是预算轴，与本轮改动的 replay 无关）：
 
 | 保留比例 | 8.3% | 14% | 17% | 28% | 33% | 67% |
 |---|---|---|---|---|---|---|
@@ -1169,7 +1209,7 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 
 绝对预算不说明问题，**预算 / 上下文比**才说明问题：留到 1/3 就能到 96%，留到 1/12 掉到 33%，而同样留 1/3 时纯 recency 只有 54%。所以「kvmem 会不会失忆」= 「预算够不够文档的 1/3」+ 「检索评分有没有真的在跑」。
 
-### 缓解手段实测（12k 文档、预算固定 2048、基线 58.3%）
+### 缓解手段实测（12k 文档、预算固定 2048、基线 58.3%；2026-11-06 测，本轮未重测）
 
 | 手段 | 命中 | 结论 |
 |---|---|---|
@@ -1182,6 +1222,18 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 ### 失败形态：不是「不知道」，是「拿邻近记录顶替」
 
 唯一那次 miss 里问的是 needle 1 的 `ZQ7K`，模型答 `P8VT`——同一轮 needle 5 的码。被驱逐的块不是让模型变空，而是让它用还在驻留的**同类记录**填空。这条对实际使用比命中率更值得警惕：失忆看起来像自信的错误答案，而不是「文档里没有」。
+
+11-22 复测把这条拆得更细：失败有两种形态，而且**不是"哪棵树"的差别**。
+
+| 丢的格子 | 问 | port 答 | fork 答 |
+|---|---|---|---|
+| port@32 仅有的 2 格（最深 0.92 的 KD-7） | `KD-7` 的码 | `B2XF`（KD-6 的码，还在驻留） | 命中（24/24） |
+| 块宽 128 时两侧都常丢的 KD-4/6/7 | `KD-7` | 前两轮给邻近码，第三轮给「文档中未提供」 | 同样：前两轮给邻近码，第三轮给「文档中未提供」 |
+
+⇒ **「拿邻近记录顶替」是主要形态**（同一张文档里 8 条格式相同的记录，丢掉哪一条都能被另一条填上），
+而"明确说没有"只在两个条件下出现：问的是**最深**的那根针（0.92，紧挨着 recent 带），且**轮次靠后**。
+两棵树在这条轴上的表现一致，所以不能据此说 fork 更"诚实"。
+对实际使用仍然成立的那句是：失忆多数时候看起来像自信的错误答案，而不是「文档里没有」。
 
 ## 本轮改动对性能的影响（架构捕获 + checkpoint 镜像 + flush 竞态）
 
@@ -1201,7 +1253,7 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 - **检索评分覆盖的架构**：`kvmem_capture_q/k/v` 已接在 qwen3、qwen35、qwen3vl、qwen3vlmoe、olmoe、ernie4-5、ernie4-5-moe、gemma4 上（gemma4 因 SWA 不走 KVMem，钩子惰性）。其余架构仍然 `q_count_` 恒为 0、计划退化成 sink+最近块，日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告。要接一个架构只需在其 attention builder 里补三个调用（norm 之后、RoPE 之前）。
 - **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
 - **多模态（mtmd）已可用（`b275aa789`）**：图片 patch **共用同一个 M-RoPE 时间位置**（一行 `15,15,15,…`），这让"行账本"（append 序）和"位置账本"（cache 寻址）天然不相等，曾经整条图片请求 500（`tail block N keeps M committed rows the packed store lost` → `init_batch` 拒批）。两处修：① `prepare_ubatches` 早备好的行视图（`logical_pos = append 序`）现在**也交给调用方的 ubatch**，否则写 cell 的那一步用 `pos[0]` 覆盖，`gpu_kv_complete()` 永远对不上；② 被拒/中断的批会留下**孤儿 cell**（图片 chunk 先记 20 行被拒、再记 22 行，那 2 个 cell 没人清），`prepare_working_set` 进门按 `seq_rm_logical(0, store_n_tokens(), -1)` 扫掉 `logical_pos ≥ store 行数` 的 cell。判据：`PROBE_PUBLISH ... used == visible == store`、图片请求 200、纯文本 PPL 逐位不变（2B：8.7998 两侧相同）。
-- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。除非要卡上限，别调它。
+- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：在 12k 文档那组里 512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。⚠️ **但「默认 = 512」不能推广**：27B 上 5611 token 文档 + 预算 2048（池 3072）时，冷启动的 Query 是整篇 175 块 > 62 块，捕获被拒，此后 `selected` 退成连续尾巴（= recency），默认参数 9/24、加 512 是 22/24。判据是 `selected` 散开还是连尾；凡是「冷启动 Query 装不下预算」的负载，512 是前提而不是可选项。
 - **LRFU 默认关，实测没有收益（27B、8 针 × 2 轮、`--kvmem-budget 2048`）**：
 
   | 配置 | 命中 | 失忆率 | 回滚 |
