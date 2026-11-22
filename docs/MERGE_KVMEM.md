@@ -429,26 +429,27 @@ fatbin 里多一份 sm_52 不改变稳态吞吐，但这确实是口径差异，
 |---|---|---|---|---|---|
 | `port-off` | 10266.7 | 212.7 | −0.7% | 无 | **3/3** |
 | `port-nokv` | **10343.7** | 211.1 | — | 无 | **3/3** |
-| `port-kv`（默认参数） | 8291.3 | 219.0 | **−19.8%** | **捕获前拒绝** | 2/3，头部答成 87 |
+| `port-kv`（默认参数，`93756cdf7` 之后） | 6152.2 | 203.4 | **−40.5%** | 应用（自动截尾 512） | **3/3** |
 | `port-kv --kvmem-query-max 512`，replay 关 | 7378.1 | 206.1 | −28.7% | 应用 | 2/3，头部答成 87 |
 | `port-kv --kvmem-query-max 512`，replay 开 | 6152.2 | 203.4 | **−40.5%** | 应用 | **3/3** |
 | `fork-nokv` | 6896.8 | 129.4 | −33.3% | 无 | **3/3** |
 | `fork-kv` | 4288.9 | 134.0 | −58.5% | 应用 | **3/3** |
 
-`port-kv` 默认参数仍是**在捕获前就拒绝**，不在评分后回滚：
+⚠️ 默认行与显式 512 行是**同一条路径**：`93756cdf7` 把"装不下就整轮拒绝"换成"截尾继续"，
+默认的 Query 是 37 块、cap 14 块，于是截到 512 token——和 `--kvmem-query-max 512` 逐格相同
+（24 格 0/0/24 逐格一致）。改之前那一行是 8291 t/s / 2/3（捕获前拒绝、只看压力视图），
+这也是「默认参数看起来便宜」的全部来源：它根本没做检索。
 
 ```
-W query_span_over_budget: prefill capture skipped: the Query span alone needs 37 of 14 blocks
-  (query=[2,4642)), so no complete retrieval plan can fit; keeping the prefill pressure view.
+KVMEM_TRACE span_clamped query=[2,5598) -> [5086,5598) cap_blocks=62     # 27B 上同一机制
 ```
-
-整段 Query 是 37 块，预算 2048 token 只给出 16 块（cap 14），所以这一轮从头到尾不会有可用的计划
-（`34063912e` 的分段：装不下就不先付捕获的钱）。这一格 4 轮答案完全相同（头部都答成 87）。
 
 **replay 的钱在这张表上第一次被单独量出来**：同一个二进制、同样的 512 行 Query，
 replay 关 7378 t/s、replay 开 6152 t/s，**−16.6%**（wall 0.79 → 0.94 s）。
 这与「把 512 行重算一遍」的预期一致，也和下一节 `-10.3%` 的量级相符（那一格的 prompt 更长）。
 买到的是一格：replay 关时头部（深度 12%、已被驱逐）4 轮全错，replay 开时 4 轮全对。
+⚠️ replay **默认是开的**（`tools/server/server-context.cpp:52`，`KVMEM_REPLAY=0` 才关），
+所以"默认参数"这一行本来就含重放；上面那次 2/3 是 `KVMEM_REPLAY=0` 的 A/B 臂。
 
 ### 质量：24 起点检索矩阵（取代单文档的 2/3 vs 3/3）
 
@@ -462,14 +463,15 @@ token 的文档时，答案卡在 token 对齐的刀口上，这个探针的分�
 
 | 单元（budget 2048 = 16 页历史，除注明外） | 命中 | 头部针 | 对 fork 的 p |
 |---|---|---|---|
-| `port-kv` 默认参数（不做检索，压力视图） | 40/72 = 55.6% | **3/24** | **0.0042** |
+| **`port-kv` 默认参数**（`93756cdf7` 后：自动截尾 512 + replay） | **58/72 = 80.6%** | **20/24** | **1.00（不可分）** |
 | `port-kv --kvmem-query-max 512`，replay 关 | 43/72 = **59.7%** | 10/24 | **0.018** |
-| **`port-kv --kvmem-query-max 512`，replay 开** | **58/72 = 80.6%** | **20/24** | **1.00（不可分）** |
+| `port-kv --kvmem-query-max 512`，replay 开（与默认逐格相同） | 58/72 = 80.6% | 20/24 | 1.00 |
 | `port-kv --kvmem-query-max 512`，replay 开，`--kvmem-budget 2560`（20 页） | 62/72 = **86.1%** | 21/24 | 0.38 |
 | **`fork-kv`** | 57/72 = **79.2%** | 19/24 | — |
 
 （预算 3072 / 4096 两档本轮未重测：那两档池子已经覆盖整篇文档，不涉及选页，11-15 测出来两侧都是 18/18。
-表里三个 `port-kv` 臂是同一份二进制，只切 `KVMEM_REPLAY` 与预算；`fork-kv` 用它的默认块宽 128。）
+表里三个 `port-kv` 臂是同一份二进制，只切 `KVMEM_REPLAY` 与预算；`fork-kv` 用它的默认块宽 128。
+默认臂与显式 512 臂逐格相同是 0/0/24——`93756cdf7` 之后默认就是那条路径。）
 
 读法：
 
@@ -479,9 +481,34 @@ token 的文档时，答案卡在 token 对齐的刀口上，这个探针的分�
 - **不补 replay 时差距是真的**：43 对 57，p=0.018，头部针 10 对 19。也就是说 11-15 那轮记的
   "16 页时 port 60% / fork 79%" 在 11-22 这轮仍然是 60 / 79——**这个差距不是上一轮的偶然**，而是缺 replay 的稳定形状。
 - **多给预算也能涨，但不是同一件事**：16 页 + replay 已经 80.6%，20 页 + replay 86.1%（p=0.38）。
-  预算曲线还在（55.6 → 59.7 → 80.6 → 86.1），但"加到 20 页就追平 fork"这条路现在不需要走了。
-- **默认参数等于没做检索**：55.6%，头部针 3/24。不开 `--kvmem-query-max` 时 port 连计划都不出
-  （`prefill capture skipped: needs 37 of 14 blocks`），这一点比具体命中率更值得记住。
+  预算曲线还在（59.7 → 80.6 → 86.1），但"加到 20 页就追平 fork"这条路现在不需要走了。
+
+### 打分跨度该多大：query-max 扫描（4649 token、budget 2048、replay 开）
+
+同一批 24 起点，只改 `--kvmem-query-max`。命中以 72 为分母；pp 是每档 3 次独立起服务的单请求中位：
+
+| query-max | 命中 | 头部针 | 中部针 | pp t/s | 对 `port-nokv` |
+|---|---|---|---|---|---|
+| 128 | 61/72 = **84.7%** | 21/24 | 16/24 | 6215 | −39.9% |
+| 256 | 60/72 = 83.3% | 21/24 | 15/24 | 7098 | −31.4% |
+| **512（默认自动截到尾 512）** | 58/72 = 80.6% | 20/24 | 14/24 | 6378 / 6581 | −38.3% |
+| 1024 | 46/72 = **63.9%** | **9/24** | 16/24 | 5685 | −45.0% |
+
+两条读法：
+
+- **不是越大越好，1024 反而塌**（46/72，配对到 512 那一档是 1 好 / 12 差，p=0.040，重跑一次逐格相同）。
+  原因是打分跨度里的 Query 行越多，page-softmax 对"平均 query"越敏感：这段 4649-token 的 user 轮里，
+  尾部 1024 行已经包含约 1k token 的**文档正文**，它们与"要找哪条记录"无关，把页分数摊平了；
+  256 只覆盖问题本身，最锐。头部针 21 → 20 → 9 就是这个形状。
+- **≤512 的三档在性能上分不出来**：这一晚 3 次中位的噪声带是 6.2–7.1k t/s（同二进制自比 ±8%），
+  128/256/512 全落在里面；只有 1024 明显慢（5685）。三档的命中差（61 / 60 / 58）也都在 p>0.8。
+- ⚠️ **128 的 84.7% 不能直接推广**：11-06 在 12k 多轮那组测过 128 = 79.2%，比 512 差 16 个点——
+  那一组的机制是"小 cap 让冷启动轮拿到一个装得下的假计划并提前定住工作集"。
+  本轮的形状是单轮长文档，两者不要混用。**默认取 512**（fork 的 driver 也默认 512），
+  要在自己的负载上换 256，先拿自己那组形状复核。
+- **修复前默认参数等于没做检索**：55.6%，头部针 3/24（`prefill capture skipped: needs 37 of 14 blocks`，
+  整轮不跑）。`93756cdf7` 之后同一份默认参数是 58/72、头部 20/24。留着这条是为了记住：
+  「默认看起来便宜」曾经全是"根本没检索"造成的。
 
 把差距拆开看。同一格两棵树**留下的 20 页是否相同**，是一个不需要任何假设的分组变量
 （从每格日志的 `KVMEM_TRACE selected` 直接读）。为此把 offset 扩到 36 格（0…35000，步长 1000）
@@ -570,7 +597,7 @@ page-softmax 会把 1% 量级的 Q 差异放大成几十个百分点的分数差
    再谈"放大 1% 的 Q 差异"已经没有剩余效应可解释。
 
 这一节取代的旧结论："port 2/3、fork 3/3，质量差距仍在"。当时那句里的 2/3 有一半是刀口 artifact：
-`port-kv` 那格根本没做检索（`prefill capture skipped`），`qm512` 那格是 4 行跨度决定的。
+`port-kv` 那格根本没做检索（`prefill capture skipped`，`93756cdf7` 之前的行为），`qm512` 那格是 4 行跨度决定的。
 
 ### Query replay：检索轮之后要按最终页集重算 Query（本轮移植）
 
@@ -814,11 +841,10 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
 1. **移植没有引入退化**：`port-off` 对 `port-nokv` 是 pp +0.2% / tg +1.8% / PPL 逐位相同；
    `old` 对 `port-nokv` 是 −0.2% / +3.1%。三者全在噪声地板内（这一晚 tg 单轮摆幅到过 262–280）。
 2. **真驱逐的代价**：bench **−18.1%（replay 关）/ −17.4%（replay 开）prefill**、decode +1.6 ~ +2.8%；
-   server 4649 token **−19.8% 首字速度（默认参数）/ −40.5%（qm512 + replay）**。
+   server 4649 token **−40.5%（默认参数 = 自动截尾 512 + replay）/ −28.7%（同跨度但 replay 关）**。
    bench 与 server 的差别来自检索轮：bench 只有压力搬运，server 还多一次打分的驱动捕获与 512 行的重放。
-3. **语义**：port 现在把"装不下"提前到捕获前（`needs 37 of 14 blocks`），fork 在同样 2048 预算下应用了一个
-   `rows=512` 的计划——两者都不硬裁，只是决定点不同。要跨这两棵树比"计划质量"，必须给 port 加
-   `--kvmem-query-max` 让它也能出计划。
+3. **语义**：port 现在**不再整轮拒绝**——装不下就把 Query 截到尾部（≤512，`93756cdf7`）继续检索；
+   fork 在同样 2048 预算下应用一个 `rows=512` 的计划。两棵树的决定点是同一个：截尾而不是硬裁。
 4. **质量：缺的是一个阶段，不是预算**。24 起点矩阵上 port 59.7% / fork 79.2%（p=0.018）；补上 Query replay 之后，
    **同样的 16 页**就是 58/72 = 80.6% 对 fork 57/72（p=1.00），配对 16:2（p=0.0103）。
    代价是 4649-token prompt 上 pp 再 −16.6%（重算 512 token，7378 → 6152 t/s）。
@@ -831,8 +857,9 @@ D slot  operator (): id  0 | task 4 | KVMem replay skipped: media inside [4388,4
 7. **开 kvmem 的 prefill 代价可以逐段拆、也可以逐段砍**：打分 77 → 7.3 ms、捕获的 163 ms 主机等待清零、
    捕获缓冲不再在 prefill 里重分配、重放按驻留指纹跳过、压力搬运只占 4%。两处捕获改动各自由同一
    二进制内的配对实验给出 **+8.6%** 与 **+5.3%**（相乘约 +14%），捕获与"全关"的差距因此收到 -14%。
-8. **失忆率（27B，8 针 × 3 轮）**：`--kvmem` 真驱逐 + qm512 + replay 开是 22/24（8.3%），fork 24/24（0%），
-   no-kv 基线 24/24；replay 关掉则掉到 18/24（25%）。详见「检索质量：失忆率实测」一节。
+8. **失忆率（27B，8 针 × 3 轮）**：`--kvmem` 真驱逐、**默认参数** 是 22/24（8.3%），fork 24/24（0%），
+   no-kv 基线 24/24；replay 关掉则掉到 18/24（25%）。修复前默认参数是 9/24（62.5%）——
+   那时它会整轮拒绝检索（`93756cdf7`）。详见「检索质量：失忆率实测」一节。
 
 ### 复现
 
@@ -846,12 +873,16 @@ bash tmp/cmp/retest2.sh ppl
 # 质量：24 起点检索矩阵（分辨率足够的那个），五臂一条命令跑完
 bash tmp/cmp/qmatrix5.sh
 #   单臂：KVMEM_REPLAY=0|1 PORT_BASE=<port> bash tmp/cmp/qrun2.sh <label> 2048 <exe> [args...]
+# 打分跨度扫描（128/256/512/1024，同时给命中与 pp）
+bash tmp/cmp/qmsweep.sh
+#   截尾生效的判据（要 -lv 4 + KVMEM_TRACE=1）：grep span_clamped
 # 失忆率（27B，8 针 x 3 轮）
 bash tmp/cmp/amnesia.sh r1        # port-kv + qm512 + replay 开
 bash tmp/cmp/amnesia.sh r0        # 同上，KVMEM_REPLAY=0
 bash tmp/cmp/amnesia.sh fork      # fork（默认块宽 128）
 bash tmp/cmp/amnesia.sh nokv      # 不用 --kvmem
 #   块宽对照要另传 --kvmem-block-tokens 128 / 32，见下表
+#   默认参数（不带 qm）的那一臂：--kvmem-budget 2048 --kvmem-gen-reserve 1024
 python tmp/cmp/setdiff.py                                # 选中集 vs 探针页的列联表
 # MTP 路径（2B + nextn 头）：MODEL_PATH 覆盖 qmatrix/lpmatrix 的模型
 MODEL_PATH=C:/Users/yj/models/Qwen3.5-2B-Q8_0.gguf bash tmp/cmp/qrun.sh mtp24 2048 \
@@ -1123,7 +1154,7 @@ on  : KVMEM_TRACE plan=query_workspace history_pages=44 kept_history=18 workspac
 | ARM | 命中 | 失忆率 |
 |---|---|---|
 | 关掉 `begin_cached_turn()`（= 修复前，11-06 测） | 13/24 | **45.8%** |
-| 打开（现在，`--kvmem-query-max 512`） | 22/24 | **8.3%** |
+| 打开（现在，默认：自动截尾到 512 + replay） | 22/24 | **8.3%** |
 | 对照：`--kvmem-method recency`（只留 sink+最近块，11-06 测） | 13/24 | 45.8% |
 
 修复前**逐位等于 recency**——这正是「计划冻在第一轮压力视图」的形状。代价是每回合重规划一次：追加回合的平均 prompt eval **1532 → 1619 ms（+5.7%）**。
@@ -1169,26 +1200,27 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 | 配置 | 块宽 | 命中 | 失忆率 |
 |---|---|---|---|
 | 不用 `--kvmem`（全上下文注意力） | — | 24/24 | 0% |
-| `--kvmem` 预算装得下（pool 9216 > 5611，不驱逐，默认参数） | 32 | 24/24 | 0% |
-| `--kvmem` **默认参数，真驱逐**（抓不到，压力视图 = recency） | 32 | 9/24 | **62.5%** |
+| `--kvmem` 预算装得下（pool 9216 > 5611，不驱逐） | 32 | 24/24 | 0% |
+| **`--kvmem` 默认参数，真驱逐**（`93756cdf7` 后：自动截尾 512 + replay） | 32 | **22/24** | **8.3%** |
+| 同上，块宽对齐 fork | 128 | 14/24 | 41.7% |
 | `--kvmem --kvmem-query-max 512`，replay 关 | 32 | 18/24 | 25.0% |
-| **`--kvmem --kvmem-query-max 512`，replay 开** | 32 | **22/24** | **8.3%** |
-| 同上（replay 开），块宽对齐 fork | 128 | 14/24 | 41.7% |
 | `fork-kv`（块宽 128 = 它的默认） | 128 | 13/24 | 45.8% |
 | **`fork-kv --kvmem-block-tokens 32`** | 32 | **24/24** | **0%** |
 
 四件事值得单独说：
 
-- **默认参数在「真驱逐 + 冷启动 Query 装不下」时是不可用状态**，这是本轮新发现。冷启动那轮 Query 就是整篇文档，
-  `needs 175 of 62 blocks` ⇒ `prefill capture skipped`；此后每轮虽然都在跑检索轮（`KVMEM_QUERY` 48 行、`plan=query_workspace`），
-  但 `selected` 是 `0 113 114 … 143` 这样一段**连续尾巴**——就是 sink+recency，8 根针里只有深于 0.54 的还在，
-  逐深度命中 0/0/0/0/0/3/3/3。加 `--kvmem-query-max 512` 之后同一份日志变成
-  `selected 0 1 2 3 5 6 7 … 40 47 48 58 73 75`（散开），命中 9 → 22/24。
-  ⇒ **在这种负载上 `--kvmem-query-max` 不是可选项，是前提**；0.8B 那张 24 格表的默认行（55.6%）是同一个形状。
-  ⚠️ 判据是 `selected` 的**形状**，不是 `kept` / `layers` 两个字段：预算装得下的那次（8192）日志里同样是
-  `kept=0 layers=0`，而它 24/24——那两个字段只说明"没有页被驱逐/没用到页统计"，不说明评分是否在跑。
-  ⚠️ 11-06 那轮在同样 2048 预算下记的是 23/24（默认参数），与本轮 9/24 不可能同时成立：这中间有提交改变了
-  「捕获被拒之后 mean-K 还能不能用」。这条单列为待查，判据是 `selected` 是散开还是连尾。
+- **默认参数曾经是这组里最差的（9/24 = 62.5%），`93756cdf7` 修掉了**。修前：冷启动那轮 Query 就是整篇文档，
+  `needs 175 of 62 blocks` ⇒ `prefill capture skipped`，整轮捕获没跑；此后每轮虽然都在跑检索轮
+  （`KVMEM_QUERY` 48 行、`plan=query_workspace`），但 `selected` 是 `0 113 114 … 176` 这样一段**连续尾巴**
+  ——sink+recency，8 根针里只有深于 0.54 的还在，逐深度命中 0/0/0/0/0/3/3/3。
+  修法是**截尾继续而不是整轮拒绝**：`span_clamped query=[2,5598) -> [5086,5598) cap_blocks=62`，
+  同一份日志的 `selected` 变成 `0 1 2 3 5 6 7 … 40 47 48 58 73 75`（散开），9 → 22/24，
+  与显式 `--kvmem-query-max 512` 那一臂逐格相同。
+  **为什么拒绝会毁整段会话**：`raw_->write_layer_mean_k()` 只在捕获的 harvest 里写
+  （`llama-memory-kvmem.cpp:4341`，且要求这一轮有 Q 行）。捕获没跑 ⇒ 那 113 个被换出的页只有 K/V、没有 mean-K
+  ⇒ 之后每轮的打分都在给"没有统计的页"排序 ⇒ 只能落到 sink+recency，而且不会自愈。
+  ⚠️ 判据是 `selected` 的**形状**，不是 `kept` / `layers`：预算装得下的那次（8192）日志里同样是
+  `kept=0 layers=0`，而它 24/24（那两个字段只在两阶段粗筛时才有意义）。
 - **replay 在这条轴上也值钱**：18 → 22/24，四个格子全在 0.42–0.79 的中段，没有一格变差。
   27B 是 hybrid（`hybrid_attn`、`n_rs_seq`、`KVMEM_GDN_ALLOCATION mode=snapshots`），
   replay 退的是 attention + recurrent 两半，只退一半在 0.8B 上已经证明只有 75%。
@@ -1253,7 +1285,9 @@ ERNIE-4.5  plan=query_workspace history_pages=40 kept_history=18 workspace=2
 - **检索评分覆盖的架构**：`kvmem_capture_q/k/v` 已接在 qwen3、qwen35、qwen3vl、qwen3vlmoe、olmoe、ernie4-5、ernie4-5-moe、gemma4 上（gemma4 因 SWA 不走 KVMem，钩子惰性）。其余架构仍然 `q_count_` 恒为 0、计划退化成 sink+最近块，日志会打一次 `retrieval_skipped reason=no_query_rows` + 警告。要接一个架构只需在其 attention builder 里补三个调用（norm 之后、RoPE 之前）。
 - **chat template 不声明 `message_delimiters` 时只能退到「本轮新增行」当 Query**（ERNIE-4.5 就是这样）：follow-up 轮会把 assistant 上一轮回复也算进 Query，比精确 span 略宽；冷启动轮不猜。
 - **多模态（mtmd）已可用（`b275aa789`）**：图片 patch **共用同一个 M-RoPE 时间位置**（一行 `15,15,15,…`），这让"行账本"（append 序）和"位置账本"（cache 寻址）天然不相等，曾经整条图片请求 500（`tail block N keeps M committed rows the packed store lost` → `init_batch` 拒批）。两处修：① `prepare_ubatches` 早备好的行视图（`logical_pos = append 序`）现在**也交给调用方的 ubatch**，否则写 cell 的那一步用 `pos[0]` 覆盖，`gpu_kv_complete()` 永远对不上；② 被拒/中断的批会留下**孤儿 cell**（图片 chunk 先记 20 行被拒、再记 22 行，那 2 个 cell 没人清），`prepare_working_set` 进门按 `seq_rm_logical(0, store_n_tokens(), -1)` 扫掉 `logical_pos ≥ store 行数` 的 cell。判据：`PROBE_PUBLISH ... used == visible == store`、图片请求 200、纯文本 PPL 逐位不变（2B：8.7998 两侧相同）。
-- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：在 12k 文档那组里 512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。⚠️ **但「默认 = 512」不能推广**：27B 上 5611 token 文档 + 预算 2048（池 3072）时，冷启动的 Query 是整篇 175 块 > 62 块，捕获被拒，此后 `selected` 退成连续尾巴（= recency），默认参数 9/24、加 512 是 22/24。判据是 `selected` 散开还是连尾；凡是「冷启动 Query 装不下预算」的负载，512 是前提而不是可选项。
+- **检索质量只由「预算 / 上下文比」决定**：留 1/3 命中 96%，留 1/12 只剩 33%；`sink/recent` 钉带反而更差（从同一份额度里扣）。`--kvmem-query-max`：在 12k 文档那组里 512 与默认（0）逐位同（95.8%，同一条 miss），**128 反而掉到 79.2%**——它把 128 token 以下的短 Query 之外的轮次也截了，冷启动轮因此拿到一个「装得下」的假计划并提前定住工作集。
+- **装不下的 Query 现在截尾而不是整轮拒绝（`93756cdf7`）**：默认 `--kvmem-query-max 0` = 不截，但整段装不下时把跨度截到尾部（≤512）继续跑检索，日志 `KVMEM_TRACE span_clamped query=[a,b) -> [c,b) cap_blocks=N`。修之前是整轮 `prefill capture skipped`，那次 prefill 的页没有 mean-K，之后每轮只能落在 sink+recency——27B 上默认 9/24、修后 22/24，与显式 512 逐格相同。连一页都放不进的极端情形才打 `retrieval round skipped`。**跨度该设多大**：4649 token / budget 2048 / replay 开扫过 128 / 256 / 512 / 1024 = 61 / 60 / 58 / 46（72 分制），pp 6215 / 7098 / 6378 / 5685 ⇒ **≤512 三档分不出高低，1024 同时掉质量与速度**（尾部 1024 行里混进约 1k token 无关正文，把页分数摊平）。默认取 512（与 fork 的 driver 一致）；想换 256 先在**你自己那组形状**上复核，12k 多轮那组里小 cap 是更差的。
+- **replay 默认开**（`tools/server/server-context.cpp:52`，只有 `KVMEM_REPLAY=0` 才关），所以所有"默认参数"的数字都已含重放；把它关掉只是 A/B 手段，不是运行配置。
 - **LRFU 默认关，实测没有收益（27B、8 针 × 2 轮、`--kvmem-budget 2048`）**：
 
   | 配置 | 命中 | 失忆率 | 回滚 |
