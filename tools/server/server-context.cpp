@@ -58,6 +58,16 @@ static bool kvmem_replay_enabled() {
     }();
     return enabled;
 }
+
+// A/B switch in the same spirit as KVMEM_REPLAY: KVMEM_REPLAY_FIT=0 restores the
+// uncapped span, which makes the replay split into an odd-shaped second batch.
+static bool kvmem_replay_fit_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("KVMEM_REPLAY_FIT");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return enabled;
+}
 #endif
 #include "fit.h"
 #include "llama.h"
@@ -11836,6 +11846,28 @@ private:
                         if (q_begin < 0 && slot.prompt.n_tokens() > 0) {
                             q_begin = (int32_t) slot.prompt.n_tokens();
                             q_end   = (int32_t) slot.task->n_tokens();
+                        }
+                        // The replay re-runs [q_begin, prompt end), and the rows past the
+                        // span's end belong to the chat template -- so a span that does not
+                        // fit one batch forces a second, freshly shaped batch. Measured on
+                        // 4649 tokens (budget 2048, block 128): the 7 leftover rows of a
+                        // 519-row replay cost more on their own than the 512 real rows
+                        // before them, because a new shape re-reserves the scheduler and
+                        // drains the device. Cap the scored span so the replay lands on one
+                        // batch of the width prefill already built. This is the same policy
+                        // as --kvmem-query-max (score the tail of a long query), one batch
+                        // earlier; KVMEM_REPLAY_FIT=0 keeps the old span for the A/B.
+                        if (kvmem_replay_fit_enabled() && q_begin >= 0 && q_end > q_begin) {
+                            // slot.prompt is still empty here (it is loaded further down), so
+                            // the length comes from the tokenized task. That can only be an
+                            // over-estimate -- a reused prefix makes the eventual prompt
+                            // shorter -- and an over-estimate shrinks the scored span, which
+                            // is the safe direction.
+                            const int32_t re_end  = (int32_t) slot.task->n_tokens();
+                            const int32_t re_room = llama_n_batch(ctx_tgt) - (re_end - q_end);
+                            if (re_room > 0 && q_end - q_begin > re_room) {
+                                q_begin = q_end - re_room;
+                            }
                         }
                         // --kvmem-query-max is enforced where the span lands, in
                         // the adapter, so a CLI or perplexity span is capped by
