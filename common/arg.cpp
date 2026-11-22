@@ -3539,7 +3539,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVMEM_QUERY_END"));
     add_opt(common_arg(
         {"--kvmem-query-max"}, "N",
-        string_format("score at most the last N tokens of a query span (a server request's last user turn, or --kvmem-query-begin/--kvmem-query-end), keeping the tail; 0 scores all of it, which retrieves over long distances better (default: %d)", params.kvmem.query_max),
+        string_format("score at most the last N tokens of a query span (a server request's last user turn, or --kvmem-query-begin/--kvmem-query-end), keeping the tail; 0 scores all of it (default: %d). A span that does not fit the working set is scored from its tail (at most 512 tokens) instead of skipping the retrieval round, so capping only changes how much of an over-budget span is ranked", params.kvmem.query_max),
         [](common_params & params, int value) {
             params.kvmem.query_max = value;
         }

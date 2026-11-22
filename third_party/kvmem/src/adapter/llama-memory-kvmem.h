@@ -145,10 +145,63 @@ public:
         first_pass_stale_ = false;
         round_span_infeasible_ = query_span_over_budget();
         if (round_span_infeasible_) {
-            return;
+            // Refusing the round also refuses the K harvest, and a page that never
+            // went through harvest has no mean-K: page-softmax then ranks it with
+            // nothing, every later round lands on sink+recency, and the session
+            // never recovers (2026-11-22, 27B, 5611-token document, budget 2048:
+            // 9/24 uncapped against 22/24 with the same span capped to its tail,
+            // while `KVMEM_QUERY`/`plan=` showed the round running every turn).
+            // Score the tail that does fit instead, bounded by the caller's cap
+            // when it asked for one. Only a span that cannot hold a single page
+            // still refuses.
+            round_span_infeasible_ = !clamp_span_to_budget();
+            if (round_span_infeasible_) {
+                warn_span_refused();
+                return;
+            }
         }
         prefill_capture_ = true;
         runtime_->store().begin_retrieval_round();
+    }
+    // How much of an over-budget span is still scored. The fork's driver hard-defaults
+    // this to 512 rows; the same value keeps the replay pass (which re-runs the very
+    // rows scored here) at ~1/10 of a 5k prefill instead of growing with the budget.
+    static constexpr int32_t auto_span_tokens = 512;
+    // Only used when a plain span cannot fit the budget: score its tail instead of
+    // giving up the whole round. A span that already fits is left untouched, because
+    // capping a short document that fits drops the head paragraph that answered it.
+    bool clamp_span_to_budget() {
+        if (explicit_spans_ || query_begin_ < 0 || query_end_ <= query_begin_) {
+            return false;
+        }
+        const uint32_t block = block_tokens_ ? block_tokens_ : 1;
+        const uint32_t budget = runtime_->store().budget_blocks();
+        const auto & cfg = runtime_->store().config();
+        const uint32_t reserve = cfg.sink_blocks + cfg.recent_blocks + 1;
+        if (!budget || budget <= reserve) {
+            return false;
+        }
+        const uint32_t cap_blocks = budget - reserve;
+        const uint32_t last = static_cast<uint32_t>(query_end_ - 1) / block;
+        const uint32_t first_fit = last + 1 > cap_blocks ? last + 1 - cap_blocks : 0;
+        // The caller's cap wins when it is the smaller one; 0 means "no cap asked for",
+        // so fall back to auto_span_tokens.
+        int32_t cap_tokens = auto_span_tokens;
+        if (query_max_ > 0 && query_max_ < cap_tokens) {
+            cap_tokens = query_max_;
+        }
+        const uint32_t fit_tokens = (cap_blocks - first_fit + 1) * block;
+        const int32_t begin = capped_query_begin(query_begin_, query_end_,
+                static_cast<int32_t>(std::min(fit_tokens, static_cast<uint32_t>(cap_tokens))));
+        if (begin <= query_begin_ || begin >= query_end_) {
+            return false;
+        }
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE span_clamped query=[%d,%d) -> [%d,%d) cap_blocks=%u\n",
+                    query_begin_, query_end_, begin, query_end_, cap_blocks);
+        }
+        query_begin_ = begin;
+        return true;
     }
     // Every block overlapping the Query span is mandatory, and query_fixed_blocks()
     // refuses a mandatory set that cannot fit the budget -- apply_retrieval() then rolls
@@ -179,26 +232,32 @@ public:
         if (span_blocks <= cap) {
             return false;
         }
-        // The WARN line below fires once per distinct span end, which is right for a log a
-        // user reads: the same conversation refuses the same span every turn. It is wrong
-        // for diagnosis -- a later refusal then looks like the round never opened at all
-        // (2026-11-09: a resumed conversation re-sends the same span end, so its refusal
-        // was silent). Keep one line per request at debug level.
-        LLAMA_LOG_DEBUG("%s: round not armed, span over budget: query=[%d,%d) needs %u of %u blocks\n",
+        // The predicate is now only "this span cannot be scored whole". Whether the round
+        // still runs is decided by begin_retrieval_round(), which scores the span's tail
+        // when the caller left the span uncapped -- so the user-visible line belongs
+        // there, not here. Keep the numbers for it and stay quiet at this level.
+        span_needed_blocks_ = span_blocks;
+        span_cap_blocks_ = cap;
+        LLAMA_LOG_DEBUG("%s: round not armed whole, span over budget: query=[%d,%d) needs %u of %u blocks\n",
                 __func__, query_begin_, query_end_, span_blocks, cap);
-        // WARN, not INFO. common_log_get_verbosity() maps the llama/ggml INFO level to the
-        // server's TRACE (4), so LLAMA_LOG_INFO never reaches the default verbosity of 3:
-        // the one line that says "retrieval did not run for this request" was invisible to
-        // every user who hit it, and its absence looked like a stale binary. Same level as
-        // the sibling "retrieval round rolled back", which this refusal stands in front of.
-        if (round_span_infeasible_end_ != query_end_) {
-            round_span_infeasible_end_ = query_end_;
-            LLAMA_LOG_WARN("%s: prefill capture skipped: the Query span alone needs %u of %u blocks "
-                    "(query=[%d,%d)), so no complete retrieval plan can fit; keeping the prefill "
-                    "pressure view. --kvmem-query-max scores only the span's tail and stays scoreable.\n",
-                    __func__, span_blocks, cap, query_begin_, query_end_);
-        }
         return true;
+    }
+    // WARN, not INFO. common_log_get_verbosity() maps the llama/ggml INFO level to the
+    // server's TRACE (4), so LLAMA_LOG_INFO never reaches the default verbosity of 3:
+    // the one line that says "retrieval did not run for this request" was invisible to
+    // every user who hit it, and its absence looked like a stale binary. Same level as
+    // the sibling "retrieval round rolled back", which this refusal stands in front of.
+    // One line per distinct span end: the same conversation refuses the same span every
+    // turn, and a resumed conversation re-sends that end, so a later refusal is silent
+    // (2026-11-09) -- the DEBUG line above is the per-request record.
+    void warn_span_refused() {
+        if (round_span_infeasible_end_ == query_end_) {
+            return;
+        }
+        round_span_infeasible_end_ = query_end_;
+        LLAMA_LOG_WARN("%s: retrieval round skipped: the Query span needs %u of %u blocks and "
+                "not even its tail fits, so the prefill pressure view is kept.\n",
+                __func__, span_needed_blocks_, span_cap_blocks_);
     }
     void accept_retrieval_round();
     void restore_history(const kvmem::LrfuState& state) { runtime_->store().restore_retrieval(state); }
@@ -650,6 +709,10 @@ private:
     // KVMEM_PERF counters.
     bool first_pass_stale_ = false;
     int32_t round_span_infeasible_end_ = -1;
+    // Filled by query_span_over_budget() so the refusal line can name the numbers
+    // without recomputing them in the round opener.
+    uint32_t span_needed_blocks_ = 0;
+    uint32_t span_cap_blocks_ = 0;
     // Set when a row of this conversation repeated its position, which is what a media
     // chunk does (it pushes one time coordinate across all of its rows). From then on
     // rows and positions are different numbers, so every conversion has to go through
