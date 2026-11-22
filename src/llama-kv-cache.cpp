@@ -13062,6 +13062,42 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
+#if defined(LLAMA_KVMEM)
+    // The KQ mask is the widest node in the graph that follows cache occupancy: it is
+    // [n_kv x n_tokens], and n_kv here is the padded occupancy. A prefill then grows it at
+    // every ubatch, and each growth makes ggml_gallocr_alloc_graph fail for that slot, so the
+    // scheduler answers with ggml_backend_synchronize + reserve_n -- a device-wide drain in the
+    // middle of prefill. Measured on 4649 tokens with a KVMem pool: mask widths 512, 1024, ...,
+    // 3072, one drain per step, 8 of them, and nokv has none because a plain cache allocates
+    // all its cells at init and never moves.
+    //
+    // A pool has a fixed cell budget, so the whole-pool width is both the widest graph this
+    // context can ever run and a constant one. Fixing it does not change what the mask means:
+    // set_input_kq_mask() already writes -inf for every cell the sequence does not own, holes
+    // included. The extra host bytes are the price: 3072 x 512 f16 per ubatch instead of an
+    // average of half that.
+    //
+    // KVMEM_MASK_WIDE=0 restores the occupancy-following width for the A/B.
+    static const bool mask_wide = []() {
+        const char * e = getenv("KVMEM_MASK_WIDE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    const llama_kvmem_params * kp = llama_kvmem_get_params();
+    if (mask_wide && kp != nullptr && kp->enabled) {
+        uint32_t widest = 0;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            widest = std::max<uint32_t>(widest, (uint32_t) v_cells[sinfo.strm[s]].size());
+        }
+        // Pin only once the pool is more than half full. From there the occupancy path
+        // keeps stepping by one ubatch up to the pool, and every step is a realloc. Below
+        // half full the pool is larger than what this request will fill, so the mask never
+        // saturates and paying for it at full width every ubatch is the worse trade.
+        if (result * 2 >= widest) {
+            result = widest;
+        }
+    }
+#endif
+
     return result;
 }
 

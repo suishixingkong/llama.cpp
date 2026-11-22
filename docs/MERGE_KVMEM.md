@@ -785,6 +785,43 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
 ⚠️ `slot.prompt` 在那个位置还是空的（prompt 在后面才装载），所以长度取自 `slot.task->n_tokens()`；
 它只可能高估（前缀被复用时真正的 prompt 更短），高估只会让打分跨度更小，是安全方向。
 
+**第五处：KQ mask 定宽，去掉 prefill 里的设备级 drain（2026-11-22）。** `attn_inp_kq_mask` 是
+`[n_kv × n_tokens]`，而不是 `n_kv` 在 KVMem 路径上等于**按占用补齐**的 cell 数：一次 prefill 里它每个
+ubatch 都长一截（512 → 1024 → … → 3072），每长一次就让 `ggml_gallocr_alloc_graph` 对这一槽返回失败，
+调度器的回答是 `ggml_backend_synchronize` + `reserve_n` —— 也就是**在 prefill 中间排空一次设备**。
+nokv 上没有这个问题：普通 cache 在初始化时就把 cell 全部占住，宽度不变。
+
+| 谁 | 一个 4649-token prefill 里的 `graph reallocation` | 说明 |
+|---|---|---|
+| `port-nokv` | **0** | mask 宽度恒为 `n_ctx` |
+| `--kvmem`（旧） | **8** | 宽度跟着占用走，每步一次 |
+| `--kvmem`（现在） | **5** | 池过半就按池宽钉住，后半程不再变 |
+
+判据是 `-lv 4` 的 `graph reallocation: nodes = 1193 (changed = 0)` 行数 + `ggml-alloc` 里的
+`src attn_inp_kq_mask ... size_max=… need=…`。修法在 `llama_kv_cache::get_n_kv()`：池子过半满之后，
+把宽度钉成池宽（此时占用路径本来也要一步步走到池宽，钉住只多出后半程那点字节）；池子比这篇文档大时
+不钉，宽度继续跟着占用走。
+
+- **吞吐上是平的**：同一二进制 `KVMEM_MASK_WIDE=0/1` 配对，3 轮 680 → 677 ms、5 轮 688 → 708 ms，
+  都在这一晚的 ±5% 噪声里；24 格答案 **24/24 逐格相同**（56/72）。
+- **为什么不做成"一直按池宽"**：`--kvmem-budget 8192`（池 9216 > 文档 4649）实测 **574 → 626 ms（−8%）**，
+  多出来的 mask 字节（每 ubatch 9.4 MB 而不是平均 4.7 MB）比省下的 drain 更贵。这就是"过半才钉"的理由。
+- 想彻底消掉剩下的 5 次，只能让**预留**就按池宽做（运行时宽度不变），但预留图不走
+  `get_n_kv()` 的 reserve 分支（实测 12 次调用里 `probe=0`），所以只能在 mask 宽度上做，就得付上面那笔字节。
+
+**试过但更慢的：把 mean-K 累加搬到 GPU。** 用现成的 `kvmem_meank_add/d2h`（decode 路径在用）按
+（块段 × 层）切片，`pack_ms` 从 **55.2 → 0.5 ms**，24 格答案 56/72 与逐格命中全部不变
+（与宿主求和的相对差 1.7e-7，只因参照用了 double）。但 **wall 反而慢 5%**（656 → 688 ms，4/5 轮更慢）：
+
+| | pack_ms（3072 token） | 最长一次 `harvest_flush` | prefill |
+|---|---|---|---|
+| 宿主累加 | 55.2 | 12.8 ms | 656 ms |
+| 设备累加 | **0.5** | 11.0 ms | **688 ms** |
+
+原因很直接：宿主打包本来就藏在 GPU 计算下面（worker 从不是瓶颈，flush 最多等 12.8 ms），
+而设备求和必须在 compute 与下一个 ubatch 的拷贝之间插一道 event 栅栏 —— 省下的是隐藏时间，
+付出的是关键路径。已经撤掉，代码里没有留开关。
+
 留在台面上的搬运（都不在主机等待上）：
 
 - **整块 V 收集 30 ms/请求**：每 ubatch 4 个新满块、6 层，合计 49 MB。这 49 MB 要过一次 D2H
@@ -800,20 +837,16 @@ cached turn 同样生效：第二轮 `n_prompt=65` 时 replay 打的是 `row=467
 **量这套东西只能用同二进制内的配对差。** 捕获开/关的绝对差在两次会话之间从 -30% 漂到 -14%
 （同一份二进制、同样的格），所以下面这类跨小时的数字不能横向比；页面上的百分比都是配对中位数。
 
-还没做、但已经量化清楚的四个方向：
+还没做、但已经量化清楚的方向（两条已试，结论在上一节）：
 
 1. **整块 V 收集**（~30 ms/请求，主线程）：只有"刚满"的块才需要，可现在每块每层一次 enqueue，
    还要 GPU→pinned→GPU 中转。若 `raw_` 能给出设备侧目标指针，这批就能变成纯 D2D gather。
 2. **`--kvmem-method recency` 的对照**：这里没有浪费可省——`want_q_capture()` 已经按 `method_ == 1`
    门控，recency 少掉的只是 Q；K 仍然要捕获，因为驱逐/回迁要靠 `raw_` 的宿主 K。
-3. **宿主打包的两个尾巴（各 ~20 ms）**：`harvest_flush()` 在检索轮之前等一次（22 ms），
-   重放里又等一次（18 ms）。两次都只等在飞的 1–2 个 ubatch 的 `pack`，
-   所以真正的单价是宿主 mean-K 逐 token 累加 —— 与上面第 2 条同一个根因。
-   搬上 GPU（`keys.mean_k()` 现在从宿主读）能同时收掉这两笔。
-4. **每 ubatch 一次的"尺寸没变却重分配"**：`sched_graph_realloc` 在 kv path 上每个 ubatch 都触发一次
-   （`changed = 0`，`ggml_gallocr_alloc_graph` 返回失败 ⇒ `ggml_backend_synchronize` + `reserve_n`），
-   nokv 上是 0 次。实测每次约 1.6 ms（14 次计 20 ms），不是大头，但它是"捕获把图撑坏"的直接证据，
-   属 ggml-sched 侧待查（上游把这一类叫 unexpected reallocation）。
+3. ~~宿主打包的两个尾巴~~ ⇒ 已测，**不是收益点**：`pack` 55.2 ms/请求确实存在，但 `harvest_flush`
+   只等过 12.8 ms（它藏在 GPU 计算下面）。搬到 GPU 反而 +5%，见上一节，已撤回。
+4. **"尺寸没变却重分配"** ⇒ 已查清并部分修掉（mask 定宽，8 → 5），见上一节：每次 1.6 ms，
+   nokv 是 0 次；剩下 5 次只能靠"预留按池宽"消掉，而预留图不走 `get_n_kv()`，代价是 mask 字节。
 
 #### MTP：draft 必须跟着重放，而且重放完不能再发「目标已还原」
 
