@@ -2,7 +2,7 @@
 // and byte accounting the caps rest on. Freestanding by design, so it runs on
 // a machine with no CUDA toolchain and no llama.cpp checkout:
 //
-//   c++ -std=c++17 -I tools/server -o /tmp/cst tests/kvmem-conversation-store-test.cpp && /tmp/cst
+//   c++ -std=c++17 -I tools/server -o /tmp/cst tests/test-kvmem-conversation-store.cpp && /tmp/cst
 //
 #include "kvmem-conversation-store.h"
 

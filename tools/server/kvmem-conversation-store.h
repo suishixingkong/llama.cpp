@@ -6,7 +6,7 @@
 // token prefix in particular, which is media-aware and lives in
 // kvmem_prompt::common_prefix) and applies the plan; this file only decides.
 //
-//   c++ -std=c++17 -I tools/server -o /tmp/cst tests/kvmem-conversation-store-test.cpp && /tmp/cst
+//   c++ -std=c++17 -I tools/server -o /tmp/cst tests/test-kvmem-conversation-store.cpp && /tmp/cst
 //
 // The three formulas are the ones the upstream kvmem project's single-store server
 // already uses (v0.16.0-rc3), transcribed verbatim so a ported request keeps the

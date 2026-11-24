@@ -908,14 +908,14 @@ endif()
 # The multi-conversation host-store policy is a freestanding header (only std
 # headers), so its decision table can be pinned without a model, a GPU or the
 # adapter: the server is the only thing that has to be right about applying it.
-llama_build_and_test(kvmem-conversation-store-test.cpp)
-target_include_directories(kvmem-conversation-store-test PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_build_and_test(test-kvmem-conversation-store.cpp)
+target_include_directories(test-kvmem-conversation-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
 # The adapter's store handles need the hook header and a real model, so this
 # one only exists in a KVMem build and skips itself when no GGUF is passed.
 if (LLAMA_KVMEM)
-    llama_build_and_test(kvmem-store-swap-test.cpp LINK llama)
-    target_include_directories(kvmem-store-swap-test PRIVATE
+    llama_build_and_test(test-kvmem-store-swap.cpp LINK llama)
+    target_include_directories(test-kvmem-store-swap PRIVATE
         ${LLAMA_KVMEM_ROOT}/kvmem/include
         ${LLAMA_KVMEM_ROOT}/src/adapter)
 endif()

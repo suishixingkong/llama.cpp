@@ -17,7 +17,7 @@
 // green on a machine that has no GGUF, the same way the other model-backed
 // tests here behave.
 //
-//   ./bin/kvmem-store-swap-test /path/to/model.gguf [device_index]
+//   ./bin/test-kvmem-store-swap /path/to/model.gguf [device_index]
 
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
